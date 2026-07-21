@@ -21,7 +21,9 @@ services:
       start_period: 10s
 
   dashboard:
-    image: sidekick-adapter:local
+    build:
+      context: ./dashboard
+    image: sidekick-dashboard:local
     container_name: sidekick-dashboard
     entrypoint: python
     command: ["-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/dashboard"]
@@ -30,8 +32,6 @@ services:
       VIRTUAL_PORT: "8080"
     expose:
       - "8080"
-    volumes:
-      - ./dashboard:/dashboard:ro
     networks:
       - agent-platform
     cap_drop:

@@ -98,6 +98,8 @@ def test_compose_routes_dashboard_and_playground_by_name() -> None:
     dashboard = proxy_config["services"]["dashboard"]
     assert dashboard["environment"]["VIRTUAL_HOST"] == "sidekick.localhost"
     assert dashboard["environment"]["VIRTUAL_PORT"] == "8080"
+    assert dashboard["build"]["context"] == str(ROOT / "proxy" / "dashboard")
+    assert "volumes" not in dashboard
 
     agent = subprocess.run(
         [
