@@ -415,6 +415,24 @@ class ChatMemoryIngestor:
         )
 
         try:
+            pending = await self._store.list_pending_memory_documents(scope_id)
+            # A sealed document already crossed a proven segment boundary. Drain it
+            # before reading more source messages so an outage cannot grow the local
+            # queue by another fetch window on every poll.
+            sealed_pending = tuple(
+                document for document in pending if document.sealed
+            )
+            (
+                earlier_messages_retained,
+                earlier_documents_created,
+                earlier_documents_unchanged,
+            ) = await self._retain_pending_documents(
+                scope_id,
+                sealed_pending,
+            )
+            pending = tuple(
+                document for document in pending if not document.sealed
+            )
             messages = await self._retry_source(
                 lambda: self._source.fetch_after(
                     chat_id,
@@ -426,9 +444,15 @@ class ChatMemoryIngestor:
             prepared = await self._prepare_documents(chat_id, messages)
             pending = self._stage_continuous_documents(
                 chat_id,
-                await self._store.list_pending_memory_documents(scope_id),
+                pending,
                 prepared,
             )
+            pending = self._seal_due_pending_documents(
+                pending,
+                watermark=until,
+            )
+            # Persist the boundary before the remote write so retries cannot reopen a
+            # document that was already quiet (or full) when retention failed.
             await self._store.stage_continuous_memory_documents(
                 scope_id,
                 pending,
@@ -439,16 +463,21 @@ class ChatMemoryIngestor:
                 messages_retained,
                 documents_created,
                 documents_unchanged,
-            ) = await self._retain_due_pending_documents(
+            ) = await self._retain_pending_documents(
                 scope_id,
-                pending,
-                watermark=until,
+                tuple(document for document in pending if document.sealed),
             )
             return ContinuousMemoryResult(
                 messages_seen=len(messages),
-                messages_retained=messages_retained,
-                documents_created=documents_created,
-                documents_unchanged=documents_unchanged,
+                messages_retained=(
+                    earlier_messages_retained + messages_retained
+                ),
+                documents_created=(
+                    earlier_documents_created + documents_created
+                ),
+                documents_unchanged=(
+                    earlier_documents_unchanged + documents_unchanged
+                ),
                 caught_up=len(messages) < self._ingestion_settings.max_messages,
             )
         except Exception as exc:
@@ -542,29 +571,41 @@ class ChatMemoryIngestor:
 
         return tuple(by_id[document_id] for document_id in ordered_ids)
 
-    async def _retain_due_pending_documents(
+    def _seal_due_pending_documents(
         self,
-        scope_id: str,
         pending: tuple[PendingMemoryDocument, ...],
         *,
         watermark: datetime,
-    ) -> tuple[int, int, int]:
-        due = tuple(
-            document
+    ) -> tuple[PendingMemoryDocument, ...]:
+        return tuple(
+            (
+                PendingMemoryDocument(
+                    episode=document.episode,
+                    staged_source_ids=document.staged_source_ids,
+                    sealed=True,
+                )
+                if not document.sealed
+                and watermark - document.last_event_at
+                >= self._ingestion_settings.segmentation.idle_gap
+                else document
+            )
             for document in pending
-            if document.sealed
-            or watermark - document.last_event_at
-            >= self._ingestion_settings.segmentation.idle_gap
         )
+
+    async def _retain_pending_documents(
+        self,
+        scope_id: str,
+        pending: tuple[PendingMemoryDocument, ...],
+    ) -> tuple[int, int, int]:
         messages_retained = 0
         documents_created = 0
         documents_unchanged = 0
         for start in range(
             0,
-            len(due),
+            len(pending),
             self._ingestion_settings.retain_concurrency,
         ):
-            batch = due[
+            batch = pending[
                 start : start + self._ingestion_settings.retain_concurrency
             ]
             results = await asyncio.gather(

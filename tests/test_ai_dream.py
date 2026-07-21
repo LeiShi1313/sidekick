@@ -1575,6 +1575,29 @@ async def test_continuous_memory_retries_a_sealed_buffer_without_replaying_sourc
         assert (
             await store.get_memory_scope_state("telegram:chat:-1001")
         ).continuous_cursor_message_id == 42
+        pending = await store.list_pending_memory_documents(
+            "telegram:chat:-1001"
+        )
+        assert len(pending) == 1
+        assert pending[0].sealed is True
+
+        newer = FakeMessage(
+            43,
+            "Do not pull this while retention is unavailable",
+            date=NOW + timedelta(minutes=5),
+        )
+        source.window = (message, newer)
+        source.by_id[newer.id] = newer
+        fetches_before_retry = len(source.window_calls)
+
+        with pytest.raises(ConnectionError, match="synthetic retain failure"):
+            await scanner.run_continuous_scope(-1001)
+
+        assert len(source.window_calls) == fetches_before_retry
+        assert (
+            await store.get_memory_scope_state("telegram:chat:-1001")
+        ).continuous_cursor_message_id == 42
+        source.window = (message,)
 
         healthy = FakeMemory()
         resumed = ChatMemoryIngestor(

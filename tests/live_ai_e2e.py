@@ -257,9 +257,9 @@ async def run() -> None:
         )
         print("scope_enable=ok")
 
-        standalone_token = f"DREAM_STANDALONE_{token}"
-        thread_root_token = f"DREAM_ROOT_{token}"
-        thread_reply_token = f"DREAM_REPLY_{token}"
+        standalone_token = f"MEMORY_STANDALONE_{token}"
+        thread_root_token = f"MEMORY_ROOT_{token}"
+        thread_reply_token = f"MEMORY_REPLY_{token}"
         standalone = await peer.send_message(
             peer_chat,
             f"Standalone synthetic lore: {standalone_token}",
@@ -275,13 +275,23 @@ async def run() -> None:
         settlement = float(
             os.environ.get("SIDEKICK_MEMORY_INGESTION_SETTLEMENT_SECONDS", "30")
         )
-        await asyncio.sleep(max(settlement, 0) + 1)
+        idle_gap = float(
+            os.environ.get("SIDEKICK_MEMORY_SEGMENT_IDLE_SECONDS", "300")
+        )
+        poll_interval = float(
+            os.environ.get("SIDEKICK_MEMORY_CONTINUOUS_POLL_SECONDS", "10")
+        )
+        retention_timeout = max(
+            180,
+            settlement + idle_gap + poll_interval + 120,
+        )
         started_at = standalone.date.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
         await wait_for_document(
             hindsight_url,
             scope_id,
             f"telegram:memory-session:{chat_id}:{started_at}:{standalone.id}",
             (standalone_token, thread_root_token, thread_reply_token),
+            timeout=retention_timeout,
         )
         print("standalone_and_thread_continuous_memory=ok")
 
