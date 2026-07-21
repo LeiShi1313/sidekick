@@ -1,0 +1,269 @@
+:root {
+  color-scheme: light;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  color: #202521;
+  background: #f3f5f2;
+  font-synthesis: none;
+  letter-spacing: 0;
+  --surface: #ffffff;
+  --surface-muted: #f8faf8;
+  --text: #202521;
+  --text-muted: #667069;
+  --border: #d8ded9;
+  --focus: #176e58;
+  --agent: #2176ae;
+  --memory: #17805f;
+  --design: #b75c1d;
+  --context: #8a4e9e;
+  --thread: #b23a48;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: #f3f5f2;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+
+a {
+  color: inherit;
+}
+
+a:focus-visible {
+  border-radius: 3px;
+  outline: 3px solid rgb(23 110 88 / 24%);
+  outline-offset: 3px;
+}
+
+.topbar {
+  border-bottom: 1px solid var(--border);
+  background: rgb(255 255 255 / 92%);
+}
+
+.topbar-inner,
+main {
+  width: min(1120px, calc(100% - 40px));
+  margin: 0 auto;
+}
+
+.topbar-inner {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.wordmark {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.environment {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+main {
+  padding: 48px 0 64px;
+}
+
+.page-heading {
+  margin-bottom: 32px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--focus);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  letter-spacing: 0;
+}
+
+h1 {
+  margin: 0;
+  font-size: 38px;
+  line-height: 1.15;
+}
+
+.section-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.resource-section {
+  border-top: 2px solid #aeb7b0;
+}
+
+.section-heading {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-heading h2 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.section-heading span,
+.section-link {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.section-link {
+  font-weight: 650;
+  text-underline-offset: 3px;
+}
+
+.section-link::after,
+.resource-item a::after {
+  content: "\2197";
+  display: inline-block;
+  margin-left: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.resource-list {
+  margin: 0;
+  padding: 0;
+  background: var(--surface);
+  list-style: none;
+}
+
+.resource-item {
+  position: relative;
+  display: grid;
+  min-height: 96px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 16px 16px 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.resource-item:last-child {
+  border-bottom: 0;
+}
+
+.resource-item::before {
+  position: absolute;
+  top: 20px;
+  bottom: 20px;
+  left: 0;
+  width: 4px;
+  border-radius: 0 3px 3px 0;
+  background: var(--item-accent);
+  content: "";
+}
+
+.resource-item--agent {
+  --item-accent: var(--agent);
+}
+
+.resource-item--memory {
+  --item-accent: var(--memory);
+}
+
+.resource-item--design {
+  --item-accent: var(--design);
+}
+
+.resource-item--context {
+  --item-accent: var(--context);
+}
+
+.resource-item--thread {
+  --item-accent: var(--thread);
+}
+
+.resource-item a {
+  font-weight: 700;
+  text-underline-offset: 3px;
+}
+
+.resource-item p {
+  max-width: 48ch;
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.resource-meta {
+  min-width: 64px;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
+@media (hover: hover) {
+  .resource-item:hover {
+    background: #fbfcfb;
+  }
+}
+
+@media (max-width: 760px) {
+  .topbar-inner,
+  main {
+    width: min(100% - 24px, 1120px);
+  }
+
+  main {
+    padding: 32px 0 40px;
+  }
+
+  h1 {
+    font-size: 32px;
+  }
+
+  .section-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .resource-item {
+    min-height: 92px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .resource-meta {
+    min-width: 0;
+    text-align: left;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+  }
+}

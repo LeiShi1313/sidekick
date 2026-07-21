@@ -15,7 +15,7 @@ memory system without making either layer depend on Telegram or QQ concepts.
 - `memory`: pinned Hindsight deployment and local patches.
 - `playground`: browser interface for exercising the agent and memory outside
   a chat platform.
-- `proxy`: local hostname routing for dashboards.
+- `proxy`: local hostname routing and the Sidekick service index.
 
 TeleFire is not a Sidekick dependency. Telegram credentials and session files
 are runtime inputs and are never stored in this repository.
@@ -68,6 +68,12 @@ docker compose --env-file agent/.env -f agent/compose.yml up -d
 docker compose --env-file .env -f docker-compose.yml up -d
 docker compose -f proxy/compose.yml up -d
 ```
+
+Human-facing services are available through the dashboard proxy:
+
+- `http://sidekick.localhost:18865`: service index.
+- `http://playground.sidekick.localhost:18865`: agent playground.
+- `http://hindsight.sidekick.localhost:18865`: Hindsight memory dashboard.
 
 The adapter compose file expects the external `memory-platform` and
 `agent-platform` networks created by the memory and agent projects. Runtime
