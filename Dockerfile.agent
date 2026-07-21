@@ -1,0 +1,26 @@
+FROM node:24-trixie-slim
+
+ENV NODE_ENV=production \
+    HOME=/agent-data \
+    PI_DATA_DIR=/agent-data/.pi-agent
+
+WORKDIR /app
+COPY agent/package.json agent/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts \
+    && npm cache clean --force \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+        /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/pnpm /usr/local/bin/pnpx
+
+COPY agent/src ./src
+
+RUN useradd --create-home --home-dir /agent-data --uid 10001 agent \
+    && mkdir -p /agent-data/.pi-agent \
+    && chmod a+r package.json package-lock.json \
+    && chmod -R a+rX /app/src \
+    && chown -R agent:agent /agent-data
+
+USER agent
+EXPOSE 8790
+
+CMD ["node", "src/main.mjs"]
