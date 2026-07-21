@@ -35,6 +35,7 @@ import sidekick.plugins.ai  # noqa: F401
 class FakeAnswer:
     def __init__(self, text: str):
         self.id = 100
+        self.initial_text = text
         self.text = text
         self.edits: list[str] = []
         self.edit_calls: list[tuple[str, dict]] = []
@@ -99,6 +100,7 @@ def make_telegram_responder(
     *,
     edit_cadence=0,
     clock=None,
+    initial_status="琢磨中。。。",
     response_format="regular_html",
     **kwargs,
 ):
@@ -107,6 +109,7 @@ def make_telegram_responder(
         transport_kwargs["clock"] = clock
     return AIResponder(
         gateway,
+        initial_status=initial_status,
         transport=TelegramChatTransport(
             response_format=response_format,
             **transport_kwargs,
@@ -311,6 +314,16 @@ def test_ai_settings_are_loaded_without_provider_specific_assumptions(monkeypatc
 
 def test_ai_command_is_registered_under_telegram():
     assert command_registry.as_fire_commands()["telegram"]["ai"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_answer_starts_with_localized_thinking_status():
+    responder = make_telegram_responder(FakeGateway(["answer"]))
+    trigger = FakeMessage("/ai answer")
+
+    await responder.answer(trigger, make_request("answer"))
+
+    assert trigger.replies[0].initial_text == "琢磨中。。。"
 
 
 @pytest.mark.asyncio

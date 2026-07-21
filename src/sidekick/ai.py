@@ -643,12 +643,14 @@ class AIResponder:
         gateway: AgentGateway,
         *,
         max_output_chars: int = 3_900,
+        initial_status: str = "Thinking...",
         transport: ChatTransport | None = None,
         logger: Any | None = None,
     ):
         self._gateway = gateway
         self._transport = transport or ObjectChatTransport()
         self._max_output_chars = max(4, max_output_chars)
+        self._initial_status = initial_status
         self._logger = logger
 
     async def answer(
@@ -656,7 +658,7 @@ class AIResponder:
     ) -> AnswerResult:
         answer = await self._transport.reply(
             trigger,
-            "Thinking...",
+            self._initial_status,
             presentation="plain",
         )
         text = ""
