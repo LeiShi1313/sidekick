@@ -50,6 +50,18 @@ secret values are placeholders.
 
 The stack is deliberately split by ownership so each layer can run on its own:
 
+1. Create the external `ollama-embedding` network by starting the separately
+   managed embedding stack.
+2. Build Sidekick's pinned Hindsight control plane from an upstream checkout:
+
+```bash
+gh repo clone vectorize-io/hindsight ../hindsight
+./memory/build-hindsight-control-plane.sh ../hindsight
+```
+
+3. Create `.env`, `agent/.env`, and `memory/.env` from their example files,
+   then start each layer:
+
 ```bash
 docker compose --env-file memory/.env -f memory/compose.yml up -d
 docker compose --env-file agent/.env -f agent/compose.yml up -d
@@ -60,4 +72,7 @@ docker compose -f proxy/compose.yml up -d
 The adapter compose file expects the external `memory-platform` and
 `agent-platform` networks created by the memory and agent projects. Runtime
 databases, Telegram sessions, model credentials, and Hindsight data stay in
-Docker volumes or local ignored files.
+Docker volumes or local ignored files. Existing TeleFire state is not migrated
+automatically; move session files and adapter databases, then republish
+knowledge-directory entries as an explicit deployment operation before
+replacing a live stack.
