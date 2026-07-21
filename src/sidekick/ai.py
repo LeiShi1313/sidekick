@@ -2117,6 +2117,11 @@ class AIStateRepository:
                 time.time(),
             ),
         )
+        if not enabled:
+            await connection.execute(
+                "DELETE FROM ai_memory_pending_documents WHERE scope_id = ?",
+                (scope_id,),
+            )
         await connection.commit()
 
     async def set_dream_memory_enabled(

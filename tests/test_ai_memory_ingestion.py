@@ -62,3 +62,43 @@ async def test_pending_memory_document_and_cursor_survive_repository_restart(tmp
         assert await second.list_pending_memory_documents(scope_id) == ()
     finally:
         await second.close()
+
+
+@pytest.mark.asyncio
+async def test_disabling_continuous_memory_discards_pending_documents(tmp_path):
+    scope_id = "telegram:chat:-1001"
+    event = MemoryEvent(
+        source_id="telegram:message:-1001:41",
+        actor_id="telegram:user:20",
+        actor_display_name="Alice",
+        occurred_at=datetime(2026, 7, 13, 12, 0, tzinfo=UTC),
+        text="Do not retain this after memory is disabled",
+    )
+    pending = PendingMemoryDocument(
+        episode=MemoryEpisode(
+            scope_id=scope_id,
+            document_id="telegram:memory-session:-1001:20260713T120000Z:41",
+            events=(event,),
+            source="telegram",
+        ),
+        staged_source_ids=(event.source_id,),
+    )
+    store = await AIStateRepository(tmp_path / "ai.db").connect()
+    try:
+        await store.set_continuous_memory_enabled(
+            scope_id,
+            True,
+            cursor_message_id=40,
+        )
+        await store.stage_continuous_memory_documents(
+            scope_id,
+            (pending,),
+            cursor_message_id=41,
+            succeeded_at=datetime(2026, 7, 13, 12, 1, tzinfo=UTC).timestamp(),
+        )
+
+        await store.set_continuous_memory_enabled(scope_id, False)
+
+        assert await store.list_pending_memory_documents(scope_id) == ()
+    finally:
+        await store.close()
