@@ -367,6 +367,9 @@ async def make_scanner(
     attachment_describer=None,
     retain_concurrency=1,
     max_messages=100,
+    idle_gap=timedelta(minutes=15),
+    max_events=1,
+    settlement_delay=timedelta(0),
     lease_seconds=3_600,
     clock=lambda: NOW.timestamp(),
     identity_resolver=None,
@@ -389,10 +392,11 @@ async def make_scanner(
         **scanner_settings(
             lookback=timedelta(hours=1),
             overlap=timedelta(minutes=10),
-            settlement_delay=timedelta(0),
+            settlement_delay=settlement_delay,
             max_messages=max_messages,
             max_thread_messages=max_thread_messages,
-            max_events=1,
+            idle_gap=idle_gap,
+            max_events=max_events,
             retain_concurrency=retain_concurrency,
             lease_seconds=lease_seconds,
         ),
@@ -1209,6 +1213,7 @@ async def test_continuous_memory_resumes_after_cursor_and_checkpoints_success(tm
         source,
         memory,
         max_messages=2,
+        max_events=30,
     )
     await store.set_dream_memory_enabled("telegram:chat:-1001", False)
     await store.set_continuous_memory_enabled(
@@ -1221,7 +1226,8 @@ async def test_continuous_memory_resumes_after_cursor_and_checkpoints_success(tm
         result = await scanner.run_continuous_scope(-1001)
 
         assert result.messages_seen == 2
-        assert result.messages_retained == 2
+        assert result.messages_retained == 0
+        assert memory.retain_calls == []
         assert result.caught_up is False
         assert source.window_calls == [
             {
@@ -1236,6 +1242,308 @@ async def test_continuous_memory_resumes_after_cursor_and_checkpoints_success(tm
         assert state.continuous_last_attempt_at == NOW.timestamp()
         assert state.continuous_last_success_at == NOW.timestamp()
         assert state.continuous_last_error is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_continuous_memory_retains_one_document_after_the_chat_is_quiet(
+    tmp_path,
+):
+    class MutableClock:
+        value = NOW.timestamp()
+
+        def __call__(self):
+            return self.value
+
+    clock = MutableClock()
+    first = FakeMessage(
+        42,
+        "First part of the same discussion",
+        date=NOW - timedelta(seconds=20),
+    )
+    second = FakeMessage(
+        43,
+        "Second part of the same discussion",
+        date=NOW - timedelta(seconds=10),
+    )
+    source = FakeSource((first, second))
+    memory = FakeMemory()
+    store, scanner = await make_scanner(
+        tmp_path,
+        source,
+        memory,
+        clock=clock,
+        idle_gap=timedelta(minutes=5),
+        max_events=30,
+    )
+    await store.set_continuous_memory_enabled(
+        "telegram:chat:-1001",
+        True,
+        cursor_message_id=41,
+    )
+    try:
+        staged = await scanner.run_continuous_scope(-1001)
+
+        assert staged.messages_seen == 2
+        assert staged.messages_retained == 0
+        assert memory.retain_calls == []
+        assert (
+            await store.get_memory_scope_state("telegram:chat:-1001")
+        ).continuous_cursor_message_id == 43
+
+        clock.value = (NOW + timedelta(minutes=5)).timestamp()
+        retained = await scanner.run_continuous_scope(-1001)
+
+        assert retained.messages_seen == 0
+        assert retained.messages_retained == 2
+        assert retained.documents_created == 1
+        assert len(memory.retain_calls) == 1
+        assert [event.text for event in memory.retain_calls[0]["episode"].events] == [
+            "First part of the same discussion",
+            "Second part of the same discussion",
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_continuous_memory_recovers_an_open_buffer_after_restart(tmp_path):
+    class MutableClock:
+        value = NOW.timestamp()
+
+        def __call__(self):
+            return self.value
+
+    clock = MutableClock()
+    message = FakeMessage(
+        42,
+        "Persist this before restart",
+        date=NOW - timedelta(seconds=10),
+    )
+    source = FakeSource((message,))
+    memory = FakeMemory()
+    state_path = tmp_path / "ai.db"
+    first_store, first_scanner = await make_scanner(
+        tmp_path,
+        source,
+        memory,
+        clock=clock,
+        idle_gap=timedelta(minutes=5),
+        max_events=30,
+    )
+    await first_store.set_continuous_memory_enabled(
+        "telegram:chat:-1001",
+        True,
+        cursor_message_id=41,
+    )
+    await first_scanner.run_continuous_scope(-1001)
+    await first_store.close()
+    assert memory.retain_calls == []
+
+    clock.value = (NOW + timedelta(minutes=5)).timestamp()
+    second_store = await AIStateRepository(state_path).connect()
+    second_scanner = ChatDreamScanner(
+        identity_codec=TELEGRAM_IDENTITY_CODEC,
+        source_retry_delay=telegram_source_retry_delay,
+        album_document_id=telegram_channel_album_document_id,
+        source=source,
+        store=second_store,
+        memory=memory,
+        prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
+        **scanner_settings(
+            settlement_delay=timedelta(0),
+            idle_gap=timedelta(minutes=5),
+            max_events=30,
+        ),
+        clock=clock,
+    )
+    try:
+        result = await second_scanner.run_continuous_scope(-1001)
+
+        assert result.messages_seen == 0
+        assert result.messages_retained == 1
+        assert len(memory.retain_calls) == 1
+        assert memory.retain_calls[0]["episode"].events[0].text == (
+            "Persist this before restart"
+        )
+    finally:
+        await second_store.close()
+
+
+@pytest.mark.asyncio
+async def test_excluded_activity_does_not_keep_a_memory_segment_open(tmp_path):
+    class MutableClock:
+        value = NOW.timestamp()
+
+        def __call__(self):
+            return self.value
+
+    clock = MutableClock()
+    useful = FakeMessage(
+        42,
+        "Useful evidence before a control command",
+        date=NOW - timedelta(seconds=10),
+    )
+    source = FakeSource((useful,))
+    memory = FakeMemory()
+    store, scanner = await make_scanner(
+        tmp_path,
+        source,
+        memory,
+        clock=clock,
+        idle_gap=timedelta(minutes=5),
+        max_events=30,
+    )
+    scope_id = "telegram:chat:-1001"
+    await store.set_continuous_memory_enabled(
+        scope_id,
+        True,
+        cursor_message_id=41,
+    )
+    try:
+        await scanner.run_continuous_scope(-1001)
+
+        control = FakeMessage(
+            43,
+            "/ai_memory_status",
+            date=NOW + timedelta(minutes=4, seconds=50),
+        )
+        source.window = (useful, control)
+        source.by_id[control.id] = control
+        await store.mark_memory_excluded_message(
+            scope_id,
+            control.id,
+            "memory-control",
+        )
+        clock.value = (NOW + timedelta(minutes=5)).timestamp()
+
+        result = await scanner.run_continuous_scope(-1001)
+
+        assert result.messages_seen == 1
+        assert result.messages_retained == 1
+        assert len(memory.retain_calls) == 1
+        assert [event.text for event in memory.retain_calls[0]["episode"].events] == [
+            "Useful evidence before a control command"
+        ]
+        assert (
+            await store.get_memory_scope_state(scope_id)
+        ).continuous_cursor_message_id == 43
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_continuous_memory_seals_a_full_segment_without_waiting_for_idle(
+    tmp_path,
+):
+    messages = tuple(
+        FakeMessage(
+            42 + index,
+            f"Message {index}",
+            date=NOW - timedelta(seconds=3 - index),
+        )
+        for index in range(3)
+    )
+    source = FakeSource(messages)
+    memory = FakeMemory()
+    store, scanner = await make_scanner(
+        tmp_path,
+        source,
+        memory,
+        idle_gap=timedelta(minutes=5),
+        max_events=2,
+    )
+    await store.set_continuous_memory_enabled(
+        "telegram:chat:-1001",
+        True,
+        cursor_message_id=41,
+    )
+    try:
+        result = await scanner.run_continuous_scope(-1001)
+
+        assert result.messages_seen == 3
+        assert result.messages_retained == 2
+        assert result.documents_created == 1
+        assert len(memory.retain_calls) == 1
+        assert [event.text for event in memory.retain_calls[0]["episode"].events] == [
+            "Message 0",
+            "Message 1",
+        ]
+        assert (
+            await store.get_memory_scope_state("telegram:chat:-1001")
+        ).continuous_cursor_message_id == 44
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_continuous_memory_retries_a_sealed_buffer_without_replaying_source(
+    tmp_path,
+):
+    class MutableClock:
+        value = NOW.timestamp()
+
+        def __call__(self):
+            return self.value
+
+    class FailingMemory(FakeMemory):
+        async def retain_many(self, episodes, *, update_mode="replace"):
+            raise ConnectionError("synthetic retain failure")
+
+    clock = MutableClock()
+    message = FakeMessage(
+        42,
+        "Retry this retained document",
+        date=NOW - timedelta(seconds=10),
+    )
+    source = FakeSource((message,))
+    failing = FailingMemory()
+    store, scanner = await make_scanner(
+        tmp_path,
+        source,
+        failing,
+        clock=clock,
+        idle_gap=timedelta(minutes=5),
+        max_events=30,
+    )
+    await store.set_continuous_memory_enabled(
+        "telegram:chat:-1001",
+        True,
+        cursor_message_id=41,
+    )
+    try:
+        await scanner.run_continuous_scope(-1001)
+        clock.value = (NOW + timedelta(minutes=5)).timestamp()
+
+        with pytest.raises(ConnectionError, match="synthetic retain failure"):
+            await scanner.run_continuous_scope(-1001)
+
+        assert (
+            await store.get_memory_scope_state("telegram:chat:-1001")
+        ).continuous_cursor_message_id == 42
+
+        healthy = FakeMemory()
+        resumed = ChatDreamScanner(
+            identity_codec=TELEGRAM_IDENTITY_CODEC,
+            source_retry_delay=telegram_source_retry_delay,
+            album_document_id=telegram_channel_album_document_id,
+            source=source,
+            store=store,
+            memory=healthy,
+            prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
+            **scanner_settings(
+                settlement_delay=timedelta(0),
+                idle_gap=timedelta(minutes=5),
+                max_events=30,
+            ),
+            clock=clock,
+        )
+        result = await resumed.run_continuous_scope(-1001)
+
+        assert result.messages_seen == 0
+        assert result.messages_retained == 1
+        assert len(healthy.retain_calls) == 1
     finally:
         await store.close()
 
@@ -1264,7 +1572,8 @@ async def test_continuous_memory_skips_excluded_messages_without_stalling_cursor
         result = await scanner.run_continuous_scope(-1001)
 
         assert result.messages_seen == 2
-        assert result.messages_retained == 1
+        assert result.messages_retained == 0
+        assert memory.retain_calls == []
         assert (
             await store.get_memory_scope_state("telegram:chat:-1001")
         ).continuous_cursor_message_id == 43
@@ -1273,7 +1582,9 @@ async def test_continuous_memory_skips_excluded_messages_without_stalling_cursor
 
 
 @pytest.mark.asyncio
-async def test_continuous_memory_checkpoints_accepted_prefix_before_failure(tmp_path):
+async def test_continuous_memory_advances_staged_cursor_before_retain_failure(
+    tmp_path,
+):
     first = FakeMessage(
         42,
         "First independent document",
@@ -1286,7 +1597,7 @@ async def test_continuous_memory_checkpoints_accepted_prefix_before_failure(tmp_
     )
     source = FakeSource([first, second])
     memory = FakeMemory(
-        fail_document="telegram:dream-session:-1001:20260713T115500Z:43"
+        fail_document="telegram:dream-session:-1001:20260713T113000Z:42"
     )
     store, scanner = await make_scanner(
         tmp_path,
@@ -1304,7 +1615,7 @@ async def test_continuous_memory_checkpoints_accepted_prefix_before_failure(tmp_
             await scanner.run_continuous_scope(-1001)
 
         state = await store.get_memory_scope_state("telegram:chat:-1001")
-        assert state.continuous_cursor_message_id == 42
+        assert state.continuous_cursor_message_id == 43
         assert state.continuous_last_success_at == NOW.timestamp()
         assert "ConnectionError" in (state.continuous_last_error or "")
     finally:

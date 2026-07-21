@@ -37,7 +37,10 @@ from sidekick.ai_memory import (
 )
 from sidekick.ai_memory_ingestion import (
     MemoryIngestionSettings,
-    MemorySegmentationSettings,
+    PendingMemoryDocument,
+    merge_pending_document,
+    pending_document_accepts,
+    segment_accepts,
 )
 
 
@@ -241,35 +244,6 @@ def _message_source_prefix(
     return f"{sample.rsplit(':', 1)[0]}:"
 
 
-def _session_accepts(
-    current: tuple[HumanObservation, ...],
-    candidate: tuple[HumanObservation, ...],
-    settings: MemorySegmentationSettings,
-) -> bool:
-    if not current:
-        return True
-    current_start = min(observation.occurred_at for observation in current)
-    current_end = max(observation.occurred_at for observation in current)
-    candidate_start = min(observation.occurred_at for observation in candidate)
-    candidate_end = max(observation.occurred_at for observation in candidate)
-    if candidate_start - current_end > settings.idle_gap:
-        return False
-    if (
-        max(current_end, candidate_end)
-        - min(
-            current_start,
-            candidate_start,
-        )
-        > settings.max_span
-    ):
-        return False
-    if len(current) + len(candidate) > settings.max_events:
-        return False
-    return sum(len(observation.text) for observation in (*current, *candidate)) <= (
-        settings.max_chars
-    )
-
-
 def _completed_message_prefix(
     messages: tuple[ReplyTarget, ...],
     documents: tuple[_DreamDocument, ...],
@@ -445,16 +419,6 @@ class ChatDreamScanner:
             - self._ingestion_settings.settlement_delay
         )
 
-        async def checkpoint(
-            cursor_message_id: int | None,
-            _scanned_until_at: float,
-        ) -> None:
-            await self._store.record_continuous_memory_success(
-                scope_id,
-                cursor_message_id=cursor_message_id,
-                succeeded_at=self._clock(),
-            )
-
         try:
             messages = await self._retry_source(
                 lambda: self._source.fetch_after(
@@ -464,26 +428,33 @@ class ChatDreamScanner:
                     limit=self._ingestion_settings.max_messages,
                 )
             )
-            result, _, complete = await self._retain_threads(
+            prepared = await self._prepare_documents(chat_id, messages)
+            pending = self._stage_continuous_documents(
                 chat_id,
-                messages,
-                checkpoint=checkpoint,
+                await self._store.list_pending_memory_documents(scope_id),
+                prepared,
             )
-            if not messages:
-                await self._store.record_continuous_memory_success(
-                    scope_id,
-                    cursor_message_id=None,
-                    succeeded_at=self._clock(),
-                )
+            await self._store.stage_continuous_memory_documents(
+                scope_id,
+                pending,
+                cursor_message_id=messages[-1].id if messages else None,
+                succeeded_at=self._clock(),
+            )
+            (
+                messages_retained,
+                documents_created,
+                documents_unchanged,
+            ) = await self._retain_due_pending_documents(
+                scope_id,
+                pending,
+                watermark=until,
+            )
             return ContinuousMemoryResult(
-                messages_seen=result.messages_seen,
-                messages_retained=result.messages_retained,
-                documents_created=result.documents_created,
-                documents_unchanged=result.documents_unchanged,
-                caught_up=(
-                    complete
-                    and len(messages) < self._ingestion_settings.max_messages
-                ),
+                messages_seen=len(messages),
+                messages_retained=messages_retained,
+                documents_created=documents_created,
+                documents_unchanged=documents_unchanged,
+                caught_up=len(messages) < self._ingestion_settings.max_messages,
             )
         except Exception as exc:
             await self._store.record_continuous_memory_failure(
@@ -492,6 +463,151 @@ class ChatDreamScanner:
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise
+
+    def _stage_continuous_documents(
+        self,
+        chat_id: int,
+        pending: tuple[PendingMemoryDocument, ...],
+        prepared: tuple[_DreamDocument, ...],
+    ) -> tuple[PendingMemoryDocument, ...]:
+        by_id = {
+            document.episode.document_id: document for document in pending
+        }
+        ordered_ids = [document.episode.document_id for document in pending]
+        open_session_id: str | None = None
+        for document in pending:
+            document_id = document.episode.document_id
+            if document.sealed or not self._is_session_document(document_id):
+                continue
+            if open_session_id is not None:
+                previous = by_id[open_session_id]
+                by_id[open_session_id] = PendingMemoryDocument(
+                    episode=previous.episode,
+                    staged_source_ids=previous.staged_source_ids,
+                    sealed=True,
+                )
+            open_session_id = document_id
+
+        for prepared_document in prepared:
+            episode = prepared_document.episode
+            window_source_ids = {
+                self._identity_codec.message_source_id(chat_id, message_id)
+                for message_id in prepared_document.window_message_ids
+            }
+            staged_source_ids = tuple(
+                event.source_id
+                for event in episode.events
+                if event.source_id in window_source_ids
+            )
+            existing = by_id.get(episode.document_id)
+            if existing is not None:
+                by_id[episode.document_id] = merge_pending_document(
+                    existing,
+                    episode,
+                    staged_source_ids,
+                )
+                if self._is_session_document(episode.document_id):
+                    open_session_id = episode.document_id
+                continue
+
+            if self._is_session_document(episode.document_id):
+                open_session = (
+                    by_id.get(open_session_id)
+                    if open_session_id is not None
+                    else None
+                )
+                if (
+                    open_session is not None
+                    and not open_session.sealed
+                    and pending_document_accepts(
+                        open_session,
+                        episode,
+                        self._ingestion_settings.segmentation,
+                    )
+                ):
+                    by_id[open_session_id] = merge_pending_document(
+                        open_session,
+                        episode,
+                        staged_source_ids,
+                    )
+                    continue
+                if open_session is not None:
+                    by_id[open_session_id] = PendingMemoryDocument(
+                        episode=open_session.episode,
+                        staged_source_ids=open_session.staged_source_ids,
+                        sealed=True,
+                    )
+                open_session_id = episode.document_id
+
+            by_id[episode.document_id] = PendingMemoryDocument(
+                episode=episode,
+                staged_source_ids=staged_source_ids,
+            )
+            ordered_ids.append(episode.document_id)
+
+        return tuple(by_id[document_id] for document_id in ordered_ids)
+
+    async def _retain_due_pending_documents(
+        self,
+        scope_id: str,
+        pending: tuple[PendingMemoryDocument, ...],
+        *,
+        watermark: datetime,
+    ) -> tuple[int, int, int]:
+        due = tuple(
+            document
+            for document in pending
+            if document.sealed
+            or watermark - document.last_event_at
+            >= self._ingestion_settings.segmentation.idle_gap
+        )
+        messages_retained = 0
+        documents_created = 0
+        documents_unchanged = 0
+        for start in range(
+            0,
+            len(due),
+            self._ingestion_settings.retain_concurrency,
+        ):
+            batch = due[
+                start : start + self._ingestion_settings.retain_concurrency
+            ]
+            results = await asyncio.gather(
+                *(
+                    self._retry_memory(
+                        lambda document=document: retain_episodes_once(
+                            self._memory,
+                            self._store,
+                            (document.episode,),
+                        )
+                    )
+                    for document in batch
+                ),
+                return_exceptions=True,
+            )
+            completed_ids: list[str] = []
+            first_error: BaseException | None = None
+            for document, created in zip(batch, results, strict=True):
+                if isinstance(created, BaseException):
+                    if first_error is None:
+                        first_error = created
+                    continue
+                completed_ids.append(document.episode.document_id)
+                messages_retained += len(document.staged_source_ids)
+                documents_created += int(created[0])
+                documents_unchanged += int(not created[0])
+            await self._store.delete_pending_memory_documents(
+                scope_id,
+                tuple(completed_ids),
+            )
+            if first_error is not None:
+                raise first_error
+        return messages_retained, documents_created, documents_unchanged
+
+    def _is_session_document(self, document_id: str) -> bool:
+        return document_id.startswith(
+            f"{self._identity_codec.source}:dream-session:"
+        )
 
     async def _renew_lease(self, scope_id: str) -> None:
         interval = max(0.05, self._ingestion_settings.lease_seconds / 3)
@@ -866,7 +982,7 @@ class ChatDreamScanner:
         unassigned_roots.sort(key=lambda item: (item[2][0].occurred_at, item[0]))
 
         for root_id, grouped, observations in unassigned_roots:
-            if open_document_id is not None and _session_accepts(
+            if open_document_id is not None and segment_accepts(
                 open_observations,
                 observations,
                 self._ingestion_settings.segmentation,
