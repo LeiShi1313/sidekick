@@ -105,7 +105,7 @@ async def wait_for_reply(
         if replies:
             reply = replies[0]
             text = (reply.raw_text or "").strip()
-            if text in {"Thinking...", "Remembering..."}:
+            if text in {"琢磨中。。。", "Remembering..."}:
                 await asyncio.sleep(0.5)
                 continue
             if text.startswith(("AI request failed", "Memory update failed")):

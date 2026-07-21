@@ -643,12 +643,14 @@ class AIResponder:
         gateway: AgentGateway,
         *,
         max_output_chars: int = 3_900,
+        initial_status: str = "Thinking...",
         transport: ChatTransport | None = None,
         logger: Any | None = None,
     ):
         self._gateway = gateway
         self._transport = transport or ObjectChatTransport()
         self._max_output_chars = max(4, max_output_chars)
+        self._initial_status = initial_status
         self._logger = logger
 
     async def answer(
@@ -656,11 +658,10 @@ class AIResponder:
     ) -> AnswerResult:
         answer = await self._transport.reply(
             trigger,
-            "Thinking...",
+            self._initial_status,
             presentation="plain",
         )
         text = ""
-        last_edited_source: str | None = None
         session_id: str | None = None
         entry_id: str | None = None
         try:
@@ -670,20 +671,17 @@ class AIResponder:
                     continue
                 if event.type == "tool_snapshot":
                     if event.summary:
-                        edited = await self._edit_message(
+                        await self._edit_message(
                             answer,
                             event.summary,
                             wait=False,
                         )
-                        if edited:
-                            last_edited_source = None
                     continue
                 if event.type == "text_delta":
                     assert event.delta is not None
                     text = event.delta if event.reset else text + event.delta
                     visible = self._truncate(text)
-                    if await self._edit_formatted(answer, visible, wait=False):
-                        last_edited_source = visible
+                    await self._edit_formatted(answer, visible, wait=False)
                     continue
                 if event.type == "run_failed":
                     if event.code == "CANCELLED":
@@ -721,19 +719,18 @@ class AIResponder:
 
             final_text = text or "AI returned an empty response."
             final_text = self._truncate(final_text)
-            if last_edited_source != final_text:
-                if not await self._edit_formatted(answer, final_text, wait=True):
-                    final_text = "AI returned an empty response."
-                    await self._edit_message(
-                        answer,
-                        final_text,
-                        wait=True,
-                    )
-                    return AnswerResult(
-                        message=answer,
-                        text=final_text,
-                        succeeded=False,
-                    )
+            if not await self._edit_formatted(answer, final_text, wait=True):
+                final_text = "AI returned an empty response."
+                await self._edit_message(
+                    answer,
+                    final_text,
+                    wait=True,
+                )
+                return AnswerResult(
+                    message=answer,
+                    text=final_text,
+                    succeeded=False,
+                )
             return AnswerResult(
                 message=answer,
                 text=final_text,
