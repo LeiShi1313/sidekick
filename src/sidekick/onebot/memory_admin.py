@@ -7,7 +7,7 @@ from urllib import error, parse, request
 
 from aiohttp import web
 
-from sidekick.ai_dream import DreamCycleBusyError
+from sidekick.ai_memory_ingestion import MemoryIngestionBusyError
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.client import OneBotReverseWebSocket
 
@@ -209,7 +209,7 @@ def _optional_display_name(value: Any) -> str | None:
 def _error_response(exc: Exception) -> web.Response:
     if isinstance(exc, (ValueError, TypeError)):
         status = 400
-    elif isinstance(exc, DreamCycleBusyError):
+    elif isinstance(exc, MemoryIngestionBusyError):
         status = 409
     else:
         status = 500

@@ -16,15 +16,20 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_attachments import ChatAttachmentDescriber
-from sidekick.ai_dream import (
-    ChatDreamScanner,
+from sidekick.ai_continuous_memory import (
     ContinuousMemoryScheduler,
     ContinuousMemorySchedulerSettings,
+)
+from sidekick.ai_dream import (
     DreamScheduler,
     DreamSchedulerSettings,
     DreamSettings,
 )
 from sidekick.ai_memory import HindsightMemoryClient
+from sidekick.ai_memory_ingestion import (
+    ChatMemoryIngestor,
+    MemoryIngestionSettings,
+)
 from sidekick.plugins.base import PluginMount
 from sidekick.telegram import TelegramCommand
 from sidekick.telegram.ai_transport import (
@@ -180,13 +185,14 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             identity_codec=TELEGRAM_IDENTITY_CODEC,
             metadata_resolver=telegram_memory_event_metadata,
         )
-        dream_runner = (
-            ChatDreamScanner(
+        memory_ingestor = (
+            ChatMemoryIngestor(
                 source=history_source,
                 store=self._store,
                 memory=self._memory,
                 prompt_builder=prompt_builder,
-                settings=DreamSettings.from_env(),
+                dream_settings=DreamSettings.from_env(),
+                ingestion_settings=MemoryIngestionSettings.from_env(),
                 identity_codec=TELEGRAM_IDENTITY_CODEC,
                 source_retry_delay=telegram_source_retry_delay,
                 album_document_id=telegram_channel_album_document_id,
@@ -195,16 +201,16 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             if self._memory is not None
             else None
         )
-        if dream_runner is not None:
+        if memory_ingestor is not None:
             self._dream_scheduler = DreamScheduler(
-                scanner=dream_runner,
+                scanner=memory_ingestor,
                 store=self._store,
                 identity_codec=TELEGRAM_IDENTITY_CODEC,
                 settings=DreamSchedulerSettings.from_env(),
                 logger=self.logger,
             )
             self._continuous_memory_scheduler = ContinuousMemoryScheduler(
-                scanner=dream_runner,
+                runner=memory_ingestor,
                 store=self._store,
                 identity_codec=TELEGRAM_IDENTITY_CODEC,
                 settings=ContinuousMemorySchedulerSettings.from_env(),
@@ -220,7 +226,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 cooldown_seconds=self._settings.delegated_cooldown,
             ),
             memory=self._memory,
-            dream_runner=dream_runner,
+            dream_runner=memory_ingestor,
             memory_scope_resolver=TelegramMemoryScopeTargetResolver(
                 self.client,
                 logger=self.logger,
