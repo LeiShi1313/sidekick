@@ -20,6 +20,40 @@ services:
       retries: 10
       start_period: 10s
 
+  dashboard:
+    image: sidekick-adapter:local
+    container_name: sidekick-dashboard
+    entrypoint: python
+    command: ["-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/dashboard"]
+    environment:
+      VIRTUAL_HOST: sidekick.localhost
+      VIRTUAL_PORT: "8080"
+    expose:
+      - "8080"
+    volumes:
+      - ./dashboard:/dashboard:ro
+    networks:
+      - agent-platform
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    pids_limit: 64
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 networks:
   agent-platform:
     external: true

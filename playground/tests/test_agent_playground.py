@@ -320,7 +320,7 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
 
             async with session.post(
                 f"{playground_url}/api/runs",
-                headers={"Origin": "http://sessions.sidekick.localhost:18865"},
+                headers={"Origin": "http://playground.sidekick.localhost:18865"},
                 json={
                     "mode": "agent",
                     "prompt": "Who owns deploys?",
@@ -517,8 +517,8 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
 
             for host in (
                 "localhost",
-                "sessions.sidekick.localhost",
-                "sessions.sidekick.localhost:18865",
+                "playground.sidekick.localhost",
+                "playground.sidekick.localhost:18865",
             ):
                 async with session.get(
                     f"{playground_url}/", headers={"Host": host}
@@ -528,7 +528,7 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
             for host in (
                 "example.com",
                 "localhost.example.com",
-                "sessions.sidekick.localhost.example.com",
+                "playground.sidekick.localhost.example.com",
                 "-invalid.localhost",
                 "invalid-.localhost",
             ):
