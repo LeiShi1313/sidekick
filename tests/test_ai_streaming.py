@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
@@ -65,6 +66,30 @@ class FakeMessage:
         return answer
 
 
+class FakeTelegramClient:
+    def __init__(self):
+        self.requests = []
+
+    async def __call__(self, request):
+        self.requests.append(request)
+
+
+class FakeRichAnswer(FakeAnswer):
+    def __init__(self, text):
+        super().__init__(text)
+        self.client = FakeTelegramClient()
+
+    async def get_input_chat(self):
+        return telegram_types.InputPeerSelf()
+
+
+class FakeRichMessage(FakeMessage):
+    async def reply(self, text: str, **kwargs):
+        answer = FakeRichAnswer(text)
+        self.replies.append(answer)
+        return answer
+
+
 class FakeGateway:
     def __init__(self, chunks=(), error: Exception | None = None):
         self.chunks = chunks
@@ -100,6 +125,7 @@ def make_telegram_responder(
     *,
     edit_cadence=0,
     clock=None,
+    sleep=None,
     initial_status="琢磨中。。。",
     response_format="regular_html",
     **kwargs,
@@ -107,6 +133,8 @@ def make_telegram_responder(
     transport_kwargs = {"edit_cadence": edit_cadence}
     if clock is not None:
         transport_kwargs["clock"] = clock
+    if sleep is not None:
+        transport_kwargs["sleep"] = sleep
     return AIResponder(
         gateway,
         initial_status=initial_status,
@@ -116,6 +144,12 @@ def make_telegram_responder(
         ),
         **kwargs,
     )
+
+
+async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:
+    async with asyncio.timeout(1):
+        while len(answer.edits) < count:
+            await asyncio.sleep(0)
 
 
 class FakeStore:
@@ -340,39 +374,179 @@ async def test_first_stream_edit_waits_for_meaningful_accumulated_text():
 
 
 @pytest.mark.asyncio
-async def test_first_stream_edit_is_released_after_one_second(monkeypatch):
-    now = [0.0]
+async def test_first_stream_gate_counts_rendered_text_instead_of_html_source():
+    long_link = '<a href="https://example.com/' + "x" * 150 + '">A</a>'
+    delta_consumed = asyncio.Event()
+    finish = asyncio.Event()
 
-    class TimedGateway(FakeGateway):
+    class PausingGateway(FakeGateway):
         async def run(self, request):
             yield AgentEvent(
                 type="run_started",
                 run_id=request.run_id,
                 session_id="session-1",
             )
-            text = ""
-            for timestamp, chunk in [(0.0, "A"), (0.4, " little"), (1.0, " more")]:
-                now[0] = timestamp
-                text += chunk
-                yield AgentEvent(
-                    type="text_delta",
-                    delta=chunk,
-                    reset=timestamp == 0.0,
-                )
+            yield AgentEvent(type="text_delta", delta=long_link, reset=True)
+            delta_consumed.set()
+            await finish.wait()
             yield AgentEvent(
                 type="run_completed",
                 session_id="session-1",
                 entry_id="entry-1",
-                answer=text,
+                answer=long_link,
             )
 
-    monkeypatch.setattr("sidekick.ai.time.monotonic", lambda: now[0])
-    responder = make_telegram_responder(TimedGateway())
+    responder = make_telegram_responder(PausingGateway())
+    trigger = FakeMessage("/ai link")
+
+    answering = asyncio.create_task(responder.answer(trigger, make_request("link")))
+    await delta_consumed.wait()
+    await asyncio.sleep(0)
+
+    assert trigger.replies[0].edits == []
+
+    finish.set()
+    await answering
+    assert trigger.replies[0].text == "A"
+
+
+@pytest.mark.asyncio
+async def test_first_stream_gate_ignores_rich_markdown_link_targets():
+    long_link = "[A](https://example.com/" + "x" * 150 + ")"
+    delta_consumed = asyncio.Event()
+    finish = asyncio.Event()
+
+    class PausingGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="text_delta", delta=long_link, reset=True)
+            delta_consumed.set()
+            await finish.wait()
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer=long_link,
+            )
+
+    responder = make_telegram_responder(
+        PausingGateway(),
+        response_format="rich_markdown",
+    )
+    trigger = FakeRichMessage("/ai link")
+
+    answering = asyncio.create_task(responder.answer(trigger, make_request("link")))
+    await delta_consumed.wait()
+    await asyncio.sleep(0)
+
+    assert trigger.replies[0].client.requests == []
+
+    finish.set()
+    await answering
+    assert trigger.replies[0].client.requests[-1].rich_message.markdown == long_link
+
+
+@pytest.mark.asyncio
+async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
+    opening_consumed = asyncio.Event()
+    send_content = asyncio.Event()
+    content_consumed = asyncio.Event()
+    finish = asyncio.Event()
+    timer_started = asyncio.Event()
+
+    async def blocked_sleep(_seconds):
+        timer_started.set()
+        await asyncio.Future()
+
+    class PausingGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="text_delta", delta="<b>", reset=True)
+            opening_consumed.set()
+            await send_content.wait()
+            yield AgentEvent(
+                type="text_delta",
+                delta=f'{"A" * 49}.</b>',
+                reset=False,
+            )
+            content_consumed.set()
+            await finish.wait()
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer=f'<b>{"A" * 49}.</b>',
+            )
+
+    responder = make_telegram_responder(PausingGateway(), sleep=blocked_sleep)
+    trigger = FakeMessage("/ai format")
+
+    answering = asyncio.create_task(responder.answer(trigger, make_request("format")))
+    await opening_consumed.wait()
+    await asyncio.sleep(0)
+    assert timer_started.is_set() is False
+    assert trigger.replies[0].edits == []
+
+    send_content.set()
+    await content_consumed.wait()
+    await wait_for_edit_count(trigger.replies[0], 1)
+    assert trigger.replies[0].text == f'{"A" * 49}.'
+
+    finish.set()
+    await answering
+
+
+@pytest.mark.asyncio
+async def test_first_stream_edit_is_released_by_timer_without_another_delta():
+    delta_consumed = asyncio.Event()
+    finish = asyncio.Event()
+    timer_started = asyncio.Event()
+    release_timer = asyncio.Event()
+
+    async def controlled_sleep(seconds):
+        assert seconds == 1.0
+        timer_started.set()
+        await release_timer.wait()
+
+    class PausingGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="text_delta", delta="A", reset=True)
+            delta_consumed.set()
+            await finish.wait()
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer="A",
+            )
+
+    responder = make_telegram_responder(PausingGateway(), sleep=controlled_sleep)
     trigger = FakeMessage("/ai explain")
 
-    await responder.answer(trigger, make_request("explain"))
+    answering = asyncio.create_task(responder.answer(trigger, make_request("explain")))
+    await delta_consumed.wait()
+    await timer_started.wait()
+    assert trigger.replies[0].edits == []
 
-    assert trigger.replies[0].edits == ["A little more"]
+    release_timer.set()
+    await wait_for_edit_count(trigger.replies[0], 1)
+    assert trigger.replies[0].edits == ["A"]
+
+    finish.set()
+    await answering
 
 
 @pytest.mark.asyncio
@@ -411,34 +585,38 @@ async def test_first_stream_gate_restarts_after_a_tool_status():
 
 
 @pytest.mark.asyncio
-async def test_stream_updates_coalesce_to_the_latest_snapshot_after_cooldown(
-    monkeypatch,
-):
+async def test_stream_updates_flush_latest_snapshot_without_another_delta():
     now = [0.0]
     first_update = "A" * 100
+    deltas_consumed = asyncio.Event()
+    finish = asyncio.Event()
+    cooldown_started = asyncio.Event()
+    release_cooldown = asyncio.Event()
 
-    class TimedGateway(FakeGateway):
+    async def controlled_sleep(seconds):
+        assert seconds == 4.0
+        cooldown_started.set()
+        await release_cooldown.wait()
+        now[0] += seconds
+
+    class PausingGateway(FakeGateway):
         async def run(self, request):
             yield AgentEvent(
                 type="run_started",
                 run_id=request.run_id,
                 session_id="session-1",
             )
-            text = ""
-            chunks = [
-                (0.0, first_update),
-                (0.1, " one"),
-                (0.2, " two"),
-                (4.1, " three"),
-            ]
-            for index, (timestamp, chunk) in enumerate(chunks):
-                now[0] = timestamp
+            text = first_update
+            yield AgentEvent(type="text_delta", delta=text, reset=True)
+            for chunk in [" one", " two"]:
                 text += chunk
                 yield AgentEvent(
                     type="text_delta",
                     delta=chunk,
-                    reset=index == 0,
+                    reset=False,
                 )
+            deltas_consumed.set()
+            await finish.wait()
             yield AgentEvent(
                 type="run_completed",
                 session_id="session-1",
@@ -446,20 +624,84 @@ async def test_stream_updates_coalesce_to_the_latest_snapshot_after_cooldown(
                 answer=text,
             )
 
-    monkeypatch.setattr("sidekick.ai.time.monotonic", lambda: now[0])
     responder = make_telegram_responder(
-        TimedGateway(),
+        PausingGateway(),
         edit_cadence=4,
         clock=lambda: now[0],
+        sleep=controlled_sleep,
     )
     trigger = FakeMessage("/ai explain")
 
-    await responder.answer(trigger, make_request("explain"))
+    answering = asyncio.create_task(responder.answer(trigger, make_request("explain")))
+    await deltas_consumed.wait()
+    await asyncio.wait_for(cooldown_started.wait(), timeout=1)
+    assert trigger.replies[0].edits == [first_update]
 
+    release_cooldown.set()
+    await wait_for_edit_count(trigger.replies[0], 2)
     assert trigger.replies[0].edits == [
         first_update,
-        f"{first_update} one two three",
+        f"{first_update} one two",
     ]
+
+    finish.set()
+    await answering
+
+
+@pytest.mark.asyncio
+async def test_final_answer_supersedes_a_queued_tool_status_and_closes_state():
+    now = [0.0]
+    final_answer = "A" * 100
+    cooldown_started = asyncio.Event()
+    release_cooldown = asyncio.Event()
+
+    async def controlled_sleep(seconds):
+        assert seconds == 4.0
+        cooldown_started.set()
+        await release_cooldown.wait()
+        now[0] += seconds
+
+    class ToolGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="text_delta", delta=final_answer, reset=True)
+            yield AgentEvent(
+                type="tool_snapshot",
+                phase="started",
+                tool="web_search",
+                summary="Searching web",
+            )
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer=final_answer,
+            )
+
+    responder = make_telegram_responder(
+        ToolGateway(),
+        edit_cadence=4,
+        clock=lambda: now[0],
+        sleep=controlled_sleep,
+    )
+    trigger = FakeMessage("/ai search")
+
+    answering = asyncio.create_task(responder.answer(trigger, make_request("search")))
+    await asyncio.wait_for(cooldown_started.wait(), timeout=1)
+    finished_before_release = answering.done()
+    release_cooldown.set()
+    result = await answering
+    await asyncio.sleep(0)
+
+    assert finished_before_release is False
+    assert result.succeeded is True
+    assert trigger.replies[0].text == final_answer
+    assert "Searching web" not in trigger.replies[0].edits
+    assert responder.transport._update_states == {}
 
 
 @pytest.mark.asyncio
@@ -606,27 +848,6 @@ def test_response_format_switches_only_for_a_bot_rich_transport():
 
 @pytest.mark.asyncio
 async def test_bot_response_uses_telegram_rich_markdown_edit():
-    class FakeTelegramClient:
-        def __init__(self):
-            self.requests = []
-
-        async def __call__(self, request):
-            self.requests.append(request)
-
-    class FakeRichAnswer(FakeAnswer):
-        def __init__(self, text):
-            super().__init__(text)
-            self.client = FakeTelegramClient()
-
-        async def get_input_chat(self):
-            return telegram_types.InputPeerSelf()
-
-    class FakeRichMessage(FakeMessage):
-        async def reply(self, text: str, **kwargs):
-            answer = FakeRichAnswer(text)
-            self.replies.append(answer)
-            return answer
-
     formatted = "**Result**\n\n| Key | Value |\n|:----|:------|\n| Mode | Rich |"
     gateway = FakeGateway([formatted])
     responder = make_telegram_responder(
