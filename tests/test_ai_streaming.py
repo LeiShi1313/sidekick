@@ -327,7 +327,143 @@ async def test_telegram_answer_starts_with_localized_thinking_status():
 
 
 @pytest.mark.asyncio
-async def test_owner_gets_one_progressively_edited_answer():
+async def test_first_stream_edit_waits_for_meaningful_accumulated_text():
+    chunks = ["A", " useful", " first", " update", " " + "x" * 80, " tail"]
+    responder = make_telegram_responder(FakeGateway(chunks))
+    trigger = FakeMessage("/ai explain")
+
+    await responder.answer(trigger, make_request("explain"))
+
+    first_update = "".join(chunks[:-1])
+    assert len(first_update) >= 100
+    assert trigger.replies[0].edits[0] == first_update
+
+
+@pytest.mark.asyncio
+async def test_first_stream_edit_is_released_after_one_second(monkeypatch):
+    now = [0.0]
+
+    class TimedGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            text = ""
+            for timestamp, chunk in [(0.0, "A"), (0.4, " little"), (1.0, " more")]:
+                now[0] = timestamp
+                text += chunk
+                yield AgentEvent(
+                    type="text_delta",
+                    delta=chunk,
+                    reset=timestamp == 0.0,
+                )
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer=text,
+            )
+
+    monkeypatch.setattr("sidekick.ai.time.monotonic", lambda: now[0])
+    responder = make_telegram_responder(TimedGateway())
+    trigger = FakeMessage("/ai explain")
+
+    await responder.answer(trigger, make_request("explain"))
+
+    assert trigger.replies[0].edits == ["A little more"]
+
+
+@pytest.mark.asyncio
+async def test_first_stream_gate_restarts_after_a_tool_status():
+    first_turn = "A" * 100
+
+    class ToolGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="text_delta", delta=first_turn, reset=True)
+            yield AgentEvent(
+                type="tool_snapshot",
+                phase="started",
+                tool="web_search",
+                summary="Searching web",
+            )
+            yield AgentEvent(type="text_delta", delta="B", reset=True)
+            yield AgentEvent(type="text_delta", delta=" short", reset=False)
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer="B short",
+            )
+
+    responder = make_telegram_responder(ToolGateway())
+    trigger = FakeMessage("/ai search")
+
+    await responder.answer(trigger, make_request("search"))
+
+    assert trigger.replies[0].edits == [first_turn, "Searching web", "B short"]
+
+
+@pytest.mark.asyncio
+async def test_stream_updates_coalesce_to_the_latest_snapshot_after_cooldown(
+    monkeypatch,
+):
+    now = [0.0]
+    first_update = "A" * 100
+
+    class TimedGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            text = ""
+            chunks = [
+                (0.0, first_update),
+                (0.1, " one"),
+                (0.2, " two"),
+                (4.1, " three"),
+            ]
+            for index, (timestamp, chunk) in enumerate(chunks):
+                now[0] = timestamp
+                text += chunk
+                yield AgentEvent(
+                    type="text_delta",
+                    delta=chunk,
+                    reset=index == 0,
+                )
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer=text,
+            )
+
+    monkeypatch.setattr("sidekick.ai.time.monotonic", lambda: now[0])
+    responder = make_telegram_responder(
+        TimedGateway(),
+        edit_cadence=4,
+        clock=lambda: now[0],
+    )
+    trigger = FakeMessage("/ai explain")
+
+    await responder.answer(trigger, make_request("explain"))
+
+    assert trigger.replies[0].edits == [
+        first_update,
+        f"{first_update} one two three",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owner_gets_one_answer_without_a_tiny_initial_edit():
     gateway = FakeGateway(["Hello", " ", "world"])
     times = iter([0.0, 1.0, 2.0, 3.0])
     responder = make_telegram_responder(
@@ -343,8 +479,7 @@ async def test_owner_gets_one_progressively_edited_answer():
     assert handled is True
     assert len(trigger.replies) == 1
     assert trigger.replies[0].text == "Hello world"
-    assert trigger.replies[0].edits[-1] == "Hello world"
-    assert any(edit == "Hello" for edit in trigger.replies[0].edits)
+    assert trigger.replies[0].edits == ["Hello world"]
     assert len(gateway.requests) == 1
     assert gateway.requests[0].prompt == "greet me"
     assert gateway.requests[0].system_prompt == PromptBuilder().system_prompt

@@ -638,6 +638,10 @@ def _memory_message_text(text: str) -> str:
 
 
 class AIResponder:
+    INITIAL_STREAM_CHARS: ClassVar[int] = 100
+    INITIAL_STREAM_BOUNDARY_CHARS: ClassVar[int] = 50
+    INITIAL_STREAM_DELAY_SECONDS: ClassVar[float] = 1.0
+
     def __init__(
         self,
         gateway: AgentGateway,
@@ -665,12 +669,16 @@ class AIResponder:
         last_edited_source: str | None = None
         session_id: str | None = None
         entry_id: str | None = None
+        stream_started_at: float | None = None
+        stream_is_visible = False
         try:
             async for event in self._gateway.run(request):
                 if event.type == "run_started":
                     session_id = event.session_id
                     continue
                 if event.type == "tool_snapshot":
+                    stream_started_at = None
+                    stream_is_visible = False
                     if event.summary:
                         edited = await self._edit_message(
                             answer,
@@ -682,10 +690,24 @@ class AIResponder:
                     continue
                 if event.type == "text_delta":
                     assert event.delta is not None
-                    text = event.delta if event.reset else text + event.delta
+                    if event.reset:
+                        text = event.delta
+                        stream_started_at = None
+                        stream_is_visible = False
+                    else:
+                        text += event.delta
                     visible = self._truncate(text)
+                    now = time.monotonic()
+                    if stream_started_at is None:
+                        stream_started_at = now
+                    if not stream_is_visible and not self._initial_stream_ready(
+                        visible,
+                        elapsed=now - stream_started_at,
+                    ):
+                        continue
                     if await self._edit_formatted(answer, visible, wait=False):
                         last_edited_source = visible
+                        stream_is_visible = True
                     continue
                 if event.type == "run_failed":
                     if event.code == "CANCELLED":
@@ -764,6 +786,18 @@ class AIResponder:
         if len(text) <= self._max_output_chars:
             return text
         return f"{text[: self._max_output_chars - 3]}..."
+
+    @classmethod
+    def _initial_stream_ready(cls, text: str, *, elapsed: float) -> bool:
+        content = text.strip()
+        if len(content) >= cls.INITIAL_STREAM_CHARS:
+            return True
+        if len(content) >= cls.INITIAL_STREAM_BOUNDARY_CHARS and (
+            text.endswith("\n")
+            or content.endswith((".", "!", "?", "。", "！", "？"))
+        ):
+            return True
+        return elapsed >= cls.INITIAL_STREAM_DELAY_SECONDS
 
     async def _edit_formatted(
         self,
