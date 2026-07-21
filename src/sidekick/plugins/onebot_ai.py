@@ -26,6 +26,7 @@ from sidekick.ai_dream import (
     DreamSchedulerSettings,
     DreamSettings,
 )
+from sidekick.ai_memory_ingestion import MemoryIngestionSettings
 from sidekick.ai_memory import HindsightMemoryClient
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
@@ -191,7 +192,8 @@ class OneBotAI(metaclass=PluginMount):
                 store=self._store,
                 memory=self._memory,
                 prompt_builder=prompt_builder,
-                settings=DreamSettings.from_env(),
+                dream_settings=DreamSettings.from_env(),
+                ingestion_settings=MemoryIngestionSettings.from_env(),
                 identity_codec=QQ_IDENTITY_CODEC,
                 source_retry_delay=onebot_source_retry_delay,
                 logger=self.logger,

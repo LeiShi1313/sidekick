@@ -24,6 +24,7 @@ from sidekick.ai_dream import (
     DreamSchedulerSettings,
     DreamSettings,
 )
+from sidekick.ai_memory_ingestion import MemoryIngestionSettings
 from sidekick.ai_memory import HindsightMemoryClient
 from sidekick.plugins.base import PluginMount
 from sidekick.telegram import TelegramCommand
@@ -186,7 +187,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 store=self._store,
                 memory=self._memory,
                 prompt_builder=prompt_builder,
-                settings=DreamSettings.from_env(),
+                dream_settings=DreamSettings.from_env(),
+                ingestion_settings=MemoryIngestionSettings.from_env(),
                 identity_codec=TELEGRAM_IDENTITY_CODEC,
                 source_retry_delay=telegram_source_retry_delay,
                 album_document_id=telegram_channel_album_document_id,

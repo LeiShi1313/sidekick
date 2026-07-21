@@ -27,6 +27,10 @@ from sidekick.ai_dream import (
 )
 from sidekick.ai_attachments import AttachmentDescription
 from sidekick.ai_memory import MemoryClientError, MemoryRetainResult
+from sidekick.ai_memory_ingestion import (
+    MemoryIngestionSettings,
+    MemorySegmentationSettings,
+)
 from sidekick.chat.commands import MemoryBackfillCommand
 from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
@@ -40,6 +44,51 @@ from sidekick.telegram.ai_history import (
 
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+
+
+def scanner_settings(
+    *,
+    lookback=timedelta(hours=24),
+    overlap=timedelta(minutes=10),
+    settlement_delay=timedelta(seconds=30),
+    max_messages=500,
+    max_thread_messages=100,
+    idle_gap=timedelta(minutes=15),
+    max_span=timedelta(hours=1),
+    max_events=30,
+    max_chars=4_000,
+    retain_concurrency=4,
+    preprocess_concurrency=12,
+    cycle_budget_seconds=50,
+    scope_timeout_seconds=300,
+    lease_seconds=3_600,
+    retry_attempts=3,
+    max_retry_delay=30,
+):
+    return {
+        "dream_settings": DreamSettings(
+            lookback=lookback,
+            overlap=overlap,
+            cycle_budget_seconds=cycle_budget_seconds,
+            scope_timeout_seconds=scope_timeout_seconds,
+        ),
+        "ingestion_settings": MemoryIngestionSettings(
+            settlement_delay=settlement_delay,
+            max_messages=max_messages,
+            max_thread_messages=max_thread_messages,
+            segmentation=MemorySegmentationSettings(
+                idle_gap=idle_gap,
+                max_span=max_span,
+                max_events=max_events,
+                max_chars=max_chars,
+            ),
+            retain_concurrency=retain_concurrency,
+            preprocess_concurrency=preprocess_concurrency,
+            lease_seconds=lease_seconds,
+            retry_attempts=retry_attempts,
+            max_retry_delay=max_retry_delay,
+        ),
+    }
 
 
 class FakeMessage:
@@ -337,13 +386,13 @@ async def make_scanner(
             identity_codec=TELEGRAM_IDENTITY_CODEC,
             metadata_resolver=telegram_memory_event_metadata,
         ),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             overlap=timedelta(minutes=10),
             settlement_delay=timedelta(0),
             max_messages=max_messages,
             max_thread_messages=max_thread_messages,
-            session_max_events=1,
+            max_events=1,
             retain_concurrency=retain_concurrency,
             lease_seconds=lease_seconds,
         ),
@@ -446,13 +495,13 @@ async def test_dream_segments_root_groups_by_message_time(tmp_path):
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             settlement_delay=timedelta(0),
-            session_idle_gap=timedelta(minutes=15),
-            session_max_span=timedelta(hours=1),
-            session_max_events=30,
-            session_max_chars=4_000,
+            idle_gap=timedelta(minutes=15),
+            max_span=timedelta(hours=1),
+            max_events=30,
+            max_chars=4_000,
         ),
         clock=lambda: NOW.timestamp(),
     )
@@ -509,13 +558,13 @@ async def test_dream_keeps_an_oversized_reply_tree_atomic(tmp_path):
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             settlement_delay=timedelta(0),
-            session_idle_gap=timedelta(minutes=15),
-            session_max_span=timedelta(hours=1),
-            session_max_events=2,
-            session_max_chars=4_000,
+            idle_gap=timedelta(minutes=15),
+            max_span=timedelta(hours=1),
+            max_events=2,
+            max_chars=4_000,
         ),
         clock=lambda: NOW.timestamp(),
     )
@@ -570,13 +619,13 @@ async def test_dream_closes_a_continuous_session_at_size_and_span_bounds(tmp_pat
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             settlement_delay=timedelta(0),
-            session_idle_gap=timedelta(minutes=15),
-            session_max_span=timedelta(minutes=15),
-            session_max_events=30,
-            session_max_chars=10,
+            idle_gap=timedelta(minutes=15),
+            max_span=timedelta(minutes=15),
+            max_events=30,
+            max_chars=10,
         ),
         clock=lambda: NOW.timestamp(),
     )
@@ -608,13 +657,13 @@ async def test_dream_appends_to_an_open_temporal_session_after_restart(tmp_path)
     )
     source = FakeSource((first,))
     memory = FakeMemory()
-    settings = DreamSettings(
+    settings = scanner_settings(
         lookback=timedelta(hours=1),
         settlement_delay=timedelta(0),
-        session_idle_gap=timedelta(minutes=15),
-        session_max_span=timedelta(hours=1),
-        session_max_events=30,
-        session_max_chars=4_000,
+        idle_gap=timedelta(minutes=15),
+        max_span=timedelta(hours=1),
+        max_events=30,
+        max_chars=4_000,
     )
     state_path = tmp_path / "ai.db"
     first_store = await AIStateRepository(state_path).connect()
@@ -631,7 +680,7 @@ async def test_dream_appends_to_an_open_temporal_session_after_restart(tmp_path)
         store=first_store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=settings,
+        **settings,
         clock=clock,
     )
     await first_scanner.run_scope(-1001)
@@ -654,7 +703,7 @@ async def test_dream_appends_to_an_open_temporal_session_after_restart(tmp_path)
         store=second_store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=settings,
+        **settings,
         clock=clock,
     )
     try:
@@ -717,12 +766,12 @@ async def test_dream_bounds_a_continuous_session_and_retains_concurrently(
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=identity_resolver),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             overlap=timedelta(minutes=10),
             settlement_delay=timedelta(0),
             max_messages=100,
-            session_max_events=20,
+            max_events=20,
             retain_concurrency=4,
         ),
         clock=lambda: NOW.timestamp(),
@@ -785,7 +834,7 @@ async def test_temporal_session_keeps_sibling_context_for_a_late_reply(tmp_path)
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             overlap=timedelta(minutes=10),
             settlement_delay=timedelta(0),
@@ -861,7 +910,7 @@ async def test_late_reply_preserves_a_legacy_packed_document(tmp_path):
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             settlement_delay=timedelta(0),
         ),
@@ -909,7 +958,7 @@ async def test_temporal_sessions_preserve_existing_thread_document_receipts(tmp_
             store=store,
             memory=memory,
             prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-            settings=DreamSettings(
+            **scanner_settings(
                 lookback=timedelta(hours=1),
                 overlap=timedelta(minutes=10),
                 settlement_delay=timedelta(0),
@@ -965,12 +1014,12 @@ async def test_budgeted_dream_advances_window_after_dropping_unprocessed_tail(tm
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             overlap=timedelta(minutes=10),
             settlement_delay=timedelta(0),
             max_messages=100,
-            session_max_events=1,
+            max_events=1,
             retain_concurrency=1,
             cycle_budget_seconds=25,
         ),
@@ -994,12 +1043,12 @@ async def test_budgeted_dream_advances_window_after_dropping_unprocessed_tail(tm
             store=store,
             memory=memory,
             prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-            settings=DreamSettings(
+            **scanner_settings(
                 lookback=timedelta(hours=1),
                 overlap=timedelta(minutes=10),
                 settlement_delay=timedelta(0),
                 max_messages=100,
-                session_max_events=1,
+                max_events=1,
                 retain_concurrency=1,
                 cycle_budget_seconds=3_600,
             ),
@@ -1672,7 +1721,7 @@ async def test_document_receipts_survive_scanner_restart(tmp_path):
         store=second_store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(settlement_delay=timedelta(0)),
+        **scanner_settings(settlement_delay=timedelta(0)),
         clock=lambda: NOW.timestamp(),
     )
     try:
@@ -1710,7 +1759,7 @@ async def test_dream_uses_settlement_delay_and_bounds_flood_wait_retry(tmp_path)
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             lookback=timedelta(hours=1),
             settlement_delay=timedelta(minutes=2),
             retry_attempts=2,
@@ -1757,7 +1806,7 @@ async def test_dream_retries_hindsight_backpressure_with_bounded_delay(tmp_path)
         store=store,
         memory=memory,
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             settlement_delay=timedelta(0),
             retry_attempts=2,
             max_retry_delay=2,
@@ -1879,7 +1928,7 @@ async def test_timed_out_scope_does_not_block_other_scopes_or_later_runs(tmp_pat
         store=store,
         memory=FakeMemory(),
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             settlement_delay=timedelta(0),
             scope_timeout_seconds=0.03,
         ),
@@ -1936,7 +1985,7 @@ async def test_scope_timeout_includes_waiting_for_an_existing_operation(tmp_path
         store=store,
         memory=FakeMemory(),
         prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-        settings=DreamSettings(
+        **scanner_settings(
             settlement_delay=timedelta(0),
             scope_timeout_seconds=0.03,
         ),
@@ -2179,20 +2228,21 @@ async def test_continuous_scheduler_waits_between_idle_cycles(tmp_path):
         await store.close()
 
 
-def test_dream_settings_load_temporal_session_limits(monkeypatch):
+def test_memory_ingestion_settings_load_temporal_session_limits(monkeypatch):
     monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_IDLE_SECONDS", "120")
     monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_MAX_SPAN_SECONDS", "600")
     monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_MAX_EVENTS", "12")
     monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_MAX_CHARS", "2048")
     monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SCOPE_TIMEOUT_SECONDS", "180")
 
-    settings = DreamSettings.from_env()
+    ingestion = MemoryIngestionSettings.from_env()
+    dream = DreamSettings.from_env()
 
-    assert settings.session_idle_gap == timedelta(minutes=2)
-    assert settings.session_max_span == timedelta(minutes=10)
-    assert settings.session_max_events == 12
-    assert settings.session_max_chars == 2_048
-    assert settings.scope_timeout_seconds == 180
+    assert ingestion.segmentation.idle_gap == timedelta(minutes=2)
+    assert ingestion.segmentation.max_span == timedelta(minutes=10)
+    assert ingestion.segmentation.max_events == 12
+    assert ingestion.segmentation.max_chars == 2_048
+    assert dream.scope_timeout_seconds == 180
 
 
 def test_continuous_scheduler_settings_load_from_environment(monkeypatch):
@@ -2239,7 +2289,8 @@ async def test_partial_failure_keeps_cursor_and_retries_only_missing_document(tm
             store=store,
             memory=healthy,
             prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
-            settings=scanner._settings,
+            dream_settings=scanner._dream_settings,
+            ingestion_settings=scanner._ingestion_settings,
             clock=lambda: NOW.timestamp(),
         )
         result = await resumed.run_scope(-1001)

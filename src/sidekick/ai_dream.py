@@ -35,6 +35,10 @@ from sidekick.ai_memory import (
     MemoryEpisode,
     retain_episodes_once,
 )
+from sidekick.ai_memory_ingestion import (
+    MemoryIngestionSettings,
+    MemorySegmentationSettings,
+)
 
 
 class DreamMessageSource(Protocol):
@@ -67,47 +71,18 @@ class DreamMessageSource(Protocol):
 class DreamSettings:
     lookback: timedelta = timedelta(hours=24)
     overlap: timedelta = timedelta(minutes=10)
-    settlement_delay: timedelta = timedelta(seconds=30)
-    max_messages: int = 500
-    max_thread_messages: int = 100
-    session_idle_gap: timedelta = timedelta(minutes=15)
-    session_max_span: timedelta = timedelta(hours=1)
-    session_max_events: int = 30
-    session_max_chars: int = 4_000
-    retain_concurrency: int = 4
-    preprocess_concurrency: int = 12
     cycle_budget_seconds: float = 50
     scope_timeout_seconds: float = 300
-    lease_seconds: float = 3_600
-    retry_attempts: int = 3
-    max_retry_delay: float = 30
 
     def __post_init__(self) -> None:
         if self.lookback <= timedelta(0):
             raise ValueError("Dream lookback must be positive")
-        if self.overlap < timedelta(0) or self.settlement_delay < timedelta(0):
-            raise ValueError("Dream overlap and settlement delay cannot be negative")
-        if self.session_idle_gap <= timedelta(0) or self.session_max_span <= timedelta(
-            0
-        ):
-            raise ValueError("Dream session time limits must be positive")
-        if (
-            self.max_messages < 1
-            or self.max_thread_messages < 1
-            or self.session_max_events < 1
-            or self.session_max_chars < 1
-            or self.retain_concurrency < 1
-            or self.preprocess_concurrency < 1
-        ):
-            raise ValueError("Dream message limits must be positive")
+        if self.overlap < timedelta(0):
+            raise ValueError("Dream overlap cannot be negative")
         if self.cycle_budget_seconds <= 0:
             raise ValueError("Dream cycle budget must be positive")
         if self.scope_timeout_seconds <= 0:
             raise ValueError("Dream scope timeout must be positive")
-        if self.lease_seconds <= 0:
-            raise ValueError("Dream lease duration must be positive")
-        if self.retry_attempts < 1 or self.max_retry_delay < 0:
-            raise ValueError("Dream retry settings are invalid")
 
     @classmethod
     def from_env(cls) -> DreamSettings:
@@ -122,65 +97,11 @@ class DreamSettings:
                     os.environ.get("SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS", "600")
                 )
             ),
-            settlement_delay=timedelta(
-                seconds=float(
-                    os.environ.get(
-                        "SIDEKICK_MEMORY_DREAM_SETTLEMENT_SECONDS",
-                        "30",
-                    )
-                )
-            ),
-            max_messages=int(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_MAX_MESSAGES", "500")
-            ),
-            max_thread_messages=int(
-                os.environ.get(
-                    "SIDEKICK_MEMORY_DREAM_MAX_THREAD_MESSAGES",
-                    "100",
-                )
-            ),
-            session_idle_gap=timedelta(
-                seconds=float(
-                    os.environ.get(
-                        "SIDEKICK_MEMORY_DREAM_SESSION_IDLE_SECONDS",
-                        "900",
-                    )
-                )
-            ),
-            session_max_span=timedelta(
-                seconds=float(
-                    os.environ.get(
-                        "SIDEKICK_MEMORY_DREAM_SESSION_MAX_SPAN_SECONDS",
-                        "3600",
-                    )
-                )
-            ),
-            session_max_events=int(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_SESSION_MAX_EVENTS", "30")
-            ),
-            session_max_chars=int(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_SESSION_MAX_CHARS", "4000")
-            ),
-            retain_concurrency=int(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_RETAIN_CONCURRENCY", "4")
-            ),
-            preprocess_concurrency=int(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_PREPROCESS_CONCURRENCY", "12")
-            ),
             cycle_budget_seconds=float(
                 os.environ.get("SIDEKICK_MEMORY_DREAM_CYCLE_BUDGET_SECONDS", "50")
             ),
             scope_timeout_seconds=float(
                 os.environ.get("SIDEKICK_MEMORY_DREAM_SCOPE_TIMEOUT_SECONDS", "300")
-            ),
-            lease_seconds=float(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_LEASE_SECONDS", "3600")
-            ),
-            retry_attempts=int(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_RETRY_ATTEMPTS", "3")
-            ),
-            max_retry_delay=float(
-                os.environ.get("SIDEKICK_MEMORY_DREAM_MAX_RETRY_DELAY", "30")
             ),
         )
 
@@ -323,7 +244,7 @@ def _message_source_prefix(
 def _session_accepts(
     current: tuple[HumanObservation, ...],
     candidate: tuple[HumanObservation, ...],
-    settings: DreamSettings,
+    settings: MemorySegmentationSettings,
 ) -> bool:
     if not current:
         return True
@@ -331,7 +252,7 @@ def _session_accepts(
     current_end = max(observation.occurred_at for observation in current)
     candidate_start = min(observation.occurred_at for observation in candidate)
     candidate_end = max(observation.occurred_at for observation in candidate)
-    if candidate_start - current_end > settings.session_idle_gap:
+    if candidate_start - current_end > settings.idle_gap:
         return False
     if (
         max(current_end, candidate_end)
@@ -339,13 +260,13 @@ def _session_accepts(
             current_start,
             candidate_start,
         )
-        > settings.session_max_span
+        > settings.max_span
     ):
         return False
-    if len(current) + len(candidate) > settings.session_max_events:
+    if len(current) + len(candidate) > settings.max_events:
         return False
     return sum(len(observation.text) for observation in (*current, *candidate)) <= (
-        settings.session_max_chars
+        settings.max_chars
     )
 
 
@@ -376,7 +297,8 @@ class ChatDreamScanner:
         store: AIStateRepository,
         memory: MemoryClient,
         prompt_builder: PromptBuilder,
-        settings: DreamSettings = DreamSettings(),
+        dream_settings: DreamSettings = DreamSettings(),
+        ingestion_settings: MemoryIngestionSettings = MemoryIngestionSettings(),
         identity_codec: IdentityCodec | None = None,
         source_retry_delay: Callable[[Exception], float | None] | None = None,
         album_document_id: (
@@ -391,7 +313,8 @@ class ChatDreamScanner:
         self._store = store
         self._memory = memory
         self._prompt_builder = prompt_builder
-        self._settings = settings
+        self._dream_settings = dream_settings
+        self._ingestion_settings = ingestion_settings
         self._identity_codec = identity_codec or prompt_builder.identity_codec
         self._source_retry_delay = source_retry_delay
         self._album_document_id = album_document_id
@@ -413,7 +336,7 @@ class ChatDreamScanner:
                     chat_id,
                     lambda: self._run_scope(chat_id),
                 ),
-                timeout_seconds=self._settings.scope_timeout_seconds,
+                timeout_seconds=self._dream_settings.scope_timeout_seconds,
             )
         except DreamCycleTimeoutError as exc:
             await self._store.record_memory_dream_failure(
@@ -477,7 +400,7 @@ class ChatDreamScanner:
                 scope_id,
                 owner=self._lease_owner,
                 acquired_at=acquired_at,
-                lease_seconds=self._settings.lease_seconds,
+                lease_seconds=self._ingestion_settings.lease_seconds,
             )
             if not acquired:
                 raise DreamCycleBusyError(
@@ -519,7 +442,7 @@ class ChatDreamScanner:
         await self._store.record_continuous_memory_attempt(scope_id, attempted_at)
         until = (
             datetime.fromtimestamp(attempted_at, UTC)
-            - self._settings.settlement_delay
+            - self._ingestion_settings.settlement_delay
         )
 
         async def checkpoint(
@@ -538,7 +461,7 @@ class ChatDreamScanner:
                     chat_id,
                     after_message_id=scope.continuous_cursor_message_id,
                     until=until,
-                    limit=self._settings.max_messages,
+                    limit=self._ingestion_settings.max_messages,
                 )
             )
             result, _, complete = await self._retain_threads(
@@ -557,7 +480,10 @@ class ChatDreamScanner:
                 messages_retained=result.messages_retained,
                 documents_created=result.documents_created,
                 documents_unchanged=result.documents_unchanged,
-                caught_up=complete and len(messages) < self._settings.max_messages,
+                caught_up=(
+                    complete
+                    and len(messages) < self._ingestion_settings.max_messages
+                ),
             )
         except Exception as exc:
             await self._store.record_continuous_memory_failure(
@@ -568,7 +494,7 @@ class ChatDreamScanner:
             raise
 
     async def _renew_lease(self, scope_id: str) -> None:
-        interval = max(0.05, self._settings.lease_seconds / 3)
+        interval = max(0.05, self._ingestion_settings.lease_seconds / 3)
         while True:
             await asyncio.sleep(interval)
             renewed_at = self._clock()
@@ -576,7 +502,7 @@ class ChatDreamScanner:
                 scope_id,
                 owner=self._lease_owner,
                 renewed_at=renewed_at,
-                lease_seconds=self._settings.lease_seconds,
+                lease_seconds=self._ingestion_settings.lease_seconds,
             ):
                 raise DreamCycleBusyError("Dream Cycle lease was lost")
 
@@ -586,7 +512,8 @@ class ChatDreamScanner:
         request: MemoryBackfillCommand,
     ) -> MemoryDreamResult:
         until = (
-            datetime.fromtimestamp(self._clock(), UTC) - self._settings.settlement_delay
+            datetime.fromtimestamp(self._clock(), UTC)
+            - self._ingestion_settings.settlement_delay
         )
         if request.mode == "days":
             since = until - timedelta(days=request.value)
@@ -611,7 +538,7 @@ class ChatDreamScanner:
         return result
 
     async def _run_scope(self, chat_id: int) -> MemoryDreamResult:
-        deadline = self._monotonic() + self._settings.cycle_budget_seconds
+        deadline = self._monotonic() + self._dream_settings.cycle_budget_seconds
         scope_id = self._identity_codec.scope_id(chat_id)
         scope = await self._store.get_memory_scope_state(scope_id)
         if scope.continuous_enabled:
@@ -622,12 +549,14 @@ class ChatDreamScanner:
         await self._store.record_memory_dream_attempt(scope_id, attempted_at)
         state = await self._store.get_memory_dream_state(scope_id)
         until = (
-            datetime.fromtimestamp(attempted_at, UTC) - self._settings.settlement_delay
+            datetime.fromtimestamp(attempted_at, UTC)
+            - self._ingestion_settings.settlement_delay
         )
         since = (
-            datetime.fromtimestamp(state.scanned_until_at, UTC) - self._settings.overlap
+            datetime.fromtimestamp(state.scanned_until_at, UTC)
+            - self._dream_settings.overlap
             if state.scanned_until_at is not None
-            else until - self._settings.lookback
+            else until - self._dream_settings.lookback
         )
         checkpoint_scanned_at = state.scanned_until_at
 
@@ -656,7 +585,7 @@ class ChatDreamScanner:
                     chat_id,
                     since=since,
                     until=until,
-                    limit=self._settings.max_messages,
+                    limit=self._ingestion_settings.max_messages,
                 )
             )
             result, _, _ = await self._retain_threads(
@@ -697,8 +626,14 @@ class ChatDreamScanner:
         completed_document_ids: set[str] = set()
         complete = True
         cursor: int | None = None
-        for start in range(0, len(documents), self._settings.retain_concurrency):
-            batch = documents[start : start + self._settings.retain_concurrency]
+        for start in range(
+            0,
+            len(documents),
+            self._ingestion_settings.retain_concurrency,
+        ):
+            batch = documents[
+                start : start + self._ingestion_settings.retain_concurrency
+            ]
             results = await asyncio.gather(
                 *(
                     self._retry_memory(
@@ -846,7 +781,7 @@ class ChatDreamScanner:
         document_groups: dict[str, dict[int, ReplyTarget]] = {}
         for root_id, document_id in assigned_documents.items():
             grouped = root_groups[root_id]
-            if len(grouped) > self._settings.max_thread_messages:
+            if len(grouped) > self._ingestion_settings.max_thread_messages:
                 raise DreamThreadLimitError(
                     f"Thread {root_id} exceeds the configured Dream thread bound"
                 )
@@ -909,7 +844,7 @@ class ChatDreamScanner:
         ] = []
         for root_id in unassigned_root_ids:
             grouped = root_groups[root_id]
-            if len(grouped) > self._settings.max_thread_messages:
+            if len(grouped) > self._ingestion_settings.max_thread_messages:
                 raise DreamThreadLimitError(
                     f"Thread {root_id} exceeds the configured Dream thread bound"
                 )
@@ -934,7 +869,7 @@ class ChatDreamScanner:
             if open_document_id is not None and _session_accepts(
                 open_observations,
                 observations,
-                self._settings,
+                self._ingestion_settings.segmentation,
             ):
                 document_id = open_document_id
                 candidate_appended = (
@@ -971,7 +906,7 @@ class ChatDreamScanner:
                 document_id.startswith(
                     f"{self._identity_codec.source}:thread:"
                 )
-                and len(ordered) > self._settings.max_thread_messages
+                and len(ordered) > self._ingestion_settings.max_thread_messages
             ):
                 raise DreamThreadLimitError(
                     f"Document {document_id} exceeds the Dream thread bound"
@@ -1043,19 +978,19 @@ class ChatDreamScanner:
             if document_id.startswith(
                 f"{self._identity_codec.source}:thread:"
             ):
-                limit = self._settings.max_thread_messages
+                limit = self._ingestion_settings.max_thread_messages
             elif document_id.startswith(
                 f"{self._identity_codec.source}:dream-session:"
             ):
                 limit = max(
-                    self._settings.max_thread_messages,
-                    self._settings.session_max_events,
+                    self._ingestion_settings.max_thread_messages,
+                    self._ingestion_settings.segmentation.max_events,
                 )
             else:
                 # Legacy ID-packed documents can be larger than new sessions.
                 limit = max(
-                    self._settings.max_messages,
-                    self._settings.max_thread_messages,
+                    self._ingestion_settings.max_messages,
+                    self._ingestion_settings.max_thread_messages,
                 )
             if len(grouped) + len(previous_ids) > limit:
                 raise DreamThreadLimitError(
@@ -1063,7 +998,9 @@ class ChatDreamScanner:
                 )
             previous_by_document[document_id] = tuple(previous_ids)
 
-        semaphore = asyncio.Semaphore(self._settings.preprocess_concurrency)
+        semaphore = asyncio.Semaphore(
+            self._ingestion_settings.preprocess_concurrency
+        )
 
         async def fetch(message_id: int) -> ReplyTarget | None:
             async with semaphore:
@@ -1097,8 +1034,12 @@ class ChatDreamScanner:
             self._store.get_memory_excluded_message_ids(scope_id, message_ids),
             self._store.get_ai_answer_message_ids(scope_id, message_ids),
         )
-        semaphore = asyncio.Semaphore(self._settings.preprocess_concurrency)
-        identity_semaphore = asyncio.Semaphore(self._settings.preprocess_concurrency)
+        semaphore = asyncio.Semaphore(
+            self._ingestion_settings.preprocess_concurrency
+        )
+        identity_semaphore = asyncio.Semaphore(
+            self._ingestion_settings.preprocess_concurrency
+        )
         identity_tasks: dict[int, asyncio.Task[Any]] = {}
         album_attachment_representatives: dict[int, int] = {}
         for message in messages:
@@ -1185,7 +1126,7 @@ class ChatDreamScanner:
         while current is not None:
             if current.id in seen:
                 break
-            if len(newest_first) >= self._settings.max_thread_messages:
+            if len(newest_first) >= self._ingestion_settings.max_thread_messages:
                 raise DreamThreadLimitError(
                     f"Reply chain at message {message.id} exceeds the configured bound"
                 )
@@ -1205,7 +1146,7 @@ class ChatDreamScanner:
         return tuple(reversed(newest_first))
 
     async def _retry_source(self, operation: Callable[[], Awaitable[Any]]) -> Any:
-        for attempt in range(1, self._settings.retry_attempts + 1):
+        for attempt in range(1, self._ingestion_settings.retry_attempts + 1):
             try:
                 return await operation()
             except Exception as exc:
@@ -1214,11 +1155,14 @@ class ChatDreamScanner:
                     if self._source_retry_delay is not None
                     else None
                 )
-                if delay is None or attempt >= self._settings.retry_attempts:
+                if (
+                    delay is None
+                    or attempt >= self._ingestion_settings.retry_attempts
+                ):
                     raise
                 delay = min(
                     max(0.0, delay),
-                    self._settings.max_retry_delay,
+                    self._ingestion_settings.max_retry_delay,
                 )
                 if self._logger is not None:
                     self._logger.warning(
@@ -1229,7 +1173,7 @@ class ChatDreamScanner:
         raise AssertionError("unreachable")
 
     async def _retry_memory(self, operation: Callable[[], Awaitable[Any]]) -> Any:
-        for attempt in range(1, self._settings.retry_attempts + 1):
+        for attempt in range(1, self._ingestion_settings.retry_attempts + 1):
             try:
                 return await operation()
             except MemoryClientError as exc:
@@ -1240,11 +1184,11 @@ class ChatDreamScanner:
             except (TimeoutError, aiohttp.ClientConnectionError) as exc:
                 error = exc
                 retry_after = None
-            if attempt >= self._settings.retry_attempts:
+            if attempt >= self._ingestion_settings.retry_attempts:
                 raise error
             delay = min(
                 retry_after if retry_after is not None else 2 ** (attempt - 1),
-                self._settings.max_retry_delay,
+                self._ingestion_settings.max_retry_delay,
             )
             if self._logger is not None:
                 self._logger.warning(
