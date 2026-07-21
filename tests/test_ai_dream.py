@@ -6,13 +6,13 @@ from types import SimpleNamespace
 import pytest
 from telethon.errors import FloodWaitError
 
-from telefire.ai import (
+from sidekick.ai import (
     AIAnswerMarker,
     AIStateRepository,
     MessageIdentity,
     PromptBuilder,
 )
-from telefire.ai_dream import (
+from sidekick.ai_dream import (
     ChatDreamScanner,
     ContinuousMemoryScheduler,
     ContinuousMemorySchedulerSettings,
@@ -25,14 +25,14 @@ from telefire.ai_dream import (
     DreamSettings,
     DreamThreadLimitError,
 )
-from telefire.ai_attachments import AttachmentDescription
-from telefire.ai_memory import MemoryClientError, MemoryRetainResult
-from telefire.chat.commands import MemoryBackfillCommand
-from telefire.telegram.ai_identity import (
+from sidekick.ai_attachments import AttachmentDescription
+from sidekick.ai_memory import MemoryClientError, MemoryRetainResult
+from sidekick.chat.commands import MemoryBackfillCommand
+from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
     telegram_memory_event_metadata,
 )
-from telefire.telegram.ai_history import (
+from sidekick.telegram.ai_history import (
     TelegramHistorySource,
     telegram_channel_album_document_id,
     telegram_source_retry_delay,
@@ -2180,11 +2180,11 @@ async def test_continuous_scheduler_waits_between_idle_cycles(tmp_path):
 
 
 def test_dream_settings_load_temporal_session_limits(monkeypatch):
-    monkeypatch.setenv("TELEFIRE_MEMORY_DREAM_SESSION_IDLE_SECONDS", "120")
-    monkeypatch.setenv("TELEFIRE_MEMORY_DREAM_SESSION_MAX_SPAN_SECONDS", "600")
-    monkeypatch.setenv("TELEFIRE_MEMORY_DREAM_SESSION_MAX_EVENTS", "12")
-    monkeypatch.setenv("TELEFIRE_MEMORY_DREAM_SESSION_MAX_CHARS", "2048")
-    monkeypatch.setenv("TELEFIRE_MEMORY_DREAM_SCOPE_TIMEOUT_SECONDS", "180")
+    monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_IDLE_SECONDS", "120")
+    monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_MAX_SPAN_SECONDS", "600")
+    monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_MAX_EVENTS", "12")
+    monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SESSION_MAX_CHARS", "2048")
+    monkeypatch.setenv("SIDEKICK_MEMORY_DREAM_SCOPE_TIMEOUT_SECONDS", "180")
 
     settings = DreamSettings.from_env()
 
@@ -2196,9 +2196,9 @@ def test_dream_settings_load_temporal_session_limits(monkeypatch):
 
 
 def test_continuous_scheduler_settings_load_from_environment(monkeypatch):
-    monkeypatch.setenv("TELEFIRE_MEMORY_CONTINUOUS_POLL_SECONDS", "4.5")
-    monkeypatch.setenv("TELEFIRE_MEMORY_CONTINUOUS_CONCURRENCY", "3")
-    monkeypatch.setenv("TELEFIRE_MEMORY_CONTINUOUS_SCOPE_BATCH_SIZE", "12")
+    monkeypatch.setenv("SIDEKICK_MEMORY_CONTINUOUS_POLL_SECONDS", "4.5")
+    monkeypatch.setenv("SIDEKICK_MEMORY_CONTINUOUS_CONCURRENCY", "3")
+    monkeypatch.setenv("SIDEKICK_MEMORY_CONTINUOUS_SCOPE_BATCH_SIZE", "12")
 
     settings = ContinuousMemorySchedulerSettings.from_env()
 

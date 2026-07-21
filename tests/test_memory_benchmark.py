@@ -6,12 +6,12 @@ import sqlite3
 
 import pytest
 
-from telefire.memory_benchmark.backends import (
+from sidekick.memory_benchmark.backends import (
     MemoryRecord,
     parse_tencent_search,
     read_tencent_memories,
 )
-from telefire.memory_benchmark.evaluation import (
+from sidekick.memory_benchmark.evaluation import (
     RecallCase,
     Evidence,
     filter_validated_cases,
@@ -21,8 +21,8 @@ from telefire.memory_benchmark.evaluation import (
     sample_memory_records,
     validate_recall_case,
 )
-from telefire.memory_benchmark.reporting import _tencent_rounds, summarize_quality
-from telefire.memory_benchmark.source import (
+from sidekick.memory_benchmark.reporting import _tencent_rounds, summarize_quality
+from sidekick.memory_benchmark.source import (
     SourceCorpus,
     parse_source_document,
     tencent_seed_payload,
@@ -32,7 +32,7 @@ from telefire.memory_benchmark.source import (
 def test_episode_export_preserves_actor_time_and_source_boundaries():
     content = json.dumps(
         {
-            "schema": "telefire.memory.episode.v1",
+            "schema": "sidekick.memory.episode.v1",
             "scope": {"id": "telegram:chat:1", "display_name": "Test Chat"},
             "events": [
                 {
@@ -166,7 +166,7 @@ def test_tencent_search_and_store_are_normalized_to_common_records(tmp_path):
             "id": "telegram:thread:1:11",
             "original_text": json.dumps(
                 {
-                    "schema": "telefire.memory.episode.v1",
+                    "schema": "sidekick.memory.episode.v1",
                     "events": [
                         {
                             "source_id": "telegram:message:1:11",
@@ -202,7 +202,7 @@ def test_tencent_search_and_store_are_normalized_to_common_records(tmp_path):
 
 def test_source_corpus_loading_does_not_mutate_payload():
     payload = {
-        "schema": "telefire.memory-benchmark.source.v1",
+        "schema": "sidekick.memory-benchmark.source.v1",
         "bank_id": "telegram:chat:1",
         "bank_name": "Test Chat",
         "exported_at": "2026-07-15T09:00:00+00:00",
@@ -241,7 +241,7 @@ def test_recall_case_requires_verbatim_source_evidence():
             "id": "telegram:thread:1:11",
             "original_text": json.dumps(
                 {
-                    "schema": "telefire.memory.episode.v1",
+                    "schema": "sidekick.memory.episode.v1",
                     "events": [
                         {
                             "source_id": "telegram:message:1:11",

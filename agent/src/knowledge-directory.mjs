@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const KNOWLEDGE_DIRECTORY_BANK_ID = "system:knowledge-directory";
-export const KNOWLEDGE_DIRECTORY_SCHEMA = "telefire.knowledge-directory.v1";
+export const KNOWLEDGE_DIRECTORY_SCHEMA = "sidekick.knowledge-directory.v1";
 
 const BANK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$/;
 const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -12,7 +12,7 @@ export function bankReferenceTag(bankId) {
   if (typeof bankId !== "string" || !BANK_ID_RE.test(bankId)) {
     throw new Error("Invalid knowledge source bank");
   }
-  return `telefire:bank-ref:${createHash("sha256").update(bankId).digest("hex")}`;
+  return `sidekick:bank-ref:${createHash("sha256").update(bankId).digest("hex")}`;
 }
 
 function provenance(item, sourceFacts) {
@@ -85,7 +85,7 @@ function validatedReference(item, sourceFacts, allowedBankIds) {
   }
   const expectedTag = bankReferenceTag(bankId);
   if (
-    metadata.client !== "telefire" ||
+    metadata.client !== "sidekick" ||
     metadata.source !== "knowledge-directory" ||
     metadata.schema !== KNOWLEDGE_DIRECTORY_SCHEMA ||
     metadata.bank_ref !== expectedTag ||

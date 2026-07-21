@@ -164,7 +164,7 @@ function memoryTarget(overrides = {}) {
 
 async function fixture(handler, overrides = {}) {
   const provider = await fakeProvider(handler);
-  const root = await mkdtemp(join(tmpdir(), "telefire-pi-test-"));
+  const root = await mkdtemp(join(tmpdir(), "sidekick-pi-test-"));
   const engine = new PiEngine({
     baseUrl: provider.baseUrl,
     apiKey: "test-key",

@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { loadConfig } from "../src/config.mjs";
 
-test("loads the standalone agent configuration without Telefire names", () => {
+test("loads the standalone agent configuration without Sidekick names", () => {
   Object.assign(process.env, {
     AI_BASE_URL: "http://provider.internal/v1",
     AI_API_KEY: "test-key",

@@ -4,9 +4,9 @@ from dataclasses import replace
 
 import pytest
 
-from telefire.ai import MemoryDreamResult, MemoryDreamState, MemoryScopeState
-from telefire.chat.identity import NamespacedIdentityCodec
-from telefire.memory_admin import MemoryAdminService
+from sidekick.ai import MemoryDreamResult, MemoryDreamState, MemoryScopeState
+from sidekick.chat.identity import NamespacedIdentityCodec
+from sidekick.memory_admin import MemoryAdminService
 
 
 class MemoryAdminStore:

@@ -12,10 +12,10 @@ import aiohttp
 from PIL import Image, ImageDraw
 from telethon import TelegramClient, events, types, utils
 
-from telefire.ai_memory import HindsightMemoryClient
-from telefire.config import apply_config
-from telefire.plugins.ai import TelegramAI
-from telefire.telegram.config import TelegramRuntimeConfig
+from sidekick.ai_memory import HindsightMemoryClient
+from sidekick.config import apply_config
+from sidekick.plugins.ai import TelegramAI
+from sidekick.telegram.config import TelegramRuntimeConfig
 
 
 async def connect_account(account: str) -> TelegramClient:
@@ -166,27 +166,27 @@ def exact_user_mention(user_id: int) -> tuple[str, list[types.TypeMessageEntity]
 
 
 async def run() -> None:
-    if os.environ.get("TELEFIRE_RUN_E2E") != "1":
-        raise RuntimeError("Set TELEFIRE_RUN_E2E=1 to run the mutating live test")
-    chat_raw = os.environ.get("TELEFIRE_E2E_CHAT_ID", "")
+    if os.environ.get("SIDEKICK_RUN_E2E") != "1":
+        raise RuntimeError("Set SIDEKICK_RUN_E2E=1 to run the mutating live test")
+    chat_raw = os.environ.get("SIDEKICK_E2E_CHAT_ID", "")
     if not chat_raw.startswith("-100"):
         raise RuntimeError(
-            "TELEFIRE_E2E_CHAT_ID must be an explicit numeric megagroup ID"
+            "SIDEKICK_E2E_CHAT_ID must be an explicit numeric megagroup ID"
         )
     chat_id = int(chat_raw)
     owner_account = os.environ.get(
-        "TELEFIRE_E2E_OWNER_SESSION",
-        os.environ.get("TELEFIRE_E2E_CONTROLLER_SESSION", "ai_e2e_peer"),
+        "SIDEKICK_E2E_OWNER_SESSION",
+        os.environ.get("SIDEKICK_E2E_CONTROLLER_SESSION", "ai_e2e_peer"),
     )
-    peer_account = os.environ.get("TELEFIRE_E2E_PEER_SESSION", "ai_e2e_peer2")
-    hindsight_url = os.environ.get("TELEFIRE_HINDSIGHT_URL") or (
-        "http://127.0.0.1:" + os.environ.get("TELEFIRE_HINDSIGHT_EXPOSE_PORT", "18888")
+    peer_account = os.environ.get("SIDEKICK_E2E_PEER_SESSION", "ai_e2e_peer2")
+    hindsight_url = os.environ.get("SIDEKICK_HINDSIGHT_URL") or (
+        "http://127.0.0.1:" + os.environ.get("SIDEKICK_HINDSIGHT_EXPOSE_PORT", "18888")
     )
     hindsight_url = hindsight_url.rstrip("/")
-    os.environ.setdefault("TELEFIRE_HINDSIGHT_URL", hindsight_url)
+    os.environ.setdefault("SIDEKICK_HINDSIGHT_URL", hindsight_url)
     os.environ.setdefault(
-        "TELEFIRE_PI_URL",
-        "http://127.0.0.1:" + os.environ.get("TELEFIRE_PI_EXPOSE_PORT", "18790"),
+        "SIDEKICK_PI_URL",
+        "http://127.0.0.1:" + os.environ.get("SIDEKICK_PI_EXPOSE_PORT", "18790"),
     )
     await wait_for_health(hindsight_url)
 
@@ -273,7 +273,7 @@ async def run() -> None:
             reply_to=thread_root.id,
         )
         settlement = float(
-            os.environ.get("TELEFIRE_MEMORY_DREAM_SETTLEMENT_SECONDS", "30")
+            os.environ.get("SIDEKICK_MEMORY_DREAM_SETTLEMENT_SECONDS", "30")
         )
         await asyncio.sleep(max(settlement, 0) + 1)
         started_at = standalone.date.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -367,7 +367,7 @@ async def run() -> None:
 
         image_token = f"ATTACHMENT_{token}"
         image_file = BytesIO()
-        image_file.name = f"telefire-{token}.png"
+        image_file.name = f"sidekick-{token}.png"
         image = Image.new("RGB", (640, 320), "white")
         drawing = ImageDraw.Draw(image)
         drawing.rectangle((30, 30, 280, 290), fill="red")

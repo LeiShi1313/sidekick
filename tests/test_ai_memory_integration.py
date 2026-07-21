@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web
 from telethon.tl import types as telegram_types
 
-from telefire.ai import (
+from sidekick.ai import (
     AIAnswerMarker,
     AIConversationHandler,
     AIStateRepository,
@@ -24,8 +24,8 @@ from telefire.ai import (
     MemoryScopeTarget,
     PromptBuilder,
 )
-from telefire.ai_attachments import AttachmentDescription
-from telefire.ai_memory import (
+from sidekick.ai_attachments import AttachmentDescription
+from sidekick.ai_memory import (
     HindsightMemoryClient,
     MemoryDocumentReceipt,
     MemoryEpisode,
@@ -35,8 +35,8 @@ from telefire.ai_memory import (
     MemoryRevisionResult,
     RecalledMemory,
 )
-from telefire.chat.commands import MemoryBackfillCommand
-from telefire.telegram.ai_identity import (
+from sidekick.chat.commands import MemoryBackfillCommand
+from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
     TelegramMessageIdentityResolver,
     TelegramMessageMentionResolver,
@@ -996,7 +996,7 @@ async def test_episode_preserves_quote_and_forward_provenance_without_raw_media(
     [TimeoutError(), ConnectionError(), ValueError("malformed")],
 )
 @pytest.mark.asyncio
-async def test_telefire_does_not_call_memory_recall(failure):
+async def test_sidekick_does_not_call_memory_recall(failure):
     logger = FakeLogger()
     memory = FakeMemory(recall_error=failure)
     gateway = FakeGateway(["answer without memory"])

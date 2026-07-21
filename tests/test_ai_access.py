@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from telefire.ai import (
+from sidekick.ai import (
     AIConversationHandler,
     AIRateLimiter,
     AIResponder,
@@ -14,9 +14,9 @@ from telefire.ai import (
     DirectoryPublicationTarget,
     PromptBuilder,
 )
-from telefire.ai_memory import MemoryRetainResult
-from telefire.memory_directory import DirectorySource
-from telefire.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
+from sidekick.ai_memory import MemoryRetainResult
+from sidekick.memory_directory import DirectorySource
+from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 
 
 def actor_id(user_id: int) -> str:

@@ -6,7 +6,7 @@ from io import BytesIO
 import pytest
 from PIL import Image
 
-from telefire.ai_attachments import (
+from sidekick.ai_attachments import (
     AttachmentAnalysisRequest,
     ChatAttachmentDescriber,
     message_has_attachment,

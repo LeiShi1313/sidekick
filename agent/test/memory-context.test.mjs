@@ -26,7 +26,7 @@ function memoryTarget(overrides = {}) {
 }
 
 function bankTag(bankId) {
-  return `telefire:bank-ref:${createHash("sha256").update(bankId).digest("hex")}`;
+  return `sidekick:bank-ref:${createHash("sha256").update(bankId).digest("hex")}`;
 }
 
 function directoryResult(bankId, name, text = `${name} is a knowledge source.`) {
@@ -38,9 +38,9 @@ function directoryResult(bankId, name, text = `${name} is a knowledge source.`) 
     entities: [],
     tags: [tag],
     metadata: {
-      client: "telefire",
+      client: "sidekick",
       source: "knowledge-directory",
-      schema: "telefire.knowledge-directory.v1",
+      schema: "sidekick.knowledge-directory.v1",
       bank_id: bankId,
       bank_ref: tag,
       source_name: name,

@@ -139,7 +139,7 @@ dmypy.json
 *.session-wal
 
 # Local runtime state
-.telefire/
+.sidekick/
 .benchmark-data/
 *.db
 *.db-journal
@@ -161,26 +161,8 @@ dmypy.json
 .vscode/
 
 *.pkl
-matrix.jpeg
-matrix.png
-matrix.webm
-matrix.webp
-guamei_*.jpeg
-all_chats
-data.csv
-matrix_all_chats
-matrix_media_decrypt.py
-test.py
-plugins/yvlu/
-src/telefire/plugins/yvlu/
 .pdm-python
 .python-version
-
-# Legacy flat layout (now in src/telefire/)
-/plugins/
-/utils.py
-/telefire.py
-/util/
 
 # pdm
 pdm.lock

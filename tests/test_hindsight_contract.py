@@ -7,16 +7,16 @@ from uuid import uuid4
 import aiohttp
 import pytest
 
-import telefire.ai_memory as ai_memory_module
-from telefire.ai_memory import HindsightMemoryClient, MemoryEpisode, MemoryEvent
-from telefire.memory_directory import DirectoryPublication, DirectorySource
+import sidekick.ai_memory as ai_memory_module
+from sidekick.ai_memory import HindsightMemoryClient, MemoryEpisode, MemoryEvent
+from sidekick.memory_directory import DirectoryPublication, DirectorySource
 
 
-HINDSIGHT_URL = os.environ.get("TELEFIRE_HINDSIGHT_URL", "").rstrip("/")
+HINDSIGHT_URL = os.environ.get("SIDEKICK_HINDSIGHT_URL", "").rstrip("/")
 
 pytestmark = pytest.mark.skipif(
     not HINDSIGHT_URL,
-    reason="TELEFIRE_HINDSIGHT_URL is required for the real Hindsight contract",
+    reason="SIDEKICK_HINDSIGHT_URL is required for the real Hindsight contract",
 )
 
 
@@ -161,7 +161,7 @@ async def test_hindsight_retain_recall_isolation_append_and_invalidation():
         "document_id": document_id,
         "update_mode": "replace",
         "metadata": {
-            "client": "telefire-contract",
+            "client": "sidekick-contract",
             "scope_id": "telegram:chat:-100701",
         },
         "entities": [

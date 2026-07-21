@@ -8,14 +8,14 @@ from typing import Any
 from aiohttp import web
 import pytest
 
-from telefire.memory_migrate import inventory_legacy_store, migrate_legacy_store
+from sidekick.memory_migrate import inventory_legacy_store, migrate_legacy_store
 
 zvec = pytest.importorskip("zvec")
 
 
 def memory_schema(dimension):
     return zvec.CollectionSchema(
-        name="telefire_memory",
+        name="sidekick_memory",
         fields=[
             zvec.FieldSchema("record_type", zvec.DataType.STRING),
             zvec.FieldSchema("subject_id", zvec.DataType.STRING),
@@ -440,7 +440,7 @@ async def test_migration_preserves_suppression_with_stable_idempotent_correction
         )
         correction_content = json.loads(correction["content"])
         correction_event = correction_content["events"][0]
-        assert correction_event["actor"]["id"] == "telefire:legacy-migration"
+        assert correction_event["actor"]["id"] == "sidekick:legacy-migration"
         assert correction_event["metadata"] == {
             "legacy_record_id": "suppressed-fact-1",
             "legacy_record_type": "fact",

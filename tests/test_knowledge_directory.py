@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from aiohttp import web
 import pytest
 
-from telefire.ai_memory import HindsightMemoryClient, MemoryClientError
-from telefire.memory_directory import (
+from sidekick.ai_memory import HindsightMemoryClient, MemoryClientError
+from sidekick.memory_directory import (
     KNOWLEDGE_DIRECTORY_BANK_ID,
     DirectoryPublication,
     DirectorySource,
@@ -88,9 +88,9 @@ async def test_directory_publication_uses_one_trusted_reference_scope():
         assert item["observation_scopes"] == [[tag]]
         assert item["update_mode"] == "replace"
         assert item["metadata"] == {
-            "client": "telefire",
+            "client": "sidekick",
             "source": "knowledge-directory",
-            "schema": "telefire.knowledge-directory.v1",
+            "schema": "sidekick.knowledge-directory.v1",
             "bank_id": publication.source.bank_id,
             "bank_ref": tag,
             "source_name": publication.source.display_name,
@@ -124,9 +124,9 @@ async def test_directory_recall_uses_exact_or_filters_and_validates_references()
                         "document_id": "directory-publication:one",
                         "tags": [tags[allowed[0]]],
                         "metadata": {
-                            "client": "telefire",
+                            "client": "sidekick",
                             "source": "knowledge-directory",
-                            "schema": "telefire.knowledge-directory.v1",
+                            "schema": "sidekick.knowledge-directory.v1",
                             "bank_id": allowed[0],
                             "bank_ref": tags[allowed[0]],
                             "source_name": "Coder Offtopic",
@@ -181,9 +181,9 @@ async def test_directory_recall_uses_source_fact_provenance_for_observations():
         "type": "world",
         "tags": [tag],
         "metadata": {
-            "client": "telefire",
+            "client": "sidekick",
             "source": "knowledge-directory",
-            "schema": "telefire.knowledge-directory.v1",
+            "schema": "sidekick.knowledge-directory.v1",
             "bank_id": bank_id,
             "bank_ref": tag,
             "source_name": "Coder Offtopic",
@@ -275,10 +275,10 @@ async def test_directory_recall_skips_result_without_verifiable_provenance(
     [
         {"tags": []},
         {"tags": ["wrong-tag"]},
-        {"metadata": {"schema": "telefire.knowledge-directory.v1"}},
+        {"metadata": {"schema": "sidekick.knowledge-directory.v1"}},
         {
             "metadata": {
-                "schema": "telefire.knowledge-directory.v1",
+                "schema": "sidekick.knowledge-directory.v1",
                 "bank_id": "qq:group:999",
                 "bank_ref": "wrong-tag",
                 "source_name": "Wrong",
@@ -299,9 +299,9 @@ async def test_directory_recall_rejects_untrusted_reference_shapes(mutation):
         "document_id": "directory-publication:one",
         "tags": [tag],
         "metadata": {
-            "client": "telefire",
+            "client": "sidekick",
             "source": "knowledge-directory",
-            "schema": "telefire.knowledge-directory.v1",
+            "schema": "sidekick.knowledge-directory.v1",
             "bank_id": bank_id,
             "bank_ref": tag,
             "source_name": "Coder Offtopic",
@@ -372,9 +372,9 @@ async def test_directory_publication_existence_requires_matching_document_contra
                 "memory_unit_count": 1,
                 "tags": [tag],
                 "document_metadata": {
-                    "client": "telefire",
+                    "client": "sidekick",
                     "source": "knowledge-directory",
-                    "schema": "telefire.knowledge-directory.v1",
+                    "schema": "sidekick.knowledge-directory.v1",
                     "bank_id": bank_id,
                     "bank_ref": tag,
                     **(

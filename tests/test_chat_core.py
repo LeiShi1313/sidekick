@@ -9,7 +9,7 @@ import sqlite3
 
 import pytest
 
-from telefire.ai import (
+from sidekick.ai import (
     AIConversationHandler,
     AIResponder,
     AIStateRepository,
@@ -18,8 +18,8 @@ from telefire.ai import (
     MemoryScopeState,
     PromptBuilder,
 )
-from telefire.chat.attachments import AttachmentDescription, AttachmentReference
-from telefire.chat.commands import (
+from sidekick.chat.attachments import AttachmentDescription, AttachmentReference
+from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
     AccessCommand,
@@ -30,8 +30,8 @@ from telefire.chat.commands import (
     MemoryStatusCommand,
     parse_chat_command,
 )
-from telefire.chat.identity import NamespacedIdentityCodec
-from telefire.chat.transport import ChatPresentation
+from sidekick.chat.identity import NamespacedIdentityCodec
+from sidekick.chat.transport import ChatPresentation
 
 
 @pytest.mark.parametrize(
@@ -40,7 +40,7 @@ from telefire.chat.transport import ChatPresentation
         ("/ai hello", AIAskCommand(prompt="hello")),
         ("/ai10 hello", AIAskCommand(prompt="hello", recent_messages=10)),
         (
-            "/ai10@TelefireBot summarize",
+            "/ai10@SidekickBot summarize",
             AIAskCommand(prompt="summarize", recent_messages=10),
         ),
         ("/ai_cancel", AICancelCommand()),
@@ -342,7 +342,7 @@ async def test_recent_history_does_not_assume_transport_message_ids_are_ordered(
 
 
 def test_shared_ai_module_has_no_telegram_adapter_imports():
-    import telefire.ai as ai_module
+    import sidekick.ai as ai_module
 
     tree = ast.parse(Path(ai_module.__file__).read_text())
     imported = {
@@ -358,8 +358,8 @@ def test_shared_ai_module_has_no_telegram_adapter_imports():
     assert not any(
         name == "telethon"
         or name.startswith("telethon.")
-        or name == "telefire.telegram"
-        or name.startswith("telefire.telegram.")
+        or name == "sidekick.telegram"
+        or name.startswith("sidekick.telegram.")
         for name in imported
     )
 

@@ -5,7 +5,7 @@ from telethon.errors import FloodWaitError
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
-from telefire.ai import (
+from sidekick.ai import (
     AIConversationHandler,
     AIResponder,
     AISettings,
@@ -13,7 +13,7 @@ from telefire.ai import (
     AgentRunRequest,
     PromptBuilder,
 )
-from telefire.chat.commands import (
+from sidekick.chat.commands import (
     AIAskCommand,
     BankGrantCommand,
     DirectoryPublishCommand,
@@ -22,14 +22,14 @@ from telefire.chat.commands import (
     MemoryRememberCommand,
     parse_chat_command,
 )
-from telefire.plugins.base import command_registry
-from telefire.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
-from telefire.telegram.ai_transport import (
+from sidekick.plugins.base import command_registry
+from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
+from sidekick.telegram.ai_transport import (
     TelegramChatTransport,
     select_telegram_response_format,
     telegram_system_prompt,
 )
-import telefire.plugins.ai  # noqa: F401
+import sidekick.plugins.ai  # noqa: F401
 
 
 class FakeAnswer:
@@ -182,7 +182,7 @@ def make_request(prompt: str) -> AgentRunRequest:
         ("/ai", AIAskCommand(prompt="")),
         ("/ai10 hello", AIAskCommand(prompt="hello", recent_messages=10)),
         (
-            "/ai10@TelefireBot summarize this",
+            "/ai10@SidekickBot summarize this",
             AIAskCommand(prompt="summarize this", recent_messages=10),
         ),
         ("/ai0 invalid", AIAskCommand(prompt="invalid", recent_messages=0)),
@@ -288,12 +288,12 @@ def test_parse_memory_backfill_has_bounded_exact_syntax(text, expected):
 
 def test_ai_settings_are_loaded_without_provider_specific_assumptions(monkeypatch):
     values = {
-        "TELEFIRE_PI_URL": "http://agent.test:8790/",
-        "TELEFIRE_PI_TOKEN": "test-agent-token",
-        "TELEFIRE_AI_MAX_OUTPUT_CHARS": "1234",
-        "TELEFIRE_AI_EDIT_CADENCE": "0.25",
-        "TELEFIRE_MEMORY_COMMAND_DELETE_DELAY": "2.5",
-        "TELEFIRE_PI_RUN_TIMEOUT": "12",
+        "SIDEKICK_PI_URL": "http://agent.test:8790/",
+        "SIDEKICK_PI_TOKEN": "test-agent-token",
+        "SIDEKICK_AI_MAX_OUTPUT_CHARS": "1234",
+        "SIDEKICK_AI_EDIT_CADENCE": "0.25",
+        "SIDEKICK_MEMORY_COMMAND_DELETE_DELAY": "2.5",
+        "SIDEKICK_PI_RUN_TIMEOUT": "12",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -346,7 +346,7 @@ async def test_edit_cadence_is_shared_across_answers(monkeypatch):
         sleeps.append(seconds)
 
     monkeypatch.setattr(
-        "telefire.telegram.ai_transport.asyncio.sleep",
+        "sidekick.telegram.ai_transport.asyncio.sleep",
         fake_sleep,
     )
     gateway = FakeGateway(["answer"])
@@ -391,7 +391,7 @@ async def test_flood_wait_delays_final_edit_without_replacing_the_answer(monkeyp
             return answer
 
     monkeypatch.setattr(
-        "telefire.telegram.ai_transport.asyncio.sleep",
+        "sidekick.telegram.ai_transport.asyncio.sleep",
         fake_sleep,
     )
     responder = make_telegram_responder(
@@ -615,7 +615,7 @@ async def test_provider_failure_uses_standard_logging_format(caplog):
     gateway = FakeGateway(error=RuntimeError("provider detail"))
     responder = make_telegram_responder(
         gateway,
-        logger=logging.getLogger("telefire-ai-test"),
+        logger=logging.getLogger("sidekick-ai-test"),
     )
     trigger = FakeMessage("/ai hello")
 

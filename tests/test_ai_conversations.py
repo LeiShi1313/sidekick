@@ -5,7 +5,7 @@ import stat
 
 import pytest
 
-from telefire.ai import (
+from sidekick.ai import (
     AIAnswerMarker,
     AIConversationHandler,
     AIStateRepository,
@@ -14,8 +14,8 @@ from telefire.ai import (
     AgentRunRequest,
     PromptBuilder,
 )
-from telefire.ai_attachments import AttachmentDescription
-from telefire.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
+from sidekick.ai_attachments import AttachmentDescription
+from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 
 
 class FakeAnswer:

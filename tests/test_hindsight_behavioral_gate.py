@@ -9,11 +9,11 @@ import aiohttp
 import pytest
 
 
-HINDSIGHT_URL = os.environ.get("TELEFIRE_HINDSIGHT_URL", "").rstrip("/")
+HINDSIGHT_URL = os.environ.get("SIDEKICK_HINDSIGHT_URL", "").rstrip("/")
 
 pytestmark = pytest.mark.skipif(
     not HINDSIGHT_URL,
-    reason="TELEFIRE_HINDSIGHT_URL is required for the behavioral gate",
+    reason="SIDEKICK_HINDSIGHT_URL is required for the behavioral gate",
 )
 
 
@@ -213,7 +213,7 @@ async def test_contextual_memory_behavioral_gate_three_paraphrases_per_scenario(
                                     "document_id": f"episode-{case.name}",
                                     "update_mode": "replace",
                                     "metadata": {
-                                        "client": "telefire-behavioral-gate",
+                                        "client": "sidekick-behavioral-gate",
                                         "scenario": case.name,
                                     },
                                 }

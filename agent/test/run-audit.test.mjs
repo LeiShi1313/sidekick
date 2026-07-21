@@ -9,7 +9,7 @@ import { RunAuditStore } from "../src/run-audit.mjs";
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "telefire-run-audit-"));
+  const root = await mkdtemp(join(tmpdir(), "sidekick-run-audit-"));
   return {
     root,
     store: new RunAuditStore(root),

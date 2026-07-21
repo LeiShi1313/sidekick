@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 from telethon.errors import MessageNotModifiedError
 
-from telefire.ai import (
+from sidekick.ai import (
     AIAnswerMarker,
     AIConversationHandler,
     AIResponder,
@@ -14,8 +14,8 @@ from telefire.ai import (
     AgentRunRequest,
     PromptBuilder,
 )
-from telefire.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
-from telefire.telegram.ai_transport import TelegramChatTransport
+from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
+from sidekick.telegram.ai_transport import TelegramChatTransport
 
 
 def make_telegram_responder(gateway, **kwargs):

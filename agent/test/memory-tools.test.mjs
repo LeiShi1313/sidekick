@@ -366,13 +366,13 @@ test("limits cross-bank traversal to two distinct consulted sources", async () =
 test("performs one extra filtered directory lookup and mints the next handle", async () => {
   const primary = "telegram:chat:-1001";
   const grant = "telegram:chat:-1002";
-  const tag = `telefire:bank-ref:${createHash("sha256").update(grant).digest("hex")}`;
+  const tag = `sidekick:bank-ref:${createHash("sha256").update(grant).digest("hex")}`;
   const app = fixture(
     (url, options) => {
       assert.match(url, /banks\/system%3Aknowledge-directory\/memories\/recall$/);
       const body = JSON.parse(options.body);
       assert.deepEqual(body.tag_groups[0].or.map((item) => item.tags[0]), [
-        `telefire:bank-ref:${createHash("sha256").update(primary).digest("hex")}`,
+        `sidekick:bank-ref:${createHash("sha256").update(primary).digest("hex")}`,
         tag,
       ]);
       return jsonResponse({
@@ -383,9 +383,9 @@ test("performs one extra filtered directory lookup and mints the next handle", a
             entities: [],
             tags: [tag],
             metadata: {
-              client: "telefire",
+              client: "sidekick",
               source: "knowledge-directory",
-              schema: "telefire.knowledge-directory.v1",
+              schema: "sidekick.knowledge-directory.v1",
               bank_id: grant,
               bank_ref: tag,
               source_name: "Arch Linux 中文群",

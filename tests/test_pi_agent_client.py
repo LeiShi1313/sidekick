@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from aiohttp import web
 
-from telefire.ai import (
+from sidekick.ai import (
     AgentContext,
     AgentIdentityAnchor,
     AgentMemoryTarget,
@@ -11,7 +11,7 @@ from telefire.ai import (
     AgentRunRequest,
     PiAgentGateway,
 )
-from telefire.ai_attachments import AttachmentAnalysisRequest
+from sidekick.ai_attachments import AttachmentAnalysisRequest
 
 
 async def serve(app: web.Application) -> tuple[web.AppRunner, str]:

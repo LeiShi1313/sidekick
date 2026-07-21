@@ -6,16 +6,16 @@ import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
 
-from telefire.ai import MemoryDreamResult, MemoryDreamState, MemoryScopeState
-from telefire.chat.identity import NamespacedIdentityCodec
-from telefire.memory_admin import MemoryAdminService
-from telefire.onebot.client import OneBotReverseWebSocket
-from telefire.onebot.memory_admin import (
+from sidekick.ai import MemoryDreamResult, MemoryDreamState, MemoryScopeState
+from sidekick.chat.identity import NamespacedIdentityCodec
+from sidekick.memory_admin import MemoryAdminService
+from sidekick.onebot.client import OneBotReverseWebSocket
+from sidekick.onebot.memory_admin import (
     OneBotMemoryAdminClient,
     mount_onebot_memory_admin,
 )
-from telefire.plugins.base import command_registry
-import telefire.plugins.onebot_ai as onebot_plugin
+from sidekick.plugins.base import command_registry
+import sidekick.plugins.onebot_ai as onebot_plugin
 
 
 class Store:
@@ -203,11 +203,11 @@ def test_onebot_memory_cli_uses_configured_publish_address(monkeypatch):
             captured["base_url"] = base_url
             captured.update(kwargs)
 
-    monkeypatch.setenv("TELEFIRE_ONEBOT_TOKEN", "secret")
-    monkeypatch.setenv("TELEFIRE_ONEBOT_SELF_ID", "329787230")
-    monkeypatch.setenv("TELEFIRE_ONEBOT_PUBLISH_HOST", "100.99.247.60")
-    monkeypatch.setenv("TELEFIRE_ONEBOT_PUBLISH_PORT", "18867")
-    monkeypatch.delenv("TELEFIRE_ONEBOT_ADMIN_URL", raising=False)
+    monkeypatch.setenv("SIDEKICK_ONEBOT_TOKEN", "secret")
+    monkeypatch.setenv("SIDEKICK_ONEBOT_SELF_ID", "329787230")
+    monkeypatch.setenv("SIDEKICK_ONEBOT_PUBLISH_HOST", "100.99.247.60")
+    monkeypatch.setenv("SIDEKICK_ONEBOT_PUBLISH_PORT", "18867")
+    monkeypatch.delenv("SIDEKICK_ONEBOT_ADMIN_URL", raising=False)
     monkeypatch.setattr(onebot_plugin, "OneBotMemoryAdminClient", Client)
 
     onebot_plugin._onebot_memory_admin_client()

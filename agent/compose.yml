@@ -3,7 +3,8 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile.agent
-    container_name: pi-agent
+    image: sidekick-pi-agent:local
+    container_name: sidekick-pi-agent
     environment:
       AI_BASE_URL: ${AI_BASE_URL}
       AI_API_KEY: ${AI_API_KEY}
@@ -48,7 +49,8 @@ services:
   agent-playground:
     build:
       context: ../playground
-    container_name: agent-playground
+    image: sidekick-agent-playground:local
+    container_name: sidekick-agent-playground
     command: ["--host", "0.0.0.0", "--port", "8780"]
     depends_on:
       pi-agent:
@@ -59,7 +61,7 @@ services:
       MEMORY_API_URL: http://memory-api:8888
       PLAYGROUND_REQUEST_TIMEOUT: ${PLAYGROUND_REQUEST_TIMEOUT:-300}
       PLAYGROUND_SYSTEM_PROMPT: ${PLAYGROUND_SYSTEM_PROMPT:-}
-      VIRTUAL_HOST: sessions.telefire.localhost
+      VIRTUAL_HOST: sessions.sidekick.localhost
       VIRTUAL_PORT: "8780"
     networks:
       - default

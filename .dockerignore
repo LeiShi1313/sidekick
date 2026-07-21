@@ -25,7 +25,7 @@ __pycache__
 *.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
-.telefire
+.sidekick
 logs
 dist
 build

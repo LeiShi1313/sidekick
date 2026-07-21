@@ -18,7 +18,7 @@ const usage = {
 };
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "telefire-session-history-"));
+  const root = await mkdtemp(join(tmpdir(), "sidekick-session-history-"));
   const workspaceDir = join(root, "workspace");
   const sessionDir = join(root, "sessions");
   const manager = SessionManager.create(workspaceDir, sessionDir, {

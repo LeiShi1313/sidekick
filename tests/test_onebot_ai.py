@@ -7,7 +7,7 @@ import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
 
-from telefire.onebot.ai import (
+from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
     OneBotChatTransport,
     OneBotDirectorySourceResolver,
@@ -16,11 +16,11 @@ from telefire.onebot.ai import (
     OneBotMessageMentionResolver,
     onebot_system_prompt,
 )
-from telefire.onebot.client import (
+from sidekick.onebot.client import (
     OneBotActionError,
     OneBotReverseWebSocket,
 )
-from telefire.onebot.message import (
+from sidekick.onebot.message import (
     OneBotMessage,
     OneBotMessageError,
 )

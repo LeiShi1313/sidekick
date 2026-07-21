@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly HINDSIGHT_REVISION="92f433c90409636804c0797071a4abbe141f76c5"
-readonly DEFAULT_IMAGE="telefire-hindsight-control-plane:0.8.4-bank-name.1"
+readonly DEFAULT_IMAGE="sidekick-hindsight-control-plane:0.8.4-bank-name.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly PATCH_FILE="${SCRIPT_DIR}/patches/bee6f5d1-bank-name-search.patch"
@@ -20,7 +20,7 @@ if ! git -C "${source_dir}" cat-file -e "${HINDSIGHT_REVISION}^{commit}" 2>/dev/
   exit 1
 fi
 
-build_dir="$(mktemp -d "${TMPDIR:-/tmp}/telefire-hindsight.XXXXXX")"
+build_dir="$(mktemp -d "${TMPDIR:-/tmp}/sidekick-hindsight.XXXXXX")"
 trap 'rm -rf -- "${build_dir}"' EXIT
 
 git -C "${source_dir}" archive "${HINDSIGHT_REVISION}" | tar -x -C "${build_dir}"
@@ -36,6 +36,6 @@ docker build \
   --label "org.opencontainers.image.source=https://github.com/vectorize-io/hindsight" \
   --label "org.opencontainers.image.revision=${HINDSIGHT_REVISION}" \
   --label "org.opencontainers.image.version=0.8.4-bank-name.1" \
-  --label "io.telefire.hindsight.control-plane-patch=bee6f5d114c09a7bf51a2ef1d5357e0bdf0d9c2d" \
+  --label "io.sidekick.hindsight.control-plane-patch=bee6f5d114c09a7bf51a2ef1d5357e0bdf0d9c2d" \
   --tag "${image}" \
   "${build_dir}"

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from aiohttp import web
 import pytest
 
-from telefire.ai_memory import (
+from sidekick.ai_memory import (
     HindsightMemoryClient,
     MemoryClientError,
     MemoryDocumentReceipt,
@@ -184,7 +184,7 @@ async def test_hindsight_client_retains_episode_and_renders_bank_recall():
             },
         ]
         retained_content = json.loads(request_item["content"])
-        assert retained_content["schema"] == "telefire.memory.episode.v1"
+        assert retained_content["schema"] == "sidekick.memory.episode.v1"
         assert retained_content["events"][1]["actor"] == {
             "id": "telegram:user:20",
             "display_name": "Bob Example",

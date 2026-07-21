@@ -10,16 +10,16 @@ from uuid import uuid4
 import aiohttp
 import pytest
 
-import telefire.ai_memory as ai_memory_module
-from telefire.ai_memory import HindsightMemoryClient
-from telefire.memory_directory import DirectoryPublication, DirectorySource
+import sidekick.ai_memory as ai_memory_module
+from sidekick.ai_memory import HindsightMemoryClient
+from sidekick.memory_directory import DirectoryPublication, DirectorySource
 
 
-HINDSIGHT_URL = os.environ.get("TELEFIRE_HINDSIGHT_URL", "").rstrip("/")
+HINDSIGHT_URL = os.environ.get("SIDEKICK_HINDSIGHT_URL", "").rstrip("/")
 
 pytestmark = pytest.mark.skipif(
     not HINDSIGHT_URL,
-    reason="TELEFIRE_HINDSIGHT_URL is required for the directory benchmark",
+    reason="SIDEKICK_HINDSIGHT_URL is required for the directory benchmark",
 )
 
 
@@ -148,7 +148,7 @@ async def test_real_hindsight_directory_routing_quality_and_latency(
             p50 = latencies[len(latencies) // 2]
             p95 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))]
             report = {
-                "schema": "telefire.knowledge-directory-benchmark.v1",
+                "schema": "sidekick.knowledge-directory-benchmark.v1",
                 "cases": rows,
                 "summary": {
                     "hits": hits,

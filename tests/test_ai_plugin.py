@@ -6,12 +6,12 @@ from telethon import utils as telegram_utils
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
-from telefire.ai import MemoryScopeTarget
-from telefire.plugins.ai import (
+from sidekick.ai import MemoryScopeTarget
+from sidekick.plugins.ai import (
     TelegramAI,
     _parse_telegram_message_link,
 )
-from telefire.telegram.ai_identity import (
+from sidekick.telegram.ai_identity import (
     TelegramDirectorySourceResolver,
     TelegramMemoryScopeTargetResolver,
 )
