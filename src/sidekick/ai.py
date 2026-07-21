@@ -23,6 +23,10 @@ from sidekick.ai_memory import (
     append_episode_once,
     retain_episode_once,
 )
+from sidekick.ai_memory_ingestion import (
+    PendingMemoryDocument,
+    decode_memory_episode,
+)
 from sidekick.ai_attachments import (
     AttachmentAnalysisRequest,
 )
@@ -1221,6 +1225,22 @@ class AIStateRepository:
                 "ALTER TABLE ai_memory_documents "
                 "ADD COLUMN event_versions TEXT NOT NULL DEFAULT '[]'"
             )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_memory_pending_documents (
+                scope_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                content TEXT NOT NULL,
+                staged_source_ids TEXT NOT NULL,
+                sealed INTEGER NOT NULL DEFAULT 0,
+                first_event_at REAL NOT NULL,
+                last_event_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (scope_id, document_id)
+            )
+            """
+        )
         await self._ensure_memory_scope_schema()
         await self._connection.execute(
             """
@@ -1825,6 +1845,135 @@ class AIStateRepository:
                 time.time(),
             ),
         )
+        await connection.commit()
+
+    async def list_pending_memory_documents(
+        self,
+        scope_id: str,
+    ) -> tuple[PendingMemoryDocument, ...]:
+        connection = self._require_connection()
+        cursor = await connection.execute(
+            """
+            SELECT document_id, source, content, staged_source_ids, sealed
+            FROM ai_memory_pending_documents
+            WHERE scope_id = ?
+            ORDER BY first_event_at, document_id
+            """,
+            (scope_id,),
+        )
+        documents: list[PendingMemoryDocument] = []
+        async for row in cursor:
+            try:
+                raw_source_ids = json.loads(row["staged_source_ids"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Malformed pending memory source IDs") from exc
+            if not isinstance(raw_source_ids, list) or not all(
+                isinstance(source_id, str) and source_id
+                for source_id in raw_source_ids
+            ):
+                raise ValueError("Malformed pending memory source IDs")
+            documents.append(
+                PendingMemoryDocument(
+                    episode=decode_memory_episode(
+                        document_id=str(row["document_id"]),
+                        source=str(row["source"]),
+                        content=str(row["content"]),
+                    ),
+                    staged_source_ids=tuple(raw_source_ids),
+                    sealed=bool(row["sealed"]),
+                )
+            )
+        return tuple(documents)
+
+    async def stage_continuous_memory_documents(
+        self,
+        scope_id: str,
+        documents: tuple[PendingMemoryDocument, ...],
+        *,
+        cursor_message_id: int | None,
+        succeeded_at: float,
+    ) -> None:
+        if any(document.episode.scope_id != scope_id for document in documents):
+            raise ValueError("One continuous memory stage cannot span scopes")
+        connection = self._require_connection()
+        await connection.executemany(
+            """
+            INSERT INTO ai_memory_pending_documents (
+                scope_id, document_id, source, content, staged_source_ids,
+                sealed, first_event_at, last_event_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope_id, document_id) DO UPDATE SET
+                source = excluded.source,
+                content = excluded.content,
+                staged_source_ids = excluded.staged_source_ids,
+                sealed = excluded.sealed,
+                first_event_at = excluded.first_event_at,
+                last_event_at = excluded.last_event_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                (
+                    scope_id,
+                    document.episode.document_id,
+                    document.episode.source,
+                    document.episode.content,
+                    json.dumps(
+                        document.staged_source_ids,
+                        separators=(",", ":"),
+                    ),
+                    int(document.sealed),
+                    min(
+                        _memory_event_timestamp(event.occurred_at)
+                        for event in document.episode.events
+                    ),
+                    max(
+                        _memory_event_timestamp(event.occurred_at)
+                        for event in document.episode.events
+                    ),
+                    succeeded_at,
+                )
+                for document in documents
+            ),
+        )
+        await connection.execute(
+            """
+            UPDATE ai_memory_scopes
+            SET continuous_cursor_message_id = COALESCE(
+                    ?, continuous_cursor_message_id
+                ),
+                continuous_last_attempt_at = ?,
+                continuous_last_success_at = ?,
+                continuous_last_error = NULL,
+                updated_at = ?
+            WHERE scope_id = ?
+            """,
+            (
+                cursor_message_id,
+                succeeded_at,
+                succeeded_at,
+                succeeded_at,
+                scope_id,
+            ),
+        )
+        await connection.commit()
+
+    async def delete_pending_memory_documents(
+        self,
+        scope_id: str,
+        document_ids: tuple[str, ...],
+    ) -> None:
+        unique_ids = tuple(dict.fromkeys(document_ids))
+        if not unique_ids:
+            return
+        connection = self._require_connection()
+        for start in range(0, len(unique_ids), 500):
+            batch = unique_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            await connection.execute(
+                "DELETE FROM ai_memory_pending_documents "  # nosec B608
+                f"WHERE scope_id = ? AND document_id IN ({placeholders})",
+                (scope_id, *batch),
+            )
         await connection.commit()
 
     async def find_memory_document_id_for_source(
@@ -3632,6 +3781,12 @@ def _message_datetime(message: ReplyTarget) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _memory_event_timestamp(value: datetime) -> float:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).timestamp()
 
 
 def _is_explicit_bank_selector(value: str) -> bool:
