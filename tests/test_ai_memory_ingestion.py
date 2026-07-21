@@ -4,7 +4,7 @@ import pytest
 
 from sidekick.ai import AIStateRepository
 from sidekick.ai_memory import MemoryEpisode, MemoryEvent
-from sidekick.ai_memory_ingestion import PendingMemoryDocument
+from sidekick.ai_memory_segments import PendingMemoryDocument
 
 
 @pytest.mark.asyncio

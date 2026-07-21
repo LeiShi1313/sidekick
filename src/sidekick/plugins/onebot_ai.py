@@ -18,16 +18,20 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_attachments import ChatAttachmentDescriber
-from sidekick.ai_dream import (
-    ChatDreamScanner,
+from sidekick.ai_continuous_memory import (
     ContinuousMemoryScheduler,
     ContinuousMemorySchedulerSettings,
+)
+from sidekick.ai_dream import (
     DreamScheduler,
     DreamSchedulerSettings,
     DreamSettings,
 )
-from sidekick.ai_memory_ingestion import MemoryIngestionSettings
 from sidekick.ai_memory import HindsightMemoryClient
+from sidekick.ai_memory_ingestion import (
+    ChatMemoryIngestor,
+    MemoryIngestionSettings,
+)
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -186,8 +190,8 @@ class OneBotAI(metaclass=PluginMount):
             identity_codec=QQ_IDENTITY_CODEC,
             metadata_resolver=onebot_memory_event_metadata,
         )
-        dream_runner = (
-            ChatDreamScanner(
+        memory_ingestor = (
+            ChatMemoryIngestor(
                 source=history_source,
                 store=self._store,
                 memory=self._memory,
@@ -201,25 +205,25 @@ class OneBotAI(metaclass=PluginMount):
             if self._memory is not None
             else None
         )
-        if dream_runner is not None:
+        if memory_ingestor is not None:
             mount_onebot_memory_admin(
                 self._bridge,
                 MemoryAdminService(
                     store=self._store,
-                    dream_runner=dream_runner,
+                    dream_runner=memory_ingestor,
                     identity_codec=QQ_IDENTITY_CODEC,
                 ),
                 display_name_resolver=self._directory.scope_name,
             )
             self._dream_scheduler = DreamScheduler(
-                scanner=dream_runner,
+                scanner=memory_ingestor,
                 store=self._store,
                 identity_codec=QQ_IDENTITY_CODEC,
                 settings=DreamSchedulerSettings.from_env(),
                 logger=self.logger,
             )
             self._continuous_scheduler = ContinuousMemoryScheduler(
-                scanner=dream_runner,
+                runner=memory_ingestor,
                 store=self._store,
                 identity_codec=QQ_IDENTITY_CODEC,
                 settings=ContinuousMemorySchedulerSettings.from_env(),
@@ -235,7 +239,7 @@ class OneBotAI(metaclass=PluginMount):
                 cooldown_seconds=self._settings.delegated_cooldown,
             ),
             memory=self._memory,
-            dream_runner=dream_runner,
+            dream_runner=memory_ingestor,
             memory_scope_resolver=OneBotMemoryScopeTargetResolver(self._bridge),
             directory_source_resolver=OneBotDirectorySourceResolver(self._bridge),
             memory_command_delete_delay=(self._settings.memory_command_delete_delay),

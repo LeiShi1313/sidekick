@@ -273,14 +273,14 @@ async def run() -> None:
             reply_to=thread_root.id,
         )
         settlement = float(
-            os.environ.get("SIDEKICK_MEMORY_DREAM_SETTLEMENT_SECONDS", "30")
+            os.environ.get("SIDEKICK_MEMORY_INGESTION_SETTLEMENT_SECONDS", "30")
         )
         await asyncio.sleep(max(settlement, 0) + 1)
         started_at = standalone.date.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
         await wait_for_document(
             hindsight_url,
             scope_id,
-            f"telegram:dream-session:{chat_id}:{started_at}:{standalone.id}",
+            f"telegram:memory-session:{chat_id}:{started_at}:{standalone.id}",
             (standalone_token, thread_root_token, thread_reply_token),
         )
         print("standalone_and_thread_continuous_memory=ok")

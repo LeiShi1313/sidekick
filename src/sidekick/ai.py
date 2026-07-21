@@ -23,7 +23,7 @@ from sidekick.ai_memory import (
     append_episode_once,
     retain_episode_once,
 )
-from sidekick.ai_memory_ingestion import (
+from sidekick.ai_memory_segments import (
     PendingMemoryDocument,
     decode_memory_episode,
 )
@@ -3638,12 +3638,13 @@ class AIConversationHandler:
                 scope_id,
                 root_source_id,
             )
-            append_to_dream_document = bool(
+            append_to_memory_document = bool(
                 existing_document_id
                 and existing_document_id.startswith(
                     (
                         f"{self._identity_codec.source}:dream-segment:",
                         f"{self._identity_codec.source}:dream-session:",
+                        f"{self._identity_codec.source}:memory-session:",
                     )
                 )
             )
@@ -3652,7 +3653,7 @@ class AIConversationHandler:
                 chat_id,
                 observations,
                 document_id=(
-                    existing_document_id if append_to_dream_document else None
+                    existing_document_id if append_to_memory_document else None
                 ),
             )
             await _record_episode_labels(self._store, episode)
@@ -3662,7 +3663,7 @@ class AIConversationHandler:
                     self._store,
                     episode,
                 )
-                if append_to_dream_document
+                if append_to_memory_document
                 else await retain_episode_once(
                     self._memory,
                     self._store,

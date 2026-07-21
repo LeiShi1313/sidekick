@@ -659,9 +659,10 @@ async def test_bare_memory_command_retains_one_ordered_multi_actor_episode():
     (
         "telegram:dream-segment:-1001:0-19",
         "telegram:dream-session:-1001:20260713T080000Z:1",
+        "telegram:memory-session:-1001:20260713T080000Z:1",
     ),
 )
-async def test_memory_command_appends_to_existing_dream_document(
+async def test_memory_command_appends_to_existing_ingestion_document(
     tmp_path,
     document_id,
 ):
