@@ -34,6 +34,7 @@ from sidekick.chat.attachments import AttachmentDescriber, AttachmentDescription
 from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
+    AIModelCommand,
     AccessCommand,
     BankGrantCommand,
     DirectoryPublishCommand,
@@ -44,6 +45,7 @@ from sidekick.chat.commands import (
     MemoryModeCommand,
     MemoryRememberCommand,
     MemoryStatusCommand,
+    MODEL_ID_RE,
     parse_chat_command,
 )
 from sidekick.chat.identity import IdentityCodec, NamespacedIdentityCodec
@@ -102,6 +104,22 @@ class AgentMemoryTarget:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentModelCatalog:
+    default_model: str
+    models: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            MODEL_ID_RE.fullmatch(self.default_model) is None
+            or not 1 <= len(self.models) <= 256
+            or self.models != tuple(sorted(set(self.models)))
+            or self.default_model not in self.models
+            or any(MODEL_ID_RE.fullmatch(model) is None for model in self.models)
+        ):
+            raise ValueError("Invalid agent model catalog")
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRunRequest:
     run_id: str
     session_id: str | None
@@ -111,6 +129,7 @@ class AgentRunRequest:
     system_prompt: str
     tool_policy: ToolPolicy
     memory: AgentMemoryTarget | None = None
+    model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +149,8 @@ class AgentEvent:
 
 
 class AgentGateway(Protocol):
+    async def list_models(self) -> AgentModelCatalog: ...
+
     def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]: ...
 
     async def cancel(self, run_id: str) -> bool: ...
@@ -153,6 +174,36 @@ class PiAgentGateway:
             await self._session.close()
             self._session = None
 
+    async def list_models(self) -> AgentModelCatalog:
+        session = self._get_session()
+        async with session.get(
+            f"{self._base_url}/v1/models",
+            headers=self._headers,
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Pi model catalog failed with HTTP {response.status}"
+                )
+            try:
+                payload = await response.json()
+            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Pi model catalog is malformed") from exc
+        if not isinstance(payload, dict) or set(payload) != {
+            "defaultModel",
+            "models",
+        }:
+            raise RuntimeError("Pi model catalog is malformed")
+        default_model = payload["defaultModel"]
+        models = payload["models"]
+        if not isinstance(default_model, str) or not isinstance(models, list):
+            raise RuntimeError("Pi model catalog is malformed")
+        if not all(isinstance(model, str) for model in models):
+            raise RuntimeError("Pi model catalog is malformed")
+        try:
+            return AgentModelCatalog(default_model, tuple(models))
+        except ValueError as exc:
+            raise RuntimeError("Pi model catalog is malformed") from exc
+
     async def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]:
         payload = {
             "runId": request.run_id,
@@ -165,6 +216,8 @@ class PiAgentGateway:
             "systemPrompt": request.system_prompt,
             "toolPolicy": request.tool_policy,
         }
+        if request.model is not None:
+            payload["model"] = request.model
         if request.memory is not None:
             payload["memory"] = {
                 "primaryBankId": request.memory.primary_bank_id,
@@ -368,6 +421,14 @@ class ConversationStore(Protocol):
     ) -> AIAnswerMarker | None: ...
 
     async def save_answer(self, marker: AIAnswerMarker) -> None: ...
+
+    async def get_model_override(self, scope_id: str) -> str | None: ...
+
+    async def set_model_override(
+        self,
+        scope_id: str,
+        model: str | None,
+    ) -> None: ...
 
     async def is_allowed(self, actor_id: str) -> bool: ...
 
@@ -750,6 +811,9 @@ class AIResponder:
 
     async def cancel(self, run_id: str) -> bool:
         return await self._gateway.cancel(run_id)
+
+    async def list_models(self) -> AgentModelCatalog:
+        return await self._gateway.list_models()
 
     @property
     def transport(self) -> ChatTransport:
@@ -1302,6 +1366,15 @@ class AIStateRepository:
             )
             """
         )
+        await self._require_connection().execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_model_overrides (
+                scope_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         await self._ensure_excluded_messages_schema()
 
     async def _ensure_ai_answers_schema(self) -> None:
@@ -1592,6 +1665,38 @@ class AIStateRepository:
                 marker.agent_entry_id,
             ),
         )
+        await connection.commit()
+
+    async def get_model_override(self, scope_id: str) -> str | None:
+        cursor = await self._require_connection().execute(
+            "SELECT model_id FROM ai_model_overrides WHERE scope_id = ?",
+            (scope_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row["model_id"]) if row is not None else None
+
+    async def set_model_override(
+        self,
+        scope_id: str,
+        model: str | None,
+    ) -> None:
+        connection = self._require_connection()
+        if model is None:
+            await connection.execute(
+                "DELETE FROM ai_model_overrides WHERE scope_id = ?",
+                (scope_id,),
+            )
+        else:
+            await connection.execute(
+                """
+                INSERT INTO ai_model_overrides (scope_id, model_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(scope_id) DO UPDATE SET
+                    model_id = excluded.model_id,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_id, model, time.time()),
+            )
         await connection.commit()
 
     async def is_allowed(self, actor_id: str) -> bool:
@@ -2569,7 +2674,18 @@ class AIConversationHandler:
         if isinstance(command, InvalidCommand):
             if not is_owner_control:
                 return False
-            if command.name == "/ai_memory_backfill":
+            if command.name == "/ai_model":
+                await self._mark_memory_excluded(
+                    scope_id,
+                    message.id,
+                    "ai-control",
+                )
+                await self._reply_memory_excluded(
+                    message,
+                    "Usage: /ai_model [model-id|default]",
+                    kind="ai-control",
+                )
+            elif command.name == "/ai_memory_backfill":
                 await self._reply_memory_excluded(
                     message,
                     "Usage: /ai_memory_backfill days <1-30> or "
@@ -2583,6 +2699,10 @@ class AIConversationHandler:
                     kind="memory-control",
                 )
             return True
+        if isinstance(command, AIModelCommand):
+            if not is_owner_control:
+                return False
+            return await self._handle_model_command(message, scope_id, command)
         if isinstance(command, MemoryBackfillCommand):
             if not is_owner_control:
                 return False
@@ -2773,6 +2893,7 @@ class AIConversationHandler:
                 system_prompt=self._prompt_builder.system_prompt,
                 tool_policy="owner" if is_owner else "delegated",
                 memory=memory_target,
+                model=await self._store.get_model_override(scope_id),
             )
             self._active_runs[actor_id] = run_id
             result = await self._responder.answer(message, request)
@@ -2889,6 +3010,93 @@ class AIConversationHandler:
         )
         await self._reply_memory_excluded(message, response, kind="memory-control")
         return True
+
+    async def _handle_model_command(
+        self,
+        message: ReplyTarget,
+        scope_id: str,
+        command: AIModelCommand,
+    ) -> bool:
+        await self._mark_memory_excluded(scope_id, message.id, "ai-control")
+        if command.action == "reset":
+            await self._store.set_model_override(scope_id, None)
+            await self._reply_memory_excluded(
+                message,
+                "AI model for this chat reset to the server default.",
+                kind="ai-control",
+            )
+            return True
+
+        try:
+            catalog = await self._responder.list_models()
+        except Exception as exc:
+            self._log_model_failure(exc)
+            await self._reply_memory_excluded(
+                message,
+                "AI model catalog is unavailable. Try again shortly.",
+                kind="ai-control",
+            )
+            return True
+
+        if command.action == "set":
+            assert command.model is not None
+            if command.model not in catalog.models:
+                await self._reply_memory_excluded(
+                    message,
+                    f"Unknown AI model: {command.model}. "
+                    "Use /ai_model to list available models.",
+                    kind="ai-control",
+                )
+                return True
+            await self._store.set_model_override(scope_id, command.model)
+            await self._reply_memory_excluded(
+                message,
+                f"AI model for this chat set to {command.model}.",
+                kind="ai-control",
+            )
+            return True
+
+        override = await self._store.get_model_override(scope_id)
+        await self._reply_memory_excluded(
+            message,
+            self._format_model_catalog(catalog, override),
+            kind="ai-control",
+        )
+        return True
+
+    @staticmethod
+    def _format_model_catalog(
+        catalog: AgentModelCatalog,
+        override: str | None,
+    ) -> str:
+        if override is None:
+            current = catalog.default_model
+            source = "server default"
+        else:
+            current = override
+            source = (
+                "chat override"
+                if override in catalog.models
+                else "chat override; currently unavailable"
+            )
+        header = (
+            f"AI model for this chat: {current} ({source}).\n\n"
+            "Available models:"
+        )
+        footer = (
+            "\n\nUse /ai_model <model-id> to switch, or "
+            "/ai_model default to reset."
+        )
+        lines: list[str] = []
+        for index, model in enumerate(catalog.models):
+            remaining = len(catalog.models) - index - 1
+            candidate = [*lines, f"- {model}"]
+            suffix = f"\n- … {remaining} more" if remaining else ""
+            if len(header) + len("\n".join(candidate)) + len(suffix) + len(footer) > 3_500:
+                lines.append(f"- … {remaining + 1} more")
+                break
+            lines = candidate
+        return f"{header}\n{'\n'.join(lines)}{footer}"
 
     async def _handle_access_command(
         self,
@@ -3723,6 +3931,14 @@ class AIConversationHandler:
             self._logger.warning(
                 "Memory %s failed (%s): %s",
                 operation,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _log_model_failure(self, exc: Exception) -> None:
+        if self._logger is not None:
+            self._logger.warning(
+                "AI model catalog failed (%s): %s",
                 type(exc).__name__,
                 exc,
             )

@@ -1,6 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 
+import { isModelId } from "./model-id.mjs";
+
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ATTACHMENT_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
@@ -102,6 +104,7 @@ export function validateRunRequest(value) {
   const sessionId = value.sessionId;
   const parentEntryId = value.parentEntryId;
   const includeMemorySnapshot = value.includeMemorySnapshot;
+  const model = value.model;
   const isRoot = sessionId === null && parentEntryId === null;
   const isContinuation =
     typeof sessionId === "string" &&
@@ -114,6 +117,10 @@ export function validateRunRequest(value) {
     !isBoundedString(value.prompt, 1, 16_000) ||
     !isBoundedString(value.systemPrompt, 1, 32_000) ||
     !new Set(["owner", "delegated", "none"]).has(value.toolPolicy) ||
+    !(
+      model === undefined ||
+      isModelId(model)
+    ) ||
     !(
       includeMemorySnapshot === undefined ||
       typeof includeMemorySnapshot === "boolean"
@@ -264,6 +271,7 @@ export function validateRunRequest(value) {
     context,
     systemPrompt: value.systemPrompt,
     toolPolicy: value.toolPolicy,
+    ...(model ? { model } : {}),
     ...(includeMemorySnapshot ? { includeMemorySnapshot: true } : {}),
     ...(memory ? { memory } : {}),
   };
@@ -355,6 +363,23 @@ export function createAgentServer({ engine, token, logger = console }) {
       json(response, 401, {
         error: { code: "UNAUTHORIZED", message: "Unauthorized" },
       });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/models") {
+      try {
+        json(response, 200, await engine.listModels());
+      } catch (error) {
+        logger.error("Model catalog request failed", {
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        });
+        json(response, 502, {
+          error: {
+            code: "MODEL_CATALOG_UNAVAILABLE",
+            message: "Model catalog unavailable",
+          },
+        });
+      }
       return;
     }
 

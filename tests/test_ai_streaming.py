@@ -11,6 +11,7 @@ from sidekick.ai import (
     AIResponder,
     AISettings,
     AgentEvent,
+    AgentModelCatalog,
     AgentRunRequest,
     PromptBuilder,
 )
@@ -49,9 +50,9 @@ class FakeAnswer:
 
 
 class FakeMessage:
-    def __init__(self, text: str, sender_id: int = 10):
+    def __init__(self, text: str, sender_id: int = 10, chat_id: int = -1001):
         self.id = 1
-        self.chat_id = -1001
+        self.chat_id = chat_id
         self.raw_text = text
         self.sender_id = sender_id
         self.reply_to_msg_id = None
@@ -91,10 +92,26 @@ class FakeRichMessage(FakeMessage):
 
 
 class FakeGateway:
-    def __init__(self, chunks=(), error: Exception | None = None):
+    def __init__(
+        self,
+        chunks=(),
+        error: Exception | None = None,
+        catalog: AgentModelCatalog | None = None,
+        catalog_error: Exception | None = None,
+    ):
         self.chunks = chunks
         self.error = error
+        self.catalog = catalog or AgentModelCatalog(
+            default_model="gpt-5.6-sol",
+            models=("claude-sonnet-4-6", "gpt-5.4-mini", "gpt-5.6-sol"),
+        )
+        self.catalog_error = catalog_error
         self.requests: list[AgentRunRequest] = []
+
+    async def list_models(self) -> AgentModelCatalog:
+        if self.catalog_error is not None:
+            raise self.catalog_error
+        return self.catalog
 
     async def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]:
         self.requests.append(request)
@@ -155,6 +172,8 @@ async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:
 class FakeStore:
     def __init__(self):
         self.saved = []
+        self.model_overrides: dict[str, str] = {}
+        self.memory_excluded: set[tuple[str, int, str]] = set()
 
     async def get_answer(self, scope_id, answer_message_id):
         return None
@@ -173,6 +192,23 @@ class FakeStore:
     async def save_answer(self, marker):
         self.saved.append(marker)
 
+    async def get_model_override(self, scope_id):
+        return self.model_overrides.get(scope_id)
+
+    async def set_model_override(self, scope_id, model):
+        if model is None:
+            self.model_overrides.pop(scope_id, None)
+        else:
+            self.model_overrides[scope_id] = model
+
+    async def mark_memory_excluded_message(self, scope_id, message_id, kind):
+        self.memory_excluded.add((scope_id, message_id, kind))
+
+    async def is_memory_excluded_message(self, scope_id, message_id):
+        return any(
+            item[:2] == (scope_id, message_id) for item in self.memory_excluded
+        )
+
     async def is_allowed(self, actor_id):
         return False
 
@@ -189,11 +225,11 @@ class FakeStore:
         return None
 
 
-def make_handler(owner_id, responder):
+def make_handler(owner_id, responder, *, store=None):
     return AIConversationHandler(
         owner_id=owner_id,
         responder=responder,
-        store=FakeStore(),
+        store=store or FakeStore(),
         prompt_builder=PromptBuilder(identity_codec=TELEGRAM_IDENTITY_CODEC),
         identity_codec=TELEGRAM_IDENTITY_CODEC,
     )
@@ -358,6 +394,121 @@ async def test_telegram_answer_starts_with_localized_thinking_status():
     await responder.answer(trigger, make_request("answer"))
 
     assert trigger.replies[0].initial_text == "琢磨中。。。"
+
+
+@pytest.mark.asyncio
+async def test_owner_can_inspect_the_current_chat_model_and_available_choices():
+    gateway = FakeGateway()
+    handler = make_handler(10, make_telegram_responder(gateway))
+    command = FakeMessage("/ai_model")
+
+    assert await handler.handle(command) is True
+
+    assert command.replies[0].text == (
+        "AI model for this chat: gpt-5.6-sol (server default).\n\n"
+        "Available models:\n"
+        "- claude-sonnet-4-6\n"
+        "- gpt-5.4-mini\n"
+        "- gpt-5.6-sol\n\n"
+        "Use /ai_model <model-id> to switch, or /ai_model default to reset."
+    )
+    assert gateway.requests == []
+
+
+@pytest.mark.asyncio
+async def test_chat_model_override_applies_only_to_that_chat():
+    gateway = FakeGateway(["answer"])
+    store = FakeStore()
+    handler = make_handler(
+        10,
+        make_telegram_responder(gateway),
+        store=store,
+    )
+
+    selected = FakeMessage("/ai_model gpt-5.4-mini", chat_id=-1001)
+    assert await handler.handle(selected) is True
+    assert selected.replies[0].text == (
+        "AI model for this chat set to gpt-5.4-mini."
+    )
+    assert store.memory_excluded == {
+        ("telegram:chat:-1001", selected.id, "ai-control"),
+        ("telegram:chat:-1001", selected.replies[0].id, "ai-control"),
+    }
+
+    assert await handler.handle(FakeMessage("/ai first", chat_id=-1001)) is True
+    assert await handler.handle(FakeMessage("/ai second", chat_id=-1002)) is True
+
+    assert [request.model for request in gateway.requests] == [
+        "gpt-5.4-mini",
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_or_nonowner_model_selection_does_not_change_the_chat():
+    gateway = FakeGateway()
+    store = FakeStore()
+    handler = make_handler(
+        10,
+        make_telegram_responder(gateway),
+        store=store,
+    )
+
+    unknown = FakeMessage("/ai_model missing-model")
+    assert await handler.handle(unknown) is True
+    assert unknown.replies[0].text == (
+        "Unknown AI model: missing-model. Use /ai_model to list available models."
+    )
+
+    nonowner = FakeMessage("/ai_model gpt-5.4-mini", sender_id=20)
+    assert await handler.handle(nonowner) is False
+    assert nonowner.replies == []
+    assert store.model_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_command_is_excluded_from_continuous_memory():
+    store = FakeStore()
+    handler = make_handler(
+        10,
+        make_telegram_responder(FakeGateway()),
+        store=store,
+    )
+    command = FakeMessage("/ai_model two models")
+
+    assert await handler.handle(command) is True
+
+    assert command.replies[0].text == "Usage: /ai_model [model-id|default]"
+    assert store.memory_excluded == {
+        ("telegram:chat:-1001", command.id, "ai-control"),
+        ("telegram:chat:-1001", command.replies[0].id, "ai-control"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_reset_succeeds_even_when_the_catalog_is_unavailable():
+    gateway = FakeGateway(catalog_error=RuntimeError("provider unavailable"))
+    store = FakeStore()
+    store.model_overrides["telegram:chat:-1001"] = "gpt-5.4-mini"
+    handler = make_handler(
+        10,
+        make_telegram_responder(gateway),
+        store=store,
+    )
+    command = FakeMessage("/ai_model default")
+
+    assert await handler.handle(command) is True
+
+    assert command.replies[0].text == (
+        "AI model for this chat reset to the server default."
+    )
+    assert store.model_overrides == {}
+
+    unavailable = FakeMessage("/ai_model")
+    assert await handler.handle(unavailable) is True
+    assert unavailable.replies[0].text == (
+        "AI model catalog is unavailable. Try again shortly."
+    )
 
 
 @pytest.mark.asyncio

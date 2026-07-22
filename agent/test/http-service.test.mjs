@@ -125,6 +125,107 @@ test("accepts a no-tools model run", async () => {
   }
 });
 
+test("accepts a bounded model selection and rejects malformed model ids", async () => {
+  const received = [];
+  const app = await listen({
+    async *run(request) {
+      received.push(request);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel() {
+      return false;
+    },
+  });
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({ ...validRun, model: "gpt-5.4-mini" }),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.equal(received[0].model, "gpt-5.4-mini");
+
+    for (const model of ["invalid model", 123]) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify({ ...validRun, model }),
+      });
+      assert.equal(rejected.status, 400);
+    }
+    assert.equal(received.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
+test("serves the authenticated model catalog without provider details", async () => {
+  const app = await listen({
+    async *run() {},
+    async cancel() {
+      return false;
+    },
+    async listModels() {
+      return {
+        defaultModel: "gpt-5.6-sol",
+        models: ["gpt-5.4-mini", "gpt-5.6-sol"],
+      };
+    },
+  });
+  try {
+    const response = await fetch(`${app.baseUrl}/v1/models`, {
+      headers: {
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      defaultModel: "gpt-5.6-sol",
+      models: ["gpt-5.4-mini", "gpt-5.6-sol"],
+    });
+
+    const unauthenticated = await fetch(`${app.baseUrl}/v1/models`);
+    assert.equal(unauthenticated.status, 401);
+  } finally {
+    await app.close();
+  }
+});
+
+test("returns a stable error when the model catalog is unavailable", async () => {
+  const app = await listen({
+    async *run() {},
+    async cancel() {
+      return false;
+    },
+    async listModels() {
+      throw new Error("provider credential detail");
+    },
+  });
+  try {
+    const response = await fetch(`${app.baseUrl}/v1/models`, {
+      headers: {
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      error: {
+        code: "MODEL_CATALOG_UNAVAILABLE",
+        message: "Model catalog unavailable",
+      },
+    });
+  } finally {
+    await app.close();
+  }
+});
+
 test("accepts a bounded memory target and rejects scope injection", async () => {
   let received;
   const app = await listen({

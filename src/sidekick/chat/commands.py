@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Literal, TypeAlias
 
 
 MAX_MEMORY_BACKFILL_DAYS = 30
 MAX_MEMORY_BACKFILL_MESSAGES = 5_000
+MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +19,16 @@ class AIAskCommand:
 @dataclass(frozen=True, slots=True)
 class AICancelCommand:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AIModelCommand:
+    action: Literal["show", "set", "reset"]
+    model: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.action == "set") != (self.model is not None):
+            raise ValueError("Only a model-selection command accepts a model")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +111,7 @@ class InvalidCommand:
 ChatCommand: TypeAlias = (
     AIAskCommand
     | AICancelCommand
+    | AIModelCommand
     | AccessCommand
     | DirectoryPublishCommand
     | BankGrantCommand
@@ -120,6 +133,10 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     if directory is not None:
         return directory
 
+    model = _parse_model_control(text.strip())
+    if model is not None:
+        return model
+
     ai = _parse_ai(text)
     if ai is not None:
         return ai
@@ -140,6 +157,21 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     if memory is not None:
         return memory
     return None
+
+
+def _parse_model_control(text: str) -> AIModelCommand | InvalidCommand | None:
+    parts = text.split()
+    if not parts or parts[0] != "/ai_model":
+        return None
+    if len(parts) == 1:
+        return AIModelCommand(action="show")
+    if len(parts) != 2:
+        return InvalidCommand(name="/ai_model")
+    if parts[1].casefold() == "default":
+        return AIModelCommand(action="reset")
+    if MODEL_ID_RE.fullmatch(parts[1]) is None:
+        return InvalidCommand(name="/ai_model")
+    return AIModelCommand(action="set", model=parts[1])
 
 
 def _parse_directory_control(text: str) -> ChatCommand | None:

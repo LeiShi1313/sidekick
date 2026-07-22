@@ -129,6 +129,12 @@ class FakeStore:
     async def save_answer(self, marker: AIAnswerMarker):
         self.markers[(marker.scope_id, marker.answer_message_id)] = marker
 
+    async def get_model_override(self, scope_id: str):
+        return None
+
+    async def set_model_override(self, scope_id: str, model: str | None):
+        return None
+
     async def is_allowed(self, actor_id: str):
         return False
 
