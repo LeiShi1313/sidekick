@@ -369,6 +369,14 @@ class ConversationStore(Protocol):
 
     async def save_answer(self, marker: AIAnswerMarker) -> None: ...
 
+    async def get_model_override(self, scope_id: str) -> str | None: ...
+
+    async def set_model_override(
+        self,
+        scope_id: str,
+        model: str | None,
+    ) -> None: ...
+
     async def is_allowed(self, actor_id: str) -> bool: ...
 
     async def allow_user(self, actor_id: str) -> None: ...
@@ -1302,6 +1310,15 @@ class AIStateRepository:
             )
             """
         )
+        await self._require_connection().execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_model_overrides (
+                scope_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         await self._ensure_excluded_messages_schema()
 
     async def _ensure_ai_answers_schema(self) -> None:
@@ -1592,6 +1609,38 @@ class AIStateRepository:
                 marker.agent_entry_id,
             ),
         )
+        await connection.commit()
+
+    async def get_model_override(self, scope_id: str) -> str | None:
+        cursor = await self._require_connection().execute(
+            "SELECT model_id FROM ai_model_overrides WHERE scope_id = ?",
+            (scope_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row["model_id"]) if row is not None else None
+
+    async def set_model_override(
+        self,
+        scope_id: str,
+        model: str | None,
+    ) -> None:
+        connection = self._require_connection()
+        if model is None:
+            await connection.execute(
+                "DELETE FROM ai_model_overrides WHERE scope_id = ?",
+                (scope_id,),
+            )
+        else:
+            await connection.execute(
+                """
+                INSERT INTO ai_model_overrides (scope_id, model_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(scope_id) DO UPDATE SET
+                    model_id = excluded.model_id,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_id, model, time.time()),
+            )
         await connection.commit()
 
     async def is_allowed(self, actor_id: str) -> bool:

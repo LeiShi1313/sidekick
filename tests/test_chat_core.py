@@ -22,6 +22,7 @@ from sidekick.chat.attachments import AttachmentDescription, AttachmentReference
 from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
+    AIModelCommand,
     AccessCommand,
     InvalidCommand,
     MemoryBackfillCommand,
@@ -44,6 +45,13 @@ from sidekick.chat.transport import ChatPresentation
             AIAskCommand(prompt="summarize", recent_messages=10),
         ),
         ("/ai_cancel", AICancelCommand()),
+        ("/ai_model", AIModelCommand(action="show")),
+        (
+            "/ai_model gpt-5.4-mini",
+            AIModelCommand(action="set", model="gpt-5.4-mini"),
+        ),
+        ("/ai_model default", AIModelCommand(action="reset")),
+        ("/ai_model two models", InvalidCommand(name="/ai_model")),
         ("/ai_allow", AccessCommand(allowed=True)),
         ("/ai_deny", AccessCommand(allowed=False)),
         (
@@ -112,6 +120,31 @@ def test_attachment_reference_contains_metadata_but_no_binary_payload():
     assert not any(
         isinstance(getattr(reference, item.name), bytes) for item in fields(reference)
     )
+
+
+@pytest.mark.asyncio
+async def test_chat_model_override_can_be_replaced_reset_and_reloaded(tmp_path):
+    path = tmp_path / "ai.db"
+    scope_id = "telegram:chat:-1001"
+    store = await AIStateRepository(path).connect()
+    try:
+        assert await store.get_model_override(scope_id) is None
+
+        await store.set_model_override(scope_id, "gpt-5.4-mini")
+        assert await store.get_model_override(scope_id) == "gpt-5.4-mini"
+
+        await store.set_model_override(scope_id, "claude-sonnet-4-6")
+    finally:
+        await store.close()
+
+    restarted = await AIStateRepository(path).connect()
+    try:
+        assert await restarted.get_model_override(scope_id) == "claude-sonnet-4-6"
+
+        await restarted.set_model_override(scope_id, None)
+        assert await restarted.get_model_override(scope_id) is None
+    finally:
+        await restarted.close()
 
 
 class FakeGateway:
