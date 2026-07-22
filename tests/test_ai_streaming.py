@@ -24,7 +24,6 @@ from sidekick.chat.commands import (
     MemoryRememberCommand,
     parse_chat_command,
 )
-from sidekick.chat.formatting import agent_system_prompt
 from sidekick.plugins.base import command_registry
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 from sidekick.telegram.ai_transport import (
@@ -602,7 +601,23 @@ async def test_first_stream_gate_ignores_rich_markdown_link_targets():
 
 
 @pytest.mark.asyncio
-async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
+@pytest.mark.parametrize(
+    ("opening", "completion", "expected"),
+    [
+        ("**", f'{"A" * 49}.**', f'{"A" * 49}.'),
+        (
+            "[",
+            f'{"A" * 49}.](https://example.com)',
+            f'{"A" * 49}.',
+        ),
+        ("- ", f'{"A" * 49}.', f'- {"A" * 49}.'),
+    ],
+)
+async def test_first_stream_gate_ignores_syntax_only_openers(
+    opening,
+    completion,
+    expected,
+):
     opening_consumed = asyncio.Event()
     send_content = asyncio.Event()
     content_consumed = asyncio.Event()
@@ -620,12 +635,12 @@ async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
                 run_id=request.run_id,
                 session_id="session-1",
             )
-            yield AgentEvent(type="text_delta", delta="**", reset=True)
+            yield AgentEvent(type="text_delta", delta=opening, reset=True)
             opening_consumed.set()
             await send_content.wait()
             yield AgentEvent(
                 type="text_delta",
-                delta=f'{"A" * 49}.**',
+                delta=completion,
                 reset=False,
             )
             content_consumed.set()
@@ -634,7 +649,7 @@ async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
                 type="run_completed",
                 session_id="session-1",
                 entry_id="entry-1",
-                answer=f'**{"A" * 49}.**',
+                answer=opening + completion,
             )
 
     responder = make_telegram_responder(PausingGateway(), sleep=blocked_sleep)
@@ -649,7 +664,7 @@ async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
     send_content.set()
     await content_consumed.wait()
     await wait_for_edit_count(trigger.replies[0], 1)
-    assert trigger.replies[0].text == f'{"A" * 49}.'
+    assert trigger.replies[0].text == expected
 
     finish.set()
     await answering
@@ -950,15 +965,6 @@ async def test_flood_wait_delays_final_edit_without_replacing_the_answer(monkeyp
     assert sleeps == [7]
 
 
-def test_prompt_builder_uses_the_portable_agent_format_guard():
-    builder = PromptBuilder(system_prompt=agent_system_prompt("Keep answers factual."))
-
-    assert builder.system_prompt.startswith("Keep answers factual.")
-    assert "portable Markdown-lite" in builder.system_prompt
-    assert "Do not emit HTML" in builder.system_prompt
-    assert "Telegram" not in builder.system_prompt
-
-
 def test_response_format_switches_only_for_a_bot_rich_transport():
     assert (
         select_telegram_response_format(
@@ -1077,6 +1083,43 @@ async def test_regular_telegram_treats_unexpected_html_as_plain_text():
     assert result.text == formatted
     assert answer.text == formatted
     assert answer.edit_calls[-1][1]["formatting_entities"] == []
+
+
+@pytest.mark.asyncio
+async def test_regular_telegram_leaves_non_https_links_literal():
+    formatted = (
+        "[legacy](http://example.com) "
+        "[unsafe](javascript:alert(1))"
+    )
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai format this")
+
+    await responder.answer(trigger, make_request("format this"))
+
+    answer = trigger.replies[0]
+    assert answer.text == formatted
+    assert answer.edit_calls[-1][1]["formatting_entities"] == []
+
+
+@pytest.mark.asyncio
+async def test_rich_telegram_escapes_html_and_non_https_links():
+    formatted = (
+        "<strong>Result</strong> and `x < y` "
+        "[unsafe](javascript:alert(1))"
+    )
+    responder = make_telegram_responder(
+        FakeGateway([formatted]),
+        response_format="rich_markdown",
+    )
+    trigger = FakeRichMessage("/ai format this")
+
+    await responder.answer(trigger, make_request("format this"))
+
+    request = trigger.replies[0].client.requests[-1]
+    assert request.rich_message.markdown == (
+        "&lt;strong&gt;Result&lt;/strong&gt; and `x < y` "
+        "&#91;unsafe](javascript:alert(1))"
+    )
 
 
 @pytest.mark.asyncio

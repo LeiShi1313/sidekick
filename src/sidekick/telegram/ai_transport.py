@@ -11,6 +11,11 @@ from telethon.extensions import markdown as telegram_markdown
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
+from sidekick.chat.formatting import (
+    PORTABLE_LINK_RE,
+    has_visible_markdown_content,
+    sanitize_rich_markdown,
+)
 from sidekick.chat.transport import ChatPresentation, SentMessage
 
 
@@ -414,8 +419,9 @@ class TelegramChatTransport:
             return text
         if self._response_format == "regular_entities":
             rendered, _ = _parse_agent_markdown(text)
-            return rendered if rendered.strip().strip("*_~`") else ""
-        return text.strip().strip("*_~`#>|:-")
+        else:
+            rendered = text
+        return rendered if has_visible_markdown_content(rendered) else ""
 
     async def _edit_snapshot(
         self,
@@ -436,8 +442,8 @@ class TelegramChatTransport:
             )
             return
 
-        text = snapshot.text
-        if not text.strip().strip("*_~`#>|:-"):
+        text = sanitize_rich_markdown(snapshot.text)
+        if not has_visible_markdown_content(snapshot.text):
             return
         client = getattr(message, "client", None)
         get_input_chat = getattr(message, "get_input_chat", None)
@@ -460,4 +466,5 @@ def _parse_agent_markdown(text: str) -> tuple[str, list[Any]]:
     return telegram_markdown.parse(
         text,
         delimiters=_TELEGRAM_MARKDOWN_DELIMITERS,
+        url_re=PORTABLE_LINK_RE,
     )

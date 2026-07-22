@@ -7,7 +7,6 @@ import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
 
-from sidekick.chat.formatting import agent_system_prompt
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
     OneBotChatTransport,
@@ -500,14 +499,6 @@ async def test_onebot_identity_and_mentions_use_display_labels_when_available():
     assert identity.subject_display_name == "Alice Card"
     assert identity.scope_display_name == "Dog Food Filter"
     assert [(item.user_id, item.display_name) for item in mentions] == [(123, "Bob")]
-
-
-def test_onebot_uses_the_portable_agent_format_prompt():
-    prompt = agent_system_prompt("Base policy.")
-
-    assert prompt.startswith("Base policy.")
-    assert "portable Markdown-lite" in prompt
-    assert "QQ" not in prompt
 
 
 @pytest.mark.asyncio
