@@ -36,6 +36,21 @@ function writeSse(response, chunks) {
 async function fakeProvider(handler) {
   const requests = [];
   const server = createServer(async (request, response) => {
+    if (request.method === "GET" && request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          data: [
+            { id: "test-model" },
+            { id: "alternate-model" },
+            { id: "invalid model" },
+            { id: 123 },
+            { id: "alternate-model" },
+          ],
+        }),
+      );
+      return;
+    }
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -192,6 +207,27 @@ async function fixture(handler, overrides = {}) {
     },
   };
 }
+
+test("lists bounded provider models and selects one for a single run", async () => {
+  const app = await fixture((body, response) => sendText(response, body.model));
+  try {
+    assert.deepEqual(await app.engine.listModels(), {
+      defaultModel: "test-model",
+      models: ["alternate-model", "test-model"],
+    });
+
+    const events = await collect(
+      app.engine,
+      request("model-run", { model: "alternate-model" }),
+    );
+
+    assert.equal(app.provider.requests[0].model, "alternate-model");
+    assert.equal(events.at(-1).answer, "alternate-model");
+    assert.equal(app.engine.model.id, "test-model");
+  } finally {
+    await app.close();
+  }
+});
 
 test("delegates read-only session history and run audit queries", async () => {
   const calls = [];

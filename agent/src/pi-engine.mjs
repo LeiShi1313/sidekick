@@ -20,6 +20,8 @@ import { SessionHistory } from "./session-history.mjs";
 import { constrainWebTools } from "./web-tools.mjs";
 
 const PROVIDER = "openai-compatible";
+const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const MAX_CATALOG_MODELS = 256;
 const RESTRICTED_TOOLS = Object.freeze([
   "web_search",
   "fetch_content",
@@ -389,6 +391,33 @@ export class PiEngine {
     return true;
   }
 
+  async listModels() {
+    const response = await fetch(`${this.model.baseUrl}/models`, {
+      headers: { authorization: `Bearer ${this.config.apiKey}` },
+      signal: AbortSignal.timeout(this.config.requestTimeoutMs),
+    });
+    if (!response.ok) throw new Error("Provider model catalog request failed");
+    const payload = await response.json();
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      !Array.isArray(payload.data) ||
+      payload.data.length > MAX_CATALOG_MODELS
+    ) {
+      throw new Error("Provider model catalog is malformed");
+    }
+    const models = new Set([this.model.id]);
+    for (const item of payload.data) {
+      if (typeof item?.id === "string" && MODEL_ID_RE.test(item.id)) {
+        models.add(item.id);
+      }
+    }
+    return {
+      defaultModel: this.model.id,
+      models: [...models].sort(),
+    };
+  }
+
   listSessions(options) {
     return this.sessionHistory.list(options);
   }
@@ -492,6 +521,9 @@ export class PiEngine {
       }
     };
     let terminalRecorded = false;
+    const model = request.model
+      ? { ...this.model, id: request.model, name: request.model }
+      : this.model;
     await record("run.request", {
       sessionId: request.sessionId,
       parentEntryId: request.parentEntryId,
@@ -499,6 +531,7 @@ export class PiEngine {
       context: request.context,
       systemPrompt: request.systemPrompt,
       toolPolicy: request.toolPolicy,
+      model: request.model ?? null,
       memory: request.memory ?? null,
       includeMemorySnapshot: Boolean(request.includeMemorySnapshot),
     });
@@ -599,7 +632,7 @@ export class PiEngine {
         agentDir: this.config.agentDir,
         authStorage: this.authStorage,
         modelRegistry: this.modelRegistry,
-        model: this.model,
+        model,
         thinkingLevel: this.thinkingLevel,
         tools: toolNames,
         customTools: [this.codeTool, ...memoryTools],
@@ -714,10 +747,10 @@ export class PiEngine {
       const preparedPrompt = buildRunPrompt(promptRequest);
       await record("model.input", {
         model: {
-          id: this.model.id,
-          provider: this.model.provider,
-          api: this.model.api,
-          reasoning: this.model.reasoning,
+          id: model.id,
+          provider: model.provider,
+          api: model.api,
+          reasoning: model.reasoning,
           thinkingLevel: this.thinkingLevel,
         },
         systemPrompt: request.systemPrompt,
