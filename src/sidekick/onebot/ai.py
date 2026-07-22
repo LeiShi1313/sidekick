@@ -13,6 +13,7 @@ from sidekick.ai import (
     MessageIdentity,
     ReplyTarget,
 )
+from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.chat.transport import ChatPresentation, SentMessage
 from sidekick.onebot.client import OneBotActionError
@@ -22,17 +23,6 @@ from sidekick.onebot.message import (
     OneBotMessageError,
 )
 from sidekick.memory_directory import DirectorySource
-
-
-ONEBOT_PLAIN_TEXT_FORMAT_GUIDE = """Response format: QQ plain text.
-- Return only the answer.
-- QQ messages do not support reliable Markdown or HTML formatting. Do not emit Markdown markers, HTML tags, pipe tables, or fenced code blocks.
-- Use short plain-text headings, numbered lines, hyphen lists, and indented text when structure is useful.
-- Keep links as full URLs and keep tables narrow enough to read as plain aligned text."""
-
-
-def onebot_system_prompt(base_prompt: str) -> str:
-    return f"{base_prompt.rstrip()}\n\n{ONEBOT_PLAIN_TEXT_FORMAT_GUIDE}".lstrip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,10 +152,11 @@ class OneBotChatTransport:
     ) -> SentMessage:
         if not isinstance(message, OneBotMessage):
             raise RuntimeError("OneBot transport requires a OneBot message")
-        message_id = await self._send(message, text)
+        rendered = self._render(text, presentation)
+        message_id = await self._send(message, rendered)
         return OneBotSentMessage(
             id=message_id,
-            text=text,
+            text=rendered,
             trigger=message,
         )
 
@@ -181,10 +172,11 @@ class OneBotChatTransport:
             raise RuntimeError("OneBot transport requires a OneBot sent message")
         if not wait:
             return False
-        final_message_id = await self._send(message.trigger, text)
+        rendered = self._render(text, presentation)
+        final_message_id = await self._send(message.trigger, rendered)
         placeholder_id = message.id
         message.id = final_message_id
-        message.text = text
+        message.text = rendered
         try:
             await self._client.call(
                 "delete_msg",
@@ -209,6 +201,12 @@ class OneBotChatTransport:
 
     def is_outgoing(self, message: Any) -> bool:
         return bool(getattr(message, "is_outgoing", getattr(message, "out", False)))
+
+    @staticmethod
+    def _render(text: str, presentation: ChatPresentation) -> str:
+        if presentation == "agent":
+            return markdown_to_plain_text(text)
+        return text
 
     async def _send(self, trigger: OneBotMessage, text: str) -> int:
         message = [
