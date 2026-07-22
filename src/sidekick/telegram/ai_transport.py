@@ -7,14 +7,22 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from telethon.errors import FloodWaitError, MessageNotModifiedError
-from telethon.extensions import html as telegram_html
+from telethon.extensions import markdown as telegram_markdown
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
 from sidekick.chat.transport import ChatPresentation, SentMessage
 
 
-TelegramResponseFormat = Literal["regular_html", "rich_markdown"]
+TelegramResponseFormat = Literal["regular_entities", "rich_markdown"]
+
+_TELEGRAM_MARKDOWN_DELIMITERS = {
+    "```": telegram_types.MessageEntityPre,
+    "**": telegram_types.MessageEntityBold,
+    "~~": telegram_types.MessageEntityStrike,
+    "*": telegram_types.MessageEntityItalic,
+    "`": telegram_types.MessageEntityCode,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,23 +45,6 @@ class _TelegramUpdateState:
     active: bool = True
 
 
-TELEGRAM_REGULAR_HTML_FORMAT_GUIDE = """Response format: Telegram regular-message HTML.
-- Return only the answer. Do not wrap the whole response in a code block.
-- Use only these formatting tags: <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strikethrough</s>, <code>inline code</code>, <pre>preformatted block</pre>, <blockquote>quoted text</blockquote>, and <a href="https://example.com">link text</a>.
-- Use a short <b>bold heading</b> on its own line instead of Markdown headings. Use plain hyphen or numbered lines for lists.
-- Telegram regular messages have no native table entity. Render a compact table as aligned text inside <pre>; render a wide table as labeled list rows.
-- Escape literal <, >, and & as &lt;, &gt;, and &amp;. Close every tag. Do not nest formatting inside <code> or <pre>.
-- Do not emit Markdown markers such as **, __, # headings, > quotes, backticks, or pipe-table syntax."""
-TELEGRAM_RICH_MARKDOWN_FORMAT_GUIDE = """Response format: Telegram Bot API rich-message Markdown.
-- Return only the answer. Use GitHub-Flavored Markdown where possible.
-- Use **bold**, *italic*, ~~strikethrough~~, `inline code`, fenced code blocks, # headings, > blockquotes, lists, and links.
-- Native tables use this structure:
-| Header 1 | Header 2 |
-|:---------|:---------|
-| Value 1  | Value 2  |
-- Keep tables compact, close every formatting delimiter and code fence, and do not wrap the whole response in a code block."""
-
-
 def select_telegram_response_format(
     *,
     is_bot_account: bool,
@@ -61,20 +52,7 @@ def select_telegram_response_format(
 ) -> TelegramResponseFormat:
     if is_bot_account and rich_messages_available:
         return "rich_markdown"
-    return "regular_html"
-
-
-def telegram_system_prompt(
-    base_prompt: str,
-    response_format: TelegramResponseFormat = "regular_html",
-) -> str:
-    if response_format == "regular_html":
-        guide = TELEGRAM_REGULAR_HTML_FORMAT_GUIDE
-    elif response_format == "rich_markdown":
-        guide = TELEGRAM_RICH_MARKDOWN_FORMAT_GUIDE
-    else:
-        raise ValueError(f"Unsupported Telegram response format: {response_format}")
-    return f"{base_prompt.rstrip()}\n\n{guide}".lstrip()
+    return "regular_entities"
 
 
 class TelegramEditLimiter:
@@ -144,7 +122,7 @@ class TelegramChatTransport:
 
     def __init__(
         self,
-        response_format: TelegramResponseFormat = "regular_html",
+        response_format: TelegramResponseFormat = "regular_entities",
         *,
         edit_limiter: TelegramEditLimiter | None = None,
         edit_cadence: float = 4.0,
@@ -434,9 +412,9 @@ class TelegramChatTransport:
     ) -> str:
         if presentation == "plain":
             return text
-        if self._response_format == "regular_html":
-            rendered, _ = telegram_html.parse(text)
-            return rendered
+        if self._response_format == "regular_entities":
+            rendered, _ = _parse_agent_markdown(text)
+            return rendered if rendered.strip().strip("*_~`") else ""
         return text.strip().strip("*_~`#>|:-")
 
     async def _edit_snapshot(
@@ -447,8 +425,8 @@ class TelegramChatTransport:
         if snapshot.presentation == "plain":
             await message.edit(snapshot.text, parse_mode=None)
             return
-        if self._response_format == "regular_html":
-            rendered, entities = telegram_html.parse(snapshot.text)
+        if self._response_format == "regular_entities":
+            rendered, entities = _parse_agent_markdown(snapshot.text)
             if not rendered.strip():
                 return
             await message.edit(
@@ -476,3 +454,10 @@ class TelegramChatTransport:
                 rich_message=telegram_types.InputRichMessageMarkdown(markdown=text),
             )
         )
+
+
+def _parse_agent_markdown(text: str) -> tuple[str, list[Any]]:
+    return telegram_markdown.parse(
+        text,
+        delimiters=_TELEGRAM_MARKDOWN_DELIMITERS,
+    )

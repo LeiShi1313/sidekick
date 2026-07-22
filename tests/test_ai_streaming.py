@@ -24,12 +24,12 @@ from sidekick.chat.commands import (
     MemoryRememberCommand,
     parse_chat_command,
 )
+from sidekick.chat.formatting import agent_system_prompt
 from sidekick.plugins.base import command_registry
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 from sidekick.telegram.ai_transport import (
     TelegramChatTransport,
     select_telegram_response_format,
-    telegram_system_prompt,
 )
 import sidekick.plugins.ai  # noqa: F401
 
@@ -144,7 +144,7 @@ def make_telegram_responder(
     clock=None,
     sleep=None,
     initial_status="琢磨中。。。",
-    response_format="regular_html",
+    response_format="regular_entities",
     **kwargs,
 ):
     transport_kwargs = {"edit_cadence": edit_cadence}
@@ -525,8 +525,8 @@ async def test_first_stream_edit_waits_for_meaningful_accumulated_text():
 
 
 @pytest.mark.asyncio
-async def test_first_stream_gate_counts_rendered_text_instead_of_html_source():
-    long_link = '<a href="https://example.com/' + "x" * 150 + '">A</a>'
+async def test_first_stream_gate_counts_rendered_text_instead_of_markup_source():
+    long_link = "[A](https://example.com/" + "x" * 150 + ")"
     delta_consumed = asyncio.Event()
     finish = asyncio.Event()
 
@@ -620,12 +620,12 @@ async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
                 run_id=request.run_id,
                 session_id="session-1",
             )
-            yield AgentEvent(type="text_delta", delta="<b>", reset=True)
+            yield AgentEvent(type="text_delta", delta="**", reset=True)
             opening_consumed.set()
             await send_content.wait()
             yield AgentEvent(
                 type="text_delta",
-                delta=f'{"A" * 49}.</b>',
+                delta=f'{"A" * 49}.**',
                 reset=False,
             )
             content_consumed.set()
@@ -634,7 +634,7 @@ async def test_first_stream_gate_uses_rendered_sentence_boundary_after_markup():
                 type="run_completed",
                 session_id="session-1",
                 entry_id="entry-1",
-                answer=f'<b>{"A" * 49}.</b>',
+                answer=f'**{"A" * 49}.**',
             )
 
     responder = make_telegram_responder(PausingGateway(), sleep=blocked_sleep)
@@ -950,18 +950,13 @@ async def test_flood_wait_delays_final_edit_without_replacing_the_answer(monkeyp
     assert sleeps == [7]
 
 
-def test_prompt_builder_appends_the_regular_telegram_format_guard():
-    builder = PromptBuilder(
-        system_prompt=telegram_system_prompt("Keep answers factual.")
-    )
+def test_prompt_builder_uses_the_portable_agent_format_guard():
+    builder = PromptBuilder(system_prompt=agent_system_prompt("Keep answers factual."))
 
     assert builder.system_prompt.startswith("Keep answers factual.")
-    assert "Telegram regular-message HTML" in builder.system_prompt
-    assert "<b>bold</b>" in builder.system_prompt
-    assert "<i>italic</i>" in builder.system_prompt
-    assert "<blockquote>quoted text</blockquote>" in builder.system_prompt
-    assert "<pre>" in builder.system_prompt
-    assert "Do not emit Markdown markers" in builder.system_prompt
+    assert "portable Markdown-lite" in builder.system_prompt
+    assert "Do not emit HTML" in builder.system_prompt
+    assert "Telegram" not in builder.system_prompt
 
 
 def test_response_format_switches_only_for_a_bot_rich_transport():
@@ -970,14 +965,14 @@ def test_response_format_switches_only_for_a_bot_rich_transport():
             is_bot_account=False,
             rich_messages_available=True,
         )
-        == "regular_html"
+        == "regular_entities"
     )
     assert (
         select_telegram_response_format(
             is_bot_account=True,
             rich_messages_available=False,
         )
-        == "regular_html"
+        == "regular_entities"
     )
     assert (
         select_telegram_response_format(
@@ -987,19 +982,13 @@ def test_response_format_switches_only_for_a_bot_rich_transport():
         == "rich_markdown"
     )
 
-    rich_builder = PromptBuilder(
-        system_prompt=telegram_system_prompt(
-            "Keep answers factual.",
-            "rich_markdown",
-        ),
-    )
-    assert "Telegram Bot API rich-message Markdown" in rich_builder.system_prompt
-    assert "| Header 1 | Header 2 |" in rich_builder.system_prompt
-
-
 @pytest.mark.asyncio
 async def test_bot_response_uses_telegram_rich_markdown_edit():
-    formatted = "**Result**\n\n| Key | Value |\n|:----|:------|\n| Mode | Rich |"
+    formatted = (
+        "**Result**\n\n"
+        "- Mode: Rich\n"
+        "- [Docs](https://example.com/docs)"
+    )
     gateway = FakeGateway([formatted])
     responder = make_telegram_responder(
         gateway,
@@ -1020,12 +1009,13 @@ async def test_bot_response_uses_telegram_rich_markdown_edit():
 
 
 @pytest.mark.asyncio
-async def test_streamed_html_is_sent_as_native_telegram_entities():
+async def test_streamed_markdown_is_sent_as_native_telegram_entities():
     formatted = (
-        "<b>Result</b>\n"
-        "<i>Estimate</i>\n"
-        "<blockquote>Supporting context</blockquote>\n"
-        "<pre>Team     Score\nNorway   1\nEngland  2</pre>"
+        "**Result**\n"
+        "*Estimate*\n"
+        "~~Obsolete~~\n"
+        "Use `x < y` and [the docs](https://example.com/docs).\n"
+        "```\nTeam     Score\nNorway   1\nEngland  2\n```"
     )
     gateway = FakeGateway([formatted])
     responder = make_telegram_responder(gateway)
@@ -1036,21 +1026,30 @@ async def test_streamed_html_is_sent_as_native_telegram_entities():
     answer = trigger.replies[0]
     assert result.text == formatted
     assert answer.text == (
-        "Result\nEstimate\nSupporting context\nTeam     Score\nNorway   1\nEngland  2"
+        "Result\nEstimate\nObsolete\nUse x < y and the docs.\n\n"
+        "Team     Score\nNorway   1\nEngland  2"
     )
     _, kwargs = answer.edit_calls[-1]
     assert kwargs["parse_mode"] is None
     assert {type(entity).__name__ for entity in kwargs["formatting_entities"]} == {
         "MessageEntityBold",
         "MessageEntityItalic",
-        "MessageEntityBlockquote",
+        "MessageEntityStrike",
+        "MessageEntityCode",
+        "MessageEntityTextUrl",
         "MessageEntityPre",
     }
+    link = next(
+        entity
+        for entity in kwargs["formatting_entities"]
+        if isinstance(entity, telegram_types.MessageEntityTextUrl)
+    )
+    assert link.url == "https://example.com/docs"
 
 
 @pytest.mark.asyncio
-async def test_streaming_waits_for_visible_text_when_an_html_tag_is_split():
-    gateway = FakeGateway(["<b>", "Result", "</b>"])
+async def test_streaming_waits_for_visible_text_when_markdown_is_split():
+    gateway = FakeGateway(["**", "Result", "**"])
     responder = make_telegram_responder(gateway)
     trigger = FakeMessage("/ai format this")
 
@@ -1064,6 +1063,20 @@ async def test_streaming_waits_for_visible_text_when_an_html_tag_is_split():
         type(entity).__name__
         for entity in answer.edit_calls[-1][1]["formatting_entities"]
     } == {"MessageEntityBold"}
+
+
+@pytest.mark.asyncio
+async def test_regular_telegram_treats_unexpected_html_as_plain_text():
+    formatted = "<strong>Result</strong>"
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai format this")
+
+    result = await responder.answer(trigger, make_request("format this"))
+
+    answer = trigger.replies[0]
+    assert result.text == formatted
+    assert answer.text == formatted
+    assert answer.edit_calls[-1][1]["formatting_entities"] == []
 
 
 @pytest.mark.asyncio
