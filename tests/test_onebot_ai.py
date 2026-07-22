@@ -277,7 +277,10 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
     )
     finalized = await transport.update(
         sent,
-        "**Final** with [the docs](https://example.com/docs) and `code`.",
+        (
+            "**Final** with [the docs](https://example.com/docs), `code`, "
+            "and 这是**重点**内容。"
+        ),
         presentation="agent",
         wait=True,
     )
@@ -286,7 +289,8 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
     assert finalized is True
     assert sent.id == 502
     assert sent.text == (
-        "Final with the docs (https://example.com/docs) and code."
+        "Final with the docs (https://example.com/docs), code, "
+        "and 这是重点内容。"
     )
     assert [call[0] for call in action_client.calls] == [
         "send_group_msg",
@@ -304,7 +308,10 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
     assert action_client.calls[1][1]["message"][1] == {
         "type": "text",
         "data": {
-            "text": "Final with the docs (https://example.com/docs) and code."
+            "text": (
+                "Final with the docs (https://example.com/docs), code, "
+                "and 这是重点内容。"
+            )
         },
     }
 

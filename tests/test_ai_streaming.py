@@ -1072,6 +1072,34 @@ async def test_streaming_waits_for_visible_text_when_markdown_is_split():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("formatted", ["`+`", "```\n[]\n```"])
+@pytest.mark.parametrize("response_format", ["regular_entities", "rich_markdown"])
+async def test_symbol_only_code_is_still_delivered_as_the_final_answer(
+    formatted,
+    response_format,
+):
+    responder = make_telegram_responder(
+        FakeGateway([formatted]),
+        response_format=response_format,
+    )
+    trigger = (
+        FakeRichMessage("/ai format this")
+        if response_format == "rich_markdown"
+        else FakeMessage("/ai format this")
+    )
+
+    result = await responder.answer(trigger, make_request("format this"))
+
+    assert result.text == formatted
+    if response_format == "rich_markdown":
+        request = trigger.replies[0].client.requests[-1]
+        assert request.rich_message.markdown == formatted
+    else:
+        expected = "+" if formatted == "`+`" else "[]"
+        assert trigger.replies[0].text == expected
+
+
+@pytest.mark.asyncio
 async def test_regular_telegram_treats_unexpected_html_as_plain_text():
     formatted = "<strong>Result</strong>"
     responder = make_telegram_responder(FakeGateway([formatted]))

@@ -13,7 +13,7 @@ from telethon.tl import types as telegram_types
 
 from sidekick.chat.formatting import (
     PORTABLE_LINK_RE,
-    has_visible_markdown_content,
+    has_streamable_markdown_content,
     sanitize_rich_markdown,
 )
 from sidekick.chat.transport import ChatPresentation, SentMessage
@@ -179,7 +179,7 @@ class TelegramChatTransport:
             await self._cancel_initial_timer(state)
             if (
                 presentation == "agent"
-                and not self._visible_text(text, presentation=presentation).strip()
+                and not self._rendered_agent_text(text).strip()
             ):
                 return False
             snapshot, _ = await self._publish(
@@ -224,7 +224,7 @@ class TelegramChatTransport:
         text: str,
     ) -> bool:
         state.buffered_agent_text = text
-        rendered = self._visible_text(text, presentation="agent")
+        rendered = self._streamable_agent_text(text)
         if not rendered.strip():
             return False
         if not state.waiting_for_first_agent_update:
@@ -285,7 +285,7 @@ class TelegramChatTransport:
             ):
                 return
             text = state.buffered_agent_text
-            if not self._visible_text(text, presentation="agent").strip():
+            if not self._streamable_agent_text(text).strip():
                 return
             state.waiting_for_first_agent_update = False
             await self._publish(
@@ -409,19 +409,15 @@ class TelegramChatTransport:
                 type(exc).__name__,
             )
 
-    def _visible_text(
-        self,
-        text: str,
-        *,
-        presentation: ChatPresentation,
-    ) -> str:
-        if presentation == "plain":
-            return text
+    def _rendered_agent_text(self, text: str) -> str:
         if self._response_format == "regular_entities":
             rendered, _ = _parse_agent_markdown(text)
-        else:
-            rendered = text
-        return rendered if has_visible_markdown_content(rendered) else ""
+            return rendered
+        return text
+
+    def _streamable_agent_text(self, text: str) -> str:
+        rendered = self._rendered_agent_text(text)
+        return rendered if has_streamable_markdown_content(rendered) else ""
 
     async def _edit_snapshot(
         self,
@@ -443,7 +439,7 @@ class TelegramChatTransport:
             return
 
         text = sanitize_rich_markdown(snapshot.text)
-        if not has_visible_markdown_content(snapshot.text):
+        if not snapshot.text.strip():
             return
         client = getattr(message, "client", None)
         get_input_chat = getattr(message, "get_input_chat", None)

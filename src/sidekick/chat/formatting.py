@@ -17,16 +17,19 @@ _FENCED_CODE_RE = re.compile(r"```[^\n`]*\n(.*?)(?:\n)?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 _ESCAPED_MARKER_RE = re.compile(r"\\([\\`*_[\]()~])")
 _BOLD_RE = re.compile(
-    r"(?<![\w*])\*\*(?=\S)([^\n]*?\S)\*\*(?![\w*])"
+    r"(?<!\*)\*\*(?=\S)([^\n]*?\S)\*\*(?!\*)"
 )
 _ITALIC_RE = re.compile(
-    r"(?<![\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])"
+    r"(?<!\*)\*(?=\S)([^*\n]*?\S)\*(?!\*)"
 )
 _STRIKETHROUGH_RE = re.compile(
-    r"(?<![\w~])~~(?=\S)([^\n]*?\S)~~(?![\w~])"
+    r"(?<!~)~~(?=\S)([^\n]*?\S)~~(?!~)"
 )
-_SYNTAX_ONLY_RE = re.compile(r"[\s*_~`\[\]()#>|:+-]+")
-_ORDERED_LIST_MARKER_RE = re.compile(r"\d+[.)]")
+_STREAM_MARKER_ONLY_RE = re.compile(
+    r"(?:\*+|_+|~+|`+|\[|#+|>+|[-+]|\d+[.)])"
+)
+_STREAM_LIST_OPENER_RE = re.compile(r"\s*(?:[-+*]|\d+[.)])\s+")
+_STREAM_TABLE_SEPARATOR_RE = re.compile(r"\|[\s:|-]*\|")
 
 
 class _PlaceholderStore:
@@ -105,13 +108,15 @@ def sanitize_rich_markdown(source: str) -> str:
     return placeholders.restore(html.escape(text, quote=False))
 
 
-def has_visible_markdown_content(source: str) -> bool:
+def has_streamable_markdown_content(source: str) -> bool:
     stripped = source.strip()
     if not stripped:
         return False
-    if _SYNTAX_ONLY_RE.fullmatch(stripped):
+    if _STREAM_MARKER_ONLY_RE.fullmatch(stripped):
         return False
-    return _ORDERED_LIST_MARKER_RE.fullmatch(stripped) is None
+    if _STREAM_LIST_OPENER_RE.fullmatch(source):
+        return False
+    return _STREAM_TABLE_SEPARATOR_RE.fullmatch(stripped) is None
 
 
 def _plain_link(match: re.Match[str]) -> str:

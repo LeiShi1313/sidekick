@@ -1,6 +1,6 @@
 from sidekick.chat.formatting import (
     agent_system_prompt,
-    has_visible_markdown_content,
+    has_streamable_markdown_content,
     markdown_to_plain_text,
     sanitize_rich_markdown,
 )
@@ -50,6 +50,12 @@ def test_markdown_to_plain_text_preserves_paired_literal_markers():
     assert markdown_to_plain_text(source) == source
 
 
+def test_markdown_to_plain_text_flattens_cjk_adjacent_emphasis():
+    source = "这是**重点**内容，也是*斜体*内容。"
+
+    assert markdown_to_plain_text(source) == "这是重点内容，也是斜体内容。"
+
+
 def test_markdown_to_plain_text_preserves_escapes_inside_code():
     source = "Use `\\*` here.\n```\n\\* stays literal\n```"
 
@@ -88,9 +94,26 @@ def test_rich_markdown_sanitizer_escapes_html_and_unsafe_links_outside_code():
     )
 
 
-def test_visible_markdown_content_rejects_syntax_only_fragments():
-    for source in ("", "**", "[", "- ", "1. ", "```", "|---|"):
-        assert has_visible_markdown_content(source) is False
+def test_streamable_markdown_content_holds_marker_only_fragments():
+    for source in (
+        "",
+        "**",
+        "[",
+        "- ",
+        "+",
+        "1. ",
+        "```",
+        "|---|",
+    ):
+        assert has_streamable_markdown_content(source) is False
 
-    for source in ("Result", "[Result", "- Result", "1", "✅"):
-        assert has_visible_markdown_content(source) is True
+    for source in (
+        "Result",
+        "[Result",
+        "- Result",
+        "1",
+        ":-)",
+        "[]",
+        "✅",
+    ):
+        assert has_streamable_markdown_content(source) is True
