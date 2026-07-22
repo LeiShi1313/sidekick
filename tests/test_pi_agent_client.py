@@ -7,6 +7,7 @@ from sidekick.ai import (
     AgentContext,
     AgentIdentityAnchor,
     AgentMemoryTarget,
+    AgentModelCatalog,
     AgentParticipantAccess,
     AgentRunRequest,
     PiAgentGateway,
@@ -24,7 +25,7 @@ async def serve(app: web.Application) -> tuple[web.AppRunner, str]:
     return runner, f"http://127.0.0.1:{port}"
 
 
-def run_request() -> AgentRunRequest:
+def run_request(*, model: str | None = None) -> AgentRunRequest:
     return AgentRunRequest(
         run_id="11111111-1111-4111-8111-111111111111",
         session_id=None,
@@ -33,6 +34,7 @@ def run_request() -> AgentRunRequest:
         context=(AgentContext(kind="reference", text="Prior conversation"),),
         system_prompt="Answer directly.",
         tool_policy="delegated",
+        model=model,
         memory=AgentMemoryTarget(
             primary_bank_id="telegram:chat:-1001",
             requester_id="telegram:user:40",
@@ -88,7 +90,10 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
     runner, base_url = await serve(app)
     gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
     try:
-        events = [event async for event in gateway.run(run_request())]
+        events = [
+            event
+            async for event in gateway.run(run_request(model="gpt-5.4-mini"))
+        ]
     finally:
         await gateway.close()
         await runner.cleanup()
@@ -101,6 +106,7 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
         "context": [{"kind": "reference", "text": "Prior conversation"}],
         "systemPrompt": "Answer directly.",
         "toolPolicy": "delegated",
+        "model": "gpt-5.4-mini",
         "memory": {
             "primaryBankId": "telegram:chat:-1001",
             "requester": {
@@ -129,6 +135,55 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
     assert events[1].summary == "Calculation result: 42"
     assert events[-1].session_id == "session-1"
     assert events[-1].entry_id == "entry-1"
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_lists_a_validated_model_catalog() -> None:
+    async def models(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == "Bearer test-agent-token"
+        return web.json_response(
+            {
+                "defaultModel": "gpt-5.6-sol",
+                "models": ["gpt-5.4-mini", "gpt-5.6-sol"],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/v1/models", models)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    try:
+        catalog = await gateway.list_models()
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert catalog == AgentModelCatalog(
+        default_model="gpt-5.6-sol",
+        models=("gpt-5.4-mini", "gpt-5.6-sol"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_rejects_a_malformed_model_catalog() -> None:
+    async def models(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "defaultModel": "gpt-5.6-sol",
+                "models": ["gpt-5.6-sol", 42],
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/v1/models", models)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    try:
+        with pytest.raises(RuntimeError, match="catalog is malformed"):
+            await gateway.list_models()
+    finally:
+        await gateway.close()
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio

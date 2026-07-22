@@ -257,6 +257,12 @@ class FakeStore:
     async def save_answer(self, marker):
         self.saved.append(marker)
 
+    async def get_model_override(self, scope_id):
+        return None
+
+    async def set_model_override(self, scope_id, model):
+        return None
+
     async def is_allowed(self, actor_id):
         return False
 

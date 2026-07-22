@@ -15,12 +15,12 @@ import { Type } from "typebox";
 import { executeJavaScript } from "./code-exec.mjs";
 import { retrieveMemoryContext } from "./memory-context.mjs";
 import { createMemoryTools, MEMORY_TOOL_NAMES } from "./memory-tools.mjs";
+import { isModelId } from "./model-id.mjs";
 import { RunAuditStore } from "./run-audit.mjs";
 import { SessionHistory } from "./session-history.mjs";
 import { constrainWebTools } from "./web-tools.mjs";
 
 const PROVIDER = "openai-compatible";
-const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const MAX_CATALOG_MODELS = 256;
 const RESTRICTED_TOOLS = Object.freeze([
   "web_search",
@@ -408,7 +408,7 @@ export class PiEngine {
     }
     const models = new Set([this.model.id]);
     for (const item of payload.data) {
-      if (typeof item?.id === "string" && MODEL_ID_RE.test(item.id)) {
+      if (isModelId(item?.id)) {
         models.add(item.id);
       }
     }

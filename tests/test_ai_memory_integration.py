@@ -157,6 +157,7 @@ class FakeStore:
         self.memory_dream_state = {}
         self.memory_labels = {}
         self.memory_scope_display_names = {}
+        self.model_overrides = {}
 
     async def get_answer(self, scope_id, answer_message_id):
         return self.markers.get((scope_id, answer_message_id))
@@ -174,6 +175,15 @@ class FakeStore:
 
     async def save_answer(self, marker):
         self.markers[(marker.scope_id, marker.answer_message_id)] = marker
+
+    async def get_model_override(self, scope_id):
+        return self.model_overrides.get(scope_id)
+
+    async def set_model_override(self, scope_id, model):
+        if model is None:
+            self.model_overrides.pop(scope_id, None)
+        else:
+            self.model_overrides[scope_id] = model
 
     async def is_allowed(self, actor_id):
         return actor_id in self.allowed

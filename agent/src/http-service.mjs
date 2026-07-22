@@ -1,6 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 
+import { isModelId } from "./model-id.mjs";
+
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ATTACHMENT_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
@@ -10,7 +12,6 @@ const MAX_BANK_GRANTS = 64;
 const MAX_PARTICIPANTS = 16;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const BANK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$/;
 const MIME_RE = /^[a-z0-9][a-z0-9.+-]{0,63}\/[a-z0-9][a-z0-9.+-]{0,127}$/;
 const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -118,7 +119,7 @@ export function validateRunRequest(value) {
     !new Set(["owner", "delegated", "none"]).has(value.toolPolicy) ||
     !(
       model === undefined ||
-      (typeof model === "string" && MODEL_ID_RE.test(model))
+      isModelId(model)
     ) ||
     !(
       includeMemorySnapshot === undefined ||
