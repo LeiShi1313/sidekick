@@ -169,6 +169,29 @@ test("memory tools are absent without a host capability", () => {
   );
 });
 
+test("memory tool prompts require explicit user intent for cross-bank recall", () => {
+  const app = fixture(() => jsonResponse({ results: [] }));
+  const queryCurrent = app.byName.get("memory_query_current");
+  const querySource = app.byName.get("memory_query_source");
+  const findSources = app.byName.get("memory_find_sources");
+
+  assert.match(
+    queryCurrent.promptSnippet,
+    /current primary memory bank.*default scope/i,
+  );
+  assert.match(queryCurrent.promptSnippet, /identity corrections/i);
+  for (const tool of [querySource, findSources]) {
+    assert.match(tool.promptSnippet, /current user explicitly asks/i);
+    assert.match(tool.promptSnippet, /person(?:'s)? name or handle/i);
+    assert.match(tool.promptSnippet, /identity clarification/i);
+    assert.match(tool.promptSnippet, /scope is ambiguous.*current bank.*ask/i);
+  }
+  assert.match(
+    findSources.promptSnippet,
+    /never use.*discover where a person or topic might appear/i,
+  );
+});
+
 test("observes memory tool HTTP with tool-call correlation", async () => {
   const observed = [];
   const payload = {

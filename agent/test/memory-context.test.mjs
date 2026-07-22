@@ -500,6 +500,22 @@ test("participant access cannot revoke an owner's issued source capability", asy
   );
   assert.match(
     result.directoryContext,
+    /authorization.*does not.*user intends.*queried/i,
+  );
+  assert.match(
+    result.directoryContext,
+    /current user explicitly asks.*other chats.*groups.*channels.*knowledge sources/i,
+  );
+  assert.match(
+    result.directoryContext,
+    /person(?:'s)? name or handle.*identity clarification.*does not justify/i,
+  );
+  assert.match(
+    result.directoryContext,
+    /scope is ambiguous.*current bank.*ask/i,
+  );
+  assert.match(
+    result.directoryContext,
     /participant access.*does not revoke.*current requester/i,
   );
   assert.match(result.directoryContext, /Bob.*no offered source access/i);

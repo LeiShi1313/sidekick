@@ -4,6 +4,7 @@ import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import {
+  CROSS_BANK_MEMORY_POLICY,
   recallDirectory,
   recallMemories,
   renderRecalledMemories,
@@ -426,9 +427,9 @@ export function createMemoryTools({
     name: "memory_query_current",
     label: "Query current memory",
     description:
-      "Run a focused follow-up recall against the current primary memory bank. Use this when initial memory misses a requested time period, topic, or detail. This never searches another bank and accepts at most two calls per run.",
+      "Run a focused follow-up recall against the current primary memory bank, which is the default scope. Use this when initial memory misses a requested time period, topic, identity, or detail. This never searches another bank and accepts at most two calls per run.",
     promptSnippet:
-      "Use memory_query_current to refine retrieval from the current primary memory bank, especially for requests about today or the current conversation. At most two calls are available, so combine constraints when possible. Use an explicit date or other concrete constraints when relevant; do not substitute a directory source for the current bank.",
+      `${CROSS_BANK_MEMORY_POLICY} Use memory_query_current for follow-up questions, identity corrections, requests about today or the current conversation, and other refinements of current-bank recall. At most two calls are available, so combine constraints and use explicit dates or other concrete details when relevant.`,
     parameters: Type.Object({
       query: Type.String({ minLength: 1, maxLength: 2_000 }),
     }),
@@ -486,9 +487,9 @@ export function createMemoryTools({
     name: "memory_query_source",
     label: "Query a knowledge source",
     description:
-      "Recall bounded evidence from one host-issued knowledge-source handle. The handle must come from the current run's directory context or memory_find_sources output.",
+      "Recall bounded evidence from one host-issued knowledge-source handle only when the current user explicitly requested cross-bank retrieval or clearly named that source as the place to consult. The handle must come from the current run's directory context or memory_find_sources output.",
     promptSnippet:
-      "Use memory_query_source when a named knowledge source is relevant. Pass only a source_N handle issued by the host and write a focused retrieval query.",
+      `${CROSS_BANK_MEMORY_POLICY} Use memory_query_source only after that explicit cross-bank intent is present. Pass only a source_N handle issued by the host and write a focused retrieval query.`,
     parameters: Type.Object({
       reference: Type.String({ pattern: "^source_[0-9]+$", maxLength: 32 }),
       query: Type.String({ minLength: 1, maxLength: 2_000 }),
@@ -557,9 +558,9 @@ export function createMemoryTools({
     name: "memory_find_sources",
     label: "Find knowledge sources",
     description:
-      "Perform the run's one additional policy-filtered lookup in the knowledge directory. This discovers sources; it does not read source-bank contents.",
+      "Perform the run's one additional policy-filtered knowledge-directory lookup only when the current user explicitly requested cross-bank retrieval or clearly named another source to consult. This discovers sources; it does not read source-bank contents.",
     promptSnippet:
-      "Use memory_find_sources at most once when the initial directory context did not resolve a relevant named source. Then query a returned source_N handle with memory_query_source.",
+      `${CROSS_BANK_MEMORY_POLICY} Use memory_find_sources at most once only after explicit cross-bank intent is present and the initial directory context did not resolve the requested named source. Never use it merely to discover where a person or topic might appear. Then query a returned source_N handle with memory_query_source.`,
     parameters: Type.Object({
       query: Type.String({ minLength: 1, maxLength: 2_000 }),
     }),
