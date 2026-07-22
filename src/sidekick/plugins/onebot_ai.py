@@ -32,6 +32,7 @@ from sidekick.ai_memory_ingestion import (
     ChatMemoryIngestor,
     MemoryIngestionSettings,
 )
+from sidekick.chat.formatting import agent_system_prompt
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -44,7 +45,6 @@ from sidekick.onebot.ai import (
     OneBotMessageMentionResolver,
     onebot_memory_event_metadata,
     onebot_source_retry_delay,
-    onebot_system_prompt,
 )
 from sidekick.onebot.client import OneBotReverseWebSocket
 from sidekick.onebot.memory_admin import (
@@ -176,7 +176,7 @@ class OneBotAI(metaclass=PluginMount):
             directory=self._directory,
         )
         prompt_builder = PromptBuilder(
-            system_prompt=onebot_system_prompt(self._settings.system_prompt),
+            system_prompt=agent_system_prompt(self._settings.system_prompt),
             max_context_messages=self._settings.max_context_messages,
             max_context_chars=self._settings.max_context_chars,
             attachment_describer=ChatAttachmentDescriber(

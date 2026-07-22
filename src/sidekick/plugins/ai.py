@@ -30,13 +30,13 @@ from sidekick.ai_memory_ingestion import (
     ChatMemoryIngestor,
     MemoryIngestionSettings,
 )
+from sidekick.chat.formatting import agent_system_prompt
 from sidekick.plugins.base import PluginMount
 from sidekick.telegram import TelegramCommand
 from sidekick.telegram.ai_transport import (
     TelegramChatTransport,
     TelegramEditLimiter,
     select_telegram_response_format,
-    telegram_system_prompt,
 )
 from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
@@ -165,10 +165,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         await self._store.connect()
         history_source = TelegramHistorySource(self.client)
         prompt_builder = PromptBuilder(
-            system_prompt=telegram_system_prompt(
-                self._settings.system_prompt,
-                response_format,
-            ),
+            system_prompt=agent_system_prompt(self._settings.system_prompt),
             max_context_messages=self._settings.max_context_messages,
             max_context_chars=self._settings.max_context_chars,
             attachment_describer=ChatAttachmentDescriber(

@@ -193,13 +193,13 @@ async def test_tool_snapshot_is_replaced_by_the_streamed_final_answer():
                 tool="web_search",
                 summary="Searching web: current release",
             )
-            yield AgentEvent(type="text_delta", delta="<b>Final", reset=True)
-            yield AgentEvent(type="text_delta", delta=" answer</b>", reset=False)
+            yield AgentEvent(type="text_delta", delta="**Final", reset=True)
+            yield AgentEvent(type="text_delta", delta=" answer**", reset=False)
             yield AgentEvent(
                 type="run_completed",
                 session_id="session-1",
                 entry_id="entry-1",
-                answer="<b>Final answer</b>",
+                answer="**Final answer**",
             )
 
     responder = make_telegram_responder(SnapshotGateway())

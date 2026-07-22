@@ -14,7 +14,6 @@ from sidekick.onebot.ai import (
     OneBotHistorySource,
     OneBotMessageIdentityResolver,
     OneBotMessageMentionResolver,
-    onebot_system_prompt,
 )
 from sidekick.onebot.client import (
     OneBotActionError,
@@ -269,7 +268,7 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
     )
     transport = OneBotChatTransport(action_client)
 
-    sent = await transport.reply(trigger, "Thinking...", presentation="plain")
+    sent = await transport.reply(trigger, "**Thinking...**", presentation="plain")
     streamed = await transport.update(
         sent,
         "partial",
@@ -278,7 +277,10 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
     )
     finalized = await transport.update(
         sent,
-        "final",
+        (
+            "**Final** with [the docs](https://example.com/docs), `code`, "
+            "and 这是**重点**内容。"
+        ),
         presentation="agent",
         wait=True,
     )
@@ -286,7 +288,10 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
     assert streamed is False
     assert finalized is True
     assert sent.id == 502
-    assert sent.text == "final"
+    assert sent.text == (
+        "Final with the docs (https://example.com/docs), code, "
+        "and 这是重点内容。"
+    )
     assert [call[0] for call in action_client.calls] == [
         "send_group_msg",
         "send_group_msg",
@@ -296,9 +301,18 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
         "type": "reply",
         "data": {"id": "101"},
     }
+    assert action_client.calls[0][1]["message"][1] == {
+        "type": "text",
+        "data": {"text": "**Thinking...**"},
+    }
     assert action_client.calls[1][1]["message"][1] == {
         "type": "text",
-        "data": {"text": "final"},
+        "data": {
+            "text": (
+                "Final with the docs (https://example.com/docs), code, "
+                "and 这是重点内容。"
+            )
+        },
     }
 
 
@@ -492,14 +506,6 @@ async def test_onebot_identity_and_mentions_use_display_labels_when_available():
     assert identity.subject_display_name == "Alice Card"
     assert identity.scope_display_name == "Dog Food Filter"
     assert [(item.user_id, item.display_name) for item in mentions] == [(123, "Bob")]
-
-
-def test_onebot_prompt_requests_plain_qq_output():
-    prompt = onebot_system_prompt("Base policy.")
-
-    assert prompt.startswith("Base policy.")
-    assert "QQ plain text" in prompt
-    assert "Markdown" in prompt
 
 
 @pytest.mark.asyncio
