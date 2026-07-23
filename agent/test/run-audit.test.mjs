@@ -147,6 +147,317 @@ test("lists run summaries by session and reports terminal state", async () => {
   }
 });
 
+test("projects current-bank run decisions into a diagnostic summary", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", {
+      prompt: "Did dog bro appear today?",
+      sessionId: null,
+      parentEntryId: null,
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await audit.record("memory.context", {
+      queries: ["2026-07-23 dog bro"],
+      memories: [{ id: "memory-1" }, { id: "memory-2" }],
+    });
+    await audit.record("memory.http.request", {
+      operation: "directory.recall",
+      toolCallId: null,
+      request: { body: { query: "Did dog bro appear today?" } },
+    });
+    await audit.record("memory.directory.result", {
+      status: "available",
+      references: [{ bankId: "telegram:chat:-2002" }],
+    });
+    await audit.record("memory.capabilities.issued", {
+      sources: [
+        {
+          handle: "source_1",
+          bankId: "telegram:chat:-2002",
+          displayName: "Other group",
+        },
+      ],
+    });
+    await audit.record("session.opened", {
+      sessionId: "session-1",
+      parentEntryId: null,
+    });
+    await audit.record("model.input", {
+      model: {
+        id: "gpt-5",
+        provider: "openai",
+        thinkingLevel: "high",
+      },
+    });
+    await audit.record("tool.started", {
+      toolCallId: "call-current-1",
+      toolName: "memory_query_current",
+      args: { query: "2026-07-23 @dota2pp" },
+    });
+    await audit.record("memory.http.response", {
+      operation: "current.recall",
+      toolCallId: "call-current-1",
+      response: { ok: true, status: 200, durationMs: 9 },
+    });
+    await audit.record("tool.completed", {
+      toolCallId: "call-current-1",
+      toolName: "memory_query_current",
+      args: { query: "2026-07-23 @dota2pp" },
+      result: {
+        details: {
+          bankId: "telegram:chat:-1001",
+          memoryIds: ["memory-2"],
+        },
+      },
+      isError: false,
+      durationMs: 12,
+    });
+    await audit.record("run.completed", {
+      sessionId: "session-1",
+      entryId: "entry-1",
+      answer: "Yes.",
+    });
+    await audit.flush();
+
+    const { summary } = await app.store.get(RUN_ID);
+
+    assert.equal(summary.status, "completed");
+    assert.equal(summary.prompt, "Did dog bro appear today?");
+    assert(Number.isInteger(summary.durationMs));
+    assert.deepEqual(summary.session, {
+      kind: "root",
+      id: "session-1",
+      parentEntryId: null,
+      entryId: "entry-1",
+    });
+    assert.deepEqual(summary.model, {
+      id: "gpt-5",
+      provider: "openai",
+      thinkingLevel: "high",
+    });
+    assert.deepEqual(summary.memory, {
+      primaryBankId: "telegram:chat:-1001",
+      route: "current_bank_only",
+      initialRecall: {
+        queries: ["2026-07-23 dog bro"],
+        memoryCount: 2,
+        eventSequence: 2,
+      },
+      directory: {
+        status: "available",
+        query: "Did dog bro appear today?",
+        sourceCount: 1,
+        eventSequence: 4,
+      },
+    });
+    assert.deepEqual(summary.tools, [
+      {
+        callId: "call-current-1",
+        name: "memory_query_current",
+        status: "completed",
+        durationMs: 12,
+        query: "2026-07-23 @dota2pp",
+        source: null,
+        eventSequence: 8,
+      },
+    ]);
+    assert.deepEqual(summary.warnings, []);
+    assert.equal(summary.failure, null);
+  } finally {
+    await app.close();
+  }
+});
+
+test("distinguishes source discovery from successful cross-bank retrieval", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", {
+      prompt: "Go to the Arch group and check the release discussion",
+      sessionId: "session-1",
+      parentEntryId: "entry-parent",
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await audit.record("memory.context", { queries: ["release"], memories: [] });
+    await audit.record("memory.directory.result", {
+      status: "available",
+      references: [{ bankId: "telegram:chat:-2002" }],
+    });
+    await audit.record("memory.capabilities.issued", {
+      sources: [
+        {
+          handle: "source_1",
+          bankId: "telegram:chat:-2002",
+          displayName: "Known group",
+        },
+      ],
+    });
+    await audit.record("session.opened", {
+      sessionId: "session-1",
+      parentEntryId: "entry-parent",
+    });
+    await audit.record("model.input", {
+      model: { id: "gpt-5", provider: "openai", thinkingLevel: "medium" },
+    });
+    await audit.record("tool.started", {
+      toolCallId: "call-find-1",
+      toolName: "memory_find_sources",
+      args: { query: "Arch group" },
+    });
+    await audit.record("tool.completed", {
+      toolCallId: "call-find-1",
+      toolName: "memory_find_sources",
+      args: { query: "Arch group" },
+      result: {
+        details: {
+          references: [
+            {
+              handle: "source_2",
+              bankId: "telegram:chat:-3003",
+              displayName: "Arch Linux 中文群",
+            },
+          ],
+        },
+      },
+      isError: false,
+      durationMs: 14,
+    });
+    await audit.record("tool.started", {
+      toolCallId: "call-source-1",
+      toolName: "memory_query_source",
+      args: { reference: "source_2", query: "release discussion" },
+    });
+    await audit.record("memory.http.request", {
+      operation: "source.recall",
+      variant: "source_2",
+      toolCallId: "call-source-1",
+      request: { body: { query: "release discussion" } },
+    });
+    await audit.record("memory.http.response", {
+      operation: "source.recall",
+      variant: "source_2",
+      toolCallId: "call-source-1",
+      response: { ok: true, status: 200, durationMs: 18 },
+    });
+    await audit.record("tool.completed", {
+      toolCallId: "call-source-1",
+      toolName: "memory_query_source",
+      args: { reference: "source_2", query: "release discussion" },
+      result: {
+        details: {
+          sourceHandle: "source_2",
+          sourceName: "Arch Linux 中文群",
+          bankId: "telegram:chat:-3003",
+          memoryIds: ["memory-9"],
+        },
+      },
+      isError: false,
+      durationMs: 23,
+    });
+    await audit.record("memory.access.warning", {
+      unavailableBankIds: ["telegram:chat:-4004"],
+    });
+    await audit.record("run.completed", {
+      sessionId: "session-1",
+      entryId: "entry-child",
+      answer: "They discussed the release.",
+    });
+    await audit.flush();
+
+    const { summary } = await app.store.get(RUN_ID);
+
+    assert.equal(summary.memory.route, "cross_bank_queried");
+    assert.deepEqual(summary.session, {
+      kind: "continuation",
+      id: "session-1",
+      parentEntryId: "entry-parent",
+      entryId: "entry-child",
+    });
+    assert.deepEqual(summary.tools, [
+      {
+        callId: "call-find-1",
+        name: "memory_find_sources",
+        status: "completed",
+        durationMs: 14,
+        query: "Arch group",
+        source: null,
+        eventSequence: 7,
+      },
+      {
+        callId: "call-source-1",
+        name: "memory_query_source",
+        status: "completed",
+        durationMs: 23,
+        query: "release discussion",
+        source: {
+          handle: "source_2",
+          displayName: "Arch Linux 中文群",
+          bankId: "telegram:chat:-3003",
+        },
+        eventSequence: 9,
+      },
+    ]);
+    assert.deepEqual(summary.warnings, [
+      {
+        kind: "memory_access",
+        unavailableBankCount: 1,
+        eventSequence: 13,
+      },
+    ]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("reports failed cross-bank attempts and incomplete runs conservatively", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", {
+      prompt: "Check another group",
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await audit.record("memory.capabilities.issued", {
+      sources: [
+        {
+          handle: "source_1",
+          bankId: "telegram:chat:-2002",
+          displayName: "Other group",
+        },
+      ],
+    });
+    await audit.record("tool.started", {
+      toolCallId: "call-source-1",
+      toolName: "memory_query_source",
+      args: { reference: "source_1", query: "today" },
+    });
+    await audit.record("tool.completed", {
+      toolCallId: "call-source-1",
+      toolName: "memory_query_source",
+      args: { reference: "source_1", query: "today" },
+      result: { content: [{ type: "text", text: "Source unavailable" }] },
+      isError: true,
+      durationMs: 3,
+    });
+    await audit.flush();
+
+    const { summary } = await app.store.get(RUN_ID);
+
+    assert.equal(summary.status, "in_progress");
+    assert.equal(summary.durationMs, null);
+    assert.equal(summary.memory.route, "cross_bank_failed");
+    assert.equal(summary.tools[0].status, "failed");
+    assert.deepEqual(summary.tools[0].source, {
+      handle: "source_1",
+      displayName: "Other group",
+      bankId: "telegram:chat:-2002",
+    });
+  } finally {
+    await app.close();
+  }
+});
+
 test("does not read audit paths for malformed or unknown run identities", async () => {
   const app = await fixture();
   try {
