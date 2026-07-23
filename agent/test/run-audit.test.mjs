@@ -240,6 +240,7 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
       primaryBankId: "telegram:chat:-1001",
       route: "current_bank_only",
       initialRecall: {
+        status: "unknown",
         queries: ["2026-07-23 dog bro"],
         memoryCount: 2,
         eventSequence: 2,
@@ -486,6 +487,41 @@ test("reports source discovery without claiming that another bank was queried", 
     assert.equal(summary.memory.route, "source_discovery_only");
     assert.equal(summary.tools[0].name, "memory_find_sources");
     assert.equal(summary.tools[0].status, "completed");
+  } finally {
+    await app.close();
+  }
+});
+
+test("reports a failed automatic primary recall instead of calling it complete", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", {
+      prompt: "What happened?",
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await audit.record("memory.http.request", {
+      exchangeId: "recall-1",
+      operation: "recall",
+      toolCallId: null,
+      request: { body: { query: "What happened?" } },
+    });
+    await audit.record("memory.http.error", {
+      exchangeId: "recall-1",
+      operation: "recall",
+      toolCallId: null,
+      durationMs: 10,
+      error: { name: "TimeoutError" },
+    });
+    await audit.record("memory.context", {
+      queries: ["What happened?"],
+      memories: [],
+    });
+    await audit.flush();
+
+    const { summary } = await app.store.get(RUN_ID);
+
+    assert.equal(summary.memory.initialRecall.status, "failed");
   } finally {
     await app.close();
   }

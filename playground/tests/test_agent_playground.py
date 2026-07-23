@@ -246,6 +246,7 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
                         "primaryBankId": "chat:engineering",
                         "route": "cross_bank_queried",
                         "initialRecall": {
+                            "status": "completed",
                             "queries": ["Who owns deployment?"],
                             "memoryCount": 1,
                             "eventSequence": 3,
@@ -632,6 +633,7 @@ async def test_session_history_and_run_audits_are_proxied_without_exposing_token
         )
         assert audit["events"][1]["data"]["result"]["content"][0]["text"] == ("Alice")
         assert audit["summary"]["memory"]["route"] == "cross_bank_queried"
+        assert audit["summary"]["memory"]["initialRecall"]["status"] == "completed"
         assert audit["summary"]["tools"][0]["name"] == "memory_reflect"
         assert received["session_queries"] == [{"limit": "20", "q": "deploy"}]
         assert received["audit_queries"] == [{"limit": "10", "sessionId": "session-1"}]

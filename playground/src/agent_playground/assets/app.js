@@ -719,7 +719,8 @@ function inspectAuditEvent(sequence) {
   const target = document.querySelector(`#audit-event-${sequence}`);
   if (!target) return;
   target.focus({ preventScroll: true });
-  target.scrollIntoView({ behavior: "smooth", block: "start" });
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  target.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
 }
 
 function traceStep({ label, detail, status, eventSequence }) {
@@ -816,7 +817,7 @@ function renderAuditDiagnosis(summary, audit) {
     steps.push({
       label: "Automatic primary recall",
       detail: `${initial.memoryCount} memories from ${initial.queries.length} queries${queryDetail}`,
-      status: "completed",
+      status: initial.status,
       eventSequence: initial.eventSequence,
     });
   }
@@ -854,10 +855,13 @@ function renderAuditDiagnosis(summary, audit) {
       label: `${summary.failure.code} · ${summary.failure.message}`,
       eventSequence: summary.failure.eventSequence,
     }] : []),
-    ...summary.warnings.map((warning) => ({
-      label: `Access warning · ${warning.unavailableBankCount} earlier source banks unavailable`,
-      eventSequence: warning.eventSequence,
-    })),
+    ...summary.warnings.map((warning) => {
+      const noun = warning.unavailableBankCount === 1 ? "bank" : "banks";
+      return {
+        label: `Access warning · ${warning.unavailableBankCount} earlier source ${noun} unavailable`,
+        eventSequence: warning.eventSequence,
+      };
+    }),
   ];
   if (notices.length > 0) {
     const warningSection = node("section", null, "trace-section trace-warnings");

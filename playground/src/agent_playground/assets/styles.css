@@ -171,7 +171,7 @@ textarea:focus, select:focus, input:focus, button:focus-visible { outline: 2px s
 .trace-step:hover { background: #edf3f3; }
 .trace-step.completed { border-left-color: #28736d; }
 .trace-step.failed, .trace-step.unavailable { border-left-color: #b42318; background: #fff7f5; }
-.trace-step.in_progress, .trace-step.unknown { border-left-color: #98702f; }
+.trace-step.in_progress, .trace-step.partial, .trace-step.unknown { border-left-color: #98702f; }
 .trace-step-header { display: flex; align-items: baseline; gap: 8px; }
 .trace-step-label { min-width: 0; flex: 1; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
 .trace-step-status { color: #6e7a7f; font-size: 9px; font-weight: 650; text-transform: uppercase; }

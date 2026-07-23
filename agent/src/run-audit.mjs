@@ -314,6 +314,33 @@ function summarizeTools(events) {
     );
 }
 
+function initialRecallStatus(events) {
+  const exchanges = new Map();
+  for (const event of events) {
+    if (!event.type.startsWith("memory.http.")) continue;
+    const data = objectValue(event.data);
+    if (data.operation !== "recall" || data.toolCallId) continue;
+    const key = stringValue(data.exchangeId, 256) ?? `${event.type}:${event.sequence}`;
+    if (event.type === "memory.http.request" && !exchanges.has(key)) {
+      exchanges.set(key, "in_progress");
+    } else if (event.type === "memory.http.response") {
+      exchanges.set(
+        key,
+        objectValue(data.response).ok === true ? "completed" : "failed",
+      );
+    } else if (event.type === "memory.http.error") {
+      exchanges.set(key, "failed");
+    }
+  }
+  const statuses = [...exchanges.values()];
+  if (statuses.length === 0) return "unknown";
+  if (statuses.includes("in_progress")) return "in_progress";
+  const completed = statuses.includes("completed");
+  const failed = statuses.includes("failed");
+  if (completed && failed) return "partial";
+  return completed ? "completed" : "failed";
+}
+
 function memoryRoute(primaryBankId, tools, events) {
   if (!primaryBankId) return "off";
   const sourceTools = tools.filter(
@@ -425,7 +452,9 @@ function summarize(events) {
     eventCount: events.length,
     session: {
       kind:
-        request.sessionId != null || request.parentEntryId != null
+        request.sessionId != null ||
+        request.parentEntryId != null ||
+        parentEntryId != null
           ? "continuation"
           : "root",
       id: sessionId,
@@ -444,6 +473,7 @@ function summarize(events) {
       route: memoryRoute(primaryBankId, tools, events),
       initialRecall: contextEvent
         ? {
+            status: initialRecallStatus(events),
             queries: (Array.isArray(context.queries) ? context.queries : [])
               .map((query) => stringValue(query, 2_000))
               .filter(Boolean)

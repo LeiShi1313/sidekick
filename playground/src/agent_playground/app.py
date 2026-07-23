@@ -748,6 +748,15 @@ def _parse_run_summary(
         if initial_recall is None:
             parsed_initial_recall = None
         else:
+            recall_status = initial_recall.get("status")
+            if recall_status not in {
+                "unknown",
+                "in_progress",
+                "completed",
+                "partial",
+                "failed",
+            }:
+                fail()
             queries = initial_recall.get("queries")
             if (
                 not isinstance(queries, list)
@@ -759,6 +768,7 @@ def _parse_run_summary(
             ):
                 fail()
             parsed_initial_recall = {
+                "status": recall_status,
                 "queries": queries,
                 "memoryCount": count(initial_recall.get("memoryCount"), 5_000),
                 "eventSequence": event_sequence(initial_recall.get("eventSequence")),
