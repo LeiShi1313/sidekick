@@ -637,7 +637,244 @@ def _parse_run_audit(payload: dict[str, Any], expected_run_id: str) -> dict[str,
         ):
             raise UpstreamUnavailable("Pi agent returned malformed audit")
         last_sequence = event["sequence"]
-    return {"runId": expected_run_id, "events": events}
+    summary = _parse_run_summary(payload.get("summary"), events)
+    return {"runId": expected_run_id, "summary": summary, "events": events}
+
+
+def _parse_run_summary(
+    value: Any,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sequences = {event["sequence"] for event in events}
+
+    def fail() -> None:
+        raise ValueError("malformed audit summary")
+
+    def optional_string(item: dict[str, Any], key: str, maximum: int) -> str | None:
+        supplied = item.get(key)
+        if supplied is None:
+            return None
+        if not isinstance(supplied, str) or len(supplied) > maximum:
+            fail()
+        return supplied
+
+    def required_string(item: dict[str, Any], key: str, maximum: int) -> str:
+        supplied = optional_string(item, key, maximum)
+        if supplied is None or not supplied:
+            fail()
+        return supplied
+
+    def count(item: Any, maximum: int = 1_000_000) -> int:
+        if (
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or not 0 <= item <= maximum
+        ):
+            fail()
+        return item
+
+    def optional_duration(item: Any) -> int | None:
+        return None if item is None else count(item, 10**12)
+
+    def event_sequence(item: Any) -> int:
+        supplied = count(item, 1_000_000)
+        if supplied not in sequences:
+            fail()
+        return supplied
+
+    def optional_identifier(item: dict[str, Any], key: str) -> str | None:
+        supplied = optional_string(item, key, 128)
+        if supplied is not None and not _IDENTIFIER_RE.fullmatch(supplied):
+            fail()
+        return supplied
+
+    try:
+        if not isinstance(value, dict):
+            fail()
+        _validate_json_tree(value)
+        status = value.get("status")
+        if status not in {"in_progress", "completed", "failed"}:
+            fail()
+        supplied_event_count = count(value.get("eventCount"))
+        if supplied_event_count != len(events):
+            fail()
+
+        session = value.get("session")
+        if not isinstance(session, dict) or session.get("kind") not in {
+            "root",
+            "continuation",
+        }:
+            fail()
+        parsed_session = {
+            "kind": session["kind"],
+            "id": optional_identifier(session, "id"),
+            "parentEntryId": optional_identifier(session, "parentEntryId"),
+            "entryId": optional_identifier(session, "entryId"),
+        }
+
+        model = value.get("model")
+        if model is not None and not isinstance(model, dict):
+            fail()
+        parsed_model = (
+            None
+            if model is None
+            else {
+                "id": optional_string(model, "id", 256),
+                "provider": optional_string(model, "provider", 128),
+                "thinkingLevel": optional_string(model, "thinkingLevel", 64),
+            }
+        )
+
+        memory = value.get("memory")
+        if not isinstance(memory, dict):
+            fail()
+        route = memory.get("route")
+        if route not in {
+            "off",
+            "current_bank_only",
+            "source_discovery_only",
+            "cross_bank_attempted",
+            "cross_bank_failed",
+            "cross_bank_queried",
+        }:
+            fail()
+        primary_bank_id = optional_string(memory, "primaryBankId", 512)
+        if (route == "off") != (primary_bank_id is None):
+            fail()
+
+        initial_recall = memory.get("initialRecall")
+        if initial_recall is not None and not isinstance(initial_recall, dict):
+            fail()
+        if initial_recall is None:
+            parsed_initial_recall = None
+        else:
+            queries = initial_recall.get("queries")
+            if (
+                not isinstance(queries, list)
+                or len(queries) > 32
+                or any(
+                    not isinstance(query, str) or len(query) > 2_000
+                    for query in queries
+                )
+            ):
+                fail()
+            parsed_initial_recall = {
+                "queries": queries,
+                "memoryCount": count(initial_recall.get("memoryCount"), 5_000),
+                "eventSequence": event_sequence(initial_recall.get("eventSequence")),
+            }
+
+        directory = memory.get("directory")
+        if directory is not None and not isinstance(directory, dict):
+            fail()
+        if directory is None:
+            parsed_directory = None
+        else:
+            directory_status = directory.get("status")
+            if directory_status not in {
+                "available",
+                "unavailable",
+                "disabled",
+                "unknown",
+            }:
+                fail()
+            parsed_directory = {
+                "status": directory_status,
+                "query": optional_string(directory, "query", 2_000),
+                "sourceCount": count(directory.get("sourceCount"), 5_000),
+                "eventSequence": event_sequence(directory.get("eventSequence")),
+            }
+
+        supplied_tools = value.get("tools")
+        if not isinstance(supplied_tools, list) or len(supplied_tools) > 1_000:
+            fail()
+        parsed_tools: list[dict[str, Any]] = []
+        for tool in supplied_tools:
+            if not isinstance(tool, dict) or tool.get("status") not in {
+                "in_progress",
+                "completed",
+                "failed",
+            }:
+                fail()
+            source = tool.get("source")
+            if source is not None and not isinstance(source, dict):
+                fail()
+            parsed_source = (
+                None
+                if source is None
+                else {
+                    "handle": optional_string(source, "handle", 32),
+                    "displayName": optional_string(source, "displayName", 512),
+                    "bankId": optional_string(source, "bankId", 512),
+                }
+            )
+            parsed_tools.append(
+                {
+                    "callId": optional_string(tool, "callId", 256),
+                    "name": required_string(tool, "name", 128),
+                    "status": tool["status"],
+                    "durationMs": optional_duration(tool.get("durationMs")),
+                    "query": optional_string(tool, "query", 2_000),
+                    "source": parsed_source,
+                    "eventSequence": event_sequence(tool.get("eventSequence")),
+                }
+            )
+
+        supplied_warnings = value.get("warnings")
+        if not isinstance(supplied_warnings, list) or len(supplied_warnings) > 1_000:
+            fail()
+        parsed_warnings: list[dict[str, Any]] = []
+        for warning in supplied_warnings:
+            if not isinstance(warning, dict) or warning.get("kind") != "memory_access":
+                fail()
+            parsed_warnings.append(
+                {
+                    "kind": "memory_access",
+                    "unavailableBankCount": count(
+                        warning.get("unavailableBankCount"), 5_000
+                    ),
+                    "eventSequence": event_sequence(warning.get("eventSequence")),
+                }
+            )
+
+        failure = value.get("failure")
+        if failure is not None and not isinstance(failure, dict):
+            fail()
+        parsed_failure = (
+            None
+            if failure is None
+            else {
+                "code": required_string(failure, "code", 128),
+                "message": required_string(failure, "message", 1_000),
+                "eventSequence": event_sequence(failure.get("eventSequence")),
+            }
+        )
+        if (status == "failed") != (parsed_failure is not None):
+            fail()
+
+        return {
+            "status": status,
+            "startedAt": optional_string(value, "startedAt", 64),
+            "finishedAt": optional_string(value, "finishedAt", 64),
+            "durationMs": optional_duration(value.get("durationMs")),
+            "prompt": optional_string(value, "prompt", 300) or "",
+            "eventCount": supplied_event_count,
+            "session": parsed_session,
+            "model": parsed_model,
+            "memory": {
+                "primaryBankId": primary_bank_id,
+                "route": route,
+                "initialRecall": parsed_initial_recall,
+                "directory": parsed_directory,
+            },
+            "tools": parsed_tools,
+            "warnings": parsed_warnings,
+            "failure": parsed_failure,
+        }
+    except (UpstreamUnavailable, ValueError, KeyError, TypeError) as error:
+        raise UpstreamUnavailable(
+            "Pi agent returned malformed audit summary"
+        ) from error
 
 
 def _validate_run_request(value: Any, default_system_prompt: str) -> dict[str, Any]:

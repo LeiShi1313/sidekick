@@ -10,6 +10,7 @@ from agent_playground.app import (
     PlaygroundSettings,
     UpstreamUnavailable,
     _parse_pi_event,
+    _parse_run_audit,
     create_app,
 )
 
@@ -223,6 +224,44 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
         return web.json_response(
             {
                 "runId": run_id,
+                "summary": {
+                    "status": "completed",
+                    "startedAt": "2026-07-13T12:00:00.000Z",
+                    "finishedAt": "2026-07-13T12:00:01.000Z",
+                    "durationMs": 1_000,
+                    "prompt": "Who owns deployment?",
+                    "eventCount": 2,
+                    "session": {
+                        "kind": "root",
+                        "id": "session-1",
+                        "parentEntryId": None,
+                        "entryId": "entry-2",
+                    },
+                    "model": {
+                        "id": "gpt-5",
+                        "provider": "openai",
+                        "thinkingLevel": "medium",
+                    },
+                    "memory": {
+                        "primaryBankId": "chat:engineering",
+                        "route": "current_bank_only",
+                        "initialRecall": None,
+                        "directory": None,
+                    },
+                    "tools": [
+                        {
+                            "callId": "call-1",
+                            "name": "memory_reflect",
+                            "status": "completed",
+                            "durationMs": 42,
+                            "query": None,
+                            "source": None,
+                            "eventSequence": 2,
+                        }
+                    ],
+                    "warnings": [],
+                    "failure": None,
+                },
                 "events": [
                     {
                         "version": 1,
@@ -451,6 +490,8 @@ async def test_session_history_and_run_audits_are_proxied_without_exposing_token
             "Who owns deployment?"
         )
         assert audit["events"][1]["data"]["result"]["content"][0]["text"] == ("Alice")
+        assert audit["summary"]["memory"]["route"] == "current_bank_only"
+        assert audit["summary"]["tools"][0]["name"] == "memory_reflect"
         assert received["session_queries"] == [{"limit": "20", "q": "deploy"}]
         assert received["audit_queries"] == [{"limit": "10", "sessionId": "session-1"}]
         assert "private-pi-token" not in json.dumps(
@@ -578,3 +619,40 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
 def test_playground_rejects_malformed_pi_memory_events(event):
     with pytest.raises(UpstreamUnavailable, match="malformed events"):
         _parse_pi_event(json.dumps(event).encode())
+
+
+def test_run_audit_requires_a_bounded_diagnostic_summary():
+    run_id = "11111111-1111-4111-8111-111111111111"
+    for summary in (
+        None,
+        {"status": "mysterious"},
+        {
+            "status": "completed",
+            "startedAt": "2026-07-13T12:00:00.000Z",
+            "finishedAt": "2026-07-13T12:00:01.000Z",
+            "durationMs": 1_000,
+            "prompt": "hello",
+            "eventCount": 0,
+            "session": {
+                "kind": "root",
+                "id": None,
+                "parentEntryId": None,
+                "entryId": None,
+            },
+            "model": None,
+            "memory": {
+                "primaryBankId": None,
+                "route": "read_every_bank",
+                "initialRecall": None,
+                "directory": None,
+            },
+            "tools": [],
+            "warnings": [],
+            "failure": None,
+        },
+    ):
+        with pytest.raises(UpstreamUnavailable, match="malformed audit summary"):
+            _parse_run_audit(
+                {"runId": run_id, "summary": summary, "events": []},
+                run_id,
+            )
