@@ -458,6 +458,39 @@ test("reports failed cross-bank attempts and incomplete runs conservatively", as
   }
 });
 
+test("reports source discovery without claiming that another bank was queried", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", {
+      prompt: "Find the named group",
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await audit.record("tool.started", {
+      toolCallId: "call-find-1",
+      toolName: "memory_find_sources",
+      args: { query: "Named group" },
+    });
+    await audit.record("tool.completed", {
+      toolCallId: "call-find-1",
+      toolName: "memory_find_sources",
+      args: { query: "Named group" },
+      result: { details: { references: [] } },
+      isError: false,
+      durationMs: 5,
+    });
+    await audit.flush();
+
+    const { summary } = await app.store.get(RUN_ID);
+
+    assert.equal(summary.memory.route, "source_discovery_only");
+    assert.equal(summary.tools[0].name, "memory_find_sources");
+    assert.equal(summary.tools[0].status, "completed");
+  } finally {
+    await app.close();
+  }
+});
+
 test("does not read audit paths for malformed or unknown run identities", async () => {
   const app = await fixture();
   try {
