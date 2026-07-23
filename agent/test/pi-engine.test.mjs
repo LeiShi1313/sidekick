@@ -282,6 +282,34 @@ test("labels background separately from the current request", () => {
   assert.match(prompt, /<current_request>\nWhat should I do\?\n<\/current_request>$/);
 });
 
+test("instructs resumed sessions to apply clarifications to the preceding request", () => {
+  const prompt = buildRunPrompt({
+    prompt: "狗哥是 @dota2pp",
+    context: [],
+    continuation: true,
+  });
+
+  assert.match(prompt, /<host_conversation_continuity>/);
+  assert.match(prompt, /follow-up turn in an existing conversation/i);
+  assert.match(prompt, /correction or clarification/i);
+  assert.match(prompt, /continue answering the preceding request/i);
+  assert.match(prompt, /instead of merely acknowledging/i);
+  assert.match(
+    prompt,
+    /<current_request>\n狗哥是 @dota2pp\n<\/current_request>$/,
+  );
+});
+
+test("does not add continuation guidance to a root request", () => {
+  const prompt = buildRunPrompt({
+    prompt: "狗哥今天出现了吗",
+    context: [],
+    continuation: false,
+  });
+
+  assert.doesNotMatch(prompt, /<host_conversation_continuity>/);
+});
+
 test("identifies the host-resolved requester for first-person references", () => {
   const prompt = buildRunPrompt({
     prompt: "What have I been doing with AI?",
@@ -493,6 +521,10 @@ test("persists a session tree and branches from mapped entries", async () => {
     const rootResult = rootEvents.at(-1);
     assert.equal(rootResult.type, "run_completed");
     assert.equal(rootResult.answer, "root answer");
+    assert.doesNotMatch(
+      JSON.stringify(app.provider.requests[0].messages),
+      /host_conversation_continuity/,
+    );
 
     const childEvents = await collect(
       app.engine,
@@ -517,6 +549,8 @@ test("persists a session tree and branches from mapped entries", async () => {
     const serialized = JSON.stringify(forkPayload.messages);
     assert.match(serialized, /root prompt/);
     assert.match(serialized, /root answer/);
+    assert.match(serialized, /host_conversation_continuity/);
+    assert.match(serialized, /continue answering the preceding request/);
     assert.doesNotMatch(serialized, /child prompt|child answer/);
   } finally {
     await app.close();
