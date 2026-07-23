@@ -564,6 +564,7 @@ export class PiEngine {
         primaryBankId: request.memory?.primaryBankId ?? null,
         queries: recalled.queries,
         memories: recalled.memories,
+        recall: recalled.recall,
         renderedContext: recalled.context,
         renderedDirectoryContext: recalled.directoryContext,
         access: recalled.access,

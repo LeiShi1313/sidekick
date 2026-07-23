@@ -690,6 +690,198 @@ function auditOptionLabel(audit) {
   return `${audit.status} · ${formatDate(audit.startedAt)} · ${short(audit.prompt, 70) || audit.runId}`;
 }
 
+function formatDuration(value) {
+  if (!Number.isFinite(value) || value < 0) return "Pending";
+  if (value < 1_000) return `${Math.round(value)} ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} s`;
+  return `${Math.floor(value / 60_000)}m ${Math.round((value % 60_000) / 1_000)}s`;
+}
+
+function routeLabel(route) {
+  return ({
+    off: "Memory off",
+    current_bank_only: "Current bank only",
+    source_discovery_only: "Source discovery only",
+    cross_bank_attempted: "Cross-bank query attempted",
+    cross_bank_failed: "Cross-bank query failed",
+    cross_bank_queried: "Cross-bank queried",
+  })[route] || "Unknown memory path";
+}
+
+function traceFact(label, value, className = "") {
+  const item = node("div", null, "trace-fact");
+  item.append(node("dt", label));
+  item.append(node("dd", value, className));
+  return item;
+}
+
+function inspectAuditEvent(sequence) {
+  const target = document.querySelector(`#audit-event-${sequence}`);
+  if (!target) return;
+  target.focus({ preventScroll: true });
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  target.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+}
+
+function traceStep({ label, detail, status, eventSequence }) {
+  const item = button(null, `trace-step ${status}`, () => inspectAuditEvent(eventSequence));
+  item.setAttribute("aria-label", `Inspect raw event #${eventSequence}: ${label}`);
+  const header = node("span", null, "trace-step-header");
+  header.append(node("span", label, "trace-step-label"));
+  header.append(node("span", status.replaceAll("_", " "), "trace-step-status"));
+  item.append(header);
+  if (detail) item.append(node("span", detail, "trace-step-detail"));
+  item.append(node("span", `Event #${eventSequence}`, "trace-step-event"));
+  return item;
+}
+
+function sourceLabel(source) {
+  return [...new Set([
+    source?.displayName,
+    source?.handle,
+    source?.bankId,
+  ].filter(Boolean))].join(" · ");
+}
+
+function toolStep(tool) {
+  const labels = {
+    memory_query_current: "Current-bank query",
+    memory_find_sources: "Model-requested source discovery",
+    memory_query_source: "Cross-bank source query",
+  };
+  const source = tool.source ? sourceLabel(tool.source) : null;
+  const detail = [
+    source,
+    tool.query && `Query: ${short(tool.query, 240)}`,
+    tool.durationMs != null && formatDuration(tool.durationMs),
+  ].filter(Boolean).join("\n");
+  return {
+    label: labels[tool.name] || `Tool · ${tool.name}`,
+    detail,
+    status: tool.status,
+    eventSequence: tool.eventSequence,
+  };
+}
+
+function renderAuditDiagnosis(summary, audit) {
+  if (!audit) {
+    elements.auditSummary.replaceChildren(
+      node("p", "Select a session and run to inspect its diagnosis.", "history-empty"),
+    );
+    return;
+  }
+  if (!summary) {
+    const loading = state.auditError ? "Run diagnosis unavailable." : "Loading run diagnosis...";
+    elements.auditSummary.replaceChildren(
+      node("p", `${audit.status} · ${audit.eventCount} events · ${audit.memoryScopeId || "memory off"}`, "trace-loading"),
+      node("p", loading, "trace-loading-detail"),
+    );
+    return;
+  }
+
+  const diagnosis = node("article", null, "trace-diagnosis");
+  const header = node("header", null, "trace-diagnosis-header");
+  const status = node("span", summary.status.replaceAll("_", " "), `trace-status ${summary.status}`);
+  header.append(status);
+  header.append(node("span", formatDuration(summary.durationMs), "trace-duration"));
+  header.append(node("span", `${summary.eventCount} events`, "trace-event-count"));
+  diagnosis.append(header);
+  if (summary.prompt) diagnosis.append(node("p", summary.prompt, "trace-prompt"));
+  diagnosis.append(node("code", audit.runId, "trace-run-id"));
+
+  const session = summary.session || {};
+  const sessionText = session.kind === "continuation"
+    ? `Continuation · ${session.id || "unknown session"}\nParent ${session.parentEntryId || "unknown"}`
+    : `Root run · ${session.id || "session pending"}`;
+  const modelText = summary.model
+    ? [
+        [summary.model.id, summary.model.provider].filter(Boolean).join(" · ") || "Unknown model",
+        `Thinking ${summary.model.thinkingLevel || "unknown"}`,
+      ].join("\n")
+    : "Model pending";
+  const queriedSources = summary.tools
+    .filter((tool) => tool.name === "memory_query_source" && tool.source)
+    .map((tool) => sourceLabel(tool.source))
+    .filter(Boolean);
+  const routeText = [
+    routeLabel(summary.memory.route),
+    queriedSources.length > 0 ? `Sources: ${[...new Set(queriedSources)].join(", ")}` : null,
+  ].filter(Boolean).join("\n");
+  const facts = node("dl", null, "trace-facts");
+  facts.append(traceFact("Session", sessionText));
+  facts.append(traceFact("Model", modelText));
+  facts.append(traceFact("Primary memory", summary.memory.primaryBankId || "Off"));
+  facts.append(traceFact("Memory path", routeText, `trace-route ${summary.memory.route}`));
+  diagnosis.append(facts);
+
+  const steps = [];
+  const initial = summary.memory.initialRecall;
+  if (summary.memory.route !== "off" && initial) {
+    const queryDetail = initial.queries.length > 0
+      ? ` · ${short(initial.queries[0], 160)}${initial.queries.length > 1 ? ` (+${initial.queries.length - 1} more)` : ""}`
+      : "";
+    steps.push({
+      label: "Automatic primary recall",
+      detail: `${initial.memoryCount} memories from ${initial.queries.length} queries${queryDetail}`,
+      status: initial.status,
+      eventSequence: initial.eventSequence,
+    });
+  }
+  const directory = summary.memory.directory;
+  if (summary.memory.route !== "off" && directory) {
+    steps.push({
+      label: "Automatic directory discovery",
+      detail: [
+        `${directory.sourceCount} source handles offered`,
+        directory.query && `Query: ${short(directory.query, 200)}`,
+      ].filter(Boolean).join("\n"),
+      status: directory.status === "available" ? "completed" : directory.status,
+      eventSequence: directory.eventSequence,
+    });
+  }
+  steps.push(...summary.tools.map(toolStep));
+
+  const trail = node("section", null, "trace-section");
+  trail.append(node("h3", "Decision trail"));
+  if (steps.length === 0) {
+    trail.append(node("p", summary.memory.route === "off" ? "Memory was disabled and no tools ran." : "No diagnostic steps were recorded.", "trace-empty"));
+  } else {
+    const list = node("ol", null, "trace-steps");
+    for (const step of steps) {
+      const listItem = node("li");
+      listItem.append(traceStep(step));
+      list.append(listItem);
+    }
+    trail.append(list);
+  }
+  diagnosis.append(trail);
+
+  const notices = [
+    ...(summary.failure ? [{
+      label: `${summary.failure.code} · ${summary.failure.message}`,
+      eventSequence: summary.failure.eventSequence,
+    }] : []),
+    ...summary.warnings.map((warning) => {
+      const noun = warning.unavailableBankCount === 1 ? "bank" : "banks";
+      return {
+        label: `Access warning · ${warning.unavailableBankCount} earlier source ${noun} unavailable`,
+        eventSequence: warning.eventSequence,
+      };
+    }),
+  ];
+  if (notices.length > 0) {
+    const warningSection = node("section", null, "trace-section trace-warnings");
+    warningSection.append(node("h3", "Warnings"));
+    for (const notice of notices) {
+      const warning = button(notice.label, "trace-warning", () => inspectAuditEvent(notice.eventSequence));
+      warning.setAttribute("aria-label", `Inspect raw event #${notice.eventSequence}: ${notice.label}`);
+      warningSection.append(warning);
+    }
+    diagnosis.append(warningSection);
+  }
+  elements.auditSummary.replaceChildren(diagnosis);
+}
+
 function renderAudits() {
   elements.auditCount.textContent = `${state.auditTotal} runs`;
   elements.auditSelect.disabled = state.audits.length === 0;
@@ -706,9 +898,7 @@ function renderAudits() {
     elements.auditSelect.value = state.selectedAuditId || state.audits[0].runId;
   }
   const summary = state.audits.find((audit) => audit.runId === state.selectedAuditId);
-  elements.auditSummary.textContent = summary
-    ? `${summary.status} · ${summary.eventCount} events · ${summary.memoryScopeId || "memory off"} · ${summary.runId}`
-    : "";
+  renderAuditDiagnosis(state.auditDetail?.summary, summary);
   if (state.auditError) {
     elements.auditEvents.replaceChildren(node("p", state.auditError, "history-empty"));
   } else if (!state.selectedSessionId) {
@@ -746,7 +936,10 @@ function auditDescription(event) {
   }
   if (event.type === "memory.http.response") {
     const response = data.response || {};
-    return `${data.operation || "memory"} · HTTP ${response.status ?? "?"} · ${response.durationMs ?? "?"} ms · ${response.bodyBytes ?? "?"} bytes`;
+    const outcome = response.usable === false
+      ? ` · unusable (${(response.failureReason || "invalid response").replaceAll("_", " ")})`
+      : "";
+    return `${data.operation || "memory"} · HTTP ${response.status ?? "?"}${outcome} · ${response.durationMs ?? "?"} ms · ${response.bodyBytes ?? "?"} bytes`;
   }
   if (event.type === "memory.http.error") return `${data.operation || "memory"} · ${data.error?.message || "request failed"}`;
   if (event.type === "memory.directory.policy") {
@@ -789,10 +982,14 @@ function renderAuditEvents() {
     elements.auditEvents.replaceChildren(node("p", "No events recorded.", "history-empty"));
     return;
   }
-  elements.auditEvents.replaceChildren(...events.map((event) => {
+  const heading = node("div", null, "raw-events-header");
+  heading.append(node("h3", "Raw events"), node("span", `${events.length} recorded`, "panel-count"));
+  elements.auditEvents.replaceChildren(heading, ...events.map((event) => {
     const category = event.type.split(".")[0];
     const warning = event.type === "memory.access.warning" ? " warning" : "";
     const item = node("article", null, `audit-event ${category}${warning}`);
+    item.id = `audit-event-${event.sequence}`;
+    item.tabIndex = -1;
     const header = node("div", null, "audit-event-header");
     header.append(node("span", `#${event.sequence}`, "audit-sequence"));
     header.append(node("span", event.type, "audit-type"));

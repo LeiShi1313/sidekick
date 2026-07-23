@@ -178,6 +178,20 @@ export async function recallMemories({
       malformed = true;
     }
   }
+  let memories = null;
+  let failureReason = null;
+  if (!response.ok) failureReason = "http_error";
+  else if (bodyBytes > MAX_RESPONSE_BYTES) {
+    failureReason = "response_too_large";
+  }
+  else if (malformed) failureReason = "malformed_json";
+  else {
+    try {
+      memories = parseMemories(payload);
+    } catch {
+      failureReason = "malformed_payload";
+    }
+  }
   await observeSafely(observe, "memory.http.response", {
     exchangeId,
     operation,
@@ -186,6 +200,8 @@ export async function recallMemories({
     response: {
       status: response.status,
       ok: response.ok,
+      usable: failureReason === null,
+      failureReason,
       durationMs: Math.max(0, Date.now() - startedAt),
       bodyBytes,
       body:
@@ -196,11 +212,14 @@ export async function recallMemories({
             : payload,
     },
   });
-  if (!response.ok || Buffer.byteLength(text) > MAX_RESPONSE_BYTES) {
+  if (
+    failureReason === "http_error" ||
+    failureReason === "response_too_large"
+  ) {
     throw new Error("Memory recall unavailable");
   }
-  if (malformed) throw new Error("Malformed memory response");
-  return parseMemories(payload);
+  if (failureReason) throw new Error("Malformed memory response");
+  return memories;
 }
 
 export async function recallDirectory({
@@ -438,6 +457,12 @@ export async function retrieveMemoryContext({
       queries: [],
       memories: [],
       context: "",
+      recall: {
+        status: "disabled",
+        attemptedCount: 0,
+        completedCount: 0,
+        failedCount: 0,
+      },
       directoryContext: "",
       directory: { status: "disabled", references: [], allowedBankIds: [] },
       access: null,
@@ -472,11 +497,25 @@ export async function retrieveMemoryContext({
   const groups = settled
     .filter((item) => item.status === "fulfilled")
     .map((item) => item.value);
+  const completedCount = groups.length;
+  const failedCount = settled.length - completedCount;
+  const recall = {
+    status:
+      completedCount === 0
+        ? "failed"
+        : failedCount === 0
+          ? "completed"
+          : "partial",
+    attemptedCount: settled.length,
+    completedCount,
+    failedCount,
+  };
   if (groups.length === 0 && directorySettled.status === "rejected") {
     return {
       queries,
       memories: [],
       context: "",
+      recall,
       directoryContext: "",
       directory: {
         status: "unavailable",
@@ -510,6 +549,7 @@ export async function retrieveMemoryContext({
     queries,
     memories: rendered.visible,
     context: rendered.context,
+    recall,
     directoryContext: renderDirectoryContext(
       capabilities,
       memory.participants,

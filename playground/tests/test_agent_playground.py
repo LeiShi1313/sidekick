@@ -10,6 +10,7 @@ from agent_playground.app import (
     PlaygroundSettings,
     UpstreamUnavailable,
     _parse_pi_event,
+    _parse_run_audit,
     create_app,
 )
 
@@ -209,7 +210,7 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
                         "finishedAt": "2026-07-13T12:00:01.000Z",
                         "prompt": "Who owns deployment?",
                         "memoryScopeId": "chat:engineering",
-                        "eventCount": 4,
+                        "eventCount": 11,
                     }
                 ],
                 "total": 1,
@@ -223,6 +224,82 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
         return web.json_response(
             {
                 "runId": run_id,
+                "summary": {
+                    "status": "completed",
+                    "startedAt": "2026-07-13T12:00:00.000Z",
+                    "finishedAt": "2026-07-13T12:00:01.000Z",
+                    "durationMs": 1_000,
+                    "prompt": "Who owns deployment?",
+                    "eventCount": 11,
+                    "session": {
+                        "kind": "root",
+                        "id": "session-1",
+                        "parentEntryId": None,
+                        "entryId": "entry-2",
+                    },
+                    "model": {
+                        "id": "gpt-5",
+                        "provider": "openai",
+                        "thinkingLevel": "medium",
+                    },
+                    "memory": {
+                        "primaryBankId": "chat:engineering",
+                        "route": "cross_bank_queried",
+                        "initialRecall": {
+                            "status": "completed",
+                            "queries": ["Who owns deployment?"],
+                            "memoryCount": 1,
+                            "eventSequence": 3,
+                        },
+                        "directory": {
+                            "status": "available",
+                            "query": "Who owns deployment?",
+                            "sourceCount": 2,
+                            "eventSequence": 4,
+                        },
+                    },
+                    "tools": [
+                        {
+                            "callId": "call-1",
+                            "name": "memory_reflect",
+                            "status": "completed",
+                            "durationMs": 42,
+                            "query": None,
+                            "source": None,
+                            "eventSequence": 2,
+                        },
+                        {
+                            "callId": "call-find-1",
+                            "name": "memory_find_sources",
+                            "status": "completed",
+                            "durationMs": 18,
+                            "query": "Deployment group",
+                            "source": None,
+                            "eventSequence": 5,
+                        },
+                        {
+                            "callId": "call-source-1",
+                            "name": "memory_query_source",
+                            "status": "completed",
+                            "durationMs": 31,
+                            "query": "Who owns deployment?",
+                            "source": {
+                                "handle": "source_2",
+                                "displayName": "Release Engineering",
+                                "bankId": "chat:release-engineering",
+                            },
+                            "eventSequence": 7,
+                        },
+                    ],
+                    "warnings": [
+                        {
+                            "kind": "memory_access",
+                            "unavailableBankCount": 1,
+                            "eventSequence": 10,
+                        }
+                    ],
+                    "failure": None,
+                },
                 "events": [
                     {
                         "version": 1,
@@ -243,7 +320,7 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
                     {
                         "version": 1,
                         "sequence": 2,
-                        "timestamp": "2026-07-13T12:00:01.000Z",
+                        "timestamp": "2026-07-13T12:00:00.100Z",
                         "runId": run_id,
                         "type": "tool.completed",
                         "data": {
@@ -252,6 +329,110 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
                             "isError": False,
                             "durationMs": 42,
                             "result": {"content": [{"type": "text", "text": "Alice"}]},
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 3,
+                        "timestamp": "2026-07-13T12:00:00.200Z",
+                        "runId": run_id,
+                        "type": "memory.context",
+                        "data": {
+                            "queries": ["Who owns deployment?"],
+                            "memories": [{"id": "memory-1"}],
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 4,
+                        "timestamp": "2026-07-13T12:00:00.250Z",
+                        "runId": run_id,
+                        "type": "memory.directory.result",
+                        "data": {"status": "available", "references": []},
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 5,
+                        "timestamp": "2026-07-13T12:00:00.300Z",
+                        "runId": run_id,
+                        "type": "tool.started",
+                        "data": {
+                            "toolCallId": "call-find-1",
+                            "toolName": "memory_find_sources",
+                            "args": {"query": "Deployment group"},
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 6,
+                        "timestamp": "2026-07-13T12:00:00.400Z",
+                        "runId": run_id,
+                        "type": "tool.completed",
+                        "data": {
+                            "toolCallId": "call-find-1",
+                            "toolName": "memory_find_sources",
+                            "isError": False,
+                            "durationMs": 18,
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 7,
+                        "timestamp": "2026-07-13T12:00:00.500Z",
+                        "runId": run_id,
+                        "type": "tool.started",
+                        "data": {
+                            "toolCallId": "call-source-1",
+                            "toolName": "memory_query_source",
+                            "args": {
+                                "reference": "source_2",
+                                "query": "Who owns deployment?",
+                            },
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 8,
+                        "timestamp": "2026-07-13T12:00:00.650Z",
+                        "runId": run_id,
+                        "type": "memory.http.response",
+                        "data": {
+                            "toolCallId": "call-source-1",
+                            "operation": "source.recall",
+                            "response": {"status": 200, "ok": True, "durationMs": 27},
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 9,
+                        "timestamp": "2026-07-13T12:00:00.700Z",
+                        "runId": run_id,
+                        "type": "tool.completed",
+                        "data": {
+                            "toolCallId": "call-source-1",
+                            "toolName": "memory_query_source",
+                            "isError": False,
+                            "durationMs": 31,
+                        },
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 10,
+                        "timestamp": "2026-07-13T12:00:00.800Z",
+                        "runId": run_id,
+                        "type": "memory.access.warning",
+                        "data": {"unavailableBankIds": ["chat:old-source"]},
+                    },
+                    {
+                        "version": 1,
+                        "sequence": 11,
+                        "timestamp": "2026-07-13T12:00:01.000Z",
+                        "runId": run_id,
+                        "type": "run.completed",
+                        "data": {
+                            "sessionId": "session-1",
+                            "entryId": "entry-2",
+                            "answer": "Alice owns it.",
                         },
                     },
                 ],
@@ -446,11 +627,14 @@ async def test_session_history_and_run_audits_are_proxied_without_exposing_token
         assert sessions["items"][0]["id"] == "session-1"
         assert detail["leafId"] == "entry-2"
         assert detail["entries"][1]["message"]["usage"]["input"] == 20
-        assert audits["items"][0]["eventCount"] == 4
+        assert audits["items"][0]["eventCount"] == 11
         assert audit["events"][0]["data"]["request"]["body"]["query"] == (
             "Who owns deployment?"
         )
         assert audit["events"][1]["data"]["result"]["content"][0]["text"] == ("Alice")
+        assert audit["summary"]["memory"]["route"] == "cross_bank_queried"
+        assert audit["summary"]["memory"]["initialRecall"]["status"] == "completed"
+        assert audit["summary"]["tools"][0]["name"] == "memory_reflect"
         assert received["session_queries"] == [{"limit": "20", "q": "deploy"}]
         assert received["audit_queries"] == [{"limit": "10", "sessionId": "session-1"}]
         assert "private-pi-token" not in json.dumps(
@@ -537,6 +721,12 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 ) as response:
                     assert response.status == 400
 
+            async with session.get(f"{playground_url}/") as response:
+                markup = await response.text()
+                assert response.status == 200
+                assert '<section id="audit-summary"' in markup
+                assert 'aria-live="polite"' in markup
+
             async with session.get(f"{playground_url}/app.js") as response:
                 script = await response.text()
                 assert "innerHTML" not in script
@@ -549,6 +739,16 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 assert "elements.newChat.disabled = running" in script
                 assert 'event.type === "memory.access.warning"' in script
                 assert "non-disclosure safeguard is advisory" in script
+                assert "function renderAuditDiagnosis" in script
+                assert "Decision trail" in script
+                assert "Inspect raw event" in script
+                assert "current_bank_only" in script
+
+            async with session.get(f"{playground_url}/styles.css") as response:
+                styles = await response.text()
+                assert response.status == 200
+                assert ".trace-facts" in styles
+                assert ".trace-step" in styles
     finally:
         assert received["runs"] == []
         await playground_runner.cleanup()
@@ -578,3 +778,40 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
 def test_playground_rejects_malformed_pi_memory_events(event):
     with pytest.raises(UpstreamUnavailable, match="malformed events"):
         _parse_pi_event(json.dumps(event).encode())
+
+
+def test_run_audit_requires_a_bounded_diagnostic_summary():
+    run_id = "11111111-1111-4111-8111-111111111111"
+    for summary in (
+        None,
+        {"status": "mysterious"},
+        {
+            "status": "completed",
+            "startedAt": "2026-07-13T12:00:00.000Z",
+            "finishedAt": "2026-07-13T12:00:01.000Z",
+            "durationMs": 1_000,
+            "prompt": "hello",
+            "eventCount": 0,
+            "session": {
+                "kind": "root",
+                "id": None,
+                "parentEntryId": None,
+                "entryId": None,
+            },
+            "model": None,
+            "memory": {
+                "primaryBankId": None,
+                "route": "read_every_bank",
+                "initialRecall": None,
+                "directory": None,
+            },
+            "tools": [],
+            "warnings": [],
+            "failure": None,
+        },
+    ):
+        with pytest.raises(UpstreamUnavailable, match="malformed audit summary"):
+            _parse_run_audit(
+                {"runId": run_id, "summary": summary, "events": []},
+                run_id,
+            )

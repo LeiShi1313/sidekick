@@ -533,7 +533,7 @@ export function createMemoryTools({
           ],
           details: {
             sourceHandle: capability.handle,
-            sourceName: capability.displayName,
+            displayName: capability.displayName,
             bankId: capability.bankId,
             unavailable: true,
           },
@@ -546,7 +546,7 @@ export function createMemoryTools({
         content: [{ type: "text", text: bounded(text, MAX_SOURCE_CHARS) }],
         details: {
           sourceHandle: capability.handle,
-          sourceName: capability.displayName,
+          displayName: capability.displayName,
           bankId: capability.bankId,
           memoryIds: rendered.visible.map((memory) => memory.id),
         },

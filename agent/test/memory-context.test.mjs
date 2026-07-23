@@ -219,6 +219,12 @@ test("keeps the surviving recall variant when the other one fails", async () => 
 
   assert.deepEqual(result.memories.map((item) => item.id), ["memory-1"]);
   assert.match(result.context, /Rocket is Alice/);
+  assert.deepEqual(result.recall, {
+    status: "partial",
+    attemptedCount: 2,
+    completedCount: 1,
+    failedCount: 1,
+  });
 });
 
 test("accepts recalled memories when Hindsight omits optional entities", async () => {
@@ -269,6 +275,12 @@ test("disables memory tools when every initial recall attempt fails", async () =
 
   assert.equal(result.context, "");
   assert.equal(result.access, null);
+  assert.deepEqual(result.recall, {
+    status: "failed",
+    attemptedCount: 2,
+    completedCount: 0,
+    failedCount: 2,
+  });
 });
 
 test("keeps reflection available after a successful empty recall", async () => {
@@ -280,6 +292,12 @@ test("keeps reflection available after a successful empty recall", async () => {
     fetchImpl: async () => response([]),
   });
 
+  assert.deepEqual(result.recall, {
+    status: "completed",
+    attemptedCount: 1,
+    completedCount: 1,
+    failedCount: 0,
+  });
   assert.deepEqual(result.access, {
     primaryBankId: "workspace:engineering",
     references: [],
@@ -341,9 +359,59 @@ test("observes the complete initial recall HTTP exchange", async () => {
   });
   assert.equal(recallEvents[1].data.response.status, 200);
   assert.equal(recallEvents[1].data.response.ok, true);
+  assert.equal(recallEvents[1].data.response.usable, true);
+  assert.equal(recallEvents[1].data.response.failureReason, null);
   assert.equal(recallEvents[1].data.response.bodyBytes, Buffer.byteLength(JSON.stringify(payload)));
   assert.deepEqual(recallEvents[1].data.response.body, payload);
   assert(Number.isInteger(recallEvents[1].data.response.durationMs));
+});
+
+test("records a successful HTTP response with unusable recall data as failed", async () => {
+  const observed = [];
+  const result = await retrieveMemoryContext({
+    baseUrl: "http://memory.internal:8888",
+    prompt: "What happened?",
+    context: [],
+    memory: memoryTarget(),
+    fetchImpl: async (url) =>
+      url.includes("system%3Aknowledge-directory")
+        ? response([])
+        : new Response(JSON.stringify({ invalid: "payload" }), { status: 200 }),
+    observe: async (event) => observed.push(event),
+  });
+
+  const recallResponse = observed.find(
+    (event) =>
+      event.type === "memory.http.response" && event.data.operation === "recall",
+  );
+  assert.equal(recallResponse.data.response.ok, true);
+  assert.equal(recallResponse.data.response.usable, false);
+  assert.equal(recallResponse.data.response.failureReason, "malformed_payload");
+  assert.equal(result.recall.status, "failed");
+});
+
+test("records an oversized successful recall response as failed", async () => {
+  const observed = [];
+  const result = await retrieveMemoryContext({
+    baseUrl: "http://memory.internal:8888",
+    prompt: "What happened?",
+    context: [],
+    memory: memoryTarget(),
+    fetchImpl: async (url) =>
+      url.includes("system%3Aknowledge-directory")
+        ? response([])
+        : new Response("x".repeat(1024 * 1024 + 1), { status: 200 }),
+    observe: async (event) => observed.push(event),
+  });
+
+  const recallResponse = observed.find(
+    (event) =>
+      event.type === "memory.http.response" && event.data.operation === "recall",
+  );
+  assert.equal(recallResponse.data.response.ok, true);
+  assert.equal(recallResponse.data.response.usable, false);
+  assert.equal(recallResponse.data.response.failureReason, "response_too_large");
+  assert.equal(result.recall.status, "failed");
 });
 
 test("prefilters delegated directory recall and issues opaque source handles", async () => {
