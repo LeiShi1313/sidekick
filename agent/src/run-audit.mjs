@@ -214,10 +214,7 @@ function registerCapability(capabilities, value) {
   if (!handle) return;
   capabilities.set(handle, {
     handle,
-    displayName: stringValue(
-      capability.displayName ?? capability.sourceName,
-      512,
-    ),
+    displayName: stringValue(capability.displayName, 512),
     bankId: stringValue(capability.bankId, 512),
   });
 }
@@ -244,21 +241,14 @@ function sourceCapabilities(events) {
   return capabilities;
 }
 
-function sourceForTool(name, started, completed, capabilities) {
+function sourceForTool(name, args, details, capabilities) {
   if (name !== "memory_query_source") return null;
-  const startedData = objectValue(started?.data);
-  const completedData = objectValue(completed?.data);
-  const args = {
-    ...objectValue(startedData.args),
-    ...objectValue(completedData.args),
-  };
-  const details = resultDetails(completedData);
   const handle = stringValue(details.sourceHandle ?? args.reference, 32);
   const capability = handle ? capabilities.get(handle) : null;
   return {
     handle,
     displayName:
-      stringValue(details.sourceName, 512) ?? capability?.displayName ?? null,
+      stringValue(details.displayName, 512) ?? capability?.displayName ?? null,
     bankId: stringValue(details.bankId, 512) ?? capability?.bankId ?? null,
   };
 }
@@ -304,7 +294,7 @@ function summarizeTools(events) {
           : "in_progress",
         durationMs: durationValue(completedData.durationMs),
         query: stringValue(args.query ?? args.question, 2_000),
-        source: sourceForTool(name, call.started, call.completed, capabilities),
+        source: sourceForTool(name, args, details, capabilities),
         eventSequence: call.started?.sequence ?? call.completed?.sequence ?? null,
       };
     })
@@ -314,7 +304,15 @@ function summarizeTools(events) {
     );
 }
 
-function initialRecallStatus(events) {
+function initialRecallStatus(context, events) {
+  const recordedStatus = objectValue(context.recall).status;
+  if (
+    ["unknown", "in_progress", "completed", "partial", "failed"].includes(
+      recordedStatus,
+    )
+  ) {
+    return recordedStatus;
+  }
   const exchanges = new Map();
   for (const event of events) {
     if (!event.type.startsWith("memory.http.")) continue;
@@ -324,9 +322,14 @@ function initialRecallStatus(events) {
     if (event.type === "memory.http.request" && !exchanges.has(key)) {
       exchanges.set(key, "in_progress");
     } else if (event.type === "memory.http.response") {
+      const response = objectValue(data.response);
       exchanges.set(
         key,
-        objectValue(data.response).ok === true ? "completed" : "failed",
+        response.usable === true
+          ? "completed"
+          : response.usable === false || response.ok === false
+            ? "failed"
+            : "unknown",
       );
     } else if (event.type === "memory.http.error") {
       exchanges.set(key, "failed");
@@ -335,33 +338,36 @@ function initialRecallStatus(events) {
   const statuses = [...exchanges.values()];
   if (statuses.length === 0) return "unknown";
   if (statuses.includes("in_progress")) return "in_progress";
+  if (statuses.includes("unknown")) return "unknown";
   const completed = statuses.includes("completed");
   const failed = statuses.includes("failed");
   if (completed && failed) return "partial";
   return completed ? "completed" : "failed";
 }
 
-function memoryRoute(primaryBankId, tools, events) {
+function memoryRoute(primaryBankId, tools) {
   if (!primaryBankId) return "off";
   const sourceTools = tools.filter(
     (tool) => tool.name === "memory_query_source",
   );
-  const sourceRecallSucceeded = events.some((event) => {
-    const data = objectValue(event.data);
-    return (
-      event.type === "memory.http.response" &&
-      data.operation === "source.recall" &&
-      objectValue(data.response).ok === true
-    );
-  });
-  if (sourceRecallSucceeded) return "cross_bank_queried";
   if (sourceTools.length > 0) {
+    if (sourceTools.some((tool) => tool.status === "completed")) {
+      return "cross_bank_queried";
+    }
     return sourceTools.every((tool) => tool.status === "failed")
       ? "cross_bank_failed"
       : "cross_bank_attempted";
   }
-  if (tools.some((tool) => tool.name === "memory_find_sources")) {
+  const discoveryTools = tools.filter(
+    (tool) => tool.name === "memory_find_sources",
+  );
+  if (discoveryTools.some((tool) => tool.status === "completed")) {
     return "source_discovery_only";
+  }
+  if (discoveryTools.length > 0) {
+    return discoveryTools.every((tool) => tool.status === "failed")
+      ? "cross_bank_failed"
+      : "cross_bank_attempted";
   }
   return "current_bank_only";
 }
@@ -470,10 +476,10 @@ function summarize(events) {
       : null,
     memory: {
       primaryBankId,
-      route: memoryRoute(primaryBankId, tools, events),
+      route: memoryRoute(primaryBankId, tools),
       initialRecall: contextEvent
         ? {
-            status: initialRecallStatus(events),
+            status: initialRecallStatus(context, events),
             queries: (Array.isArray(context.queries) ? context.queries : [])
               .map((query) => stringValue(query, 2_000))
               .filter(Boolean)

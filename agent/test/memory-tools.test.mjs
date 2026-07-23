@@ -265,6 +265,8 @@ test("queries only a host-issued source handle and exposes no bank ID to the mod
   assert.match(result.content[0].text, /cross-memory-1/);
   assert.doesNotMatch(result.content[0].text, /current primary memory bank/i);
   assert.doesNotMatch(result.content[0].text, /qq:group:686743769/);
+  assert.equal(result.details.sourceHandle, "source_1");
+  assert.equal(result.details.displayName, "Coder Offtopic");
   assert.equal(result.details.bankId, bankId);
   await assert.rejects(
     querySource.execute("call-source-2", {

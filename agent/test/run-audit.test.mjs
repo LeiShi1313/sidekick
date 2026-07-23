@@ -7,6 +7,7 @@ import test from "node:test";
 import { RunAuditStore } from "../src/run-audit.mjs";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const SECOND_RUN_ID = "22222222-2222-4222-8222-222222222222";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "sidekick-run-audit-"));
@@ -348,7 +349,7 @@ test("distinguishes source discovery from successful cross-bank retrieval", asyn
       result: {
         details: {
           sourceHandle: "source_2",
-          sourceName: "Arch Linux 中文群",
+          displayName: "Arch Linux 中文群",
           bankId: "telegram:chat:-3003",
           memoryIds: ["memory-9"],
         },
@@ -433,12 +434,25 @@ test("reports failed cross-bank attempts and incomplete runs conservatively", as
       toolName: "memory_query_source",
       args: { reference: "source_1", query: "today" },
     });
+    await audit.record("memory.http.response", {
+      operation: "source.recall",
+      toolCallId: "call-source-1",
+      response: { ok: true, status: 200, durationMs: 2 },
+    });
     await audit.record("tool.completed", {
       toolCallId: "call-source-1",
       toolName: "memory_query_source",
       args: { reference: "source_1", query: "today" },
-      result: { content: [{ type: "text", text: "Source unavailable" }] },
-      isError: true,
+      result: {
+        content: [{ type: "text", text: "Source unavailable" }],
+        details: {
+          sourceHandle: "source_1",
+          displayName: "Other group",
+          bankId: "telegram:chat:-2002",
+          unavailable: true,
+        },
+      },
+      isError: false,
       durationMs: 3,
     });
     await audit.flush();
@@ -492,7 +506,54 @@ test("reports source discovery without claiming that another bank was queried", 
   }
 });
 
-test("reports a failed automatic primary recall instead of calling it complete", async () => {
+test("classifies failed and unfinished source discovery as cross-bank outcomes", async () => {
+  const app = await fixture();
+  try {
+    const failed = await app.store.start(RUN_ID);
+    await failed.record("run.request", {
+      prompt: "Check another group",
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await failed.record("tool.started", {
+      toolCallId: "call-find-failed",
+      toolName: "memory_find_sources",
+      args: { query: "another group" },
+    });
+    await failed.record("tool.completed", {
+      toolCallId: "call-find-failed",
+      toolName: "memory_find_sources",
+      result: { details: { unavailable: true, references: [] } },
+      isError: false,
+      durationMs: 4,
+    });
+    await failed.flush();
+
+    const unfinished = await app.store.start(SECOND_RUN_ID);
+    await unfinished.record("run.request", {
+      prompt: "Check another group",
+      memory: { primaryBankId: "telegram:chat:-1001" },
+    });
+    await unfinished.record("tool.started", {
+      toolCallId: "call-find-running",
+      toolName: "memory_find_sources",
+      args: { query: "another group" },
+    });
+    await unfinished.flush();
+
+    assert.equal(
+      (await app.store.get(RUN_ID)).summary.memory.route,
+      "cross_bank_failed",
+    );
+    assert.equal(
+      (await app.store.get(SECOND_RUN_ID)).summary.memory.route,
+      "cross_bank_attempted",
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("uses the parsed automatic recall outcome instead of a successful HTTP status", async () => {
   const app = await fixture();
   try {
     const audit = await app.store.start(RUN_ID);
@@ -506,16 +567,26 @@ test("reports a failed automatic primary recall instead of calling it complete",
       toolCallId: null,
       request: { body: { query: "What happened?" } },
     });
-    await audit.record("memory.http.error", {
+    await audit.record("memory.http.response", {
       exchangeId: "recall-1",
       operation: "recall",
       toolCallId: null,
       durationMs: 10,
-      error: { name: "TimeoutError" },
+      response: {
+        ok: true,
+        status: 200,
+        body: { invalid: "payload" },
+      },
     });
     await audit.record("memory.context", {
       queries: ["What happened?"],
       memories: [],
+      recall: {
+        status: "failed",
+        attemptedCount: 1,
+        completedCount: 0,
+        failedCount: 1,
+      },
     });
     await audit.flush();
 

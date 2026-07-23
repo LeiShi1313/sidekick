@@ -735,15 +735,21 @@ function traceStep({ label, detail, status, eventSequence }) {
   return item;
 }
 
+function sourceLabel(source) {
+  return [...new Set([
+    source?.displayName,
+    source?.handle,
+    source?.bankId,
+  ].filter(Boolean))].join(" · ");
+}
+
 function toolStep(tool) {
   const labels = {
     memory_query_current: "Current-bank query",
     memory_find_sources: "Model-requested source discovery",
     memory_query_source: "Cross-bank source query",
   };
-  const source = tool.source
-    ? [tool.source.displayName || tool.source.handle, tool.source.bankId].filter(Boolean).join(" · ")
-    : null;
+  const source = tool.source ? sourceLabel(tool.source) : null;
   const detail = [
     source,
     tool.query && `Query: ${short(tool.query, 240)}`,
@@ -795,7 +801,7 @@ function renderAuditDiagnosis(summary, audit) {
     : "Model pending";
   const queriedSources = summary.tools
     .filter((tool) => tool.name === "memory_query_source" && tool.source)
-    .map((tool) => tool.source.displayName || tool.source.handle || tool.source.bankId)
+    .map((tool) => sourceLabel(tool.source))
     .filter(Boolean);
   const routeText = [
     routeLabel(summary.memory.route),
@@ -930,7 +936,10 @@ function auditDescription(event) {
   }
   if (event.type === "memory.http.response") {
     const response = data.response || {};
-    return `${data.operation || "memory"} · HTTP ${response.status ?? "?"} · ${response.durationMs ?? "?"} ms · ${response.bodyBytes ?? "?"} bytes`;
+    const outcome = response.usable === false
+      ? ` · unusable (${(response.failureReason || "invalid response").replaceAll("_", " ")})`
+      : "";
+    return `${data.operation || "memory"} · HTTP ${response.status ?? "?"}${outcome} · ${response.durationMs ?? "?"} ms · ${response.bodyBytes ?? "?"} bytes`;
   }
   if (event.type === "memory.http.error") return `${data.operation || "memory"} · ${data.error?.message || "request failed"}`;
   if (event.type === "memory.directory.policy") {

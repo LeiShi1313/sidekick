@@ -700,6 +700,11 @@ test("records a correlated run audit with memory, model, and tool details", asyn
       (event) => event.type === "memory.http.request",
     );
     assert.equal(memoryRequest.data.request.body.budget, "mid");
+    const memoryContext = audit.events.find(
+      (event) => event.type === "memory.context",
+    );
+    assert.equal(memoryContext.data.recall.status, "completed");
+    assert.equal(audit.summary.memory.initialRecall.status, "completed");
     const modelInput = audit.events.find((event) => event.type === "model.input");
     assert.match(modelInput.data.prompt, /Alice owns deployment/);
     assert.equal(modelInput.data.model.id, "test-model");
