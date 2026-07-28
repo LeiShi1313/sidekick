@@ -24,6 +24,7 @@ from sidekick.chat.commands import (
     AICancelCommand,
     AIModelCommand,
     AccessCommand,
+    ChatAccessCommand,
     InvalidCommand,
     MemoryBackfillCommand,
     MemoryModeCommand,
@@ -54,6 +55,11 @@ from sidekick.chat.transport import ChatPresentation
         ("/ai_model two models", InvalidCommand(name="/ai_model")),
         ("/ai_allow", AccessCommand(allowed=True)),
         ("/ai_deny", AccessCommand(allowed=False)),
+        ("/ai_access open", ChatAccessCommand(action="open")),
+        ("/ai_access restricted", ChatAccessCommand(action="restricted")),
+        ("/ai_access status", ChatAccessCommand(action="status")),
+        ("/ai_access", InvalidCommand(name="/ai_access")),
+        ("/ai_access everyone", InvalidCommand(name="/ai_access")),
         (
             "/ai_memory remember this",
             MemoryRememberCommand(instruction="remember this"),
@@ -143,6 +149,31 @@ async def test_chat_model_override_can_be_replaced_reset_and_reloaded(tmp_path):
 
         await restarted.set_model_override(scope_id, None)
         assert await restarted.get_model_override(scope_id) is None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_access_mode_is_restricted_by_default_and_persists(tmp_path):
+    path = tmp_path / "ai.db"
+    telegram_scope = "telegram:chat:-1001"
+    qq_scope = "qq:group:1001"
+    store = await AIStateRepository(path).connect()
+    try:
+        assert await store.is_chat_access_open(telegram_scope) is False
+
+        await store.set_chat_access_open(telegram_scope, True)
+        assert await store.is_chat_access_open(telegram_scope) is True
+        assert await store.is_chat_access_open(qq_scope) is False
+    finally:
+        await store.close()
+
+    restarted = await AIStateRepository(path).connect()
+    try:
+        assert await restarted.is_chat_access_open(telegram_scope) is True
+
+        await restarted.set_chat_access_open(telegram_scope, False)
+        assert await restarted.is_chat_access_open(telegram_scope) is False
     finally:
         await restarted.close()
 

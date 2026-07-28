@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
 import pytest
 from telethon.errors import FloodWaitError
@@ -160,6 +161,13 @@ def make_telegram_responder(
         ),
         **kwargs,
     )
+
+
+def test_telegram_transport_distinguishes_group_messages():
+    transport = TelegramChatTransport()
+
+    assert transport.is_group(SimpleNamespace(is_group=True)) is True
+    assert transport.is_group(SimpleNamespace(is_group=False)) is False
 
 
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:

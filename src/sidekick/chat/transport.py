@@ -35,6 +35,8 @@ class ChatTransport(Protocol):
 
     def is_outgoing(self, message: Any) -> bool: ...
 
+    def is_group(self, message: Any) -> bool: ...
+
 
 class ObjectChatTransport:
     """Adapter for SDK message objects exposing reply/edit/delete methods."""
@@ -79,3 +81,9 @@ class ObjectChatTransport:
         if outgoing is None:
             outgoing = getattr(message, "out", False)
         return bool(outgoing)
+
+    def is_group(self, message: Any) -> bool:
+        group = getattr(message, "is_group", None)
+        if group is not None:
+            return bool(group)
+        return getattr(message, "message_type", None) == "group"

@@ -41,6 +41,11 @@ class AccessCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatAccessCommand:
+    action: Literal["open", "restricted", "status"]
+
+
+@dataclass(frozen=True, slots=True)
 class DirectoryPublishCommand:
     arguments: str
 
@@ -113,6 +118,7 @@ ChatCommand: TypeAlias = (
     | AICancelCommand
     | AIModelCommand
     | AccessCommand
+    | ChatAccessCommand
     | DirectoryPublishCommand
     | BankGrantCommand
     | MemoryRememberCommand
@@ -137,6 +143,10 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     if model is not None:
         return model
 
+    chat_access = _parse_chat_access_control(text.strip())
+    if chat_access is not None:
+        return chat_access
+
     ai = _parse_ai(text)
     if ai is not None:
         return ai
@@ -157,6 +167,17 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     if memory is not None:
         return memory
     return None
+
+
+def _parse_chat_access_control(
+    text: str,
+) -> ChatAccessCommand | InvalidCommand | None:
+    parts = text.split()
+    if not parts or parts[0] != "/ai_access":
+        return None
+    if len(parts) != 2 or parts[1] not in {"open", "restricted", "status"}:
+        return InvalidCommand(name="/ai_access")
+    return ChatAccessCommand(action=parts[1])
 
 
 def _parse_model_control(text: str) -> AIModelCommand | InvalidCommand | None:
