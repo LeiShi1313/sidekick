@@ -16,13 +16,14 @@ class TelegramHistorySource:
         self,
         trigger: ReplyTarget,
         *,
+        before: ReplyTarget,
         limit: int,
     ) -> tuple[ReplyTarget, ...]:
-        if trigger.chat_id is None:
+        if trigger.chat_id is None or before.chat_id != trigger.chat_id:
             return ()
         kwargs: dict[str, Any] = {
             "limit": limit,
-            "max_id": trigger.id,
+            "max_id": before.id,
         }
         reply_header = getattr(trigger, "reply_to", None)
         if bool(getattr(reply_header, "forum_topic", False)):

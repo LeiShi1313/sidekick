@@ -102,8 +102,8 @@ class FakeHistorySource:
         self.messages = tuple(messages)
         self.calls = []
 
-    async def fetch_recent(self, trigger, *, limit):
-        self.calls.append((trigger.id, limit))
+    async def fetch_recent(self, trigger, *, before, limit):
+        self.calls.append((before.id, limit))
         return self.messages[-limit:]
 
 
@@ -254,6 +254,61 @@ async def test_numbered_trigger_uses_recent_chat_context_in_a_new_session():
 
 
 @pytest.mark.asyncio
+async def test_numbered_reply_uses_history_window_ending_at_replied_message():
+    start = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
+    first = FakeMessage("First anchored message", sender_id=20, date=start)
+    second = FakeMessage(
+        "Second anchored message",
+        sender_id=30,
+        date=start + timedelta(minutes=1),
+    )
+    anchor = FakeMessage(
+        "Replied-to anchor",
+        sender_id=40,
+        date=start + timedelta(minutes=2),
+    )
+    intervening = FakeMessage(
+        "Message after the anchor",
+        sender_id=50,
+        date=start + timedelta(minutes=3),
+    )
+    trigger = FakeMessage(
+        "/ai3 summarize from there",
+        reply_to=anchor,
+        date=start + timedelta(minutes=4),
+    )
+
+    class TimelineHistorySource:
+        def __init__(self):
+            self.messages = (first, second, anchor, intervening, trigger)
+            self.calls = []
+
+        async def fetch_recent(self, message, *, before, limit):
+            self.calls.append((before.id, limit))
+            index = next(
+                index
+                for index, candidate in enumerate(self.messages)
+                if candidate.id == before.id
+            )
+            return self.messages[max(0, index - limit) : index]
+
+    history = TimelineHistorySource()
+    gateway = FakeGateway(["Summary"])
+    handler, _ = make_handler(gateway, history_source=history)
+
+    assert await handler.handle(trigger) is True
+
+    assert history.calls == [(anchor.id, 2)]
+    context = gateway.requests[0].context[0].text
+    assert "First anchored message" in context
+    assert "Second anchored message" in context
+    assert "Replied-to anchor" in context
+    assert "Message after the anchor" not in context
+    assert context.count("context=recent") == 2
+    assert "context=reply_path,recent" in context
+
+
+@pytest.mark.asyncio
 async def test_numbered_trigger_unifies_reply_path_and_recent_context():
     start = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
     root = FakeMessage("Original proposal", sender_id=20, date=start)
@@ -263,30 +318,37 @@ async def test_numbered_trigger_unifies_reply_path_and_recent_context():
         reply_to=root,
         date=start + timedelta(minutes=1),
     )
-    ambient = FakeMessage(
-        "Related ambient update",
-        sender_id=40,
-        date=start + timedelta(minutes=2),
-    )
     trigger = FakeMessage(
         "/ai2 compare these",
         reply_to=branch,
         date=start + timedelta(minutes=3),
     )
-    history = FakeHistorySource((branch, ambient))
+    history = FakeHistorySource((root,))
     gateway = FakeGateway(["Comparison"])
     handler, _ = make_handler(gateway, history_source=history)
 
     assert await handler.handle(trigger) is True
 
+    assert history.calls == [(branch.id, 1)]
     context = gateway.requests[0].context[0].text
     assert context.count("Reply on the proposal") == 1
     assert "context=reply_path,recent" in context
     assert "Current request replies to [m2]" in context
     assert context.index("Original proposal") < context.index("Reply on the proposal")
-    assert context.index("Reply on the proposal") < context.index(
-        "Related ambient update"
-    )
+
+
+@pytest.mark.asyncio
+async def test_numbered_reply_with_one_message_needs_no_history_lookup():
+    anchor = FakeMessage("Only the replied-to message", sender_id=20)
+    trigger = FakeMessage("/ai1 summarize this", reply_to=anchor)
+    gateway = FakeGateway(["Summary"])
+    handler, _ = make_handler(gateway)
+
+    assert await handler.handle(trigger) is True
+
+    context = gateway.requests[0].context[0].text
+    assert "Only the replied-to message" in context
+    assert "Current request replies to [m1]" in context
 
 
 @pytest.mark.asyncio
@@ -299,7 +361,7 @@ async def test_numbered_trigger_rejoins_nearest_ai_session():
     first_answer = trigger.replies[0]
     branch = FakeMessage("A later human comment", sender_id=20, reply_to=first_answer)
     rejoin = FakeMessage("/ai3 relate recent chat", reply_to=branch)
-    history.messages = (branch,)
+    history.messages = (trigger, first_answer)
 
     assert await handler.handle(rejoin) is True
 
@@ -309,6 +371,7 @@ async def test_numbered_trigger_rejoins_nearest_ai_session():
     request = gateway.requests[1]
     assert request.session_id == root_marker.agent_session_id
     assert request.parent_entry_id == root_marker.agent_entry_id
+    assert history.calls == [(branch.id, 2)]
     assert "A later human comment" in request.context[0].text
     assert "role=assistant" in request.context[0].text
 
@@ -332,7 +395,7 @@ async def test_numbered_trigger_rejects_recent_count_above_configured_limit():
 @pytest.mark.asyncio
 async def test_numbered_trigger_reports_unavailable_recent_history():
     class FailingHistorySource:
-        async def fetch_recent(self, trigger, *, limit):
+        async def fetch_recent(self, trigger, *, before, limit):
             raise ConnectionError("Telegram unavailable")
 
     trigger = FakeMessage("/ai2 summarize")

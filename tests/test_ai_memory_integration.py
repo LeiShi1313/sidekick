@@ -774,7 +774,7 @@ async def test_recent_chat_participants_become_memory_identity_anchors():
     recent = FakeMessage("Alice prefers local models", sender_id=20)
 
     class HistorySource:
-        async def fetch_recent(self, trigger, *, limit):
+        async def fetch_recent(self, trigger, *, before, limit):
             assert limit == 1
             return (recent,)
 
@@ -841,7 +841,7 @@ async def test_recent_only_context_is_not_automatically_retained():
     recent = FakeMessage("Alice prefers local models", sender_id=20)
 
     class HistorySource:
-        async def fetch_recent(self, trigger, *, limit):
+        async def fetch_recent(self, trigger, *, before, limit):
             return (recent,)
 
     store = FakeStore()
