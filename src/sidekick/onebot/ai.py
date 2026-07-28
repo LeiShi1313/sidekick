@@ -253,33 +253,34 @@ class OneBotHistorySource:
         self,
         trigger: ReplyTarget,
         *,
+        before: ReplyTarget,
         limit: int,
     ) -> tuple[OneBotMessage, ...]:
-        if trigger.chat_id is None:
+        if trigger.chat_id is None or before.chat_id != trigger.chat_id:
             return ()
         messages = await self._history(
             trigger.chat_id,
             count=limit + 1,
-            message_seq=trigger.id,
+            message_seq=before.id,
             reverse_order=True,
             scope_display_name=getattr(trigger, "scope_display_name", None),
         )
-        trigger_index = next(
+        anchor_index = next(
             (
                 index
                 for index, message in enumerate(messages)
-                if message.id == trigger.id
+                if message.id == before.id
             ),
             None,
         )
-        if trigger_index is not None:
-            candidates = messages[:trigger_index]
+        if anchor_index is not None:
+            candidates = messages[:anchor_index]
         else:
-            occurred_at = _message_time(trigger)
+            occurred_at = _message_time(before)
             candidates = tuple(
                 message
                 for message in messages
-                if message.id != trigger.id and message.date <= occurred_at
+                if message.id != before.id and message.date <= occurred_at
             )
         return candidates[-limit:]
 

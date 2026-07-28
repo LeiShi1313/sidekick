@@ -408,6 +408,7 @@ class MessageHistorySource(Protocol):
         self,
         trigger: ReplyTarget,
         *,
+        before: ReplyTarget,
         limit: int,
     ) -> tuple[ReplyTarget, ...]: ...
 
@@ -964,29 +965,49 @@ class PromptBuilder:
         *,
         recent_messages: int | None = None,
     ) -> ChatContext:
-        reply_path = await self._load_reply_path(
-            await self._transport.get_reply(trigger)
-        )
+        reply_target = await self._transport.get_reply(trigger)
+        reply_path = await self._load_reply_path(reply_target)
         recent: tuple[ReplyTarget, ...] = ()
         if recent_messages is not None:
             if not 1 <= recent_messages <= self.max_context_messages:
                 raise ValueError("Recent context count is outside configured limits")
-            if self.history_source is None:
-                raise ChatContextUnavailable("Recent chat history is unavailable")
-            try:
-                supplied = await self.history_source.fetch_recent(
-                    trigger,
-                    limit=recent_messages,
-                )
-            except Exception as exc:
-                raise ChatContextUnavailable(
-                    "Recent chat history is unavailable"
-                ) from exc
+            history_anchor = (
+                reply_target if reply_target is not None else trigger
+            )
+            history_limit = (
+                recent_messages - 1
+                if reply_target is not None
+                else recent_messages
+            )
+            supplied: tuple[ReplyTarget, ...] = ()
+            if history_limit:
+                if self.history_source is None:
+                    raise ChatContextUnavailable("Recent chat history is unavailable")
+                try:
+                    supplied = await self.history_source.fetch_recent(
+                        trigger,
+                        before=history_anchor,
+                        limit=history_limit,
+                    )
+                except Exception as exc:
+                    raise ChatContextUnavailable(
+                        "Recent chat history is unavailable"
+                    ) from exc
+            bounded_history = supplied[-history_limit:] if history_limit else ()
             recent = tuple(
                 message
-                for message in supplied[-recent_messages:]
-                if message.chat_id == trigger.chat_id and message.id != trigger.id
+                for message in bounded_history
+                if message.chat_id == trigger.chat_id
+                and message.id not in {trigger.id, history_anchor.id}
             )
+            if reply_target is not None:
+                recent = (*recent, reply_target)
+                recent_keys = {(message.chat_id, message.id) for message in recent}
+                reply_path = tuple(
+                    message
+                    for message in reply_path
+                    if (message.chat_id, message.id) in recent_keys
+                )
         return await self._build_chat_context(
             reply_path,
             recent,

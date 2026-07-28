@@ -392,7 +392,7 @@ async def test_private_reply_lookup_supplies_conversation_peer_to_get_msg():
 
 
 @pytest.mark.asyncio
-async def test_onebot_history_uses_transport_order_not_random_message_id_order():
+async def test_onebot_history_uses_transport_order_and_explicit_anchor():
     action_client = RecordingActionClient(
         responses=[
             {
@@ -406,8 +406,8 @@ async def test_onebot_history_uses_transport_order_not_random_message_id_order()
                         text="newer",
                     ),
                     group_event(
-                        message_id=100,
-                        text="/ai2 summarize",
+                        message_id=90,
+                        text="Replied-to anchor",
                     ),
                 ]
             }
@@ -417,9 +417,14 @@ async def test_onebot_history_uses_transport_order_not_random_message_id_order()
         group_event(message_id=100, text="/ai2 summarize"),
         action_client=action_client,
     )
+    anchor = OneBotMessage.from_payload(
+        group_event(message_id=90, text="Replied-to anchor"),
+        action_client=action_client,
+    )
 
     messages = await OneBotHistorySource(action_client).fetch_recent(
         trigger,
+        before=anchor,
         limit=2,
     )
 
@@ -427,7 +432,7 @@ async def test_onebot_history_uses_transport_order_not_random_message_id_order()
     action, params, _ = action_client.calls[0]
     assert action == "get_group_msg_history"
     assert params["group_id"] == "700"
-    assert params["message_seq"] == "100"
+    assert params["message_seq"] == "90"
     assert params["reverse_order"] is True
 
 

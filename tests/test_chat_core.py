@@ -375,7 +375,7 @@ async def test_attachment_detection_does_not_require_telegram_file_attributes():
 @pytest.mark.asyncio
 async def test_recent_history_does_not_assume_transport_message_ids_are_ordered():
     class History:
-        async def fetch_recent(self, trigger, *, limit):
+        async def fetch_recent(self, trigger, *, before, limit):
             messages = (
                 MinimalMessage(
                     "first",

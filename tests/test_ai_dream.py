@@ -188,6 +188,7 @@ class FakeSource:
 async def test_telegram_history_source_fetches_recent_messages_from_current_topic():
     older = FakeMessage(41, "Older topic message")
     newer = FakeMessage(42, "Newer topic message")
+    anchor = FakeMessage(45, "Replied-to topic message")
 
     class Client:
         def __init__(self):
@@ -210,11 +211,15 @@ async def test_telegram_history_source_fetches_recent_messages_from_current_topi
         },
     )()
 
-    messages = await TelegramHistorySource(client).fetch_recent(trigger, limit=2)
+    messages = await TelegramHistorySource(client).fetch_recent(
+        trigger,
+        before=anchor,
+        limit=2,
+    )
 
     assert messages == (older, newer)
     assert client.calls == [
-        (-1001, {"limit": 2, "max_id": 50, "reply_to": 12})
+        (-1001, {"limit": 2, "max_id": 45, "reply_to": 12})
     ]
 
 
@@ -234,7 +239,11 @@ async def test_telegram_history_source_uses_whole_chat_outside_forum_topics():
     trigger = FakeMessage(50, "/ai1 summarize", reply_to=FakeMessage(48, "branch"))
     trigger.reply_to = type("ReplyHeader", (), {"forum_topic": False})()
 
-    messages = await TelegramHistorySource(client).fetch_recent(trigger, limit=1)
+    messages = await TelegramHistorySource(client).fetch_recent(
+        trigger,
+        before=trigger,
+        limit=1,
+    )
 
     assert messages == (message,)
     assert client.calls == [(-1001, {"limit": 1, "max_id": 50})]
