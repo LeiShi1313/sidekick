@@ -218,6 +218,9 @@ class TelegramChatTransport:
     def is_outgoing(self, message: Any) -> bool:
         return bool(getattr(message, "out", False))
 
+    def is_group(self, message: Any) -> bool:
+        return bool(getattr(message, "is_group", False))
+
     async def _offer_agent_update(
         self,
         state: _TelegramUpdateState,

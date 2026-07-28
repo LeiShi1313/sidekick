@@ -105,6 +105,22 @@ def test_qq_identity_codec_separates_group_and_private_scopes():
     assert QQ_IDENTITY_CODEC.message_source_id(-42, 9) == "qq:message:private:42:9"
 
 
+def test_onebot_transport_distinguishes_group_messages():
+    transport = OneBotChatTransport(RecordingActionClient())
+
+    group = OneBotMessage.from_payload(
+        group_event(),
+        action_client=RecordingActionClient(),
+    )
+    private = OneBotMessage.from_payload(
+        private_event(),
+        action_client=RecordingActionClient(),
+    )
+
+    assert transport.is_group(group) is True
+    assert transport.is_group(private) is False
+
+
 @pytest.mark.asyncio
 async def test_qq_directory_resolves_current_and_numeric_groups():
     client = RecordingActionClient(

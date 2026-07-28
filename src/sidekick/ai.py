@@ -37,6 +37,7 @@ from sidekick.chat.commands import (
     AIModelCommand,
     AccessCommand,
     BankGrantCommand,
+    ChatAccessCommand,
     DirectoryPublishCommand,
     InvalidCommand,
     MemoryBackfillCommand,
@@ -435,6 +436,10 @@ class ConversationStore(Protocol):
     async def allow_user(self, actor_id: str) -> None: ...
 
     async def deny_user(self, actor_id: str) -> None: ...
+
+    async def is_chat_access_open(self, scope_id: str) -> bool: ...
+
+    async def set_chat_access_open(self, scope_id: str, enabled: bool) -> None: ...
 
     async def grant_bank(self, actor_id: str, bank_id: str) -> bool: ...
 
@@ -1375,6 +1380,14 @@ class AIStateRepository:
             )
             """
         )
+        await self._require_connection().execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_chat_access (
+                scope_id TEXT PRIMARY KEY,
+                opened_at REAL NOT NULL
+            )
+            """
+        )
         await self._ensure_excluded_messages_schema()
 
     async def _ensure_ai_answers_schema(self) -> None:
@@ -1729,6 +1742,32 @@ class AIStateRepository:
             "DELETE FROM ai_bank_grants WHERE actor_id = ?",
             (actor_id,),
         )
+        await connection.commit()
+
+    async def is_chat_access_open(self, scope_id: str) -> bool:
+        if not is_canonical_bank_id(scope_id):
+            raise ValueError("Chat access requires a canonical chat identity")
+        cursor = await self._require_connection().execute(
+            "SELECT 1 FROM ai_chat_access WHERE scope_id = ?",
+            (scope_id,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def set_chat_access_open(self, scope_id: str, enabled: bool) -> None:
+        if not is_canonical_bank_id(scope_id):
+            raise ValueError("Chat access requires a canonical chat identity")
+        connection = self._require_connection()
+        if enabled:
+            await connection.execute(
+                "INSERT INTO ai_chat_access (scope_id, opened_at) VALUES (?, ?) "
+                "ON CONFLICT(scope_id) DO UPDATE SET opened_at = excluded.opened_at",
+                (scope_id, time.time()),
+            )
+        else:
+            await connection.execute(
+                "DELETE FROM ai_chat_access WHERE scope_id = ?",
+                (scope_id,),
+            )
         await connection.commit()
 
     async def grant_bank(self, actor_id: str, bank_id: str) -> bool:
@@ -2685,6 +2724,12 @@ class AIConversationHandler:
                     "Usage: /ai_model [model-id|default]",
                     kind="ai-control",
                 )
+            elif command.name == "/ai_access":
+                await self._reply_memory_excluded(
+                    message,
+                    "Usage: /ai_access open|restricted|status",
+                    kind="ai-control",
+                )
             elif command.name == "/ai_memory_backfill":
                 await self._reply_memory_excluded(
                     message,
@@ -2727,6 +2772,14 @@ class AIConversationHandler:
             if not is_owner_control:
                 return False
             return await self._handle_access_command(message, command)
+        if isinstance(command, ChatAccessCommand):
+            if not is_owner_control:
+                return False
+            return await self._handle_chat_access_command(
+                message,
+                scope_id,
+                command,
+            )
         if isinstance(command, DirectoryPublishCommand):
             if not is_owner_control:
                 return False
@@ -2737,7 +2790,12 @@ class AIConversationHandler:
             return await self._handle_bank_grant(message, command)
 
         if isinstance(command, AICancelCommand):
-            if not is_owner and not await self._store.is_allowed(actor_id):
+            if not await self._has_ai_access(
+                message,
+                scope_id=scope_id,
+                actor_id=actor_id,
+                is_owner=is_owner,
+            ):
                 return False
             return await self._handle_cancel(message, actor_id)
 
@@ -2747,7 +2805,12 @@ class AIConversationHandler:
         if ai_trigger is None and message.reply_to_msg_id is None:
             return False
 
-        if not is_owner and not await self._store.is_allowed(actor_id):
+        if not await self._has_ai_access(
+            message,
+            scope_id=scope_id,
+            actor_id=actor_id,
+            is_owner=is_owner,
+        ):
             return False
         if (
             ai_trigger is not None
@@ -3129,6 +3192,52 @@ class AIConversationHandler:
         await self._reply_memory_excluded(message, response, kind="ai-control")
         await self._delete_command_message(message, command.name)
         return True
+
+    async def _handle_chat_access_command(
+        self,
+        message: ReplyTarget,
+        scope_id: str,
+        command: ChatAccessCommand,
+    ) -> bool:
+        if not self._transport.is_group(message):
+            await self._reply_memory_excluded(
+                message,
+                "Group AI access can only be changed in a group chat.",
+                kind="ai-control",
+            )
+            return True
+        if command.action == "status":
+            enabled = await self._store.is_chat_access_open(scope_id)
+            response = (
+                "AI access for this group is open."
+                if enabled
+                else "AI access for this group is restricted."
+            )
+        else:
+            enabled = command.action == "open"
+            await self._store.set_chat_access_open(scope_id, enabled)
+            response = (
+                "AI access opened for this group."
+                if enabled
+                else "AI access restricted to the owner and individually allowed users."
+            )
+        await self._reply_memory_excluded(message, response, kind="ai-control")
+        await self._delete_command_message(message, "/ai_access")
+        return True
+
+    async def _has_ai_access(
+        self,
+        message: ReplyTarget,
+        *,
+        scope_id: str,
+        actor_id: str,
+        is_owner: bool,
+    ) -> bool:
+        if is_owner or await self._store.is_allowed(actor_id):
+            return True
+        if not self._transport.is_group(message):
+            return False
+        return await self._store.is_chat_access_open(scope_id)
 
     async def _handle_directory_publish(
         self,

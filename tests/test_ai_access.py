@@ -48,12 +48,14 @@ class FakeMessage:
         sender_id: int,
         reply_to=None,
         chat_id: int = -1001,
+        is_group: bool = True,
     ):
         self.id = self.__class__.next_id
         self.__class__.next_id += 1
         self.raw_text = text
         self.sender_id = sender_id
         self.chat_id = chat_id
+        self.is_group = is_group
         self.reply_to_msg_id = reply_to.id if reply_to else None
         self.date = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
         self._reply_to = reply_to
@@ -208,6 +210,97 @@ async def test_owner_can_allow_user_who_can_start_continue_and_fork(tmp_path):
         assert len(gateway.requests) == 3
         assert gateway.requests[2].prompt == "fork"
         assert gateway.requests[2].parent_entry_id == "entry-1"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_can_open_and_restrict_ai_access_for_one_group(tmp_path):
+    gateway = FakeGateway(["group answer", "continued answer", "whitelisted answer"])
+    handler, store = await make_handler(tmp_path / "state.db", gateway, cooldown=0)
+    try:
+        open_command = FakeMessage("/ai_access open", sender_id=10)
+        assert await handler.handle(open_command) is True
+        assert open_command.replies[0].text == "AI access opened for this group."
+        assert open_command.deleted is True
+        assert await store.is_chat_access_open("telegram:chat:-1001") is True
+
+        group_request = FakeMessage("/ai group question", sender_id=20)
+        assert await handler.handle(group_request) is True
+        assert gateway.requests[0].tool_policy == "delegated"
+
+        continuation = FakeMessage(
+            "continue",
+            sender_id=20,
+            reply_to=group_request.replies[0],
+        )
+        assert await handler.handle(continuation) is True
+        assert gateway.requests[1].session_id == "session-1"
+        assert gateway.requests[1].parent_entry_id == "entry-1"
+
+        other_group_request = FakeMessage(
+            "/ai other group question",
+            sender_id=20,
+            chat_id=-1002,
+        )
+        assert await handler.handle(other_group_request) is False
+        assert other_group_request.replies == []
+
+        status = FakeMessage("/ai_access status", sender_id=10)
+        assert await handler.handle(status) is True
+        assert status.replies[0].text == "AI access for this group is open."
+
+        restricted = FakeMessage("/ai_access restricted", sender_id=10)
+        assert await handler.handle(restricted) is True
+        assert restricted.replies[0].text == (
+            "AI access restricted to the owner and individually allowed users."
+        )
+        assert await store.is_chat_access_open("telegram:chat:-1001") is False
+
+        denied = FakeMessage("/ai denied again", sender_id=20)
+        assert await handler.handle(denied) is False
+
+        await store.allow_user(actor_id(30))
+        whitelisted = FakeMessage("/ai still allowed", sender_id=30)
+        assert await handler.handle(whitelisted) is True
+        assert gateway.requests[2].tool_policy == "delegated"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_access_cannot_open_private_chats_or_be_changed_by_members(tmp_path):
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        FakeGateway(["must not be called"]),
+        cooldown=0,
+    )
+    try:
+        private_command = FakeMessage(
+            "/ai_access open",
+            sender_id=10,
+            chat_id=20,
+            is_group=False,
+        )
+        assert await handler.handle(private_command) is True
+        assert private_command.replies[0].text == (
+            "Group AI access can only be changed in a group chat."
+        )
+        assert await store.is_chat_access_open("telegram:chat:20") is False
+
+        await store.set_chat_access_open("telegram:chat:20", True)
+        private_request = FakeMessage(
+            "/ai private",
+            sender_id=20,
+            chat_id=20,
+            is_group=False,
+        )
+        assert await handler.handle(private_request) is False
+
+        member_command = FakeMessage("/ai_access restricted", sender_id=20)
+        assert await handler.handle(member_command) is False
+        assert member_command.replies == []
+        assert await store.is_chat_access_open("telegram:chat:-1001") is False
     finally:
         await store.close()
 

@@ -202,6 +202,9 @@ class OneBotChatTransport:
     def is_outgoing(self, message: Any) -> bool:
         return bool(getattr(message, "is_outgoing", getattr(message, "out", False)))
 
+    def is_group(self, message: Any) -> bool:
+        return getattr(message, "message_type", None) == "group"
+
     @staticmethod
     def _render(text: str, presentation: ChatPresentation) -> str:
         if presentation == "agent":
