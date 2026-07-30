@@ -72,6 +72,19 @@ A recalled or redacted WeChat message is excluded from later local reads and
 backfills, but recall cannot erase a copy that was already retained in
 Hindsight; that memory must be revised or removed through the memory service.
 
+The root Compose stack declares `wechat-host-ai` and `wechat-peer-ai`. Each
+worker joins only its matching bridge network, uses its own WeChat projection
+and AI state databases, and shares the existing Pi agent and Hindsight services.
+Start or update both workers without recreating the Telegram or OneBot adapters:
+
+```bash
+docker compose up -d --build wechat-host-ai wechat-peer-ai
+```
+
+The Compose healthcheck applies the same live capability gates as the adapter.
+Optional connector bearer tokens are configured independently with
+`SIDEKICK_WECHAT_HOST_TOKEN` and `SIDEKICK_WECHAT_PEER_TOKEN`.
+
 ## Containers
 
 The stack is deliberately split by ownership so each layer can run on its own:
