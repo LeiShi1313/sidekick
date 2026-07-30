@@ -112,6 +112,20 @@ def test_identity_codec_keeps_network_identities_disjoint():
     assert qq.parse_scope_id("telegram:chat:7") is None
 
 
+def test_identity_codec_round_trips_message_source_components():
+    codec = NamespacedIdentityCodec(
+        source="example",
+        actor_kind="user",
+        scope_kind="chat",
+    )
+    source_id = codec.message_source_id("room:one", "message:two")
+
+    assert codec.parse_message_source_id(source_id) == (
+        "room:one",
+        "message:two",
+    )
+
+
 def test_attachment_reference_contains_metadata_but_no_binary_payload():
     reference = AttachmentReference(
         key="onebot11:self-1:message-2:image-0",
@@ -631,9 +645,7 @@ async def test_state_repository_preserves_opaque_memory_cursors(tmp_path):
         }
         dream_types = {
             row[1]: row[2]
-            for row in connection.execute(
-                "PRAGMA table_info(ai_memory_dream_state)"
-            )
+            for row in connection.execute("PRAGMA table_info(ai_memory_dream_state)")
         }
 
     assert scope_types["continuous_cursor_message_id"] == "BLOB"
@@ -702,7 +714,9 @@ async def test_state_repository_migrates_integer_memory_cursors(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_state_repository_migrates_namespaced_integer_message_id_columns(tmp_path):
+async def test_state_repository_migrates_namespaced_integer_message_id_columns(
+    tmp_path,
+):
     path = tmp_path / "ai.db"
     with sqlite3.connect(path) as connection:
         connection.executescript(

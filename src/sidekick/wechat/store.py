@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import time
 
@@ -54,6 +55,7 @@ class WeChatStateRepository:
             );
             CREATE TABLE IF NOT EXISTS wechat_messages (
                 local_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_order INTEGER NOT NULL,
                 connector_key TEXT NOT NULL,
                 account_id TEXT NOT NULL,
                 chat_id TEXT NOT NULL,
@@ -84,6 +86,48 @@ class WeChatStateRepository:
                 processed_at REAL NOT NULL,
                 PRIMARY KEY (connector_key, account_id, chat_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS wechat_projection_counters (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                last_memory_order INTEGER NOT NULL,
+                PRIMARY KEY (connector_key, account_id)
+            );
+            """
+        )
+        message_columns = {
+            str(row["name"])
+            async for row in await connection.execute(
+                "PRAGMA table_info(wechat_messages)"
+            )
+        }
+        if "memory_order" not in message_columns:
+            await connection.execute(
+                "ALTER TABLE wechat_messages ADD COLUMN memory_order INTEGER"
+            )
+            await connection.execute(
+                "UPDATE wechat_messages SET memory_order = local_order"
+            )
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS wechat_messages_by_memory_order
+            ON wechat_messages (
+                connector_key, account_id, memory_order
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO wechat_projection_counters (
+                connector_key, account_id, last_memory_order
+            )
+            SELECT connector_key, account_id, MAX(memory_order)
+            FROM wechat_messages
+            GROUP BY connector_key, account_id
+            ON CONFLICT(connector_key, account_id) DO UPDATE SET
+                last_memory_order = MAX(
+                    wechat_projection_counters.last_memory_order,
+                    excluded.last_memory_order
+                )
             """
         )
         await connection.commit()
@@ -106,8 +150,7 @@ class WeChatStateRepository:
     ) -> None:
         connection = self._require_connection()
         cursor = await connection.execute(
-            "SELECT account_id, cursor FROM wechat_connectors "
-            "WHERE connector_key = ?",
+            "SELECT account_id, cursor FROM wechat_connectors WHERE connector_key = ?",
             (connector_key,),
         )
         existing = await cursor.fetchone()
@@ -222,14 +265,25 @@ class WeChatStateRepository:
                 raise WeChatAPIContractError("Malformed WeChat message removal")
             chat_id = _event_id(payload.get("chatId"), "chatId")
             message_id = _event_id(payload.get("id"), "id")
+            memory_order = await self._next_memory_order(
+                connector_key,
+                account_id,
+            )
             await connection.execute(
                 """
                 UPDATE wechat_messages
-                SET removed = 1, last_event_cursor = ?, updated_at = ?
+                SET memory_order = CASE
+                        WHEN removed = 0 THEN ?
+                        ELSE memory_order
+                    END,
+                    removed = 1,
+                    last_event_cursor = ?,
+                    updated_at = ?
                 WHERE connector_key = ? AND account_id = ?
                   AND chat_id = ? AND message_id = ?
                 """,
                 (
+                    memory_order,
                     event.cursor,
                     time.time(),
                     connector_key,
@@ -253,7 +307,9 @@ class WeChatStateRepository:
         try:
             if processed_message is not None:
                 if processed_message.connector_key != connector_key:
-                    raise ValueError("Processed WeChat message belongs to another connector")
+                    raise ValueError(
+                        "Processed WeChat message belongs to another connector"
+                    )
                 await connection.execute(
                     """
                     INSERT OR IGNORE INTO wechat_processed_messages (
@@ -374,6 +430,65 @@ class WeChatStateRepository:
         rows = await cursor.fetchall()
         return tuple(WeChatMessage.from_row(row) for row in reversed(rows))
 
+    async def fetch_memory_window(
+        self,
+        connector_key: str,
+        chat_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+    ) -> tuple[WeChatMessage, ...]:
+        if limit < 1:
+            return ()
+        if limit > 5_001:
+            raise ValueError("WeChat memory window exceeds the supported bound")
+        cursor = await self._require_connection().execute(
+            self._message_select()
+            + " AND messages.chat_id = ?"
+            + " AND messages.timestamp >= ? AND messages.timestamp <= ?"
+            + " ORDER BY messages.timestamp DESC, messages.local_order DESC"
+            + " LIMIT ?",
+            (
+                connector_key,
+                chat_id,
+                since.timestamp(),
+                until.timestamp(),
+                limit,
+            ),
+        )
+        rows = await cursor.fetchall()
+        return tuple(WeChatMessage.from_row(row) for row in reversed(rows))
+
+    async def fetch_memory_after(
+        self,
+        connector_key: str,
+        chat_id: str,
+        *,
+        after_memory_order: int,
+        until: datetime,
+        limit: int,
+    ) -> tuple[WeChatMessage, ...]:
+        if after_memory_order < 0:
+            raise ValueError("WeChat memory cursor cannot be negative")
+        if limit < 1:
+            return ()
+        if limit > 5_001:
+            raise ValueError("WeChat memory window exceeds the supported bound")
+        cursor = await self._require_connection().execute(
+            self._message_select()
+            + " AND messages.chat_id = ? AND messages.memory_order > ?"
+            + " ORDER BY messages.memory_order LIMIT ?",
+            (connector_key, chat_id, after_memory_order, limit),
+        )
+        messages: list[WeChatMessage] = []
+        async for row in cursor:
+            message = WeChatMessage.from_row(row)
+            if message.date > until:
+                break
+            messages.append(message)
+        return tuple(messages)
+
     async def count_messages(self, connector_key: str) -> int:
         cursor = await self._require_connection().execute(
             """
@@ -436,16 +551,50 @@ class WeChatStateRepository:
         cursor: str,
         now: float,
     ) -> None:
-        await self._require_connection().execute(
+        connection = self._require_connection()
+        memory_order = await self._next_memory_order(connector_key, account_id)
+        await connection.execute(
             """
             INSERT INTO wechat_messages (
-                connector_key, account_id, chat_id, message_id, direction,
-                message_type, sender_id, reply_to_message_id, content,
+                memory_order, connector_key, account_id, chat_id, message_id,
+                direction, message_type, sender_id, reply_to_message_id, content,
                 content_redacted, timestamp, source, sequence,
                 last_event_cursor, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(connector_key, account_id, chat_id, message_id)
             DO UPDATE SET
+                memory_order = CASE
+                    WHEN wechat_messages.direction IS NOT excluded.direction
+                      OR wechat_messages.message_type IS NOT excluded.message_type
+                      OR wechat_messages.sender_id IS NOT excluded.sender_id
+                      OR (
+                          excluded.reply_to_message_id IS NOT NULL
+                          AND wechat_messages.reply_to_message_id
+                              IS NOT excluded.reply_to_message_id
+                      )
+                      OR (
+                          excluded.content <> ''
+                          AND (
+                              wechat_messages.content IS NOT excluded.content
+                              OR wechat_messages.content_redacted
+                                  IS NOT excluded.content_redacted
+                          )
+                      )
+                      OR (
+                          excluded.timestamp > 0
+                          AND wechat_messages.timestamp IS NOT excluded.timestamp
+                      )
+                      OR (
+                          excluded.source IS NOT NULL
+                          AND wechat_messages.source IS NOT excluded.source
+                      )
+                      OR (
+                          excluded.sequence IS NOT NULL
+                          AND wechat_messages.sequence IS NOT excluded.sequence
+                      )
+                    THEN excluded.memory_order
+                    ELSE wechat_messages.memory_order
+                END,
                 direction = excluded.direction,
                 message_type = excluded.message_type,
                 sender_id = excluded.sender_id,
@@ -471,6 +620,7 @@ class WeChatStateRepository:
                 updated_at = excluded.updated_at
             """,
             (
+                memory_order,
                 connector_key,
                 account_id,
                 message.chat_id,
@@ -488,6 +638,27 @@ class WeChatStateRepository:
                 now,
             ),
         )
+
+    async def _next_memory_order(
+        self,
+        connector_key: str,
+        account_id: str,
+    ) -> int:
+        cursor = await self._require_connection().execute(
+            """
+            INSERT INTO wechat_projection_counters (
+                connector_key, account_id, last_memory_order
+            ) VALUES (?, ?, 1)
+            ON CONFLICT(connector_key, account_id) DO UPDATE SET
+                last_memory_order = last_memory_order + 1
+            RETURNING last_memory_order
+            """,
+            (connector_key, account_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("WeChat projection counter did not advance")
+        return int(row["last_memory_order"])
 
     async def _connector_state(self, connector_key: str) -> aiosqlite.Row:
         cursor = await self._require_connection().execute(

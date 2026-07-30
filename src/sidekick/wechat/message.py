@@ -9,6 +9,7 @@ from typing import Any
 class WeChatMessage:
     connector_key: str
     account_id: str
+    memory_cursor: int
     id: str
     chat_id: str
     raw_text: str
@@ -33,6 +34,7 @@ class WeChatMessage:
         return cls(
             connector_key=str(values["connector_key"]),
             account_id=str(values["account_id"]),
+            memory_cursor=int(values["memory_order"]),
             id=str(values["message_id"]),
             chat_id=str(values["chat_id"]),
             raw_text=str(values["content"]),
@@ -56,9 +58,7 @@ class WeChatMessage:
             ),
             source=(str(values["source"]) if values["source"] is not None else None),
             sequence=(
-                str(values["sequence"])
-                if values["sequence"] is not None
-                else None
+                str(values["sequence"]) if values["sequence"] is not None else None
             ),
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from typing import Any, Protocol
 from urllib.parse import quote, unquote
@@ -47,6 +48,22 @@ class WeChatIdentityCodec:
         message_id: ExternalId,
     ) -> str:
         return f"wechat:message:{_component(scope_id)}:{_component(message_id)}"
+
+    def parse_message_source_id(
+        self,
+        source_id: str,
+    ) -> tuple[ExternalId, ExternalId] | None:
+        prefix = "wechat:message:"
+        if not source_id.startswith(prefix):
+            return None
+        parts = source_id.removeprefix(prefix).split(":")
+        if len(parts) != 2:
+            return None
+        scope_id = _decoded_component(parts[0])
+        message_id = _decoded_component(parts[1])
+        if scope_id is None or message_id is None:
+            return None
+        return scope_id, message_id
 
     def thread_document_id(
         self,
@@ -273,6 +290,43 @@ class WeChatHistorySource:
             message_id,
         )
 
+    async def fetch_window(
+        self,
+        chat_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+    ) -> tuple[WeChatMessage, ...]:
+        return await self._store.fetch_memory_window(
+            self._connector_key,
+            chat_id,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+
+    async def fetch_after(
+        self,
+        chat_id: str,
+        *,
+        after_message_id: ExternalId,
+        until: datetime,
+        limit: int,
+    ) -> tuple[WeChatMessage, ...]:
+        if isinstance(after_message_id, bool) or not isinstance(
+            after_message_id,
+            int,
+        ):
+            raise ValueError("WeChat continuous memory cursor is invalid")
+        return await self._store.fetch_memory_after(
+            self._connector_key,
+            chat_id,
+            after_memory_order=after_message_id,
+            until=until,
+            limit=limit,
+        )
+
 
 def _component(value: ExternalId) -> str:
     if isinstance(value, bool):
@@ -281,6 +335,13 @@ def _component(value: ExternalId) -> str:
     if not normalized or normalized != normalized.strip():
         raise ValueError("WeChat IDs cannot be empty or padded")
     return quote(normalized, safe="-_.~")
+
+
+def _decoded_component(value: str) -> str | None:
+    decoded = unquote(value)
+    if not decoded or quote(decoded, safe="-_.~") != value:
+        return None
+    return decoded
 
 
 def _request_id(trigger: WeChatMessage, purpose: str) -> str:

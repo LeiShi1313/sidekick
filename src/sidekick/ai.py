@@ -345,6 +345,16 @@ class ReplyTarget(Protocol):
     date: datetime | None
 
 
+def _memory_cursor(message: ReplyTarget) -> ExternalId:
+    """Return the source cursor represented by a memory-ingestion message."""
+    cursor = getattr(message, "memory_cursor", message.id)
+    if isinstance(cursor, bool) or not isinstance(cursor, (int, str)):
+        raise ValueError("Memory message cursor must be an external ID")
+    if isinstance(cursor, str) and not cursor:
+        raise ValueError("Memory message cursor cannot be empty")
+    return cursor
+
+
 @dataclass(frozen=True, slots=True)
 class MessageIdentity:
     subject_id: str | None = None
@@ -981,13 +991,9 @@ class PromptBuilder:
         if recent_messages is not None:
             if not 1 <= recent_messages <= self.max_context_messages:
                 raise ValueError("Recent context count is outside configured limits")
-            history_anchor = (
-                reply_target if reply_target is not None else trigger
-            )
+            history_anchor = reply_target if reply_target is not None else trigger
             history_limit = (
-                recent_messages - 1
-                if reply_target is not None
-                else recent_messages
+                recent_messages - 1 if reply_target is not None else recent_messages
             )
             supplied: tuple[ReplyTarget, ...] = ()
             if history_limit:
@@ -1407,8 +1413,7 @@ class AIStateRepository:
                 "parent_answer_message_id",
             )
             if all(
-                column_types.get(column) == "BLOB"
-                for column in external_id_columns
+                column_types.get(column) == "BLOB" for column in external_id_columns
             ):
                 if "agent_session_id" not in columns:
                     await connection.execute(
@@ -1533,9 +1538,7 @@ class AIStateRepository:
 
     async def _ensure_excluded_messages_schema(self) -> None:
         connection = self._require_connection()
-        column_types = await self._table_column_types(
-            "ai_memory_excluded_messages"
-        )
+        column_types = await self._table_column_types("ai_memory_excluded_messages")
         columns = set(column_types)
         if not columns:
             await self._create_excluded_messages_table()
@@ -1671,8 +1674,7 @@ class AIStateRepository:
             return
 
         await connection.execute(
-            "ALTER TABLE ai_memory_dream_state "
-            "RENAME TO ai_memory_dream_state_legacy"
+            "ALTER TABLE ai_memory_dream_state RENAME TO ai_memory_dream_state_legacy"
         )
         await self._create_memory_dream_table()
         values = {
@@ -1695,10 +1697,10 @@ class AIStateRepository:
                 lease_owner, lease_expires_at
             )
             SELECT
-                scope_id, {values['cursor_message_id']},
-                {values['scanned_until_at']}, {values['last_attempt_at']},
-                {values['last_success_at']}, {values['last_error']},
-                {values['lease_owner']}, {values['lease_expires_at']}
+                scope_id, {values["cursor_message_id"]},
+                {values["scanned_until_at"]}, {values["last_attempt_at"]},
+                {values["last_success_at"]}, {values["last_error"]},
+                {values["lease_owner"]}, {values["lease_expires_at"]}
             FROM ai_memory_dream_state_legacy
             """  # nosec B608
         )
@@ -2111,8 +2113,7 @@ class AIStateRepository:
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("Malformed pending memory source IDs") from exc
             if not isinstance(raw_source_ids, list) or not all(
-                isinstance(source_id, str) and source_id
-                for source_id in raw_source_ids
+                isinstance(source_id, str) and source_id for source_id in raw_source_ids
             ):
                 raise ValueError("Malformed pending memory source IDs")
             documents.append(
@@ -3244,20 +3245,19 @@ class AIConversationHandler:
                 if override in catalog.models
                 else "chat override; currently unavailable"
             )
-        header = (
-            f"AI model for this chat: {current} ({source}).\n\n"
-            "Available models:"
-        )
+        header = f"AI model for this chat: {current} ({source}).\n\nAvailable models:"
         footer = (
-            "\n\nUse /ai_model <model-id> to switch, or "
-            "/ai_model default to reset."
+            "\n\nUse /ai_model <model-id> to switch, or /ai_model default to reset."
         )
         lines: list[str] = []
         for index, model in enumerate(catalog.models):
             remaining = len(catalog.models) - index - 1
             candidate = [*lines, f"- {model}"]
             suffix = f"\n- … {remaining} more" if remaining else ""
-            if len(header) + len("\n".join(candidate)) + len(suffix) + len(footer) > 3_500:
+            if (
+                len(header) + len("\n".join(candidate)) + len(suffix) + len(footer)
+                > 3_500
+            ):
                 lines.append(f"- … {remaining + 1} more")
                 break
             lines = candidate
@@ -3514,7 +3514,7 @@ class AIConversationHandler:
             target = MemoryScopeTarget(
                 chat_id=message.chat_id,
                 display_name=identity.scope_display_name,
-                latest_message_id=message.id,
+                latest_message_id=_memory_cursor(message),
             )
 
         scope_id = self._identity_codec.scope_id(target.chat_id)

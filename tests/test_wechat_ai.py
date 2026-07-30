@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import timedelta
 
 import pytest
 
@@ -13,7 +14,14 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_continuous_memory import ContinuousMemoryScheduler
-from sidekick.ai_memory_ingestion import ContinuousMemoryResult
+from sidekick.ai_dream import DreamSettings
+from sidekick.ai_memory import MemoryRetainResult
+from sidekick.ai_memory_ingestion import (
+    ChatMemoryIngestor,
+    ContinuousMemoryResult,
+    MemoryIngestionSettings,
+)
+from sidekick.ai_memory_segments import MemorySegmentationSettings
 from sidekick.wechat.ai import (
     WECHAT_IDENTITY_CODEC,
     WeChatChatTransport,
@@ -46,9 +54,7 @@ class RecordingConnectorClient:
         self.calls: list[dict[str, str]] = []
 
     async def send_text_and_wait(self, *, request_id, to, content):
-        self.calls.append(
-            {"request_id": request_id, "to": to, "content": content}
-        )
+        self.calls.append({"request_id": request_id, "to": to, "content": content})
         if not self.responses:
             raise AssertionError("No WeChat send response prepared")
         response = self.responses.pop(0)
@@ -182,7 +188,9 @@ async def test_wechat_responder_defers_placeholder_and_sends_one_bounded_final(
 
 
 @pytest.mark.asyncio
-async def test_wechat_transport_uses_stable_request_id_for_same_trigger(tmp_path) -> None:
+async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
+    tmp_path,
+) -> None:
     store, trigger = await bootstrap_store(tmp_path / "wechat.db")
     client = RecordingConnectorClient(
         (
@@ -376,3 +384,89 @@ async def test_continuous_memory_scheduler_accepts_wechat_scope_ids(tmp_path) ->
     assert scanner.calls == [GROUP_ID]
     assert result.scopes_seen == 1
     assert result.scopes_succeeded == 1
+
+
+@pytest.mark.asyncio
+async def test_wechat_continuous_memory_checkpoints_projection_cursor(tmp_path) -> None:
+    class RecordingMemory:
+        def __init__(self):
+            self.episodes = []
+
+        async def retain_many(self, episodes, *, update_mode="replace"):
+            self.episodes.extend(episodes)
+            return MemoryRetainResult(accepted=True, items_count=len(episodes))
+
+    wechat_store, trigger = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="project decision",
+        direction="in",
+    )
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    memory = RecordingMemory()
+    source = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    scanner = ChatMemoryIngestor(
+        source=source,
+        store=ai_store,
+        memory=memory,
+        prompt_builder=PromptBuilder(
+            identity_resolver=WeChatMessageIdentityResolver(),
+            mention_resolver=WeChatMessageMentionResolver(),
+            history_source=source,
+            identity_codec=WECHAT_IDENTITY_CODEC,
+        ),
+        dream_settings=DreamSettings(),
+        ingestion_settings=MemoryIngestionSettings(
+            settlement_delay=timedelta(0),
+            segmentation=MemorySegmentationSettings(
+                idle_gap=timedelta(seconds=1),
+            ),
+        ),
+        identity_codec=WECHAT_IDENTITY_CODEC,
+        clock=lambda: 1_783_773_000,
+    )
+    scope_id = WECHAT_IDENTITY_CODEC.scope_id(GROUP_ID)
+    await ai_store.set_continuous_memory_enabled(
+        scope_id,
+        True,
+        cursor_message_id=0,
+    )
+    try:
+        initial_result = await scanner.run_continuous_scope(GROUP_ID)
+        initial_state = await ai_store.get_memory_scope_state(scope_id)
+
+        revision = WeChatEvent.parse(
+            {
+                "schemaVersion": "wechat-bridge/v1alpha1",
+                "cursor": "late-revision",
+                "event": "message",
+                "connectionGeneration": 41,
+                "id": trigger.id,
+                "chatId": GROUP_ID,
+                "direction": "in",
+                "messageType": "text",
+                "senderId": "wxid_alice",
+                "content": "project decision, corrected",
+                "timestamp": 1_783_772_734,
+                "source": "wechat+localdb",
+            }
+        )
+        corrected = await wechat_store.project_event(CONNECTOR_KEY, revision)
+        assert corrected is not None
+
+        revised_result = await scanner.run_continuous_scope(GROUP_ID)
+        revised_state = await ai_store.get_memory_scope_state(scope_id)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert initial_result.messages_seen == 1
+    assert initial_result.messages_retained == 1
+    assert initial_state.continuous_cursor_message_id == trigger.memory_cursor
+    assert revised_result.messages_seen == 1
+    assert revised_result.messages_retained == 1
+    assert revised_state.continuous_cursor_message_id == corrected.memory_cursor
+    assert corrected.memory_cursor > trigger.memory_cursor
+    assert [event.source_id for event in memory.episodes[0].events] == [
+        WECHAT_IDENTITY_CODEC.message_source_id(GROUP_ID, trigger.id)
+    ]
+    assert memory.episodes[-1].events[0].text == "project decision, corrected"
