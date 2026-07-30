@@ -714,7 +714,7 @@ class AIResponder:
         gateway: AgentGateway,
         *,
         max_output_chars: int = 3_900,
-        initial_status: str = "Thinking...",
+        initial_status: str | None = "Thinking...",
         transport: ChatTransport | None = None,
         logger: Any | None = None,
     ):
@@ -727,11 +727,17 @@ class AIResponder:
     async def answer(
         self, trigger: ReplyTarget, request: AgentRunRequest
     ) -> AnswerResult:
-        answer = await self._transport.reply(
-            trigger,
-            self._initial_status,
-            presentation="plain",
-        )
+        if self._initial_status is None:
+            draft_reply = getattr(self._transport, "draft_reply", None)
+            if not callable(draft_reply):
+                raise RuntimeError("Chat transport cannot defer an AI response")
+            answer = await draft_reply(trigger)
+        else:
+            answer = await self._transport.reply(
+                trigger,
+                self._initial_status,
+                presentation="plain",
+            )
         text = ""
         session_id: str | None = None
         entry_id: str | None = None

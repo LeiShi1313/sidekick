@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from typing import Any, Protocol
 from urllib.parse import quote, unquote
 
-from sidekick.ai import ReplyTarget
+from sidekick.ai import MessageIdentity, MentionedUser, ReplyTarget
+from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
+from sidekick.chat.transport import ChatPresentation, SentMessage
+from sidekick.wechat.api import (
+    MAX_TEXT_BYTES,
+    WeChatSendFailed,
+    WeChatSendOperation,
+    WeChatSendOutcomeUnknown,
+)
 from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import WeChatStateRepository
 
@@ -56,6 +66,171 @@ class WeChatIdentityCodec:
 WECHAT_IDENTITY_CODEC: IdentityCodec = WeChatIdentityCodec()
 
 
+class WeChatTextSender(Protocol):
+    async def send_text_and_wait(
+        self,
+        *,
+        request_id: str,
+        to: str,
+        content: str,
+    ) -> WeChatSendOperation: ...
+
+
+@dataclass(slots=True)
+class WeChatSentMessage:
+    id: str
+    text: str | None
+    trigger: WeChatMessage
+    request_id: str
+    sent: bool = False
+    failed: bool = False
+    uncertain: bool = False
+
+
+class WeChatChatTransport:
+    def __init__(
+        self,
+        client: WeChatTextSender,
+        store: WeChatStateRepository,
+        connector_key: str,
+        *,
+        logger: Any | None = None,
+    ):
+        self._client = client
+        self._store = store
+        self._connector_key = connector_key
+        self._logger = logger
+
+    async def draft_reply(self, message: Any) -> WeChatSentMessage:
+        trigger = self._trigger(message)
+        request_id = _request_id(trigger, "answer")
+        return WeChatSentMessage(
+            id=f"draft:{request_id}",
+            text=None,
+            trigger=trigger,
+            request_id=request_id,
+        )
+
+    async def get_reply(self, message: Any) -> WeChatMessage | None:
+        if not isinstance(message, WeChatMessage) or message.reply_to_msg_id is None:
+            return None
+        return await self._store.get_message(
+            self._connector_key,
+            message.chat_id,
+            message.reply_to_msg_id,
+        )
+
+    async def reply(
+        self,
+        message: Any,
+        text: str,
+        *,
+        presentation: ChatPresentation,
+    ) -> SentMessage:
+        trigger = self._trigger(message)
+        rendered = self._render(text, presentation)
+        sent = WeChatSentMessage(
+            id=f"draft:{_request_id(trigger, 'reply')}",
+            text=None,
+            trigger=trigger,
+            request_id=_request_id(trigger, "reply"),
+        )
+        await self._send(sent, rendered)
+        return sent
+
+    async def update(
+        self,
+        message: SentMessage,
+        text: str,
+        *,
+        presentation: ChatPresentation,
+        wait: bool,
+    ) -> bool:
+        if not isinstance(message, WeChatSentMessage):
+            raise RuntimeError("WeChat transport requires a WeChat sent message")
+        if not wait:
+            return False
+        rendered = self._render(text, presentation)
+        if message.uncertain:
+            message.text = rendered
+            return True
+        if message.sent:
+            return message.text == rendered
+        if message.failed:
+            message.request_id = _request_id(message.trigger, "failure")
+            message.failed = False
+        await self._send(message, rendered)
+        return True
+
+    async def delete(self, _message: Any) -> None:
+        # Deletion is deliberately not mapped to WeChat Recall. Recall has a
+        # narrower capability and uncertainty contract than local cleanup.
+        return None
+
+    def is_outgoing(self, message: Any) -> bool:
+        return bool(getattr(message, "is_outgoing", getattr(message, "out", False)))
+
+    def is_group(self, message: Any) -> bool:
+        return getattr(message, "chat_type", None) == "group"
+
+    async def _send(self, message: WeChatSentMessage, text: str) -> None:
+        try:
+            operation = await self._client.send_text_and_wait(
+                request_id=message.request_id,
+                to=message.trigger.chat_id,
+                content=text,
+            )
+        except WeChatSendOutcomeUnknown:
+            message.uncertain = True
+            message.text = text
+            raise
+        except WeChatSendFailed:
+            message.failed = True
+            message.text = text
+            raise
+        except Exception:
+            # A transport failure can happen after the connector accepted the
+            # request. Keep the original ID/payload reserved and never replace
+            # it with an error message under that ID.
+            message.uncertain = True
+            message.text = text
+            raise
+        assert operation.message_id is not None
+        message.id = operation.message_id
+        message.text = text
+        message.sent = True
+
+    @staticmethod
+    def _trigger(message: Any) -> WeChatMessage:
+        if not isinstance(message, WeChatMessage):
+            raise RuntimeError("WeChat transport requires a WeChat message")
+        return message
+
+    @staticmethod
+    def _render(text: str, presentation: ChatPresentation) -> str:
+        rendered = markdown_to_plain_text(text) if presentation == "agent" else text
+        return _truncate_utf8(rendered, MAX_TEXT_BYTES)
+
+
+class WeChatMessageIdentityResolver:
+    async def resolve(self, message: ReplyTarget) -> MessageIdentity:
+        return MessageIdentity(
+            subject_id=(
+                WECHAT_IDENTITY_CODEC.actor_id(message.sender_id)
+                if message.sender_id is not None
+                else None
+            ),
+            subject_display_name=getattr(message, "sender_display_name", None),
+            scope_display_name=getattr(message, "scope_display_name", None),
+            is_human=message.sender_id is not None,
+        )
+
+
+class WeChatMessageMentionResolver:
+    async def resolve(self, _message: ReplyTarget) -> tuple[MentionedUser, ...]:
+        return ()
+
+
 class WeChatHistorySource:
     def __init__(self, store: WeChatStateRepository, connector_key: str):
         self._store = store
@@ -100,3 +275,18 @@ def _component(value: ExternalId) -> str:
     if not normalized or normalized != normalized.strip():
         raise ValueError("WeChat IDs cannot be empty or padded")
     return quote(normalized, safe="-_.~")
+
+
+def _request_id(trigger: WeChatMessage, purpose: str) -> str:
+    fingerprint = "\0".join(
+        (trigger.account_id, trigger.chat_id, trigger.id, purpose)
+    ).encode("utf-8")
+    return f"sidekick.wechat.{purpose}.{sha256(fingerprint).hexdigest()[:40]}"
+
+
+def _truncate_utf8(text: str, maximum: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= maximum:
+        return text
+    prefix = encoded[: maximum - 3].decode("utf-8", errors="ignore")
+    return f"{prefix}..."
