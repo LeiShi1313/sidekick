@@ -49,7 +49,11 @@ from sidekick.chat.commands import (
     MODEL_ID_RE,
     parse_chat_command,
 )
-from sidekick.chat.identity import IdentityCodec, NamespacedIdentityCodec
+from sidekick.chat.identity import (
+    ExternalId,
+    IdentityCodec,
+    NamespacedIdentityCodec,
+)
 from sidekick.chat.transport import ChatTransport, ObjectChatTransport, SentMessage
 from sidekick.memory_directory import (
     DirectoryPublication,
@@ -333,11 +337,11 @@ class PiAgentGateway:
 
 
 class ReplyTarget(Protocol):
-    id: int
-    chat_id: int | None
+    id: ExternalId
+    chat_id: ExternalId | None
     raw_text: str | None
-    sender_id: int | None
-    reply_to_msg_id: int | None
+    sender_id: ExternalId | None
+    reply_to_msg_id: ExternalId | None
     date: datetime | None
 
 
@@ -355,15 +359,15 @@ class MessageIdentity:
 
 @dataclass(frozen=True, slots=True)
 class MentionedUser:
-    user_id: int
+    user_id: ExternalId
     display_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryScopeTarget:
-    chat_id: int
+    chat_id: ExternalId
     display_name: str | None = None
-    latest_message_id: int = 0
+    latest_message_id: ExternalId = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,11 +419,11 @@ class MessageHistorySource(Protocol):
 
 class ConversationStore(Protocol):
     async def get_answer(
-        self, scope_id: str, answer_message_id: int
+        self, scope_id: str, answer_message_id: ExternalId
     ) -> AIAnswerMarker | None: ...
 
     async def get_turn_for_message(
-        self, scope_id: str, message_id: int
+        self, scope_id: str, message_id: ExternalId
     ) -> AIAnswerMarker | None: ...
 
     async def save_answer(self, marker: AIAnswerMarker) -> None: ...
@@ -510,14 +514,14 @@ class ConversationStore(Protocol):
     async def mark_memory_excluded_message(
         self,
         scope_id: str,
-        message_id: int,
+        message_id: ExternalId,
         kind: str,
     ) -> None: ...
 
     async def is_memory_excluded_message(
         self,
         scope_id: str,
-        message_id: int,
+        message_id: ExternalId,
     ) -> bool: ...
 
 
@@ -637,12 +641,12 @@ class AISettings:
 @dataclass(frozen=True, slots=True)
 class AIAnswerMarker:
     scope_id: str
-    answer_message_id: int
-    trigger_message_id: int
+    answer_message_id: ExternalId
+    trigger_message_id: ExternalId
     requester_id: str
     prompt: str
     answer_text: str
-    parent_answer_message_id: int | None
+    parent_answer_message_id: ExternalId | None
     reference_context: str
     agent_session_id: str | None
     agent_entry_id: str | None
@@ -659,24 +663,24 @@ class AnswerResult:
 
 @dataclass(frozen=True, slots=True)
 class HumanObservation:
-    message_id: int
-    sender_id: int
+    message_id: ExternalId
+    sender_id: ExternalId
     text: str
     occurred_at: datetime
     mentioned_at: datetime | None = None
     identity: MessageIdentity = MessageIdentity()
-    reply_to_message_id: int | None = None
+    reply_to_message_id: ExternalId | None = None
     mentioned_users: tuple[MentionedUser, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class ChatContextMessage:
-    message_id: int
-    chat_id: int | None
-    sender_id: int | None
+    message_id: ExternalId
+    chat_id: ExternalId | None
+    sender_id: ExternalId | None
     occurred_at: datetime
-    reply_to_message_id: int | None
+    reply_to_message_id: ExternalId | None
     content: str
     identity: MessageIdentity
     observation: HumanObservation | None
@@ -687,7 +691,7 @@ class ChatContextMessage:
 @dataclass(frozen=True, slots=True)
 class ChatContext:
     messages: tuple[ChatContextMessage, ...] = ()
-    current_reply_to_message_id: int | None = None
+    current_reply_to_message_id: ExternalId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1029,7 +1033,7 @@ class PromptBuilder:
         current: ReplyTarget | None,
     ) -> tuple[ReplyTarget, ...]:
         newest_first: list[ReplyTarget] = []
-        seen: set[tuple[int | None, int]] = set()
+        seen: set[tuple[ExternalId | None, ExternalId]] = set()
         while current is not None and len(newest_first) < self.max_context_messages:
             key = (current.chat_id, current.id)
             if key in seen:
@@ -1044,10 +1048,13 @@ class PromptBuilder:
         reply_path: tuple[ReplyTarget, ...],
         recent: tuple[ReplyTarget, ...],
         *,
-        current_reply_to_message_id: int | None,
+        current_reply_to_message_id: ExternalId | None,
     ) -> ChatContext:
-        candidates: dict[tuple[int | None, int], _ChatContextCandidate] = {}
-        priority: list[tuple[int | None, int]] = []
+        candidates: dict[
+            tuple[ExternalId | None, ExternalId],
+            _ChatContextCandidate,
+        ] = {}
+        priority: list[tuple[ExternalId | None, ExternalId]] = []
 
         def select(message: ReplyTarget, *, reply: bool, ambient: bool) -> None:
             key = (message.chat_id, message.id)
@@ -1064,7 +1071,7 @@ class PromptBuilder:
         for message in reversed(recent):
             select(message, reply=False, ambient=True)
 
-        chronological_keys: list[tuple[int | None, int]] = []
+        chronological_keys: list[tuple[ExternalId | None, ExternalId]] = []
         for message in (*reversed(reply_path), *recent):
             key = (message.chat_id, message.id)
             if key not in chronological_keys:
@@ -1075,7 +1082,7 @@ class PromptBuilder:
                 candidate.order_hint = order_hint
 
         normalized: list[ChatContextMessage] = []
-        order_hints: dict[int, int] = {}
+        order_hints: dict[ExternalId, int] = {}
         used_chars = 0
         attachment_count = 0
         for key in priority:
@@ -1147,7 +1154,7 @@ class PromptBuilder:
         self,
         context: ChatContext,
         *,
-        assistant_message_ids: frozenset[int] = frozenset(),
+        assistant_message_ids: frozenset[ExternalId] = frozenset(),
     ) -> str:
         if not context.messages:
             return ""
@@ -1413,27 +1420,45 @@ class AIStateRepository:
 
     async def _ensure_ai_answers_schema(self) -> None:
         connection = self._require_connection()
-        columns = await self._table_columns("ai_answers")
+        column_types = await self._table_column_types("ai_answers")
+        columns = set(column_types)
         if not columns:
             await self._create_ai_answers_table()
             return
         if "scope_id" in columns:
-            if "agent_session_id" not in columns:
-                await connection.execute(
-                    "ALTER TABLE ai_answers ADD COLUMN agent_session_id TEXT"
-                )
-            if "agent_entry_id" not in columns:
-                await connection.execute(
-                    "ALTER TABLE ai_answers ADD COLUMN agent_entry_id TEXT"
-                )
-            await self._create_ai_answers_index()
-            return
+            external_id_columns = (
+                "answer_message_id",
+                "trigger_message_id",
+                "parent_answer_message_id",
+            )
+            if all(
+                column_types.get(column) == "BLOB"
+                for column in external_id_columns
+            ):
+                if "agent_session_id" not in columns:
+                    await connection.execute(
+                        "ALTER TABLE ai_answers ADD COLUMN agent_session_id TEXT"
+                    )
+                if "agent_entry_id" not in columns:
+                    await connection.execute(
+                        "ALTER TABLE ai_answers ADD COLUMN agent_entry_id TEXT"
+                    )
+                await self._create_ai_answers_index()
+                return
 
         session_value = "agent_session_id" if "agent_session_id" in columns else "NULL"
         entry_value = "agent_entry_id" if "agent_entry_id" in columns else "NULL"
         await connection.execute("DROP INDEX IF EXISTS ai_answers_by_trigger")
         await connection.execute("ALTER TABLE ai_answers RENAME TO ai_answers_legacy")
         await self._create_ai_answers_table()
+        scope_value = (
+            "scope_id" if "scope_id" in columns else "'telegram:chat:' || chat_id"
+        )
+        requester_value = (
+            "requester_id"
+            if "scope_id" in columns
+            else "'telegram:user:' || requester_id"
+        )
         await connection.execute(
             f"""
             INSERT INTO ai_answers (
@@ -1442,10 +1467,10 @@ class AIStateRepository:
                 agent_session_id, agent_entry_id
             )
             SELECT
-                'telegram:chat:' || chat_id,
+                {scope_value},
                 answer_message_id,
                 trigger_message_id,
-                'telegram:user:' || requester_id,
+                {requester_value},
                 prompt,
                 answer_text,
                 parent_answer_message_id,
@@ -1463,12 +1488,12 @@ class AIStateRepository:
             """
             CREATE TABLE ai_answers (
                 scope_id TEXT NOT NULL,
-                answer_message_id INTEGER NOT NULL,
-                trigger_message_id INTEGER NOT NULL,
+                answer_message_id BLOB NOT NULL,
+                trigger_message_id BLOB NOT NULL,
                 requester_id TEXT NOT NULL,
                 prompt TEXT NOT NULL,
                 answer_text TEXT NOT NULL,
-                parent_answer_message_id INTEGER,
+                parent_answer_message_id BLOB,
                 reference_context TEXT NOT NULL,
                 agent_session_id TEXT,
                 agent_entry_id TEXT,
@@ -1533,29 +1558,35 @@ class AIStateRepository:
 
     async def _ensure_excluded_messages_schema(self) -> None:
         connection = self._require_connection()
-        columns = await self._table_columns("ai_memory_excluded_messages")
+        column_types = await self._table_column_types(
+            "ai_memory_excluded_messages"
+        )
+        columns = set(column_types)
         if not columns:
             await self._create_excluded_messages_table()
             return
-        if "scope_id" in columns:
+        if "scope_id" in columns and column_types.get("message_id") == "BLOB":
             return
         await connection.execute(
             "ALTER TABLE ai_memory_excluded_messages "
             "RENAME TO ai_memory_excluded_messages_legacy"
         )
         await self._create_excluded_messages_table()
+        scope_value = (
+            "scope_id" if "scope_id" in columns else "'telegram:chat:' || chat_id"
+        )
         await connection.execute(
-            """
+            f"""
             INSERT INTO ai_memory_excluded_messages (
                 scope_id, message_id, kind, created_at
             )
             SELECT
-                'telegram:chat:' || chat_id,
+                {scope_value},
                 message_id,
                 kind,
                 created_at
             FROM ai_memory_excluded_messages_legacy
-            """
+            """  # nosec B608
         )
         await connection.execute("DROP TABLE ai_memory_excluded_messages_legacy")
 
@@ -1564,7 +1595,7 @@ class AIStateRepository:
             """
             CREATE TABLE ai_memory_excluded_messages (
                 scope_id TEXT NOT NULL,
-                message_id INTEGER NOT NULL,
+                message_id BLOB NOT NULL,
                 kind TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 PRIMARY KEY (scope_id, message_id)
@@ -1573,15 +1604,18 @@ class AIStateRepository:
         )
 
     async def _table_columns(self, table: str) -> set[str]:
+        return set(await self._table_column_types(table))
+
+    async def _table_column_types(self, table: str) -> dict[str, str]:
         connection = self._require_connection()
         cursor = await connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
             (table,),
         )
         if await cursor.fetchone() is None:
-            return set()
+            return {}
         return {
-            str(row["name"])
+            str(row["name"]): str(row["type"]).upper()
             async for row in await connection.execute(
                 f"PRAGMA table_info({table})"  # nosec B608
             )
@@ -1640,7 +1674,7 @@ class AIStateRepository:
         )
 
     async def get_answer(
-        self, scope_id: str, answer_message_id: int
+        self, scope_id: str, answer_message_id: ExternalId
     ) -> AIAnswerMarker | None:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -1651,7 +1685,7 @@ class AIStateRepository:
         return _marker_from_row(row) if row else None
 
     async def get_turn_for_message(
-        self, scope_id: str, message_id: int
+        self, scope_id: str, message_id: ExternalId
     ) -> AIAnswerMarker | None:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -2566,7 +2600,7 @@ class AIStateRepository:
     async def mark_memory_excluded_message(
         self,
         scope_id: str,
-        message_id: int,
+        message_id: ExternalId,
         kind: str,
     ) -> None:
         connection = self._require_connection()
@@ -2583,7 +2617,7 @@ class AIStateRepository:
     async def is_memory_excluded_message(
         self,
         scope_id: str,
-        message_id: int,
+        message_id: ExternalId,
     ) -> bool:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -2596,11 +2630,11 @@ class AIStateRepository:
     async def get_memory_excluded_message_ids(
         self,
         scope_id: str,
-        message_ids: tuple[int, ...],
-    ) -> frozenset[int]:
+        message_ids: tuple[ExternalId, ...],
+    ) -> frozenset[ExternalId]:
         connection = self._require_connection()
         unique_ids = tuple(dict.fromkeys(message_ids))
-        excluded: set[int] = set()
+        excluded: set[ExternalId] = set()
         for start in range(0, len(unique_ids), 500):
             batch = unique_ids[start : start + 500]
             placeholders = ",".join("?" for _ in batch)
@@ -2610,17 +2644,17 @@ class AIStateRepository:
                 (scope_id, *batch),
             )
             async for row in cursor:
-                excluded.add(int(row["message_id"]))
+                excluded.add(row["message_id"])
         return frozenset(excluded)
 
     async def get_ai_answer_message_ids(
         self,
         scope_id: str,
-        message_ids: tuple[int, ...],
-    ) -> frozenset[int]:
+        message_ids: tuple[ExternalId, ...],
+    ) -> frozenset[ExternalId]:
         connection = self._require_connection()
         unique_ids = tuple(dict.fromkeys(message_ids))
-        answers: set[int] = set()
+        answers: set[ExternalId] = set()
         for start in range(0, len(unique_ids), 500):
             batch = unique_ids[start : start + 500]
             placeholders = ",".join("?" for _ in batch)
@@ -2630,7 +2664,7 @@ class AIStateRepository:
                 (scope_id, *batch),
             )
             async for row in cursor:
-                answers.add(int(row["answer_message_id"]))
+                answers.add(row["answer_message_id"])
         return frozenset(answers)
 
     def _require_connection(self) -> aiosqlite.Connection:
@@ -2683,7 +2717,7 @@ class AIRateLimiter:
 class AIConversationHandler:
     def __init__(
         self,
-        owner_id: int,
+        owner_id: ExternalId,
         responder: AIResponder,
         store: ConversationStore,
         prompt_builder: PromptBuilder,
@@ -2849,7 +2883,7 @@ class AIConversationHandler:
             )
             return True
 
-        parent_answer_id: int | None = None
+        parent_answer_id: ExternalId | None = None
         agent_session_id: str | None = None
         parent_entry_id: str | None = None
         reference_context = ""
@@ -3059,7 +3093,7 @@ class AIConversationHandler:
         assert message.chat_id is not None
         scope_id = self._identity_codec.scope_id(message.chat_id)
         current = await self._transport.get_reply(message)
-        seen: set[tuple[int | None, int]] = set()
+        seen: set[tuple[ExternalId | None, ExternalId]] = set()
         for _ in range(self._prompt_builder.max_context_messages):
             if current is None:
                 return None
@@ -3545,7 +3579,7 @@ class AIConversationHandler:
         await self._schedule_memory_command_delete(message, "/ai_memory_list")
         return True
 
-    async def _continuous_memory_enabled(self, chat_id: int) -> bool:
+    async def _continuous_memory_enabled(self, chat_id: ExternalId) -> bool:
         try:
             state = await self._store.get_memory_scope_state(
                 self._identity_codec.scope_id(chat_id)
@@ -3661,7 +3695,7 @@ class AIConversationHandler:
     async def _mark_memory_excluded(
         self,
         scope_id: str,
-        message_id: int,
+        message_id: ExternalId,
         kind: str,
     ) -> None:
         try:
@@ -3678,12 +3712,12 @@ class AIConversationHandler:
         scope_id: str,
         context: ChatContext,
     ) -> tuple[
-        frozenset[int],
+        frozenset[ExternalId],
         tuple[HumanObservation, ...],
         tuple[HumanObservation, ...],
     ]:
-        assistant_message_ids: set[int] = set()
-        uncertain_message_ids: set[int] = set()
+        assistant_message_ids: set[ExternalId] = set()
+        uncertain_message_ids: set[ExternalId] = set()
         for message in context.messages:
             try:
                 marker = await self._store.get_answer(
@@ -3719,8 +3753,8 @@ class AIConversationHandler:
     async def _build_agent_memory_target(
         self,
         *,
-        requester_id: int,
-        chat_id: int,
+        requester_id: ExternalId,
+        chat_id: ExternalId,
         requester_identity: MessageIdentity,
         current_mentions: tuple[MentionedUser, ...],
         observations: list[HumanObservation],
@@ -3963,7 +3997,7 @@ class AIConversationHandler:
 
     async def _retain_observations(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         observations: tuple[HumanObservation, ...],
     ) -> MemoryChainRetain | None:
         if self._memory is None or not observations:
@@ -4190,10 +4224,10 @@ def _format_memory_time(timestamp: float | None) -> str:
 
 def _chat_memory_episode(
     identity_codec: IdentityCodec,
-    chat_id: int,
+    chat_id: ExternalId,
     observations: tuple[HumanObservation, ...],
     *,
-    root_message_id: int | None = None,
+    root_message_id: ExternalId | None = None,
     document_id: str | None = None,
 ) -> MemoryEpisode:
     if not observations:
@@ -4253,15 +4287,15 @@ def _chat_memory_episode(
 def _chat_revision_episode(
     identity_codec: IdentityCodec,
     *,
-    chat_id: int,
-    command_message_id: int,
-    owner_id: int,
+    chat_id: ExternalId,
+    command_message_id: ExternalId,
+    owner_id: ExternalId,
     owner_display_name: str | None,
-    target_id: int,
+    target_id: ExternalId,
     target_display_name: str | None,
     instruction: str,
     occurred_at: datetime,
-    target_message_id: int,
+    target_message_id: ExternalId,
 ) -> MemoryEpisode:
     target_key = identity_codec.actor_id(target_id)
     target_label = (

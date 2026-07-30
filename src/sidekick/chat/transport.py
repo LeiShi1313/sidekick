@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Literal, Protocol
 
+from sidekick.chat.identity import ExternalId
+
 
 ChatPresentation = Literal["plain", "agent"]
 
 
 class SentMessage(Protocol):
-    id: int
+    id: ExternalId
     text: str | None
 
 
