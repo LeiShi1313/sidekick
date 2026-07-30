@@ -99,6 +99,7 @@ def test_compose_declares_isolated_workers_for_both_wechat_bridges() -> None:
         assert service["read_only"] is True
         assert service["restart"] == "unless-stopped"
         assert service["healthcheck"]["test"][0] == "CMD"
+        assert "client.get_messages(limit=1_000)" in service["healthcheck"]["test"][3]
         assert service["volumes"] == [
             {
                 "type": "volume",

@@ -264,10 +264,14 @@ class WeChatMessageList:
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatMessageList:
         rows = _required_array(payload, "data")
+        messages: list[WeChatConnectorMessage] = []
+        for row in rows:
+            message = _object(row, "message")
+            if _is_senderless_unsupported_message(message):
+                continue
+            messages.append(WeChatConnectorMessage.parse(message))
         return cls(
-            messages=tuple(
-                WeChatConnectorMessage.parse(_object(row, "message")) for row in rows
-            ),
+            messages=tuple(messages),
             cursor=_required_id(payload, "cursor"),
         )
 
@@ -301,6 +305,11 @@ class WeChatEvent:
         if self.name != "message":
             raise WeChatAPIContractError("WeChat event is not a message")
         return WeChatConnectorMessage.parse(self.payload)
+
+    def is_senderless_unsupported_message(self) -> bool:
+        return self.name == "message" and _is_senderless_unsupported_message(
+            self.payload
+        )
 
     def removed_message(self) -> tuple[str, str]:
         if self.name != "message_remove" or self.payload.get("status") != "recalled":
@@ -638,6 +647,17 @@ def _required_id(payload: Mapping[str, Any], field: str) -> str:
 
 def _required_wechat_id(payload: Mapping[str, Any], field: str) -> str:
     return _canonical_wechat_id(payload.get(field), field)
+
+
+def _is_senderless_unsupported_message(payload: Mapping[str, Any]) -> bool:
+    message_type = payload.get("messageType")
+    return (
+        "senderId" not in payload
+        and isinstance(message_type, str)
+        and bool(message_type)
+        and message_type == message_type.strip()
+        and message_type != "text"
+    )
 
 
 def _optional_id(payload: Mapping[str, Any], field: str) -> str | None:
