@@ -10,7 +10,9 @@ import pytest
 
 from sidekick.wechat.api import (
     WeChatAPIContractError,
+    WeChatConnectorMessage,
     WeChatConnectorClient,
+    WeChatSendOperation,
     WeChatSendOutcomeUnknown,
 )
 
@@ -18,8 +20,54 @@ from sidekick.wechat.api import (
 API_HEADERS = {"X-WeChat-Bridge-API-Version": "v1alpha1"}
 
 
+def connector_message_payload(message_id: str) -> dict[str, object]:
+    return {
+        "id": message_id,
+        "chatId": "filehelper",
+        "direction": "in",
+        "messageType": "text",
+        "senderId": "wxid_alice",
+        "content": "hello",
+        "timestamp": 1_783_772_734,
+    }
+
+
 def json_response(payload: object, *, status: int = 200) -> web.Response:
     return web.json_response(payload, status=status, headers=API_HEADERS)
+
+
+@pytest.mark.parametrize(
+    "message_id",
+    ("0", "01", "18446744073709551616"),
+)
+def test_wechat_client_rejects_noncanonical_message_ids(message_id: str) -> None:
+    with pytest.raises(WeChatAPIContractError, match="message id"):
+        WeChatConnectorMessage.parse(connector_message_payload(message_id))
+
+    with pytest.raises(WeChatAPIContractError, match="message id"):
+        WeChatSendOperation.parse(
+            {
+                "requestId": "request-1",
+                "status": "submitted",
+                "messageId": message_id,
+            }
+        )
+
+
+def test_wechat_client_preserves_maximum_uint64_message_id_as_text() -> None:
+    message_id = "18446744073709551615"
+
+    message = WeChatConnectorMessage.parse(connector_message_payload(message_id))
+    operation = WeChatSendOperation.parse(
+        {
+            "requestId": "request-1",
+            "status": "submitted",
+            "messageId": message_id,
+        }
+    )
+
+    assert message.id == message_id
+    assert operation.message_id == message_id
 
 
 @pytest.mark.asyncio

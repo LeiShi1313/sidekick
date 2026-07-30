@@ -17,6 +17,7 @@ API_VERSION_HEADER = "X-WeChat-Bridge-API-Version"
 EVENT_SCHEMA_VERSION = "wechat-bridge/v1alpha1"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_TEXT_BYTES = 4_095
+MAX_NATIVE_MESSAGE_ID = "18446744073709551615"
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
@@ -217,16 +218,8 @@ class WeChatConnectorMessage:
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatConnectorMessage:
-        message_id = _required_id(payload, "id")
-        if not message_id.isascii() or not message_id.isdecimal() or int(message_id) < 1:
-            raise WeChatAPIContractError("WeChat message id must be a decimal string")
-        reply_id = _optional_id(payload, "replyToMessageId")
-        if reply_id is not None and (
-            not reply_id.isascii() or not reply_id.isdecimal() or int(reply_id) < 1
-        ):
-            raise WeChatAPIContractError(
-                "WeChat replyToMessageId must be a decimal string"
-            )
+        message_id = _required_native_message_id(payload, "id")
+        reply_id = _optional_native_message_id(payload, "replyToMessageId")
         sequence = payload.get("seq")
         if sequence is not None:
             if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
@@ -306,13 +299,6 @@ class WeChatSendOperation:
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatSendOperation:
-        message_id = _optional_id(payload, "messageId")
-        if message_id is not None and (
-            not message_id.isascii()
-            or not message_id.isdecimal()
-            or int(message_id) < 1
-        ):
-            raise WeChatAPIContractError("WeChat outbound message id is invalid")
         return cls(
             request_id=_required_id(payload, "requestId"),
             status=_required_enum(
@@ -320,7 +306,7 @@ class WeChatSendOperation:
                 "status",
                 {"queued", "dispatching", "submitted", "failed", "unknown"},
             ),
-            message_id=message_id,
+            message_id=_optional_native_message_id(payload, "messageId"),
             error_code=_optional_text(payload, "errorCode"),
             to=_optional_id(payload, "to"),
         )
@@ -615,6 +601,38 @@ def _required_id(payload: Mapping[str, Any], field: str) -> str:
 def _optional_id(payload: Mapping[str, Any], field: str) -> str | None:
     value = payload.get(field)
     return None if value is None else _external_id(value, field)
+
+
+def _required_native_message_id(
+    payload: Mapping[str, Any],
+    field: str,
+) -> str:
+    return _native_message_id(_required_id(payload, field), field)
+
+
+def _optional_native_message_id(
+    payload: Mapping[str, Any],
+    field: str,
+) -> str | None:
+    value = _optional_id(payload, field)
+    return None if value is None else _native_message_id(value, field)
+
+
+def _native_message_id(value: str, field: str) -> str:
+    if (
+        not value.isascii()
+        or not value.isdecimal()
+        or value[0] == "0"
+        or len(value) > len(MAX_NATIVE_MESSAGE_ID)
+        or (
+            len(value) == len(MAX_NATIVE_MESSAGE_ID)
+            and value > MAX_NATIVE_MESSAGE_ID
+        )
+    ):
+        raise WeChatAPIContractError(
+            f"WeChat {field} must be a canonical non-zero decimal message id"
+        )
+    return value
 
 
 def _required_bool(payload: Mapping[str, Any], field: str) -> bool:
