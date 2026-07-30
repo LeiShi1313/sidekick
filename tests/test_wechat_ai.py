@@ -42,6 +42,7 @@ from sidekick.wechat.api import (
     WeChatSendOutcomeUnknown,
     WeChatSession,
 )
+from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import WeChatStateRepository
 
 
@@ -160,6 +161,34 @@ async def bootstrap_store(path, *, trigger_text="/ai hello", direction="out"):
     observed = await store.get_message(CONNECTOR_KEY, GROUP_ID, trigger.id)
     assert observed is not None
     return store, observed
+
+
+async def project_quoted_reply(
+    store: WeChatStateRepository,
+    *,
+    reply_to: str,
+    content: str = "/ai explain this",
+) -> WeChatMessage:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "quoted-command",
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": "5159667620982040828",
+            "chatId": GROUP_ID,
+            "direction": "out",
+            "messageType": "app",
+            "senderId": ACCOUNT_ID,
+            "replyToMessageId": reply_to,
+            "content": content,
+            "timestamp": 1_783_772_735,
+            "source": "wechat+message-reconciler",
+        }
+    )
+    message = await store.project_event(CONNECTOR_KEY, event)
+    assert message is not None
+    return message
 
 
 @pytest.mark.asyncio
@@ -401,6 +430,112 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
         assert await replay_store.is_processed(echoed_message) is True
     finally:
         await replay_store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_conversation_handler_uses_quoted_message_as_context(
+    tmp_path,
+) -> None:
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="The bridge uses a native hook and local projection.",
+        direction="in",
+    )
+    command = await project_quoted_reply(wechat_store, reply_to=target.id)
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    gateway = FinalGateway("Here is how it works.")
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            gateway,
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    try:
+        handled = await handler.handle(command)
+        marker = await ai_store.get_answer(
+            identity_codec.scope_id(GROUP_ID),
+            "7158246912028861544",
+        )
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert gateway.requests[0].prompt == "explain this"
+    assert len(gateway.requests[0].context) == 1
+    assert "The bridge uses a native hook and local projection." in (
+        gateway.requests[0].context[0].text
+    )
+    assert marker is not None
+    assert "context=reply_path" in marker.reference_context
+    assert "The bridge uses a native hook and local projection." in (
+        marker.reference_context
+    )
+
+
+@pytest.mark.asyncio
+async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    wechat_store, _ = await bootstrap_store(tmp_path / "wechat.db")
+    command = await project_quoted_reply(
+        wechat_store,
+        reply_to="3159667620982040828",
+    )
+
+    async def unavailable_reply(*_args, **_kwargs):
+        raise RuntimeError("projection unavailable")
+
+    monkeypatch.setattr(wechat_store, "get_message", unavailable_reply)
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    gateway = FinalGateway("Answer without quoted context.")
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            gateway,
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    try:
+        handled = await handler.handle(command)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert gateway.requests[0].prompt == "explain this"
+    assert gateway.requests[0].context == ()
+    assert client.calls[0]["content"] == "Answer without quoted context."
 
 
 @pytest.mark.asyncio
