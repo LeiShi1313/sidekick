@@ -18,6 +18,7 @@ from sidekick.ai import (
     ReplyTarget,
     _chat_memory_episode,
     _memory_message_text,
+    _memory_cursor,
     _message_datetime,
     _record_episode_labels,
 )
@@ -26,7 +27,7 @@ from sidekick.chat.commands import (
     MAX_MEMORY_BACKFILL_MESSAGES,
     MemoryBackfillCommand,
 )
-from sidekick.chat.identity import IdentityCodec
+from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.ai_memory import (
     MemoryClient,
     MemoryClientError,
@@ -46,7 +47,7 @@ from sidekick.ai_memory_segments import (
 class MemoryMessageSource(Protocol):
     async def fetch_window(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         *,
         since: datetime,
         until: datetime,
@@ -55,15 +56,15 @@ class MemoryMessageSource(Protocol):
 
     async def fetch_message(
         self,
-        chat_id: int,
-        message_id: int,
+        chat_id: ExternalId,
+        message_id: ExternalId,
     ) -> ReplyTarget | None: ...
 
     async def fetch_after(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         *,
-        after_message_id: int,
+        after_message_id: ExternalId,
         until: datetime,
         limit: int,
     ) -> tuple[ReplyTarget, ...]: ...
@@ -163,7 +164,7 @@ class ContinuousMemoryResult:
 @dataclass(frozen=True, slots=True)
 class PreparedMemoryDocument:
     episode: MemoryEpisode
-    window_message_ids: frozenset[int]
+    window_message_ids: frozenset[ExternalId]
 
 
 class MemoryIngestionBusyError(RuntimeError):
@@ -184,29 +185,26 @@ class MemoryThreadLimitError(RuntimeError):
 
 def _memory_session_document_id(
     identity_codec: IdentityCodec,
-    chat_id: int,
-    root_message_id: int,
+    chat_id: ExternalId,
+    root_message_id: ExternalId,
     started_at: datetime,
 ) -> str:
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=UTC)
     stamp = started_at.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return (
-        f"{identity_codec.source}:memory-session:"
-        f"{chat_id}:{stamp}:{root_message_id}"
-    )
+    return f"{identity_codec.source}:memory-session:{chat_id}:{stamp}:{root_message_id}"
 
 
 def _memory_session_prefix(
     identity_codec: IdentityCodec,
-    chat_id: int,
+    chat_id: ExternalId,
 ) -> str:
     return f"{identity_codec.source}:memory-session:{chat_id}:"
 
 
 def _legacy_memory_session_prefix(
     identity_codec: IdentityCodec,
-    chat_id: int,
+    chat_id: ExternalId,
 ) -> str:
     return f"{identity_codec.source}:dream-session:{chat_id}:"
 
@@ -227,14 +225,6 @@ def _session_document_sort_key(document_id: str) -> tuple[str, str]:
     parts = document_id.rsplit(":", 2)
     started_at = parts[-2] if len(parts) == 3 else ""
     return started_at, document_id
-
-
-def _message_source_prefix(
-    identity_codec: IdentityCodec,
-    chat_id: int,
-) -> str:
-    sample = identity_codec.message_source_id(chat_id, 1)
-    return f"{sample.rsplit(':', 1)[0]}:"
 
 
 def _completed_message_prefix(
@@ -269,7 +259,7 @@ class ChatMemoryIngestor:
         identity_codec: IdentityCodec | None = None,
         source_retry_delay: Callable[[Exception], float | None] | None = None,
         album_document_id: (
-            Callable[[int, ReplyTarget], str | None] | None
+            Callable[[ExternalId, ReplyTarget], str | None] | None
         ) = None,
         clock: Any = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -289,14 +279,14 @@ class ChatMemoryIngestor:
         self._sleep = sleep
         self._monotonic = monotonic
         self._logger = logger
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[ExternalId, asyncio.Lock] = {}
         self._lease_owner = uuid4().hex
 
     @property
     def identity_codec(self) -> IdentityCodec:
         return self._identity_codec
 
-    async def run_scope(self, chat_id: int) -> MemoryDreamResult:
+    async def run_scope(self, chat_id: ExternalId) -> MemoryDreamResult:
         try:
             return await self._run_bounded(
                 lambda: self._run_exclusive(
@@ -340,7 +330,7 @@ class ChatMemoryIngestor:
 
     async def run_backfill(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         request: MemoryBackfillCommand,
     ) -> MemoryDreamResult:
         return await self._run_exclusive(
@@ -348,7 +338,10 @@ class ChatMemoryIngestor:
             lambda: self._run_backfill(chat_id, request),
         )
 
-    async def run_continuous_scope(self, chat_id: int) -> ContinuousMemoryResult:
+    async def run_continuous_scope(
+        self,
+        chat_id: ExternalId,
+    ) -> ContinuousMemoryResult:
         return await self._run_exclusive(
             chat_id,
             lambda: self._run_continuous_scope(chat_id),
@@ -356,7 +349,7 @@ class ChatMemoryIngestor:
 
     async def _run_exclusive(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         operation: Callable[[], Awaitable[Any]],
     ) -> Any:
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
@@ -399,7 +392,7 @@ class ChatMemoryIngestor:
 
     async def _run_continuous_scope(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
     ) -> ContinuousMemoryResult:
         scope_id = self._identity_codec.scope_id(chat_id)
         scope = await self._store.get_memory_scope_state(scope_id)
@@ -419,9 +412,7 @@ class ChatMemoryIngestor:
             # A sealed document already crossed a proven segment boundary. Drain it
             # before reading more source messages so an outage cannot grow the local
             # queue by another fetch window on every poll.
-            sealed_pending = tuple(
-                document for document in pending if document.sealed
-            )
+            sealed_pending = tuple(document for document in pending if document.sealed)
             (
                 earlier_messages_retained,
                 earlier_documents_created,
@@ -430,9 +421,7 @@ class ChatMemoryIngestor:
                 scope_id,
                 sealed_pending,
             )
-            pending = tuple(
-                document for document in pending if not document.sealed
-            )
+            pending = tuple(document for document in pending if not document.sealed)
             messages = await self._retry_source(
                 lambda: self._source.fetch_after(
                     chat_id,
@@ -456,7 +445,7 @@ class ChatMemoryIngestor:
             await self._store.stage_continuous_memory_documents(
                 scope_id,
                 pending,
-                cursor_message_id=messages[-1].id if messages else None,
+                cursor_message_id=_memory_cursor(messages[-1]) if messages else None,
                 succeeded_at=self._clock(),
             )
             (
@@ -469,15 +458,9 @@ class ChatMemoryIngestor:
             )
             return ContinuousMemoryResult(
                 messages_seen=len(messages),
-                messages_retained=(
-                    earlier_messages_retained + messages_retained
-                ),
-                documents_created=(
-                    earlier_documents_created + documents_created
-                ),
-                documents_unchanged=(
-                    earlier_documents_unchanged + documents_unchanged
-                ),
+                messages_retained=(earlier_messages_retained + messages_retained),
+                documents_created=(earlier_documents_created + documents_created),
+                documents_unchanged=(earlier_documents_unchanged + documents_unchanged),
                 caught_up=len(messages) < self._ingestion_settings.max_messages,
             )
         except Exception as exc:
@@ -490,13 +473,11 @@ class ChatMemoryIngestor:
 
     def _stage_continuous_documents(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         pending: tuple[PendingMemoryDocument, ...],
         prepared: tuple[PreparedMemoryDocument, ...],
     ) -> tuple[PendingMemoryDocument, ...]:
-        by_id = {
-            document.episode.document_id: document for document in pending
-        }
+        by_id = {document.episode.document_id: document for document in pending}
         ordered_ids = [document.episode.document_id for document in pending]
         open_session_id: str | None = None
         for document in pending:
@@ -536,9 +517,7 @@ class ChatMemoryIngestor:
 
             if self._is_session_document(episode.document_id):
                 open_session = (
-                    by_id.get(open_session_id)
-                    if open_session_id is not None
-                    else None
+                    by_id.get(open_session_id) if open_session_id is not None else None
                 )
                 if (
                     open_session is not None
@@ -605,9 +584,7 @@ class ChatMemoryIngestor:
             len(pending),
             self._ingestion_settings.retain_concurrency,
         ):
-            batch = pending[
-                start : start + self._ingestion_settings.retain_concurrency
-            ]
+            batch = pending[start : start + self._ingestion_settings.retain_concurrency]
             results = await asyncio.gather(
                 *(
                     self._retry_memory(
@@ -649,7 +626,7 @@ class ChatMemoryIngestor:
     async def _latest_session_receipt(
         self,
         scope_id: str,
-        chat_id: int,
+        chat_id: ExternalId,
     ) -> tuple[str, MemoryDocumentReceipt] | None:
         candidates = await asyncio.gather(
             self._store.get_latest_memory_document_receipt(
@@ -686,7 +663,7 @@ class ChatMemoryIngestor:
 
     async def _run_backfill(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         request: MemoryBackfillCommand,
     ) -> MemoryDreamResult:
         until = (
@@ -715,7 +692,7 @@ class ChatMemoryIngestor:
         result, _, _ = await self._retain_threads(chat_id, messages)
         return result
 
-    async def _run_scope(self, chat_id: int) -> MemoryDreamResult:
+    async def _run_scope(self, chat_id: ExternalId) -> MemoryDreamResult:
         deadline = self._monotonic() + self._dream_settings.cycle_budget_seconds
         scope_id = self._identity_codec.scope_id(chat_id)
         scope = await self._store.get_memory_scope_state(scope_id)
@@ -739,7 +716,7 @@ class ChatMemoryIngestor:
         checkpoint_scanned_at = state.scanned_until_at
 
         async def checkpoint(
-            cursor_message_id: int | None,
+            cursor_message_id: ExternalId | None,
             scanned_until_at: float,
         ) -> None:
             nonlocal checkpoint_scanned_at
@@ -774,7 +751,7 @@ class ChatMemoryIngestor:
             )
             await self._store.record_memory_dream_success(
                 scope_id,
-                cursor_message_id=messages[-1].id if messages else None,
+                cursor_message_id=_memory_cursor(messages[-1]) if messages else None,
                 scanned_until_at=until.timestamp(),
                 succeeded_at=self._clock(),
             )
@@ -789,21 +766,21 @@ class ChatMemoryIngestor:
 
     async def _retain_threads(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         messages: tuple[ReplyTarget, ...],
         *,
         deadline: float | None = None,
-        checkpoint: Callable[[int | None, float], Awaitable[None]] | None = None,
-    ) -> tuple[MemoryDreamResult, int | None, bool]:
+        checkpoint: Callable[[ExternalId | None, float], Awaitable[None]] | None = None,
+    ) -> tuple[MemoryDreamResult, ExternalId | None, bool]:
         started_at = self._monotonic()
         documents = await self._prepare_documents(chat_id, messages)
         prepared_at = self._monotonic()
         documents_created = 0
         documents_unchanged = 0
-        retained_window_ids: set[int] = set()
+        retained_window_ids: set[ExternalId] = set()
         completed_document_ids: set[str] = set()
         complete = True
-        cursor: int | None = None
+        cursor: ExternalId | None = None
         for start in range(
             0,
             len(documents),
@@ -842,7 +819,7 @@ class ChatMemoryIngestor:
                     completed_document_ids,
                 )
                 if prefix:
-                    cursor = prefix[-1].id
+                    cursor = _memory_cursor(prefix[-1])
                     await checkpoint(
                         cursor,
                         _message_datetime(prefix[-1]).timestamp(),
@@ -857,7 +834,7 @@ class ChatMemoryIngestor:
                 complete = False
                 break
         if complete and messages:
-            cursor = messages[-1].id
+            cursor = _memory_cursor(messages[-1])
             if not documents and checkpoint is not None:
                 await checkpoint(
                     cursor,
@@ -889,15 +866,15 @@ class ChatMemoryIngestor:
 
     async def _prepare_documents(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         messages: tuple[ReplyTarget, ...],
     ) -> tuple[PreparedMemoryDocument, ...]:
         window_ids = {message.id for message in messages}
         window_positions = {message.id: index for index, message in enumerate(messages)}
         known = {message.id: message for message in messages}
-        root_groups: dict[int, dict[int, ReplyTarget]] = {}
-        fixed_document_ids: dict[int, str] = {}
-        album_roots: dict[int, int] = {}
+        root_groups: dict[ExternalId, dict[ExternalId, ReplyTarget]] = {}
+        fixed_document_ids: dict[ExternalId, str] = {}
+        album_roots: dict[int, ExternalId] = {}
         for message in messages:
             chain = await self._load_chain(chat_id, message, known)
             if not chain:
@@ -929,7 +906,7 @@ class ChatMemoryIngestor:
             source_ids,
         )
 
-        assigned_documents: dict[int, str] = {}
+        assigned_documents: dict[ExternalId, str] = {}
         for root_id, grouped in root_groups.items():
             root_source_id = self._identity_codec.message_source_id(
                 chat_id,
@@ -956,7 +933,7 @@ class ChatMemoryIngestor:
             assigned_document_ids,
         )
 
-        document_groups: dict[str, dict[int, ReplyTarget]] = {}
+        document_groups: dict[str, dict[ExternalId, ReplyTarget]] = {}
         for root_id, document_id in assigned_documents.items():
             grouped = root_groups[root_id]
             if len(grouped) > self._ingestion_settings.max_thread_messages:
@@ -1015,7 +992,11 @@ class ChatMemoryIngestor:
         )
         candidate_appended = False
         unassigned_roots: list[
-            tuple[int, dict[int, ReplyTarget], tuple[HumanObservation, ...]]
+            tuple[
+                ExternalId,
+                dict[ExternalId, ReplyTarget],
+                tuple[HumanObservation, ...],
+            ]
         ] = []
         for root_id in unassigned_root_ids:
             grouped = root_groups[root_id]
@@ -1038,7 +1019,7 @@ class ChatMemoryIngestor:
             )
             if observations:
                 unassigned_roots.append((root_id, grouped, observations))
-        unassigned_roots.sort(key=lambda item: (item[2][0].occurred_at, item[0]))
+        unassigned_roots.sort(key=lambda item: (item[2][0].occurred_at, str(item[0])))
 
         for root_id, grouped, observations in unassigned_roots:
             if open_document_id is not None and segment_accepts(
@@ -1078,9 +1059,7 @@ class ChatMemoryIngestor:
                 key=lambda message: (_message_datetime(message), message.id),
             )
             if (
-                document_id.startswith(
-                    f"{self._identity_codec.source}:thread:"
-                )
+                document_id.startswith(f"{self._identity_codec.source}:thread:")
                 and len(ordered) > self._ingestion_settings.max_thread_messages
             ):
                 raise MemoryThreadLimitError(
@@ -1126,33 +1105,30 @@ class ChatMemoryIngestor:
 
     async def _hydrate_previous_events(
         self,
-        chat_id: int,
-        document_groups: dict[str, dict[int, ReplyTarget]],
+        chat_id: ExternalId,
+        document_groups: dict[str, dict[ExternalId, ReplyTarget]],
         receipts: dict[str, MemoryDocumentReceipt],
-        known: dict[int, ReplyTarget],
+        known: dict[ExternalId, ReplyTarget],
     ) -> None:
-        prefix = _message_source_prefix(self._identity_codec, chat_id)
-        previous_by_document: dict[str, tuple[int, ...]] = {}
-        missing_ids: set[int] = set()
+        previous_by_document: dict[str, tuple[ExternalId, ...]] = {}
+        missing_ids: set[ExternalId] = set()
         for document_id, grouped in document_groups.items():
             receipt = receipts.get(document_id)
             if receipt is None:
                 continue
-            previous_ids: list[int] = []
+            previous_ids: list[ExternalId] = []
             for source_id, _ in receipt.event_versions:
-                if not source_id.startswith(prefix):
+                parsed = self._identity_codec.parse_message_source_id(source_id)
+                if parsed is None:
                     continue
-                try:
-                    message_id = int(source_id.removeprefix(prefix))
-                except ValueError:
+                source_chat_id, message_id = parsed
+                if source_chat_id != chat_id:
                     continue
-                if message_id > 0 and message_id not in grouped:
+                if message_id not in grouped:
                     previous_ids.append(message_id)
                     if message_id not in known:
                         missing_ids.add(message_id)
-            if document_id.startswith(
-                f"{self._identity_codec.source}:thread:"
-            ):
+            if document_id.startswith(f"{self._identity_codec.source}:thread:"):
                 limit = self._ingestion_settings.max_thread_messages
             elif _is_memory_session_document(self._identity_codec, document_id):
                 limit = max(
@@ -1171,11 +1147,9 @@ class ChatMemoryIngestor:
                 )
             previous_by_document[document_id] = tuple(previous_ids)
 
-        semaphore = asyncio.Semaphore(
-            self._ingestion_settings.preprocess_concurrency
-        )
+        semaphore = asyncio.Semaphore(self._ingestion_settings.preprocess_concurrency)
 
-        async def fetch(message_id: int) -> ReplyTarget | None:
+        async def fetch(message_id: ExternalId) -> ReplyTarget | None:
             async with semaphore:
                 return await self._retry_source(
                     lambda: self._source.fetch_message(chat_id, message_id)
@@ -1183,7 +1157,7 @@ class ChatMemoryIngestor:
 
         if missing_ids:
             fetched = await asyncio.gather(
-                *(fetch(message_id) for message_id in sorted(missing_ids))
+                *(fetch(message_id) for message_id in sorted(missing_ids, key=str))
             )
             for message in fetched:
                 if message is not None:
@@ -1198,23 +1172,21 @@ class ChatMemoryIngestor:
 
     async def _build_observations(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         messages: tuple[ReplyTarget, ...],
-    ) -> dict[int, HumanObservation]:
+    ) -> dict[ExternalId, HumanObservation]:
         message_ids = tuple(message.id for message in messages)
         scope_id = self._identity_codec.scope_id(chat_id)
         excluded_ids, answer_ids = await asyncio.gather(
             self._store.get_memory_excluded_message_ids(scope_id, message_ids),
             self._store.get_ai_answer_message_ids(scope_id, message_ids),
         )
-        semaphore = asyncio.Semaphore(
-            self._ingestion_settings.preprocess_concurrency
-        )
+        semaphore = asyncio.Semaphore(self._ingestion_settings.preprocess_concurrency)
         identity_semaphore = asyncio.Semaphore(
             self._ingestion_settings.preprocess_concurrency
         )
-        identity_tasks: dict[int, asyncio.Task[Any]] = {}
-        album_attachment_representatives: dict[int, int] = {}
+        identity_tasks: dict[ExternalId, asyncio.Task[Any]] = {}
+        album_attachment_representatives: dict[int, ExternalId] = {}
         for message in messages:
             grouped_id = getattr(message, "grouped_id", None)
             if (
@@ -1289,12 +1261,12 @@ class ChatMemoryIngestor:
 
     async def _load_chain(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         message: ReplyTarget,
-        known: dict[int, ReplyTarget],
+        known: dict[ExternalId, ReplyTarget],
     ) -> tuple[ReplyTarget, ...]:
         newest_first: list[ReplyTarget] = []
-        seen: set[int] = set()
+        seen: set[ExternalId] = set()
         current: ReplyTarget | None = message
         while current is not None:
             if current.id in seen:
@@ -1328,10 +1300,7 @@ class ChatMemoryIngestor:
                     if self._source_retry_delay is not None
                     else None
                 )
-                if (
-                    delay is None
-                    or attempt >= self._ingestion_settings.retry_attempts
-                ):
+                if delay is None or attempt >= self._ingestion_settings.retry_attempts:
                     raise
                 delay = min(
                     max(0.0, delay),

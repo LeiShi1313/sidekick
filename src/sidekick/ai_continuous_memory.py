@@ -10,13 +10,13 @@ from sidekick.ai_memory_ingestion import (
     ContinuousMemoryResult,
     MemoryIngestionBusyError,
 )
-from sidekick.chat.identity import IdentityCodec
+from sidekick.chat.identity import ExternalId, IdentityCodec
 
 
 class ContinuousMemoryRunner(Protocol):
     async def run_continuous_scope(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
     ) -> ContinuousMemoryResult: ...
 
 
@@ -103,10 +103,7 @@ class ContinuousMemoryScheduler:
         scopes = tuple(
             (scope_id, chat_id)
             for scope_id in await self._store.list_continuous_memory_scopes()
-            if isinstance(
-                chat_id := self._identity_codec.parse_scope_id(scope_id),
-                int,
-            )
+            if (chat_id := self._identity_codec.parse_scope_id(scope_id)) is not None
         )
         semaphore = asyncio.Semaphore(self._settings.concurrency)
         succeeded = 0
@@ -118,7 +115,7 @@ class ContinuousMemoryScheduler:
 
         async def run(
             scope_id: str,
-            chat_id: int,
+            chat_id: ExternalId,
         ) -> tuple[str, ContinuousMemoryResult | None]:
             async with semaphore:
                 try:

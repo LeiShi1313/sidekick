@@ -10,6 +10,7 @@ import sqlite3
 import pytest
 
 from sidekick.ai import (
+    AIAnswerMarker,
     AIConversationHandler,
     AIResponder,
     AIStateRepository,
@@ -109,6 +110,20 @@ def test_identity_codec_keeps_network_identities_disjoint():
     assert telegram.parse_scope_id("telegram:chat:7") == 7
     assert qq.parse_scope_id("qq:group:7") == 7
     assert qq.parse_scope_id("telegram:chat:7") is None
+
+
+def test_identity_codec_round_trips_message_source_components():
+    codec = NamespacedIdentityCodec(
+        source="example",
+        actor_kind="user",
+        scope_kind="chat",
+    )
+    source_id = codec.message_source_id("room:one", "message:two")
+
+    assert codec.parse_message_source_id(source_id) == (
+        "room:one",
+        "message:two",
+    )
 
 
 def test_attachment_reference_contains_metadata_but_no_binary_payload():
@@ -530,3 +545,237 @@ async def test_state_repository_migrates_legacy_telegram_identity_columns(tmp_pa
         )
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_state_repository_preserves_opaque_decimal_string_message_ids(tmp_path):
+    path = tmp_path / "ai.db"
+    scope_id = "wechat:chat:56825427596%40chatroom"
+    answer_id = "7158246912028861544"
+    trigger_id = "4159667620982040828"
+    store = await AIStateRepository(path).connect()
+    try:
+        await store.save_answer(
+            AIAnswerMarker(
+                scope_id=scope_id,
+                answer_message_id=answer_id,
+                trigger_message_id=trigger_id,
+                requester_id="wechat:user:wxid_example",
+                prompt="question",
+                answer_text="answer",
+                parent_answer_message_id=None,
+                reference_context="",
+                agent_session_id="session-1",
+                agent_entry_id="entry-1",
+            )
+        )
+        await store.mark_memory_excluded_message(
+            scope_id,
+            answer_id,
+            "ai-answer",
+        )
+
+        marker = await store.get_answer(scope_id, answer_id)
+        answer_ids = await store.get_ai_answer_message_ids(
+            scope_id,
+            (answer_id,),
+        )
+        excluded_ids = await store.get_memory_excluded_message_ids(
+            scope_id,
+            (answer_id,),
+        )
+    finally:
+        await store.close()
+
+    assert marker is not None
+    assert marker.answer_message_id == answer_id
+    assert marker.trigger_message_id == trigger_id
+    assert answer_ids == frozenset({answer_id})
+    assert excluded_ids == frozenset({answer_id})
+
+    with sqlite3.connect(path) as connection:
+        answer_types = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA table_info(ai_answers)")
+        }
+        exclusion_types = {
+            row[1]: row[2]
+            for row in connection.execute(
+                "PRAGMA table_info(ai_memory_excluded_messages)"
+            )
+        }
+
+    assert answer_types["answer_message_id"] == "BLOB"
+    assert answer_types["trigger_message_id"] == "BLOB"
+    assert answer_types["parent_answer_message_id"] == "BLOB"
+    assert exclusion_types["message_id"] == "BLOB"
+
+
+@pytest.mark.asyncio
+async def test_state_repository_preserves_opaque_memory_cursors(tmp_path):
+    path = tmp_path / "ai.db"
+    scope_id = "wechat:chat:56825427596%40chatroom"
+    cursor = "4159667620982040828"
+    store = await AIStateRepository(path).connect()
+    try:
+        await store.set_continuous_memory_enabled(
+            scope_id,
+            True,
+            cursor_message_id=cursor,
+        )
+        await store.record_memory_dream_success(
+            scope_id,
+            cursor_message_id=cursor,
+            scanned_until_at=1_783_772_734,
+            succeeded_at=1_783_772_735,
+        )
+
+        scope = await store.get_memory_scope_state(scope_id)
+        dream = await store.get_memory_dream_state(scope_id)
+    finally:
+        await store.close()
+
+    assert scope.continuous_cursor_message_id == cursor
+    assert dream.cursor_message_id == cursor
+
+    with sqlite3.connect(path) as connection:
+        scope_types = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA table_info(ai_memory_scopes)")
+        }
+        dream_types = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA table_info(ai_memory_dream_state)")
+        }
+
+    assert scope_types["continuous_cursor_message_id"] == "BLOB"
+    assert dream_types["cursor_message_id"] == "BLOB"
+
+
+@pytest.mark.asyncio
+async def test_state_repository_migrates_integer_memory_cursors(tmp_path):
+    path = tmp_path / "ai.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ai_memory_scopes (
+                scope_id TEXT PRIMARY KEY,
+                continuous_enabled INTEGER NOT NULL DEFAULT 0,
+                dream_enabled INTEGER NOT NULL DEFAULT 0,
+                display_name TEXT,
+                continuous_cursor_message_id INTEGER,
+                continuous_last_attempt_at REAL,
+                continuous_last_success_at REAL,
+                continuous_last_error TEXT,
+                updated_at REAL NOT NULL
+            );
+            INSERT INTO ai_memory_scopes VALUES (
+                'telegram:chat:-1001', 1, 0, 'Example', 42,
+                NULL, NULL, NULL, 1
+            );
+            CREATE TABLE ai_memory_dream_state (
+                scope_id TEXT PRIMARY KEY,
+                cursor_message_id INTEGER,
+                scanned_until_at REAL,
+                last_attempt_at REAL,
+                last_success_at REAL,
+                last_error TEXT,
+                lease_owner TEXT,
+                lease_expires_at REAL
+            );
+            INSERT INTO ai_memory_dream_state VALUES (
+                'telegram:chat:-1001', 41, 1, 2, 3, NULL, NULL, NULL
+            );
+            """
+        )
+
+    store = await AIStateRepository(path).connect()
+    try:
+        scope = await store.get_memory_scope_state("telegram:chat:-1001")
+        dream = await store.get_memory_dream_state("telegram:chat:-1001")
+    finally:
+        await store.close()
+
+    assert scope.continuous_cursor_message_id == 42
+    assert dream.cursor_message_id == 41
+
+    with sqlite3.connect(path) as connection:
+        scope_type = connection.execute(
+            "SELECT type FROM pragma_table_info('ai_memory_scopes') "
+            "WHERE name = 'continuous_cursor_message_id'"
+        ).fetchone()[0]
+        dream_type = connection.execute(
+            "SELECT type FROM pragma_table_info('ai_memory_dream_state') "
+            "WHERE name = 'cursor_message_id'"
+        ).fetchone()[0]
+
+    assert scope_type == "BLOB"
+    assert dream_type == "BLOB"
+
+
+@pytest.mark.asyncio
+async def test_state_repository_migrates_namespaced_integer_message_id_columns(
+    tmp_path,
+):
+    path = tmp_path / "ai.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ai_answers (
+                scope_id TEXT NOT NULL,
+                answer_message_id INTEGER NOT NULL,
+                trigger_message_id INTEGER NOT NULL,
+                requester_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer_text TEXT NOT NULL,
+                parent_answer_message_id INTEGER,
+                reference_context TEXT NOT NULL,
+                agent_session_id TEXT,
+                agent_entry_id TEXT,
+                PRIMARY KEY (scope_id, answer_message_id)
+            );
+            INSERT INTO ai_answers VALUES (
+                'telegram:chat:-1001', 100, 1, 'telegram:user:20',
+                'question', 'answer', NULL, '', 's1', 'e1'
+            );
+            CREATE TABLE ai_memory_excluded_messages (
+                scope_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (scope_id, message_id)
+            );
+            INSERT INTO ai_memory_excluded_messages VALUES (
+                'telegram:chat:-1001', 101, 'ai-answer', 3
+            );
+            """
+        )
+
+    store = await AIStateRepository(path).connect()
+    try:
+        marker = await store.get_answer("telegram:chat:-1001", 100)
+        excluded = await store.is_memory_excluded_message(
+            "telegram:chat:-1001",
+            101,
+        )
+    finally:
+        await store.close()
+
+    assert marker is not None
+    assert marker.answer_message_id == 100
+    assert excluded is True
+
+    with sqlite3.connect(path) as connection:
+        answer_types = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA table_info(ai_answers)")
+        }
+        exclusion_types = {
+            row[1]: row[2]
+            for row in connection.execute(
+                "PRAGMA table_info(ai_memory_excluded_messages)"
+            )
+        }
+
+    assert answer_types["answer_message_id"] == "BLOB"
+    assert exclusion_types["message_id"] == "BLOB"

@@ -56,6 +56,30 @@ class QQIdentityCodec:
         scope_kind, scope_value = _scope_components(scope_id)
         return f"qq:message:{scope_kind}:{scope_value}:{_component(message_id)}"
 
+    def parse_message_source_id(
+        self,
+        source_id: str,
+    ) -> tuple[ExternalId, ExternalId] | None:
+        prefix = "qq:message:"
+        if not source_id.startswith(prefix):
+            return None
+        parts = source_id.removeprefix(prefix).split(":")
+        if len(parts) != 3:
+            return None
+        scope_kind, scope_component, message_component = parts
+        scope_value = _positive_int(scope_component)
+        message_id = _positive_int(message_component)
+        if (
+            scope_kind not in {"group", "private"}
+            or scope_value is None
+            or message_id is None
+            or str(scope_value) != scope_component
+            or str(message_id) != message_component
+        ):
+            return None
+        chat_id = scope_value if scope_kind == "group" else -scope_value
+        return chat_id, message_id
+
     def thread_document_id(
         self,
         scope_id: ExternalId,
