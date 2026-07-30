@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 import sqlite3
 
@@ -26,6 +27,38 @@ from sidekick.wechat.store import WeChatStateRepository
 CONNECTOR_KEY = "http://127.0.0.1:18188"
 ACCOUNT_ID = "wxid_self"
 GROUP_ID = "56825427596@chatroom"
+
+
+class PausingWeChatStateRepository(WeChatStateRepository):
+    def __init__(self, path):
+        super().__init__(path)
+        self.pause_chat_refresh = False
+        self.chat_refresh_deleted = asyncio.Event()
+        self.resume_chat_refresh = asyncio.Event()
+
+    async def _replace_chats(
+        self,
+        connector_key: str,
+        account_id: str,
+        generation: int,
+        chats: WeChatChatList,
+        *,
+        now: float,
+    ) -> None:
+        if self.pause_chat_refresh:
+            await self._require_connection().execute(
+                "DELETE FROM wechat_chats WHERE connector_key = ? AND account_id = ?",
+                (connector_key, account_id),
+            )
+            self.chat_refresh_deleted.set()
+            await self.resume_chat_refresh.wait()
+        await super()._replace_chats(
+            connector_key,
+            account_id,
+            generation,
+            chats,
+            now=now,
+        )
 
 
 def connector_message(
@@ -215,6 +248,44 @@ async def test_wechat_store_upserts_revisions_and_acks_processing_atomically(tmp
         assert await restarted.is_processed(command) is True
     finally:
         await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_store_hides_partial_chat_refreshes_from_concurrent_reads(
+    tmp_path,
+) -> None:
+    store = await PausingWeChatStateRepository(tmp_path / "wechat.db").connect()
+    refresh_task = None
+    read_task = None
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=chat_list(),
+            messages=WeChatMessageList(messages=(), cursor="bootstrap-messages"),
+        )
+        store.pause_chat_refresh = True
+        refresh_task = asyncio.create_task(
+            store.refresh_chats(CONNECTOR_KEY, chat_list(cursor="refresh-chats"))
+        )
+        await store.chat_refresh_deleted.wait()
+
+        read_task = asyncio.create_task(store.get_chat(CONNECTOR_KEY, GROUP_ID))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(read_task), timeout=0.1)
+
+        store.resume_chat_refresh.set()
+        await refresh_task
+        chat = await read_task
+        assert chat is not None
+        assert chat.id == GROUP_ID
+    finally:
+        store.resume_chat_refresh.set()
+        if refresh_task is not None:
+            await asyncio.gather(refresh_task, return_exceptions=True)
+        if read_task is not None:
+            await asyncio.gather(read_task, return_exceptions=True)
+        await store.close()
 
 
 @pytest.mark.asyncio

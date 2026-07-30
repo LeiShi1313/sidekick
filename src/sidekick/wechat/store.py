@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 import time
+from typing import Concatenate, ParamSpec, TypeVar
 
 import aiosqlite
 
@@ -18,11 +22,41 @@ from sidekick.wechat.api import (
 from sidekick.wechat.message import WeChatMessage
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _serialized(
+    method: Callable[
+        Concatenate[WeChatStateRepository, _P],
+        Awaitable[_R],
+    ],
+) -> Callable[
+    Concatenate[WeChatStateRepository, _P],
+    Awaitable[_R],
+]:
+    @wraps(method)
+    async def locked(
+        self: WeChatStateRepository,
+        /,
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _R:
+        async with self._access_lock:
+            return await method(self, *args, **kwargs)
+
+    return locked
+
+
 class WeChatStateRepository:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._connection: aiosqlite.Connection | None = None
+        # aiosqlite serializes statements, not multi-statement transactions.
+        # Readers share this lock so they cannot observe an in-progress refresh.
+        self._access_lock = asyncio.Lock()
 
+    @_serialized
     async def connect(self) -> WeChatStateRepository:
         parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -137,11 +171,13 @@ class WeChatStateRepository:
         self.path.chmod(0o600)
         return self
 
+    @_serialized
     async def close(self) -> None:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
 
+    @_serialized
     async def bootstrap(
         self,
         *,
@@ -211,6 +247,7 @@ class WeChatStateRepository:
             await connection.rollback()
             raise
 
+    @_serialized
     async def refresh_chats(
         self,
         connector_key: str,
@@ -232,6 +269,7 @@ class WeChatStateRepository:
             await connection.rollback()
             raise
 
+    @_serialized
     async def project_event(
         self,
         connector_key: str,
@@ -294,6 +332,7 @@ class WeChatStateRepository:
             await connection.commit()
         return None
 
+    @_serialized
     async def acknowledge_event(
         self,
         connector_key: str,
@@ -335,6 +374,7 @@ class WeChatStateRepository:
             await connection.rollback()
             raise
 
+    @_serialized
     async def is_processed(self, message: WeChatMessage) -> bool:
         cursor = await self._require_connection().execute(
             """
@@ -351,6 +391,7 @@ class WeChatStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    @_serialized
     async def mark_processed_identity(
         self,
         connector_key: str,
@@ -369,18 +410,22 @@ class WeChatStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def get_cursor(self, connector_key: str) -> str:
         state = await self._connector_state(connector_key)
         return str(state["cursor"])
 
+    @_serialized
     async def get_account_id(self, connector_key: str) -> str:
         state = await self._connector_state(connector_key)
         return str(state["account_id"])
 
+    @_serialized
     async def get_generation(self, connector_key: str) -> int:
         state = await self._connector_state(connector_key)
         return int(state["connection_generation"])
 
+    @_serialized
     async def get_message(
         self,
         connector_key: str,
@@ -410,6 +455,7 @@ class WeChatStateRepository:
         row = await cursor.fetchone()
         return WeChatMessage.from_row(row) if row is not None else None
 
+    @_serialized
     async def get_chat(
         self,
         connector_key: str,
@@ -437,6 +483,7 @@ class WeChatStateRepository:
             ),
         )
 
+    @_serialized
     async def get_latest_memory_cursor(
         self,
         connector_key: str,
@@ -461,6 +508,7 @@ class WeChatStateRepository:
             else 0
         )
 
+    @_serialized
     async def fetch_recent(
         self,
         connector_key: str,
@@ -495,6 +543,7 @@ class WeChatStateRepository:
         rows = await cursor.fetchall()
         return tuple(WeChatMessage.from_row(row) for row in reversed(rows))
 
+    @_serialized
     async def fetch_memory_window(
         self,
         connector_key: str,
@@ -525,6 +574,7 @@ class WeChatStateRepository:
         rows = await cursor.fetchall()
         return tuple(WeChatMessage.from_row(row) for row in reversed(rows))
 
+    @_serialized
     async def fetch_memory_after(
         self,
         connector_key: str,
@@ -554,6 +604,7 @@ class WeChatStateRepository:
             messages.append(message)
         return tuple(messages)
 
+    @_serialized
     async def count_messages(self, connector_key: str) -> int:
         cursor = await self._require_connection().execute(
             """
