@@ -8,6 +8,7 @@ services:
     environment:
       AI_BASE_URL: ${AI_BASE_URL}
       AI_API_KEY: ${AI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
       AI_CHAT_MODEL: ${AI_CHAT_MODEL}
       AI_REASONING_EFFORT: ${AI_REASONING_EFFORT:-none}
       AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-4000}
