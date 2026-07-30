@@ -56,6 +56,8 @@ idempotent text send, and stable outbound message-ID capabilities. Its local
 projection defaults to `~/.sidekick/wechat.db`. Connector history remains
 partial by contract: Sidekick can backfill only messages that this connector
 instance has already observed and stored, never a complete WeChat chat history.
+Keep an unauthenticated connector bound to loopback; use its bearer token (and
+TLS outside a trusted local network) whenever it is reachable by another host.
 
 When `SIDEKICK_HINDSIGHT_URL` is set, the WeChat channel uses the same memory
 commands as the other chat adapters. `/ai` receives an account-scoped Hindsight
@@ -66,6 +68,9 @@ continuous ingestion for new messages in that chat. Continuous and Dream
 ingestion are off per chat until explicitly enabled. Setting
 `SIDEKICK_HINDSIGHT_URL` to an empty value disables memory; memory commands then
 report that Hindsight is disabled instead of silently changing ingestion state.
+A recalled or redacted WeChat message is excluded from later local reads and
+backfills, but recall cannot erase a copy that was already retained in
+Hindsight; that memory must be revised or removed through the memory service.
 
 ## Containers
 

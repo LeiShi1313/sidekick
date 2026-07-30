@@ -50,6 +50,7 @@ class WeChatBootstrap:
 class _PendingEvent:
     event: WeChatEvent
     operation: asyncio.Task[WeChatMessage | None] | None = None
+    processed_persisted: bool = False
     commit_cursor: bool = True
     rebootstrap: bool = False
 
@@ -128,7 +129,7 @@ class WeChatEventPump:
                     and not stream_ended
                     and len(pending) < self._handler_concurrency
                 ):
-                    next_event = asyncio.create_task(anext(iterator))
+                    next_event = asyncio.create_task(iterator.__anext__())
 
                 wait_for: set[asyncio.Task[object]] = {stopped}
                 if next_event is not None:
@@ -226,6 +227,7 @@ class WeChatEventPump:
         self,
         pending: deque[_PendingEvent],
     ) -> Literal["rebootstrap"] | None:
+        await self._persist_out_of_order_completions(pending)
         while pending:
             current = pending[0]
             operation = current.operation
@@ -236,12 +238,39 @@ class WeChatEventPump:
                 await self._store.acknowledge_event(
                     self._connector_key,
                     current.event.cursor,
-                    processed_message=processed,
+                    processed_message=(
+                        None if current.processed_persisted else processed
+                    ),
                 )
             pending.popleft()
             if current.rebootstrap:
                 return "rebootstrap"
         return None
+
+    async def _persist_out_of_order_completions(
+        self,
+        pending: deque[_PendingEvent],
+    ) -> None:
+        for current in tuple(pending)[1:]:
+            operation = current.operation
+            if (
+                operation is None
+                or not operation.done()
+                or operation.cancelled()
+                or current.processed_persisted
+                or operation.exception() is not None
+            ):
+                continue
+            message = operation.result()
+            if message is None:
+                continue
+            await self._store.mark_processed_identity(
+                self._connector_key,
+                message.account_id,
+                message.chat_id,
+                message.id,
+            )
+            current.processed_persisted = True
 
     @staticmethod
     async def _handle_message(

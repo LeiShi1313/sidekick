@@ -35,16 +35,18 @@ def connector_message(
     sender_id: str = "wxid_alice",
     reply_to_message_id: str | None = None,
     timestamp: int = 1_783_772_734,
+    message_type: str = "text",
+    content_redacted: bool = False,
 ) -> WeChatConnectorMessage:
     return WeChatConnectorMessage(
         id=message_id,
         chat_id=GROUP_ID,
         direction="in",
-        message_type="text",
+        message_type=message_type,
         sender_id=sender_id,
         reply_to_message_id=reply_to_message_id,
         content=content,
-        content_redacted=False,
+        content_redacted=content_redacted,
         timestamp=timestamp,
         source="wechat+localdb",
         sequence=None,
@@ -300,6 +302,100 @@ async def test_wechat_memory_source_reads_stored_windows_and_late_revisions(tmp_
         assert target.chat_id == GROUP_ID
         assert target.display_name == "Example group"
         assert target.latest_message_id == revised.memory_cursor
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_history_excludes_redacted_and_unsupported_messages(tmp_path):
+    visible_id = "3159667620982040828"
+    redacted_id = "4159667620982040828"
+    image_id = "5159667620982040828"
+    anchor_id = "6159667620982040828"
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=chat_list(),
+            messages=WeChatMessageList(
+                messages=(
+                    connector_message(visible_id, "visible", timestamp=1_783_772_700),
+                    connector_message(
+                        redacted_id,
+                        "must not escape",
+                        timestamp=1_783_772_701,
+                        content_redacted=True,
+                    ),
+                    connector_message(
+                        image_id,
+                        "unsupported image metadata",
+                        timestamp=1_783_772_702,
+                        message_type="image",
+                    ),
+                    connector_message(anchor_id, "/ai summarize"),
+                ),
+                cursor="bootstrap-messages",
+            ),
+        )
+        source = WeChatHistorySource(store, CONNECTOR_KEY)
+        anchor = await source.fetch_message(GROUP_ID, anchor_id)
+        assert anchor is not None
+
+        recent = await source.fetch_recent(anchor, before=anchor, limit=10)
+        window = await source.fetch_window(
+            GROUP_ID,
+            since=datetime.fromtimestamp(1_783_772_699, UTC),
+            until=datetime.fromtimestamp(1_783_772_735, UTC),
+            limit=10,
+        )
+
+        assert [message.id for message in recent] == [visible_id]
+        assert [message.id for message in window] == [visible_id, anchor_id]
+        assert await source.fetch_message(GROUP_ID, redacted_id) is None
+        assert await source.fetch_message(GROUP_ID, image_id) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_store_applies_empty_redaction_revision(tmp_path):
+    message_id = "3159667620982040828"
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=chat_list(),
+            messages=WeChatMessageList(
+                messages=(connector_message(message_id, "private text"),),
+                cursor="bootstrap-messages",
+            ),
+        )
+        redaction = event(
+            {
+                "id": message_id,
+                "chatId": GROUP_ID,
+                "direction": "in",
+                "messageType": "text",
+                "senderId": "wxid_alice",
+                "contentRedacted": True,
+                "timestamp": 1_783_772_734,
+                "source": "wechat+hook",
+            },
+            cursor="redacted-revision",
+        )
+
+        projected = await store.project_event(CONNECTOR_KEY, redaction)
+        visible = await WeChatHistorySource(store, CONNECTOR_KEY).fetch_message(
+            GROUP_ID,
+            message_id,
+        )
+
+        assert projected is not None
+        assert projected.content_redacted is True
+        assert projected.raw_text == ""
+        assert visible is None
     finally:
         await store.close()
 

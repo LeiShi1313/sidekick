@@ -157,6 +157,7 @@ class FakeConnectorClient:
         self.messages = WeChatMessageList(messages=(), cursor="10")
         self.event_values = list(events)
         self.after_values: list[str] = []
+        self.chat_reads = 0
 
     async def get_session(self):
         return self.session
@@ -165,6 +166,7 @@ class FakeConnectorClient:
         return self.capabilities
 
     async def get_chats(self):
+        self.chat_reads += 1
         return self.chats
 
     async def get_messages(self, *, limit):
@@ -196,6 +198,8 @@ def message_event(
     content: str = "/ai hello",
     reply_to: str | None = None,
     connection_generation: int = 41,
+    message_type: str = "text",
+    content_redacted: bool = False,
 ) -> WeChatEvent:
     payload = {
         "schemaVersion": "wechat-bridge/v1alpha1",
@@ -204,12 +208,14 @@ def message_event(
         "id": message_id,
         "chatId": CHAT_ID,
         "direction": "out",
-        "messageType": "text",
+        "messageType": message_type,
         "senderId": ACCOUNT_ID,
         "content": content,
         "timestamp": 1_783_772_734,
         "connectionGeneration": connection_generation,
     }
+    if content_redacted:
+        payload["contentRedacted"] = True
     if reply_to is not None:
         payload["replyToMessageId"] = reply_to
     return WeChatEvent.parse(payload)
@@ -246,6 +252,44 @@ async def test_wechat_event_pump_handles_each_message_once_and_then_acks(tmp_pat
 
         assert replay_result == "reconnect"
         assert len(handler.messages) == 1
+        assert await store.get_cursor(CONNECTOR_KEY) == "12"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_ignores_unsupported_messages_without_chat_refresh(
+    tmp_path,
+) -> None:
+    client = FakeConnectorClient(
+        (
+            message_event(
+                cursor="11",
+                content="redacted",
+                content_redacted=True,
+            ),
+            message_event(
+                cursor="12",
+                message_id="4159667620982040829",
+                content="image metadata",
+                message_type="image",
+            ),
+        )
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert result == "reconnect"
+        assert handler.messages == []
+        assert client.chat_reads == 1
         assert await store.get_cursor(CONNECTOR_KEY) == "12"
     finally:
         await store.close()
@@ -495,6 +539,72 @@ async def test_wechat_event_pump_commits_concurrent_handlers_in_cursor_order(tmp
 
         handler.first_release.set()
         assert await asyncio.wait_for(task, timeout=1) == "reconnect"
+        assert await store.get_cursor(CONNECTOR_KEY) == "12"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_does_not_repeat_later_completed_handler(
+    tmp_path,
+) -> None:
+    class FailFirstOnceHandler:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.second_done = asyncio.Event()
+            self.failed = False
+
+        async def handle(self, message):
+            self.calls.append(message.raw_text)
+            if message.raw_text == "/ai first" and not self.failed:
+                await self.second_done.wait()
+                self.failed = True
+                raise RuntimeError("first handler failed")
+            if message.raw_text == "/ai second":
+                self.second_done.set()
+            return True
+
+    events = (
+        message_event(cursor="11", content="/ai first"),
+        message_event(
+            cursor="12",
+            message_id="4159667620982040829",
+            content="/ai second",
+        ),
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = FailFirstOnceHandler()
+    first_client = FakeConnectorClient(events)
+    try:
+        bootstrap = await bootstrap_wechat_channel(
+            first_client,
+            store,
+            CONNECTOR_KEY,
+        )
+        with pytest.raises(RuntimeError, match="first handler failed"):
+            await WeChatEventPump(
+                first_client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+                handler_concurrency=2,
+            ).run(handler, asyncio.Event())
+
+        assert await store.get_cursor(CONNECTOR_KEY) == "10"
+
+        replay_client = FakeConnectorClient(events)
+        assert (
+            await WeChatEventPump(
+                replay_client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+                handler_concurrency=2,
+            ).run(handler, asyncio.Event())
+            == "reconnect"
+        )
+
+        assert handler.calls == ["/ai first", "/ai second", "/ai first"]
         assert await store.get_cursor(CONNECTOR_KEY) == "12"
     finally:
         await store.close()

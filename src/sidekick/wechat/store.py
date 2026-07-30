@@ -105,14 +105,15 @@ class WeChatStateRepository:
             await connection.execute(
                 "ALTER TABLE wechat_messages ADD COLUMN memory_order INTEGER"
             )
-            await connection.execute(
-                "UPDATE wechat_messages SET memory_order = local_order"
-            )
+        await connection.execute(
+            "UPDATE wechat_messages SET memory_order = local_order "
+            "WHERE memory_order IS NULL"
+        )
         await connection.execute(
             """
-            CREATE INDEX IF NOT EXISTS wechat_messages_by_memory_order
+            CREATE INDEX IF NOT EXISTS wechat_messages_by_chat_memory_order
             ON wechat_messages (
-                connector_key, account_id, memory_order
+                connector_key, account_id, chat_id, memory_order
             )
             """
         )
@@ -255,17 +256,14 @@ class WeChatStateRepository:
                 now=time.time(),
             )
             await connection.commit()
-            return await self.get_message(
+            return await self._get_message(
                 connector_key,
                 message.chat_id,
                 message.id,
+                include_unsupported=True,
             )
         if event.name == "message_remove":
-            payload = event.payload
-            if payload.get("status") != "recalled":
-                raise WeChatAPIContractError("Malformed WeChat message removal")
-            chat_id = _event_id(payload.get("chatId"), "chatId")
-            message_id = _event_id(payload.get("id"), "id")
+            chat_id, message_id = event.removed_message()
             memory_order = await self._next_memory_order(
                 connector_key,
                 account_id,
@@ -389,8 +387,23 @@ class WeChatStateRepository:
         chat_id: str,
         message_id: str,
     ) -> WeChatMessage | None:
+        return await self._get_message(
+            connector_key,
+            chat_id,
+            message_id,
+            include_unsupported=False,
+        )
+
+    async def _get_message(
+        self,
+        connector_key: str,
+        chat_id: str,
+        message_id: str,
+        *,
+        include_unsupported: bool,
+    ) -> WeChatMessage | None:
         cursor = await self._require_connection().execute(
-            self._message_select()
+            self._message_select(include_unsupported=include_unsupported)
             + " AND messages.chat_id = ? AND messages.message_id = ?",
             (connector_key, chat_id, message_id),
         )
@@ -633,6 +646,10 @@ class WeChatStateRepository:
                           )
                       )
                       OR (
+                          excluded.content_redacted = 1
+                          AND wechat_messages.content_redacted != 1
+                      )
+                      OR (
                           excluded.timestamp > 0
                           AND wechat_messages.timestamp IS NOT excluded.timestamp
                       )
@@ -655,10 +672,12 @@ class WeChatStateRepository:
                     wechat_messages.reply_to_message_id
                 ),
                 content = CASE
+                    WHEN excluded.content_redacted = 1 THEN ''
                     WHEN excluded.content <> '' THEN excluded.content
                     ELSE wechat_messages.content
                 END,
                 content_redacted = CASE
+                    WHEN excluded.content_redacted = 1 THEN 1
                     WHEN excluded.content <> '' THEN excluded.content_redacted
                     ELSE wechat_messages.content_redacted
                 END,
@@ -723,8 +742,8 @@ class WeChatStateRepository:
         return row
 
     @staticmethod
-    def _message_select() -> str:
-        return """
+    def _message_select(*, include_unsupported: bool = False) -> str:
+        query = """
             SELECT
                 messages.*,
                 connectors.account_id AS self_id,
@@ -740,14 +759,15 @@ class WeChatStateRepository:
              AND chats.chat_id = messages.chat_id
             WHERE messages.connector_key = ? AND messages.removed = 0
         """
+        if include_unsupported:
+            return query
+        return (
+            query
+            + " AND messages.content_redacted = 0"
+            + " AND messages.message_type = 'text'"
+        )
 
     def _require_connection(self) -> aiosqlite.Connection:
         if self._connection is None:
             raise RuntimeError("WeChat state repository is not connected")
         return self._connection
-
-
-def _event_id(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise WeChatAPIContractError(f"WeChat removal {field} is invalid")
-    return value

@@ -12,6 +12,7 @@ from sidekick.wechat.api import (
     WeChatAPIContractError,
     WeChatConnectorMessage,
     WeChatConnectorClient,
+    WeChatEvent,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
 )
@@ -68,6 +69,42 @@ def test_wechat_client_preserves_maximum_uint64_message_id_as_text() -> None:
 
     assert message.id == message_id
     assert operation.message_id == message_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("chatId", "room with spaces"),
+        ("senderId", "wxid_alice/../../other"),
+        ("chatId", f"a{'b' * 160}"),
+    ),
+)
+def test_wechat_client_rejects_noncanonical_wechat_ids(
+    field: str,
+    value: str,
+) -> None:
+    payload = connector_message_payload("4159667620982040828")
+    payload[field] = value
+
+    with pytest.raises(WeChatAPIContractError, match=field):
+        WeChatConnectorMessage.parse(payload)
+
+
+def test_wechat_client_validates_recall_event_identity() -> None:
+    malformed = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "message_remove",
+            "connectionGeneration": 41,
+            "status": "recalled",
+            "chatId": "not a canonical/chat",
+            "id": "4159667620982040828",
+        }
+    )
+
+    with pytest.raises(WeChatAPIContractError, match="chatId"):
+        malformed.removed_message()
 
 
 @pytest.mark.asyncio
@@ -375,7 +412,7 @@ async def test_wechat_client_replays_events_after_opaque_cursor() -> None:
         client = WeChatConnectorClient(str(server.make_url("/")))
         try:
             stream: AsyncIterator = client.events(after="opaque-current")
-            event = await anext(stream)
+            event = await stream.__anext__()
             await stream.aclose()
         finally:
             await client.close()

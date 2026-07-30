@@ -152,6 +152,9 @@ class WeChatAI(metaclass=PluginMount):
         try:
             while not stop.is_set():
                 try:
+                    # Stop account-scoped ingestion before bootstrap can switch the
+                    # active connector account in the local projection.
+                    await self._close_channel_runtime()
                     bootstrap = await bootstrap_wechat_channel(
                         self._client,
                         self._wechat_store,

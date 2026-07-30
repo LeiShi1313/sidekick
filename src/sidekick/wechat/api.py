@@ -19,6 +19,8 @@ MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_TEXT_BYTES = 4_095
 MAX_NATIVE_MESSAGE_ID = "18446744073709551615"
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+CANONICAL_WECHAT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,159}")
+MAX_OPAQUE_ID_BYTES = 4_096
 
 
 class WeChatAPIError(RuntimeError):
@@ -44,10 +46,12 @@ class WeChatSession:
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatSession:
-        status = _required_enum(payload, "status", {"unknown", "logged_in", "logged_out"})
+        status = _required_enum(
+            payload, "status", {"unknown", "logged_in", "logged_out"}
+        )
         return cls(
             status=status,
-            self_id=_required_id(payload, "selfId"),
+            self_id=_required_wechat_id(payload, "selfId"),
             display_name=_optional_text(payload, "displayName"),
             hook_connected=_required_bool(payload, "hookConnected"),
             connection_generation=_required_positive_int(
@@ -60,7 +64,9 @@ class WeChatSession:
 
     def require_current_login(self) -> None:
         if self.status != "logged_in" or not self.hook_connected:
-            raise WeChatAPIContractError("WeChat connector is not logged in and connected")
+            raise WeChatAPIContractError(
+                "WeChat connector is not logged in and connected"
+            )
         if self.content_redacted:
             raise WeChatAPIContractError(
                 "WeChat event content is redacted; /ai commands cannot be observed"
@@ -85,7 +91,9 @@ class WeChatCapabilities:
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatCapabilities:
         if payload.get("apiVersion") != API_VERSION:
-            raise WeChatAPIContractError("WeChat capabilities API version is unsupported")
+            raise WeChatAPIContractError(
+                "WeChat capabilities API version is unsupported"
+            )
         messages = _required_object(payload, "messages")
         events = _required_object(payload, "events")
         runtime = _required_object(payload, "runtime")
@@ -144,7 +152,7 @@ class WeChatChat:
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatChat:
         return cls(
-            id=_required_id(payload, "id"),
+            id=_required_wechat_id(payload, "id"),
             type=_required_enum(payload, "type", {"direct", "group"}),
             display_name=_optional_text(payload, "displayName"),
         )
@@ -197,7 +205,9 @@ class WeChatChatList:
 
     def require_current(self, generation: int) -> None:
         if not self.snapshot.complete or not self.snapshot.current:
-            raise WeChatAPIContractError("WeChat chat snapshot is not complete and current")
+            raise WeChatAPIContractError(
+                "WeChat chat snapshot is not complete and current"
+            )
         if self.snapshot.connection_generation != generation:
             raise WeChatAPIContractError("WeChat chat snapshot generation is stale")
 
@@ -222,17 +232,21 @@ class WeChatConnectorMessage:
         reply_id = _optional_native_message_id(payload, "replyToMessageId")
         sequence = payload.get("seq")
         if sequence is not None:
-            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            if (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence < 0
+            ):
                 raise WeChatAPIContractError("WeChat message seq is invalid")
             sequence_text = str(sequence)
         else:
             sequence_text = None
         return cls(
             id=message_id,
-            chat_id=_required_id(payload, "chatId"),
+            chat_id=_required_wechat_id(payload, "chatId"),
             direction=_required_enum(payload, "direction", {"in", "out"}),
             message_type=_required_text(payload, "messageType"),
-            sender_id=_required_id(payload, "senderId"),
+            sender_id=_required_wechat_id(payload, "senderId"),
             reply_to_message_id=reply_id,
             content=_optional_raw_text(payload, "content") or "",
             content_redacted=_optional_bool(payload, "contentRedacted", False),
@@ -288,6 +302,14 @@ class WeChatEvent:
             raise WeChatAPIContractError("WeChat event is not a message")
         return WeChatConnectorMessage.parse(self.payload)
 
+    def removed_message(self) -> tuple[str, str]:
+        if self.name != "message_remove" or self.payload.get("status") != "recalled":
+            raise WeChatAPIContractError("Malformed WeChat message removal")
+        return (
+            _required_wechat_id(self.payload, "chatId"),
+            _required_native_message_id(self.payload, "id"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class WeChatSendOperation:
@@ -308,7 +330,7 @@ class WeChatSendOperation:
             ),
             message_id=_optional_native_message_id(payload, "messageId"),
             error_code=_optional_text(payload, "errorCode"),
-            to=_optional_id(payload, "to"),
+            to=_optional_wechat_id(payload, "to"),
         )
 
 
@@ -372,7 +394,7 @@ class WeChatConnectorClient:
             raise ValueError("WeChat message limit must be between 1 and 1000")
         params = {"limit": str(limit)}
         if chat_id is not None:
-            params["chatId"] = _external_id(chat_id, "chat_id")
+            params["chatId"] = _canonical_wechat_id(chat_id, "chat_id")
         payload = await self._request_json("GET", "/messages", params=params)
         return WeChatMessageList.parse(payload)
 
@@ -385,7 +407,7 @@ class WeChatConnectorClient:
     ) -> WeChatSendOperation:
         if REQUEST_ID_RE.fullmatch(request_id) is None:
             raise ValueError("WeChat request ID must be 1-128 URL-safe characters")
-        target = _external_id(to, "to")
+        target = _canonical_wechat_id(to, "to")
         if not isinstance(content, str) or not content:
             raise ValueError("WeChat text content cannot be empty")
         if len(content.encode("utf-8")) > MAX_TEXT_BYTES:
@@ -509,7 +531,9 @@ class WeChatConnectorClient:
             try:
                 decoded = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise WeChatAPIContractError("WeChat connector returned malformed JSON") from exc
+                raise WeChatAPIContractError(
+                    "WeChat connector returned malformed JSON"
+                ) from exc
             payload = _object(decoded, "response")
             if response.status not in expected_statuses:
                 error = payload.get("error")
@@ -519,7 +543,9 @@ class WeChatConnectorClient:
                 raise WeChatAPIError(
                     response.status,
                     code if isinstance(code, str) and code else "HTTP_ERROR",
-                    message if isinstance(message, str) and message else "request failed",
+                    message
+                    if isinstance(message, str) and message
+                    else "request failed",
                 )
             return payload
 
@@ -591,16 +617,37 @@ def _external_id(value: Any, field: str) -> str:
         raise WeChatAPIContractError(f"WeChat {field} must be an opaque string ID")
     if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
         raise WeChatAPIContractError(f"WeChat {field} contains control characters")
+    if len(value.encode("utf-8")) > MAX_OPAQUE_ID_BYTES:
+        raise WeChatAPIContractError(f"WeChat {field} is oversized")
     return value
+
+
+def _canonical_wechat_id(value: Any, field: str) -> str:
+    external_id = _external_id(value, field)
+    if (
+        CANONICAL_WECHAT_ID_RE.fullmatch(external_id) is None
+        or external_id == "@chatroom"
+    ):
+        raise WeChatAPIContractError(f"WeChat {field} must be a canonical WeChat ID")
+    return external_id
 
 
 def _required_id(payload: Mapping[str, Any], field: str) -> str:
     return _external_id(payload.get(field), field)
 
 
+def _required_wechat_id(payload: Mapping[str, Any], field: str) -> str:
+    return _canonical_wechat_id(payload.get(field), field)
+
+
 def _optional_id(payload: Mapping[str, Any], field: str) -> str | None:
     value = payload.get(field)
     return None if value is None else _external_id(value, field)
+
+
+def _optional_wechat_id(payload: Mapping[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    return None if value is None else _canonical_wechat_id(value, field)
 
 
 def _required_native_message_id(
@@ -624,10 +671,7 @@ def _native_message_id(value: str, field: str) -> str:
         or not value.isdecimal()
         or value[0] == "0"
         or len(value) > len(MAX_NATIVE_MESSAGE_ID)
-        or (
-            len(value) == len(MAX_NATIVE_MESSAGE_ID)
-            and value > MAX_NATIVE_MESSAGE_ID
-        )
+        or (len(value) == len(MAX_NATIVE_MESSAGE_ID) and value > MAX_NATIVE_MESSAGE_ID)
     ):
         raise WeChatAPIContractError(
             f"WeChat {field} must be a canonical non-zero decimal message id"
