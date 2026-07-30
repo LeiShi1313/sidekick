@@ -10,7 +10,7 @@ from croniter import croniter
 
 from sidekick.ai import AIStateRepository, MemoryDreamRunner
 from sidekick.ai_memory_ingestion import MemoryIngestionBusyError
-from sidekick.chat.identity import IdentityCodec
+from sidekick.chat.identity import ExternalId, IdentityCodec
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,17 +129,14 @@ class DreamScheduler:
         scopes = tuple(
             (scope_id, chat_id)
             for scope_id in await self._store.list_memory_dream_scopes()
-            if isinstance(
-                chat_id := self._identity_codec.parse_scope_id(scope_id),
-                int,
-            )
+            if (chat_id := self._identity_codec.parse_scope_id(scope_id)) is not None
         )
         semaphore = asyncio.Semaphore(self._settings.concurrency)
         succeeded = 0
         failed = 0
         busy = 0
 
-        async def run(scope_id: str, chat_id: int) -> str:
+        async def run(scope_id: str, chat_id: ExternalId) -> str:
             async with semaphore:
                 try:
                     await self._scanner.run_scope(chat_id)

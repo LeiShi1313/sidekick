@@ -598,6 +598,110 @@ async def test_state_repository_preserves_opaque_decimal_string_message_ids(tmp_
 
 
 @pytest.mark.asyncio
+async def test_state_repository_preserves_opaque_memory_cursors(tmp_path):
+    path = tmp_path / "ai.db"
+    scope_id = "wechat:chat:56825427596%40chatroom"
+    cursor = "4159667620982040828"
+    store = await AIStateRepository(path).connect()
+    try:
+        await store.set_continuous_memory_enabled(
+            scope_id,
+            True,
+            cursor_message_id=cursor,
+        )
+        await store.record_memory_dream_success(
+            scope_id,
+            cursor_message_id=cursor,
+            scanned_until_at=1_783_772_734,
+            succeeded_at=1_783_772_735,
+        )
+
+        scope = await store.get_memory_scope_state(scope_id)
+        dream = await store.get_memory_dream_state(scope_id)
+    finally:
+        await store.close()
+
+    assert scope.continuous_cursor_message_id == cursor
+    assert dream.cursor_message_id == cursor
+
+    with sqlite3.connect(path) as connection:
+        scope_types = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA table_info(ai_memory_scopes)")
+        }
+        dream_types = {
+            row[1]: row[2]
+            for row in connection.execute(
+                "PRAGMA table_info(ai_memory_dream_state)"
+            )
+        }
+
+    assert scope_types["continuous_cursor_message_id"] == "BLOB"
+    assert dream_types["cursor_message_id"] == "BLOB"
+
+
+@pytest.mark.asyncio
+async def test_state_repository_migrates_integer_memory_cursors(tmp_path):
+    path = tmp_path / "ai.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ai_memory_scopes (
+                scope_id TEXT PRIMARY KEY,
+                continuous_enabled INTEGER NOT NULL DEFAULT 0,
+                dream_enabled INTEGER NOT NULL DEFAULT 0,
+                display_name TEXT,
+                continuous_cursor_message_id INTEGER,
+                continuous_last_attempt_at REAL,
+                continuous_last_success_at REAL,
+                continuous_last_error TEXT,
+                updated_at REAL NOT NULL
+            );
+            INSERT INTO ai_memory_scopes VALUES (
+                'telegram:chat:-1001', 1, 0, 'Example', 42,
+                NULL, NULL, NULL, 1
+            );
+            CREATE TABLE ai_memory_dream_state (
+                scope_id TEXT PRIMARY KEY,
+                cursor_message_id INTEGER,
+                scanned_until_at REAL,
+                last_attempt_at REAL,
+                last_success_at REAL,
+                last_error TEXT,
+                lease_owner TEXT,
+                lease_expires_at REAL
+            );
+            INSERT INTO ai_memory_dream_state VALUES (
+                'telegram:chat:-1001', 41, 1, 2, 3, NULL, NULL, NULL
+            );
+            """
+        )
+
+    store = await AIStateRepository(path).connect()
+    try:
+        scope = await store.get_memory_scope_state("telegram:chat:-1001")
+        dream = await store.get_memory_dream_state("telegram:chat:-1001")
+    finally:
+        await store.close()
+
+    assert scope.continuous_cursor_message_id == 42
+    assert dream.cursor_message_id == 41
+
+    with sqlite3.connect(path) as connection:
+        scope_type = connection.execute(
+            "SELECT type FROM pragma_table_info('ai_memory_scopes') "
+            "WHERE name = 'continuous_cursor_message_id'"
+        ).fetchone()[0]
+        dream_type = connection.execute(
+            "SELECT type FROM pragma_table_info('ai_memory_dream_state') "
+            "WHERE name = 'cursor_message_id'"
+        ).fetchone()[0]
+
+    assert scope_type == "BLOB"
+    assert dream_type == "BLOB"
+
+
+@pytest.mark.asyncio
 async def test_state_repository_migrates_namespaced_integer_message_id_columns(tmp_path):
     path = tmp_path / "ai.db"
     with sqlite3.connect(path) as connection:

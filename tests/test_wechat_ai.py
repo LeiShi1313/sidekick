@@ -12,6 +12,8 @@ from sidekick.ai import (
     AgentRunRequest,
     PromptBuilder,
 )
+from sidekick.ai_continuous_memory import ContinuousMemoryScheduler
+from sidekick.ai_memory_ingestion import ContinuousMemoryResult
 from sidekick.wechat.ai import (
     WECHAT_IDENTITY_CODEC,
     WeChatChatTransport,
@@ -337,3 +339,40 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
         assert await replay_store.is_processed(echoed_message) is True
     finally:
         await replay_store.close()
+
+
+@pytest.mark.asyncio
+async def test_continuous_memory_scheduler_accepts_wechat_scope_ids(tmp_path) -> None:
+    class RecordingScanner:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def run_continuous_scope(self, chat_id):
+            self.calls.append(chat_id)
+            return ContinuousMemoryResult(
+                messages_seen=1,
+                messages_retained=1,
+                documents_created=1,
+                documents_unchanged=0,
+                caught_up=True,
+            )
+
+    store = await AIStateRepository(tmp_path / "ai.db").connect()
+    scanner = RecordingScanner()
+    await store.set_continuous_memory_enabled(
+        WECHAT_IDENTITY_CODEC.scope_id(GROUP_ID),
+        True,
+        cursor_message_id="4159667620982040828",
+    )
+    try:
+        result = await ContinuousMemoryScheduler(
+            runner=scanner,
+            store=store,
+            identity_codec=WECHAT_IDENTITY_CODEC,
+        ).run_once()
+    finally:
+        await store.close()
+
+    assert scanner.calls == [GROUP_ID]
+    assert result.scopes_seen == 1
+    assert result.scopes_succeeded == 1

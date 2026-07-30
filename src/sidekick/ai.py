@@ -501,7 +501,7 @@ class ConversationStore(Protocol):
         scope_id: str,
         enabled: bool,
         display_name: str | None = None,
-        cursor_message_id: int | None = None,
+        cursor_message_id: ExternalId | None = None,
     ) -> None: ...
 
     async def set_dream_memory_enabled(
@@ -528,7 +528,7 @@ class ConversationStore(Protocol):
 @dataclass(frozen=True, slots=True)
 class MemoryDreamState:
     scope_id: str
-    cursor_message_id: int | None = None
+    cursor_message_id: ExternalId | None = None
     scanned_until_at: float | None = None
     last_attempt_at: float | None = None
     last_success_at: float | None = None
@@ -543,7 +543,7 @@ class MemoryScopeState:
     display_name: str | None = None
     continuous_enabled: bool = False
     dream_enabled: bool = False
-    continuous_cursor_message_id: int | None = None
+    continuous_cursor_message_id: ExternalId | None = None
     continuous_last_attempt_at: float | None = None
     continuous_last_success_at: float | None = None
     continuous_last_error: str | None = None
@@ -559,11 +559,11 @@ class MemoryDreamResult:
 
 
 class MemoryDreamRunner(Protocol):
-    async def run_scope(self, chat_id: int) -> MemoryDreamResult: ...
+    async def run_scope(self, chat_id: ExternalId) -> MemoryDreamResult: ...
 
     async def run_backfill(
         self,
-        chat_id: int,
+        chat_id: ExternalId,
         request: MemoryBackfillCommand,
     ) -> MemoryDreamResult: ...
 
@@ -1342,38 +1342,7 @@ class AIStateRepository:
             """
         )
         await self._ensure_memory_scope_schema()
-        await self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ai_memory_dream_state (
-                scope_id TEXT PRIMARY KEY,
-                cursor_message_id INTEGER,
-                scanned_until_at REAL,
-                last_attempt_at REAL,
-                last_success_at REAL,
-                last_error TEXT,
-                lease_owner TEXT,
-                lease_expires_at REAL
-            )
-            """
-        )
-        dream_columns = {
-            row["name"]
-            async for row in await self._connection.execute(
-                "PRAGMA table_info(ai_memory_dream_state)"
-            )
-        }
-        if "lease_owner" not in dream_columns:
-            await self._connection.execute(
-                "ALTER TABLE ai_memory_dream_state ADD COLUMN lease_owner TEXT"
-            )
-        if "lease_expires_at" not in dream_columns:
-            await self._connection.execute(
-                "ALTER TABLE ai_memory_dream_state ADD COLUMN lease_expires_at REAL"
-            )
-        if "scanned_until_at" not in dream_columns:
-            await self._connection.execute(
-                "ALTER TABLE ai_memory_dream_state ADD COLUMN scanned_until_at REAL"
-            )
+        await self._ensure_memory_dream_schema()
         await self._connection.commit()
         self.path.chmod(0o600)
         return self
@@ -1629,36 +1598,48 @@ class AIStateRepository:
 
     async def _ensure_memory_scope_schema(self) -> None:
         connection = self._require_connection()
-        cursor = await connection.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'ai_memory_scopes'"
-        )
-        exists = await cursor.fetchone() is not None
-        if not exists:
+        column_types = await self._table_column_types("ai_memory_scopes")
+        columns = set(column_types)
+        if not columns:
             await self._create_memory_scope_table()
             return
-        columns = {
-            row["name"]
-            async for row in await connection.execute(
-                "PRAGMA table_info(ai_memory_scopes)"
-            )
-        }
-        if "enabled" not in columns:
+        if (
+            "enabled" not in columns
+            and column_types.get("continuous_cursor_message_id") == "BLOB"
+        ):
             return
         await connection.execute(
             "ALTER TABLE ai_memory_scopes RENAME TO ai_memory_scopes_legacy"
         )
         await self._create_memory_scope_table()
-        await connection.execute(
-            """
-            INSERT INTO ai_memory_scopes (
-                scope_id, continuous_enabled, dream_enabled, display_name,
-                updated_at
+        if "enabled" in columns:
+            await connection.execute(
+                """
+                INSERT INTO ai_memory_scopes (
+                    scope_id, continuous_enabled, dream_enabled, display_name,
+                    updated_at
+                )
+                SELECT scope_id, 0, enabled, display_name, updated_at
+                FROM ai_memory_scopes_legacy
+                """
             )
-            SELECT scope_id, 0, enabled, display_name, updated_at
-            FROM ai_memory_scopes_legacy
-            """
-        )
+        else:
+            await connection.execute(
+                """
+                INSERT INTO ai_memory_scopes (
+                    scope_id, continuous_enabled, dream_enabled, display_name,
+                    continuous_cursor_message_id,
+                    continuous_last_attempt_at, continuous_last_success_at,
+                    continuous_last_error, updated_at
+                )
+                SELECT
+                    scope_id, continuous_enabled, dream_enabled, display_name,
+                    continuous_cursor_message_id,
+                    continuous_last_attempt_at, continuous_last_success_at,
+                    continuous_last_error, updated_at
+                FROM ai_memory_scopes_legacy
+                """
+            )
         await connection.execute("DROP TABLE ai_memory_scopes_legacy")
 
     async def _create_memory_scope_table(self) -> None:
@@ -1670,11 +1651,71 @@ class AIStateRepository:
                 continuous_enabled INTEGER NOT NULL DEFAULT 0,
                 dream_enabled INTEGER NOT NULL DEFAULT 0,
                 display_name TEXT,
-                continuous_cursor_message_id INTEGER,
+                continuous_cursor_message_id BLOB,
                 continuous_last_attempt_at REAL,
                 continuous_last_success_at REAL,
                 continuous_last_error TEXT,
                 updated_at REAL NOT NULL
+            )
+            """
+        )
+
+    async def _ensure_memory_dream_schema(self) -> None:
+        connection = self._require_connection()
+        column_types = await self._table_column_types("ai_memory_dream_state")
+        columns = set(column_types)
+        if not columns:
+            await self._create_memory_dream_table()
+            return
+        if column_types.get("cursor_message_id") == "BLOB":
+            return
+
+        await connection.execute(
+            "ALTER TABLE ai_memory_dream_state "
+            "RENAME TO ai_memory_dream_state_legacy"
+        )
+        await self._create_memory_dream_table()
+        values = {
+            column: column if column in columns else "NULL"
+            for column in (
+                "cursor_message_id",
+                "scanned_until_at",
+                "last_attempt_at",
+                "last_success_at",
+                "last_error",
+                "lease_owner",
+                "lease_expires_at",
+            )
+        }
+        await connection.execute(
+            f"""
+            INSERT INTO ai_memory_dream_state (
+                scope_id, cursor_message_id, scanned_until_at,
+                last_attempt_at, last_success_at, last_error,
+                lease_owner, lease_expires_at
+            )
+            SELECT
+                scope_id, {values['cursor_message_id']},
+                {values['scanned_until_at']}, {values['last_attempt_at']},
+                {values['last_success_at']}, {values['last_error']},
+                {values['lease_owner']}, {values['lease_expires_at']}
+            FROM ai_memory_dream_state_legacy
+            """  # nosec B608
+        )
+        await connection.execute("DROP TABLE ai_memory_dream_state_legacy")
+
+    async def _create_memory_dream_table(self) -> None:
+        await self._require_connection().execute(
+            """
+            CREATE TABLE ai_memory_dream_state (
+                scope_id TEXT PRIMARY KEY,
+                cursor_message_id BLOB,
+                scanned_until_at REAL,
+                last_attempt_at REAL,
+                last_success_at REAL,
+                last_error TEXT,
+                lease_owner TEXT,
+                lease_expires_at REAL
             )
             """
         )
@@ -2092,7 +2133,7 @@ class AIStateRepository:
         scope_id: str,
         documents: tuple[PendingMemoryDocument, ...],
         *,
-        cursor_message_id: int | None,
+        cursor_message_id: ExternalId | None,
         succeeded_at: float,
     ) -> None:
         if any(document.episode.scope_id != scope_id for document in documents):
@@ -2291,7 +2332,7 @@ class AIStateRepository:
         scope_id: str,
         enabled: bool,
         display_name: str | None = None,
-        cursor_message_id: int | None = None,
+        cursor_message_id: ExternalId | None = None,
     ) -> None:
         connection = self._require_connection()
         await connection.execute(
@@ -2385,7 +2426,7 @@ class AIStateRepository:
         self,
         scope_id: str,
         *,
-        cursor_message_id: int | None,
+        cursor_message_id: ExternalId | None,
         succeeded_at: float,
     ) -> None:
         connection = self._require_connection()
@@ -2551,7 +2592,7 @@ class AIStateRepository:
         self,
         scope_id: str,
         *,
-        cursor_message_id: int | None,
+        cursor_message_id: ExternalId | None,
         scanned_until_at: float,
         succeeded_at: float,
     ) -> None:
