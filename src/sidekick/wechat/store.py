@@ -296,6 +296,24 @@ class WeChatStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    async def mark_processed_identity(
+        self,
+        connector_key: str,
+        account_id: str,
+        chat_id: str,
+        message_id: str,
+    ) -> None:
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            INSERT OR IGNORE INTO wechat_processed_messages (
+                connector_key, account_id, chat_id, message_id, processed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (connector_key, account_id, chat_id, message_id, time.time()),
+        )
+        await connection.commit()
+
     async def get_cursor(self, connector_key: str) -> str:
         state = await self._connector_state(connector_key)
         return str(state["cursor"])

@@ -24,6 +24,7 @@ from sidekick.wechat.api import (
     WeChatChatList,
     WeChatChatSnapshot,
     WeChatConnectorMessage,
+    WeChatEvent,
     WeChatMessageList,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
@@ -310,3 +311,29 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
     assert marker.answer_message_id == "7158246912028861544"
     assert gateway.requests[0].prompt == "hello"
     assert client.calls[0]["content"] == "hello from Sidekick"
+
+    outbound_echo = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "message",
+            "id": "7158246912028861544",
+            "chatId": GROUP_ID,
+            "direction": "out",
+            "messageType": "text",
+            "senderId": ACCOUNT_ID,
+            "content": "/ai this must not trigger",
+            "timestamp": 1_783_772_735,
+            "connectionGeneration": 41,
+        }
+    )
+    replay_store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        echoed_message = await replay_store.project_event(
+            CONNECTOR_KEY,
+            outbound_echo,
+        )
+        assert echoed_message is not None
+        assert await replay_store.is_processed(echoed_message) is True
+    finally:
+        await replay_store.close()

@@ -196,6 +196,12 @@ class WeChatChatTransport:
             message.text = text
             raise
         assert operation.message_id is not None
+        await self._store.mark_processed_identity(
+            self._connector_key,
+            message.trigger.account_id,
+            message.trigger.chat_id,
+            operation.message_id,
+        )
         message.id = operation.message_id
         message.text = text
         message.sent = True
