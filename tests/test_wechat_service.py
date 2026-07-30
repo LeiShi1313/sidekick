@@ -260,6 +260,58 @@ async def test_wechat_event_pump_handles_each_message_once_and_then_acks(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_wechat_event_pump_dispatches_textual_quoted_app_messages(
+    tmp_path,
+) -> None:
+    client = FakeConnectorClient(
+        (
+            message_event(
+                cursor="11",
+                content="/ai explain this",
+                reply_to="3159667620982040828",
+                message_type="app",
+            ),
+            message_event(
+                cursor="12",
+                message_id="4159667620982040829",
+                content="continue the answer",
+                reply_to="3159667620982040829",
+                message_type="app",
+            ),
+            message_event(
+                cursor="13",
+                message_id="4159667620982040830",
+                content="/ai not a quoted reply",
+                message_type="app",
+            ),
+        )
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert result == "reconnect"
+        assert [message.id for message in handler.messages] == [
+            "4159667620982040828",
+            "4159667620982040829",
+        ]
+        assert [message.reply_to_msg_id for message in handler.messages] == [
+            "3159667620982040828",
+            "3159667620982040829",
+        ]
+        assert await store.get_cursor(CONNECTOR_KEY) == "13"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_wechat_event_pump_ignores_unsupported_messages_without_chat_refresh(
     tmp_path,
 ) -> None:

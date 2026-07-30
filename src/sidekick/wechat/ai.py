@@ -152,11 +152,20 @@ class WeChatChatTransport:
     async def get_reply(self, message: Any) -> WeChatMessage | None:
         if not isinstance(message, WeChatMessage) or message.reply_to_msg_id is None:
             return None
-        return await self._store.get_message(
-            self._connector_key,
-            message.chat_id,
-            message.reply_to_msg_id,
-        )
+        try:
+            return await self._store.get_message(
+                self._connector_key,
+                message.chat_id,
+                message.reply_to_msg_id,
+            )
+        except Exception as exc:
+            if self._logger is not None:
+                self._logger.debug(
+                    "WeChat reply lookup failed (%s): %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            return None
 
     async def reply(
         self,

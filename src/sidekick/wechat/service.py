@@ -290,7 +290,13 @@ class WeChatEventPump:
 
 def _dispatchable(message: WeChatMessage) -> bool:
     return (
-        message.message_type == "text"
-        and not message.content_redacted
+        not message.content_redacted
         and bool(message.raw_text.strip())
+        and (
+            message.message_type == "text"
+            or (
+                message.message_type == "app"
+                and message.reply_to_msg_id is not None
+            )
+        )
     )
