@@ -1,0 +1,1 @@
+"""WeChat Linux connector adapter."""
