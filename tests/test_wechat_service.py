@@ -200,6 +200,7 @@ def message_event(
     connection_generation: int = 41,
     message_type: str = "text",
     content_redacted: bool = False,
+    sender_id: str | None = ACCOUNT_ID,
 ) -> WeChatEvent:
     payload = {
         "schemaVersion": "wechat-bridge/v1alpha1",
@@ -209,11 +210,12 @@ def message_event(
         "chatId": CHAT_ID,
         "direction": "out",
         "messageType": message_type,
-        "senderId": ACCOUNT_ID,
         "content": content,
         "timestamp": 1_783_772_734,
         "connectionGeneration": connection_generation,
     }
+    if sender_id is not None:
+        payload["senderId"] = sender_id
     if content_redacted:
         payload["contentRedacted"] = True
     if reply_to is not None:
@@ -291,6 +293,36 @@ async def test_wechat_event_pump_ignores_unsupported_messages_without_chat_refre
         assert handler.messages == []
         assert client.chat_reads == 1
         assert await store.get_cursor(CONNECTOR_KEY) == "12"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_acks_senderless_unsupported_message(tmp_path) -> None:
+    client = FakeConnectorClient(
+        (
+            message_event(
+                cursor="11",
+                message_type="app",
+                sender_id=None,
+            ),
+        )
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert result == "reconnect"
+        assert handler.messages == []
+        assert client.chat_reads == 1
+        assert await store.get_cursor(CONNECTOR_KEY) == "11"
     finally:
         await store.close()
 

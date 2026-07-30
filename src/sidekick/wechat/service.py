@@ -204,6 +204,8 @@ class WeChatEventPump:
             return _PendingEvent(event=event)
 
         if event.name == "message":
+            if event.is_senderless_unsupported_message():
+                return _PendingEvent(event=event)
             message = await self._store.project_event(self._connector_key, event)
             if message is None:
                 await self._refresh_chats(generation)

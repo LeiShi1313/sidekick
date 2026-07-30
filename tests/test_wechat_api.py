@@ -13,6 +13,7 @@ from sidekick.wechat.api import (
     WeChatConnectorMessage,
     WeChatConnectorClient,
     WeChatEvent,
+    WeChatMessageList,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
 )
@@ -105,6 +106,34 @@ def test_wechat_client_validates_recall_event_identity() -> None:
 
     with pytest.raises(WeChatAPIContractError, match="chatId"):
         malformed.removed_message()
+
+
+def test_wechat_message_list_skips_senderless_unsupported_history_rows() -> None:
+    text = connector_message_payload("4159667620982040828")
+    app = {
+        **connector_message_payload("4159667620982040829"),
+        "messageType": "app",
+    }
+    unknown = {
+        **connector_message_payload("4159667620982040830"),
+        "messageType": "unknown",
+    }
+    app.pop("senderId")
+    unknown.pop("senderId")
+
+    messages = WeChatMessageList.parse(
+        {"data": [app, text, unknown], "cursor": "108739"}
+    )
+
+    assert [message.id for message in messages.messages] == [text["id"]]
+
+
+def test_wechat_message_list_rejects_senderless_text_history_row() -> None:
+    text = connector_message_payload("4159667620982040828")
+    text.pop("senderId")
+
+    with pytest.raises(WeChatAPIContractError, match="senderId"):
+        WeChatMessageList.parse({"data": [text], "cursor": "108739"})
 
 
 @pytest.mark.asyncio

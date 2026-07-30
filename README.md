@@ -56,6 +56,8 @@ idempotent text send, and stable outbound message-ID capabilities. Its local
 projection defaults to `~/.sidekick/wechat.db`. Connector history remains
 partial by contract: Sidekick can backfill only messages that this connector
 instance has already observed and stored, never a complete WeChat chat history.
+Retained non-text rows without a canonical `senderId` are ignored because they
+cannot be safely attributed; text rows still require a canonical sender.
 Keep an unauthenticated connector bound to loopback; use its bearer token (and
 TLS outside a trusted local network) whenever it is reachable by another host.
 
@@ -81,7 +83,8 @@ Start or update both workers without recreating the Telegram or OneBot adapters:
 docker compose up -d --build wechat-host-ai wechat-peer-ai
 ```
 
-The Compose healthcheck applies the same live capability gates as the adapter.
+The Compose healthcheck applies the same live capability gates and parses the
+same bounded history window as the adapter bootstrap.
 Optional connector bearer tokens are configured independently with
 `SIDEKICK_WECHAT_HOST_TOKEN` and `SIDEKICK_WECHAT_PEER_TOKEN`.
 
