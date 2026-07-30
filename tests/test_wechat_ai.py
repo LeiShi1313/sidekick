@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import timedelta
 
@@ -26,6 +27,7 @@ from sidekick.wechat.ai import (
     WECHAT_IDENTITY_CODEC,
     WeChatChatTransport,
     WeChatHistorySource,
+    WeChatIdentityCodec,
     WeChatMessageIdentityResolver,
     WeChatMessageMentionResolver,
 )
@@ -85,6 +87,15 @@ class FinalGateway:
 
     async def cancel(self, _run_id: str) -> bool:
         return True
+
+
+class RecordingMemory:
+    def __init__(self):
+        self.episodes = []
+
+    async def retain_many(self, episodes, *, update_mode="replace"):
+        self.episodes.extend(episodes)
+        return MemoryRetainResult(accepted=True, items_count=len(episodes))
 
 
 def submitted(
@@ -211,6 +222,41 @@ async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
 
 
 @pytest.mark.asyncio
+async def test_wechat_transport_sends_followup_when_reply_cannot_be_edited(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient(
+        (
+            submitted(message_id="7158246912028861544"),
+            submitted(message_id="8158246912028861544"),
+        )
+    )
+    transport = WeChatChatTransport(client, store, CONNECTOR_KEY)
+    try:
+        progress = await transport.reply(
+            trigger,
+            "Backfilling stored WeChat messages...",
+            presentation="plain",
+        )
+        updated = await transport.update(
+            progress,
+            "Memory backfill complete.",
+            presentation="plain",
+            wait=True,
+        )
+    finally:
+        await store.close()
+
+    assert updated is True
+    assert [call["content"] for call in client.calls] == [
+        "Backfilling stored WeChat messages...",
+        "Memory backfill complete.",
+    ]
+    assert client.calls[0]["request_id"] != client.calls[1]["request_id"]
+
+
+@pytest.mark.asyncio
 async def test_wechat_responder_does_not_resubmit_unknown_outcome(tmp_path) -> None:
     store, trigger = await bootstrap_store(tmp_path / "wechat.db")
     operation = WeChatSendOperation(
@@ -286,12 +332,14 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
     transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
     history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
     gateway = FinalGateway("hello from Sidekick")
+    memory = RecordingMemory()
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     prompt_builder = PromptBuilder(
         transport=transport,
         history_source=history,
-        identity_resolver=WeChatMessageIdentityResolver(),
+        identity_resolver=WeChatMessageIdentityResolver(identity_codec),
         mention_resolver=WeChatMessageMentionResolver(),
-        identity_codec=WECHAT_IDENTITY_CODEC,
+        identity_codec=identity_codec,
     )
     handler = AIConversationHandler(
         owner_id=ACCOUNT_ID,
@@ -302,13 +350,14 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
         ),
         store=ai_store,
         prompt_builder=prompt_builder,
+        memory=memory,
         transport=transport,
-        identity_codec=WECHAT_IDENTITY_CODEC,
+        identity_codec=identity_codec,
     )
     try:
         handled = await handler.handle(trigger)
         marker = await ai_store.get_answer(
-            WECHAT_IDENTITY_CODEC.scope_id(GROUP_ID),
+            identity_codec.scope_id(GROUP_ID),
             "7158246912028861544",
         )
     finally:
@@ -320,6 +369,11 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
     assert marker.trigger_message_id == "4159667620982040828"
     assert marker.answer_message_id == "7158246912028861544"
     assert gateway.requests[0].prompt == "hello"
+    assert gateway.requests[0].memory is not None
+    assert gateway.requests[0].memory.primary_bank_id == identity_codec.scope_id(
+        GROUP_ID
+    )
+    assert memory.episodes[0].scope_id == identity_codec.scope_id(GROUP_ID)
     assert client.calls[0]["content"] == "hello from Sidekick"
 
     outbound_echo = WeChatEvent.parse(
@@ -347,6 +401,283 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
         assert await replay_store.is_processed(echoed_message) is True
     finally:
         await replay_store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_manual_memory_command_retains_stored_reply_chain(
+    tmp_path,
+) -> None:
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="Remember the launch date is Friday",
+        direction="in",
+    )
+    command_event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "manual-memory-command",
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": "5159667620982040828",
+            "chatId": GROUP_ID,
+            "direction": "out",
+            "messageType": "text",
+            "senderId": ACCOUNT_ID,
+            "replyToMessageId": target.id,
+            "content": "/ai_memory",
+            "timestamp": 1_783_772_735,
+            "source": "wechat+hook",
+        }
+    )
+    command = await wechat_store.project_event(CONNECTOR_KEY, command_event)
+    assert command is not None
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    memory = RecordingMemory()
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            FinalGateway(),
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=history,
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        memory=memory,
+        memory_command_delete_delay=0,
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    try:
+        handled = await handler.handle(command)
+        await asyncio.sleep(0)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert client.calls[0]["content"] == "Memory stored from reply chain: 1 message."
+    assert memory.episodes[0].events[0].source_id == (
+        identity_codec.message_source_id(GROUP_ID, target.id)
+    )
+    assert memory.episodes[0].events[0].text == ("Remember the launch date is Friday")
+
+
+@pytest.mark.asyncio
+async def test_wechat_backfill_reports_and_ingests_only_locally_stored_history(
+    tmp_path,
+) -> None:
+    caveat = (
+        "WeChat backfill covers only messages already observed and stored by Sidekick."
+    )
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="The migration window starts at 22:00",
+        direction="in",
+    )
+    command_event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "backfill-command",
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": "5159667620982040828",
+            "chatId": GROUP_ID,
+            "direction": "out",
+            "messageType": "text",
+            "senderId": ACCOUNT_ID,
+            "content": "/ai_memory_backfill messages 10",
+            "timestamp": 1_783_772_735,
+            "source": "wechat+hook",
+        }
+    )
+    command = await wechat_store.project_event(CONNECTOR_KEY, command_event)
+    assert command is not None
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient(
+        (
+            submitted(message_id="7158246912028861544"),
+            submitted(message_id="8158246912028861544"),
+        )
+    )
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    memory = RecordingMemory()
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    prompt_builder = PromptBuilder(
+        transport=transport,
+        history_source=history,
+        identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+        mention_resolver=WeChatMessageMentionResolver(),
+        identity_codec=identity_codec,
+    )
+    scanner = ChatMemoryIngestor(
+        source=history,
+        store=ai_store,
+        memory=memory,
+        prompt_builder=prompt_builder,
+        dream_settings=DreamSettings(),
+        ingestion_settings=MemoryIngestionSettings(
+            settlement_delay=timedelta(0),
+        ),
+        identity_codec=identity_codec,
+        clock=lambda: 1_783_773_000,
+    )
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            FinalGateway(),
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=prompt_builder,
+        memory=memory,
+        dream_runner=scanner,
+        memory_backfill_caveat=caveat,
+        memory_command_delete_delay=0,
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    try:
+        handled = await handler.handle(command)
+        final_reply_excluded = await ai_store.is_memory_excluded_message(
+            identity_codec.scope_id(GROUP_ID),
+            "8158246912028861544",
+        )
+        await asyncio.sleep(0)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert final_reply_excluded is True
+    assert caveat in client.calls[0]["content"]
+    assert caveat in client.calls[1]["content"]
+    assert "scanned 2 messages; retained 1" in client.calls[1]["content"]
+    assert [event.source_id for event in memory.episodes[0].events] == [
+        identity_codec.message_source_id(GROUP_ID, target.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_memory_enable_starts_after_command_projection_cursor(
+    tmp_path,
+) -> None:
+    class NoopDreamRunner:
+        async def run_scope(self, _chat_id):
+            raise AssertionError("Dream should not run while enabling memory")
+
+        async def run_backfill(self, _chat_id, _request):
+            raise AssertionError("Backfill should not run while enabling memory")
+
+    wechat_store, command = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="/ai_memory_enable",
+        direction="out",
+    )
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    memory = RecordingMemory()
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            FinalGateway(),
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=history,
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        memory=memory,
+        dream_runner=NoopDreamRunner(),
+        memory_command_delete_delay=0,
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    scope_id = identity_codec.scope_id(GROUP_ID)
+    try:
+        handled = await handler.handle(command)
+        state = await ai_store.get_memory_scope_state(scope_id)
+        await asyncio.sleep(0)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert state.continuous_enabled is True
+    assert state.continuous_cursor_message_id == command.memory_cursor
+    assert client.calls[0]["content"] == (
+        "Continuous memory enabled for this chat. New messages will be remembered."
+    )
+
+
+@pytest.mark.asyncio
+async def test_wechat_memory_enable_reports_when_hindsight_is_disabled(
+    tmp_path,
+) -> None:
+    wechat_store, command = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="/ai_memory_enable",
+        direction="out",
+    )
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            FinalGateway(),
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=history,
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        memory=None,
+        dream_runner=None,
+        memory_command_delete_delay=0,
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    scope_id = identity_codec.scope_id(GROUP_ID)
+    try:
+        handled = await handler.handle(command)
+        state = await ai_store.get_memory_scope_state(scope_id)
+        await asyncio.sleep(0)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert state.continuous_enabled is False
+    assert client.calls[0]["content"] == (
+        "Memory ingestion is unavailable because Hindsight is disabled."
+    )
 
 
 @pytest.mark.asyncio
@@ -388,14 +719,6 @@ async def test_continuous_memory_scheduler_accepts_wechat_scope_ids(tmp_path) ->
 
 @pytest.mark.asyncio
 async def test_wechat_continuous_memory_checkpoints_projection_cursor(tmp_path) -> None:
-    class RecordingMemory:
-        def __init__(self):
-            self.episodes = []
-
-        async def retain_many(self, episodes, *, update_mode="replace"):
-            self.episodes.extend(episodes)
-            return MemoryRetainResult(accepted=True, items_count=len(episodes))
-
     wechat_store, trigger = await bootstrap_store(
         tmp_path / "wechat.db",
         trigger_text="project decision",

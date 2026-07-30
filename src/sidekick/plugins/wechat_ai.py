@@ -15,13 +15,29 @@ from sidekick.ai import (
     PiAgentGateway,
     PromptBuilder,
 )
+from sidekick.ai_continuous_memory import (
+    ContinuousMemoryScheduler,
+    ContinuousMemorySchedulerSettings,
+)
+from sidekick.ai_dream import (
+    DreamScheduler,
+    DreamSchedulerSettings,
+    DreamSettings,
+)
+from sidekick.ai_memory import HindsightMemoryClient
+from sidekick.ai_memory_ingestion import (
+    ChatMemoryIngestor,
+    MemoryIngestionSettings,
+)
+from sidekick.chat.identity import IdentityCodec
 from sidekick.chat.formatting import agent_system_prompt
 from sidekick.plugins.base import PluginMount
 from sidekick.runtime import build_logger
 from sidekick.wechat.ai import (
-    WECHAT_IDENTITY_CODEC,
     WeChatChatTransport,
     WeChatHistorySource,
+    WeChatIdentityCodec,
+    WeChatMemoryScopeTargetResolver,
     WeChatMessageIdentityResolver,
     WeChatMessageMentionResolver,
 )
@@ -43,10 +59,14 @@ class WeChatRuntimeSettings:
 
     @classmethod
     def from_env(cls) -> WeChatRuntimeSettings:
-        connector_url = os.environ.get(
-            "SIDEKICK_WECHAT_URL",
-            "http://127.0.0.1:18188",
-        ).strip().rstrip("/")
+        connector_url = (
+            os.environ.get(
+                "SIDEKICK_WECHAT_URL",
+                "http://127.0.0.1:18188",
+            )
+            .strip()
+            .rstrip("/")
+        )
         if not connector_url:
             raise ValueError("SIDEKICK_WECHAT_URL cannot be empty")
         try:
@@ -74,6 +94,15 @@ class WeChatRuntimeSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _WeChatChannelRuntime:
+    handler: AIConversationHandler
+    identity_codec: IdentityCodec
+    memory_ingestor: ChatMemoryIngestor | None
+    dream_scheduler: DreamScheduler | None
+    continuous_scheduler: ContinuousMemoryScheduler | None
+
+
 class WeChatAI(metaclass=PluginMount):
     command_group = "wechat"
     command_name = "ai"
@@ -93,6 +122,15 @@ class WeChatAI(metaclass=PluginMount):
             token=self._settings.agent_token,
             timeout=self._settings.request_timeout,
         )
+        self._memory = (
+            HindsightMemoryClient(
+                self._settings.hindsight_url,
+                timeout=self._settings.hindsight_timeout,
+            )
+            if self._settings.hindsight_url
+            else None
+        )
+        self._channel_runtime: _WeChatChannelRuntime | None = None
 
     def __call__(self) -> None:
         """Run the Pi-powered WeChat Linux connector adapter."""
@@ -119,7 +157,7 @@ class WeChatAI(metaclass=PluginMount):
                         self._wechat_store,
                         self._client.base_url,
                     )
-                    handler = self._build_handler(bootstrap)
+                    handler = await self._activate_channel_runtime(bootstrap)
                     self.logger.info(
                         "WeChat AI connected (self_id=%s, generation=%s)",
                         bootstrap.session.self_id,
@@ -145,15 +183,21 @@ class WeChatAI(metaclass=PluginMount):
                     )
                 await _wait_or_stop(stop, self._runtime.reconnect_delay)
         finally:
+            await self._close_channel_runtime()
             await self._client.close()
+            if self._memory is not None:
+                await self._memory.close()
             await self._gateway.close()
             await self._ai_store.close()
             await self._wechat_store.close()
 
-    def _build_handler(
+    def _build_channel_runtime(
         self,
         bootstrap: WeChatBootstrap,
-    ) -> AIConversationHandler:
+    ) -> _WeChatChannelRuntime:
+        identity_codec = WeChatIdentityCodec(
+            account_id=bootstrap.session.self_id,
+        )
         transport = WeChatChatTransport(
             self._client,
             self._wechat_store,
@@ -175,13 +219,49 @@ class WeChatAI(metaclass=PluginMount):
             system_prompt=agent_system_prompt(self._settings.system_prompt),
             max_context_messages=self._settings.max_context_messages,
             max_context_chars=self._settings.max_context_chars,
-            identity_resolver=WeChatMessageIdentityResolver(),
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
             mention_resolver=WeChatMessageMentionResolver(),
             history_source=history,
             transport=transport,
-            identity_codec=WECHAT_IDENTITY_CODEC,
+            identity_codec=identity_codec,
         )
-        return AIConversationHandler(
+        memory_ingestor = (
+            ChatMemoryIngestor(
+                source=history,
+                store=self._ai_store,
+                memory=self._memory,
+                prompt_builder=prompt_builder,
+                dream_settings=DreamSettings.from_env(),
+                ingestion_settings=MemoryIngestionSettings.from_env(),
+                identity_codec=identity_codec,
+                logger=self.logger,
+            )
+            if self._memory is not None
+            else None
+        )
+        dream_scheduler = (
+            DreamScheduler(
+                scanner=memory_ingestor,
+                store=self._ai_store,
+                identity_codec=identity_codec,
+                settings=DreamSchedulerSettings.from_env(),
+                logger=self.logger,
+            )
+            if memory_ingestor is not None
+            else None
+        )
+        continuous_scheduler = (
+            ContinuousMemoryScheduler(
+                runner=memory_ingestor,
+                store=self._ai_store,
+                identity_codec=identity_codec,
+                settings=ContinuousMemorySchedulerSettings.from_env(),
+                logger=self.logger,
+            )
+            if memory_ingestor is not None
+            else None
+        )
+        handler = AIConversationHandler(
             owner_id=bootstrap.session.self_id,
             responder=responder,
             store=self._ai_store,
@@ -190,17 +270,52 @@ class WeChatAI(metaclass=PluginMount):
                 self._ai_store,
                 cooldown_seconds=self._settings.delegated_cooldown,
             ),
-            memory=None,
-            dream_runner=None,
-            memory_scope_resolver=None,
-            directory_source_resolver=None,
-            memory_command_delete_delay=(
-                self._settings.memory_command_delete_delay
+            memory=self._memory,
+            dream_runner=memory_ingestor,
+            memory_scope_resolver=WeChatMemoryScopeTargetResolver(
+                self._wechat_store,
+                self._client.base_url,
             ),
+            directory_source_resolver=None,
+            memory_backfill_caveat=(
+                "WeChat backfill covers only messages already observed and stored "
+                "by Sidekick; WeChat does not expose complete chat history here."
+            ),
+            memory_command_delete_delay=(self._settings.memory_command_delete_delay),
             transport=transport,
-            identity_codec=WECHAT_IDENTITY_CODEC,
+            identity_codec=identity_codec,
             logger=self.logger,
         )
+        return _WeChatChannelRuntime(
+            handler=handler,
+            identity_codec=identity_codec,
+            memory_ingestor=memory_ingestor,
+            dream_scheduler=dream_scheduler,
+            continuous_scheduler=continuous_scheduler,
+        )
+
+    async def _activate_channel_runtime(
+        self,
+        bootstrap: WeChatBootstrap,
+    ) -> AIConversationHandler:
+        await self._close_channel_runtime()
+        runtime = self._build_channel_runtime(bootstrap)
+        self._channel_runtime = runtime
+        if runtime.continuous_scheduler is not None:
+            runtime.continuous_scheduler.start()
+        if runtime.dream_scheduler is not None:
+            runtime.dream_scheduler.start()
+        return runtime.handler
+
+    async def _close_channel_runtime(self) -> None:
+        runtime = self._channel_runtime
+        self._channel_runtime = None
+        if runtime is None:
+            return
+        if runtime.continuous_scheduler is not None:
+            await runtime.continuous_scheduler.close()
+        if runtime.dream_scheduler is not None:
+            await runtime.dream_scheduler.close()
 
 
 async def _wait_or_stop(stop: asyncio.Event, delay: float) -> None:

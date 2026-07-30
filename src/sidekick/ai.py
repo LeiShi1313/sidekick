@@ -2774,6 +2774,7 @@ class AIConversationHandler:
         dream_runner: MemoryDreamRunner | None = None,
         memory_scope_resolver: MemoryScopeTargetResolver | None = None,
         directory_source_resolver: DirectorySourceResolver | None = None,
+        memory_backfill_caveat: str | None = None,
         memory_command_delete_delay: float = 3.0,
         transport: ChatTransport | None = None,
         identity_codec: IdentityCodec | None = None,
@@ -2781,6 +2782,8 @@ class AIConversationHandler:
     ):
         if memory_command_delete_delay < 0:
             raise ValueError("memory_command_delete_delay cannot be negative")
+        if memory_backfill_caveat is not None and not memory_backfill_caveat.strip():
+            raise ValueError("memory_backfill_caveat cannot be blank")
         self._owner_id = owner_id
         self._responder = responder
         self._store = store
@@ -2790,6 +2793,7 @@ class AIConversationHandler:
         self._dream_runner = dream_runner
         self._memory_scope_resolver = memory_scope_resolver
         self._directory_source_resolver = directory_source_resolver
+        self._memory_backfill_caveat = memory_backfill_caveat
         self._memory_command_delete_delay = memory_command_delete_delay
         self._memory_command_delete_tasks: set[asyncio.Task[None]] = set()
         self._logger = logger
@@ -2806,6 +2810,8 @@ class AIConversationHandler:
         command = parse_chat_command(message.raw_text)
         is_owner = actor_id == self._owner_actor_id
         is_owner_control = is_owner or self._transport.is_outgoing(message)
+        if command is not None and not isinstance(command, AIAskCommand):
+            await self._mark_memory_excluded(scope_id, message.id, "ai-control")
         if isinstance(command, MemoryRememberCommand):
             if not is_owner_control:
                 return False
@@ -3484,6 +3490,14 @@ class AIConversationHandler:
         command: MemoryModeCommand,
     ) -> bool:
         assert message.chat_id is not None
+        if command.enabled and self._memory is None:
+            await self._reply_memory_excluded(
+                message,
+                "Memory ingestion is unavailable because Hindsight is disabled.",
+                kind="memory-control",
+            )
+            await self._schedule_memory_command_delete(message, command.name)
+            return True
         is_remote = command.target is not None
         if is_remote:
             if self._memory_scope_resolver is None:
@@ -3689,9 +3703,14 @@ class AIConversationHandler:
             progress_text = f"Backfilling the last {request.value} days..."
         else:
             progress_text = f"Backfilling the latest {request.value} messages..."
+        caveat_suffix = (
+            f"\n\n{self._memory_backfill_caveat}"
+            if self._memory_backfill_caveat is not None
+            else ""
+        )
         progress = await self._reply_memory_excluded(
             message,
-            progress_text,
+            f"{progress_text}{caveat_suffix}",
             kind="memory-control",
         )
         await self._schedule_memory_command_delete(message, "/ai_memory_backfill")
@@ -3702,9 +3721,14 @@ class AIConversationHandler:
             await self._transport.update(
                 progress,
                 "Memory backfill failed. Accepted documents are safe; "
-                "retry the same command.",
+                f"retry the same command.{caveat_suffix}",
                 presentation="plain",
                 wait=True,
+            )
+            await self._mark_memory_excluded(
+                self._identity_codec.scope_id(message.chat_id),
+                progress.id,
+                "memory-control",
             )
             return True
         await self._transport.update(
@@ -3713,9 +3737,14 @@ class AIConversationHandler:
             f"scanned {_pluralize(result.messages_seen, 'message')}; "
             f"retained {result.messages_retained} in "
             f"{_pluralize(result.documents_created, 'updated thread')}; "
-            f"{result.documents_unchanged} unchanged.",
+            f"{result.documents_unchanged} unchanged.{caveat_suffix}",
             presentation="plain",
             wait=True,
+        )
+        await self._mark_memory_excluded(
+            self._identity_codec.scope_id(message.chat_id),
+            progress.id,
+            "memory-control",
         )
         return True
 
@@ -3914,7 +3943,8 @@ class AIConversationHandler:
         if self._memory is None:
             await self._reply_memory_excluded(
                 message,
-                "Memory update failed. Existing memory was not changed.",
+                "Memory update is unavailable because Hindsight is disabled. "
+                "Existing memory was not changed.",
                 kind="memory-control",
             )
             return True

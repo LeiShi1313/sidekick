@@ -6,7 +6,7 @@ from hashlib import sha256
 from typing import Any, Protocol
 from urllib.parse import quote, unquote
 
-from sidekick.ai import MessageIdentity, MentionedUser, ReplyTarget
+from sidekick.ai import MemoryScopeTarget, MessageIdentity, MentionedUser, ReplyTarget
 from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.chat.transport import ChatPresentation, SentMessage
@@ -23,15 +23,22 @@ from sidekick.wechat.store import WeChatStateRepository
 @dataclass(frozen=True, slots=True)
 class WeChatIdentityCodec:
     source: str = "wechat"
+    account_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.source != "wechat":
+            raise ValueError("WeChat identity source must be 'wechat'")
+        if self.account_id is not None:
+            _component(self.account_id)
 
     def actor_id(self, actor_id: ExternalId) -> str:
-        return f"wechat:user:{_component(actor_id)}"
+        return f"{self._identity_prefix()}user:{_component(actor_id)}"
 
     def scope_id(self, scope_id: ExternalId) -> str:
-        return f"wechat:chat:{_component(scope_id)}"
+        return f"{self._identity_prefix()}chat:{_component(scope_id)}"
 
     def parse_scope_id(self, scope_id: str) -> ExternalId | None:
-        prefix = "wechat:chat:"
+        prefix = f"{self._identity_prefix()}chat:"
         if not scope_id.startswith(prefix):
             return None
         encoded = scope_id.removeprefix(prefix)
@@ -47,13 +54,16 @@ class WeChatIdentityCodec:
         scope_id: ExternalId,
         message_id: ExternalId,
     ) -> str:
-        return f"wechat:message:{_component(scope_id)}:{_component(message_id)}"
+        return (
+            f"{self._identity_prefix()}message:{_component(scope_id)}:"
+            f"{_component(message_id)}"
+        )
 
     def parse_message_source_id(
         self,
         source_id: str,
     ) -> tuple[ExternalId, ExternalId] | None:
-        prefix = "wechat:message:"
+        prefix = f"{self._identity_prefix()}message:"
         if not source_id.startswith(prefix):
             return None
         parts = source_id.removeprefix(prefix).split(":")
@@ -70,14 +80,25 @@ class WeChatIdentityCodec:
         scope_id: ExternalId,
         root_message_id: ExternalId,
     ) -> str:
-        return f"wechat:thread:{_component(scope_id)}:{_component(root_message_id)}"
+        return (
+            f"{self._identity_prefix()}thread:{_component(scope_id)}:"
+            f"{_component(root_message_id)}"
+        )
 
     def revision_document_id(
         self,
         scope_id: ExternalId,
         message_id: ExternalId,
     ) -> str:
-        return f"wechat:revision:{_component(scope_id)}:{_component(message_id)}"
+        return (
+            f"{self._identity_prefix()}revision:{_component(scope_id)}:"
+            f"{_component(message_id)}"
+        )
+
+    def _identity_prefix(self) -> str:
+        if self.account_id is None:
+            return "wechat:"
+        return f"wechat:account:{_component(self.account_id)}:"
 
 
 WECHAT_IDENTITY_CODEC: IdentityCodec = WeChatIdentityCodec()
@@ -172,7 +193,14 @@ class WeChatChatTransport:
             message.text = rendered
             return True
         if message.sent:
-            return message.text == rendered
+            if message.text == rendered:
+                return True
+            content_fingerprint = sha256(rendered.encode("utf-8")).hexdigest()[:16]
+            message.request_id = _request_id(
+                message.trigger,
+                f"update.{content_fingerprint}",
+            )
+            message.sent = False
         if message.failed:
             message.request_id = _request_id(message.trigger, "failure")
             message.failed = False
@@ -236,10 +264,13 @@ class WeChatChatTransport:
 
 
 class WeChatMessageIdentityResolver:
+    def __init__(self, identity_codec: IdentityCodec = WECHAT_IDENTITY_CODEC):
+        self._identity_codec = identity_codec
+
     async def resolve(self, message: ReplyTarget) -> MessageIdentity:
         return MessageIdentity(
             subject_id=(
-                WECHAT_IDENTITY_CODEC.actor_id(message.sender_id)
+                self._identity_codec.actor_id(message.sender_id)
                 if message.sender_id is not None
                 else None
             ),
@@ -325,6 +356,38 @@ class WeChatHistorySource:
             after_memory_order=after_message_id,
             until=until,
             limit=limit,
+        )
+
+
+class WeChatMemoryScopeTargetResolver:
+    def __init__(self, store: WeChatStateRepository, connector_key: str):
+        self._store = store
+        self._connector_key = connector_key
+
+    async def resolve(
+        self,
+        target: str,
+        *,
+        include_latest_message: bool = False,
+    ) -> MemoryScopeTarget:
+        chat_id = target.strip()
+        if not chat_id or chat_id != target:
+            raise ValueError("WeChat target must be an exact stored chat ID")
+        chat = await self._store.get_chat(self._connector_key, chat_id)
+        if chat is None:
+            raise ValueError("WeChat chat is not present in the local projection")
+        latest_memory_cursor = (
+            await self._store.get_latest_memory_cursor(
+                self._connector_key,
+                chat_id,
+            )
+            if include_latest_message
+            else 0
+        )
+        return MemoryScopeTarget(
+            chat_id=chat.id,
+            display_name=chat.display_name,
+            latest_message_id=latest_memory_cursor,
         )
 
 

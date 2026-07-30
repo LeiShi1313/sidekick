@@ -8,6 +8,7 @@ import aiosqlite
 
 from sidekick.wechat.api import (
     WeChatAPIContractError,
+    WeChatChat,
     WeChatChatList,
     WeChatConnectorMessage,
     WeChatEvent,
@@ -395,6 +396,57 @@ class WeChatStateRepository:
         )
         row = await cursor.fetchone()
         return WeChatMessage.from_row(row) if row is not None else None
+
+    async def get_chat(
+        self,
+        connector_key: str,
+        chat_id: str,
+    ) -> WeChatChat | None:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT chats.chat_id, chats.chat_type, chats.display_name
+            FROM wechat_chats AS chats
+            JOIN wechat_connectors AS connectors
+              ON connectors.connector_key = chats.connector_key
+             AND connectors.account_id = chats.account_id
+            WHERE chats.connector_key = ? AND chats.chat_id = ?
+            """,
+            (connector_key, chat_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return WeChatChat(
+            id=str(row["chat_id"]),
+            type=str(row["chat_type"]),
+            display_name=(
+                str(row["display_name"]) if row["display_name"] is not None else None
+            ),
+        )
+
+    async def get_latest_memory_cursor(
+        self,
+        connector_key: str,
+        chat_id: str,
+    ) -> int:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT MAX(messages.memory_order) AS memory_order
+            FROM wechat_messages AS messages
+            JOIN wechat_connectors AS connectors
+              ON connectors.connector_key = messages.connector_key
+             AND connectors.account_id = messages.account_id
+            WHERE messages.connector_key = ? AND messages.chat_id = ?
+              AND messages.removed = 0
+            """,
+            (connector_key, chat_id),
+        )
+        row = await cursor.fetchone()
+        return (
+            int(row["memory_order"])
+            if row is not None and row["memory_order"] is not None
+            else 0
+        )
 
     async def fetch_recent(
         self,

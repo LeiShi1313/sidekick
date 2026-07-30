@@ -5,7 +5,12 @@ import sqlite3
 
 import pytest
 
-from sidekick.wechat.ai import WECHAT_IDENTITY_CODEC, WeChatHistorySource
+from sidekick.wechat.ai import (
+    WECHAT_IDENTITY_CODEC,
+    WeChatHistorySource,
+    WeChatIdentityCodec,
+    WeChatMemoryScopeTargetResolver,
+)
 from sidekick.wechat.api import (
     WeChatChat,
     WeChatChatList,
@@ -105,6 +110,22 @@ def test_wechat_identity_codec_round_trips_opaque_ids() -> None:
     assert WECHAT_IDENTITY_CODEC.parse_message_source_id(
         "wechat:message:56825427596%40chatroom:4159667620982040828"
     ) == (GROUP_ID, "4159667620982040828")
+
+
+def test_wechat_account_identity_codec_isolates_memory_banks() -> None:
+    first = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    second = WeChatIdentityCodec(account_id="wxid_other")
+    scope_id = first.scope_id(GROUP_ID)
+    source_id = first.message_source_id(GROUP_ID, "4159667620982040828")
+
+    assert scope_id == ("wechat:account:wxid_self:chat:56825427596%40chatroom")
+    assert first.parse_scope_id(scope_id) == GROUP_ID
+    assert second.parse_scope_id(scope_id) is None
+    assert first.parse_message_source_id(source_id) == (
+        GROUP_ID,
+        "4159667620982040828",
+    )
+    assert second.parse_message_source_id(source_id) is None
 
 
 @pytest.mark.asyncio
@@ -271,6 +292,14 @@ async def test_wechat_memory_source_reads_stored_windows_and_late_revisions(tmp_
         assert [message.id for message in after] == [oldest_id]
         assert after[0].raw_text == "earlier, corrected"
         assert after[0].memory_cursor > latest.memory_cursor
+
+        target = await WeChatMemoryScopeTargetResolver(
+            store,
+            CONNECTOR_KEY,
+        ).resolve(GROUP_ID, include_latest_message=True)
+        assert target.chat_id == GROUP_ID
+        assert target.display_name == "Example group"
+        assert target.latest_message_id == revised.memory_cursor
     finally:
         await store.close()
 

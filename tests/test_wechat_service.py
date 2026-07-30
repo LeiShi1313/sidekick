@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from types import SimpleNamespace
 
 import pytest
 
+from sidekick.ai import AISettings, AIStateRepository
 from sidekick.wechat.api import (
     WeChatCapabilities,
     WeChatChat,
@@ -14,7 +17,7 @@ from sidekick.wechat.api import (
     WeChatSession,
 )
 from sidekick.plugins.base import command_registry
-from sidekick.plugins.wechat_ai import WeChatRuntimeSettings
+from sidekick.plugins.wechat_ai import WeChatAI, WeChatRuntimeSettings
 from sidekick.wechat.service import (
     WeChatEventPump,
     bootstrap_wechat_channel,
@@ -41,6 +44,77 @@ def test_wechat_runtime_settings_and_cli_command(monkeypatch, tmp_path) -> None:
     assert settings.state_path == state_path
     assert settings.reconnect_delay == 1.5
     assert command_registry.as_fire_commands()["wechat"]["ai"]
+
+
+def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
+    memory = object()
+    plugin = object.__new__(WeChatAI)
+    plugin._settings = AISettings(
+        agent_url="http://agent.invalid",
+        agent_token="test-token",
+        state_path=tmp_path / "ai.db",
+    )
+    plugin._client = SimpleNamespace(base_url=CONNECTOR_KEY)
+    plugin._wechat_store = WeChatStateRepository(tmp_path / "wechat.db")
+    plugin._ai_store = AIStateRepository(tmp_path / "ai.db")
+    plugin._gateway = object()
+    plugin._memory = memory
+    plugin.logger = logging.getLogger("test-wechat-memory-runtime")
+
+    runtime = plugin._build_channel_runtime(
+        SimpleNamespace(session=FakeConnectorClient().session)
+    )
+
+    assert runtime.handler._memory is memory
+    assert runtime.handler._dream_runner is runtime.memory_ingestor
+    assert runtime.handler._memory_scope_resolver is not None
+    assert runtime.dream_scheduler is not None
+    assert runtime.continuous_scheduler is not None
+    assert runtime.identity_codec.scope_id(CHAT_ID) == (
+        "wechat:account:wxid_self:chat:56825427596%40chatroom"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
+    calls: list[str] = []
+
+    class Scheduler:
+        def __init__(self, name: str):
+            self.name = name
+
+        def start(self) -> None:
+            calls.append(f"start:{self.name}")
+
+        async def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    old = SimpleNamespace(
+        continuous_scheduler=Scheduler("old-continuous"),
+        dream_scheduler=Scheduler("old-dream"),
+    )
+    new_handler = object()
+    new = SimpleNamespace(
+        handler=new_handler,
+        continuous_scheduler=Scheduler("new-continuous"),
+        dream_scheduler=Scheduler("new-dream"),
+    )
+    plugin = object.__new__(WeChatAI)
+    plugin._channel_runtime = old
+    plugin._build_channel_runtime = lambda _bootstrap: new
+
+    handler = await plugin._activate_channel_runtime(object())
+    await plugin._close_channel_runtime()
+
+    assert handler is new_handler
+    assert calls == [
+        "close:old-continuous",
+        "close:old-dream",
+        "start:new-continuous",
+        "start:new-dream",
+        "close:new-continuous",
+        "close:new-dream",
+    ]
 
 
 class FakeConnectorClient:
@@ -157,9 +231,7 @@ async def test_wechat_event_pump_handles_each_message_once_and_then_acks(tmp_pat
 
         assert result == "reconnect"
         assert client.after_values == ["10"]
-        assert [message.id for message in handler.messages] == [
-            "4159667620982040828"
-        ]
+        assert [message.id for message in handler.messages] == ["4159667620982040828"]
         assert await store.get_cursor(CONNECTOR_KEY) == "11"
 
         replay_client = FakeConnectorClient(
