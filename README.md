@@ -10,6 +10,8 @@ memory system without making either layer depend on Telegram or QQ concepts.
   attachments, response transport, and conversation handling.
 - `src/sidekick/telegram`: Telegram adapter and history/identity integration.
 - `src/sidekick/onebot`: OneBot 11 adapter for QQ groups.
+- `src/sidekick/wechat`: WeChat Linux connector client, durable event
+  projection, and AI transport.
 - `agent`: Pi-based agent loop, web/code tools, memory tools, session history,
   and run auditing.
 - `memory`: pinned Hindsight deployment and local patches.
@@ -38,6 +40,7 @@ The CLI loads only the installed Sidekick adapters:
 ```bash
 uv run sidekick telegram ai --account default
 uv run sidekick onebot ai
+uv run sidekick wechat ai
 uv run sidekick-memory-migrate --help
 uv run sidekick-memory-benchmark --help
 ```
@@ -45,6 +48,14 @@ uv run sidekick-memory-benchmark --help
 Configuration can be supplied through `.env`, environment variables, or
 `~/.sidekick/config.toml`. Start from the committed `.env.example` files; all
 secret values are placeholders.
+
+The WeChat adapter reads `SIDEKICK_WECHAT_URL` (default
+`http://127.0.0.1:18188`) and the optional `SIDEKICK_WECHAT_TOKEN`. It requires
+the connector's complete/current chat snapshot, durable event replay,
+idempotent text send, and stable outbound message-ID capabilities. Its local
+projection defaults to `~/.sidekick/wechat.db`. Connector history remains
+partial by contract, and continuous memory ingestion is not enabled by this
+initial adapter.
 
 ## Containers
 
