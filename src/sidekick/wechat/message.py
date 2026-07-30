@@ -12,6 +12,7 @@ class WeChatMessage:
     id: str
     chat_id: str
     raw_text: str
+    content_redacted: bool
     sender_id: str
     reply_to_msg_id: str | None
     date: datetime
@@ -35,6 +36,7 @@ class WeChatMessage:
             id=str(values["message_id"]),
             chat_id=str(values["chat_id"]),
             raw_text=str(values["content"]),
+            content_redacted=bool(values["content_redacted"]),
             sender_id=str(values["sender_id"]),
             reply_to_msg_id=(
                 str(values["reply_to_message_id"])
