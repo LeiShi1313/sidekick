@@ -115,19 +115,26 @@ class RecordingHandler:
         return True
 
 
-def message_event(*, cursor: str, reply_to: str | None = None) -> WeChatEvent:
+def message_event(
+    *,
+    cursor: str,
+    message_id: str = "4159667620982040828",
+    content: str = "/ai hello",
+    reply_to: str | None = None,
+    connection_generation: int = 41,
+) -> WeChatEvent:
     payload = {
         "schemaVersion": "wechat-bridge/v1alpha1",
         "cursor": cursor,
         "event": "message",
-        "id": "4159667620982040828",
+        "id": message_id,
         "chatId": CHAT_ID,
         "direction": "out",
         "messageType": "text",
         "senderId": ACCOUNT_ID,
-        "content": "/ai hello",
+        "content": content,
         "timestamp": 1_783_772_734,
-        "connectionGeneration": 41,
+        "connectionGeneration": connection_generation,
     }
     if reply_to is not None:
         payload["replyToMessageId"] = reply_to
@@ -221,6 +228,80 @@ async def test_wechat_event_pump_acks_disconnect_and_requests_rebootstrap(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
+    tmp_path,
+):
+    event = message_event(cursor="11", connection_generation=42)
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    client = FakeConnectorClient((event,))
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert result == "rebootstrap"
+        assert await store.get_cursor(CONNECTOR_KEY) == "10"
+        assert handler.messages == []
+
+        client.session = WeChatSession(
+            status="logged_in",
+            self_id=ACCOUNT_ID,
+            display_name="Sidekick",
+            hook_connected=True,
+            connection_generation=42,
+            content_redacted=False,
+            cursor="11",
+        )
+        client.capabilities = WeChatCapabilities(
+            receive_text=True,
+            stable_inbound_message_ids=True,
+            send_text=True,
+            request_idempotency=True,
+            outbound_stable_message_id=True,
+            websocket=True,
+            cursor=True,
+            replay=True,
+            durable_cursor=True,
+            text_send_ready=True,
+            connection_generation=42,
+            history=False,
+        )
+        client.chats = WeChatChatList(
+            chats=client.chats.chats,
+            snapshot=WeChatChatSnapshot(
+                id="snapshot-42",
+                complete=True,
+                current=True,
+                count=1,
+                cursor="11",
+                connection_generation=42,
+            ),
+            cursor="11",
+        )
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+
+        replay_result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert replay_result == "reconnect"
+        assert [message.id for message in handler.messages] == [event.payload["id"]]
+        assert await store.get_cursor(CONNECTOR_KEY) == "11"
+        assert client.after_values == ["10", "10"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_wechat_event_pump_stops_without_waiting_for_an_event(tmp_path):
     class BlockingClient(FakeConnectorClient):
         async def events(self, *, after):
@@ -245,5 +326,167 @@ async def test_wechat_event_pump_stops_without_waiting_for_an_event(tmp_path):
         stop.set()
 
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_reads_cancel_while_ai_request_is_running(tmp_path):
+    class CancellableHandler:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.messages = []
+
+        async def handle(self, message):
+            self.messages.append(message.raw_text)
+            if message.raw_text == "/ai long task":
+                self.started.set()
+                await self.release.wait()
+            elif message.raw_text == "/ai_cancel":
+                await self.started.wait()
+                self.release.set()
+            return True
+
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    client = FakeConnectorClient(
+        (
+            message_event(cursor="11", content="/ai long task"),
+            message_event(
+                cursor="12",
+                message_id="4159667620982040829",
+                content="/ai_cancel",
+            ),
+        )
+    )
+    handler = CancellableHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        result = await asyncio.wait_for(
+            WeChatEventPump(
+                client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+                handler_concurrency=2,
+            ).run(handler, asyncio.Event()),
+            timeout=1,
+        )
+
+        assert result == "reconnect"
+        assert handler.messages == ["/ai long task", "/ai_cancel"]
+        assert await store.get_cursor(CONNECTOR_KEY) == "12"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_commits_concurrent_handlers_in_cursor_order(tmp_path):
+    class OrderedHandler:
+        def __init__(self):
+            self.first_release = asyncio.Event()
+            self.second_done = asyncio.Event()
+
+        async def handle(self, message):
+            if message.raw_text == "/ai first":
+                await self.first_release.wait()
+            else:
+                self.second_done.set()
+            return True
+
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    client = FakeConnectorClient(
+        (
+            message_event(cursor="11", content="/ai first"),
+            message_event(
+                cursor="12",
+                message_id="4159667620982040829",
+                content="/ai second",
+            ),
+        )
+    )
+    handler = OrderedHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        task = asyncio.create_task(
+            WeChatEventPump(
+                client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+                handler_concurrency=2,
+            ).run(handler, asyncio.Event())
+        )
+        await asyncio.wait_for(handler.second_done.wait(), timeout=1)
+
+        assert await store.get_cursor(CONNECTOR_KEY) == "10"
+
+        handler.first_release.set()
+        assert await asyncio.wait_for(task, timeout=1) == "reconnect"
+        assert await store.get_cursor(CONNECTOR_KEY) == "12"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_stops_dispatch_at_rebootstrap_boundary(tmp_path):
+    class BlockingHandler:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.later_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.messages = []
+
+        async def handle(self, message):
+            self.messages.append(message.raw_text)
+            if message.raw_text == "/ai long task":
+                self.started.set()
+                await self.release.wait()
+            else:
+                self.later_started.set()
+            return True
+
+    session_update = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "12",
+            "event": "session_update",
+            "connectionGeneration": 41,
+        }
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    client = FakeConnectorClient(
+        (
+            message_event(cursor="11", content="/ai long task"),
+            session_update,
+            message_event(
+                cursor="13",
+                message_id="4159667620982040829",
+                content="/ai must wait for the new session",
+            ),
+        )
+    )
+    handler = BlockingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        task = asyncio.create_task(
+            WeChatEventPump(
+                client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+                handler_concurrency=3,
+            ).run(handler, asyncio.Event())
+        )
+        await asyncio.wait_for(handler.started.wait(), timeout=1)
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(handler.later_started.wait(), timeout=0.05)
+
+        assert handler.messages == ["/ai long task"]
+
+        handler.release.set()
+        assert await asyncio.wait_for(task, timeout=1) == "rebootstrap"
+        assert await store.get_cursor(CONNECTOR_KEY) == "12"
     finally:
         await store.close()

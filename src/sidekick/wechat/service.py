@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -45,6 +46,14 @@ class WeChatBootstrap:
     messages: WeChatMessageList
 
 
+@dataclass(slots=True)
+class _PendingEvent:
+    event: WeChatEvent
+    operation: asyncio.Task[WeChatMessage | None] | None = None
+    commit_cursor: bool = True
+    rebootstrap: bool = False
+
+
 async def bootstrap_wechat_channel(
     client: WeChatBootstrapClient,
     store: WeChatStateRepository,
@@ -82,11 +91,16 @@ class WeChatEventPump:
         store: WeChatStateRepository,
         connector_key: str,
         bootstrap: WeChatBootstrap,
+        *,
+        handler_concurrency: int = 8,
     ):
+        if handler_concurrency < 1:
+            raise ValueError("WeChat handler concurrency must be positive")
         self._client = client
         self._store = store
         self._connector_key = connector_key
         self._bootstrap = bootstrap
+        self._handler_concurrency = handler_concurrency
 
     async def run(
         self,
@@ -96,97 +110,146 @@ class WeChatEventPump:
         after = await self._store.get_cursor(self._connector_key)
         stream = self._client.events(after=after)
         iterator = stream.__aiter__()
+        pending: deque[_PendingEvent] = deque()
+        next_event: asyncio.Task[WeChatEvent] | None = None
+        stopped = asyncio.create_task(stop.wait())
+        stream_ended = False
         try:
             while True:
-                next_event = asyncio.create_task(anext(iterator))
-                stopped = asyncio.create_task(stop.wait())
+                result = await self._ack_ready_events(pending)
+                if result is not None:
+                    return result
+                if stop.is_set():
+                    return "stopped"
+                if stream_ended and not pending:
+                    return "reconnect"
+                if (
+                    next_event is None
+                    and not stream_ended
+                    and len(pending) < self._handler_concurrency
+                ):
+                    next_event = asyncio.create_task(anext(iterator))
+
+                wait_for: set[asyncio.Task[object]] = {stopped}
+                if next_event is not None:
+                    wait_for.add(next_event)
+                if pending and pending[0].operation is not None:
+                    wait_for.add(pending[0].operation)
                 done, _ = await asyncio.wait(
-                    {next_event, stopped},
+                    wait_for,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stopped in done:
-                    next_event.cancel()
-                    await asyncio.gather(next_event, return_exceptions=True)
                     return "stopped"
-                stopped.cancel()
-                await asyncio.gather(stopped, return_exceptions=True)
-                try:
-                    event = next_event.result()
-                except StopAsyncIteration:
-                    return "reconnect"
-                result = await self._handle_event(handler, event)
-                if result is not None:
-                    return result
+                if next_event is not None and next_event in done:
+                    try:
+                        event = next_event.result()
+                    except StopAsyncIteration:
+                        stream_ended = True
+                    else:
+                        prepared = await self._prepare_event(handler, event)
+                        pending.append(prepared)
+                        if prepared.rebootstrap:
+                            # Do not dispatch anything beyond an account/session
+                            # boundary using the old bootstrap state.
+                            stream_ended = True
+                    next_event = None
         finally:
+            if next_event is not None:
+                next_event.cancel()
+                await asyncio.gather(next_event, return_exceptions=True)
+            operations = [
+                item.operation
+                for item in pending
+                if item.operation is not None and not item.operation.done()
+            ]
+            for operation in operations:
+                operation.cancel()
+            if operations:
+                await asyncio.gather(*operations, return_exceptions=True)
+            stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
             close = getattr(iterator, "aclose", None)
             if callable(close):
                 await close()
 
-    async def _handle_event(
+    async def _prepare_event(
         self,
         handler: WeChatInboundHandler,
         event: WeChatEvent,
-    ) -> Literal["rebootstrap"] | None:
+    ) -> _PendingEvent:
         generation = self._bootstrap.session.connection_generation
         if (
             event.connection_generation is not None
             and event.connection_generation != generation
         ):
-            await self._store.acknowledge_event(
-                self._connector_key,
-                event.cursor,
+            return _PendingEvent(
+                event=event,
+                commit_cursor=event.connection_generation < generation,
+                rebootstrap=True,
             )
-            return "rebootstrap"
 
         if event.name == "hook_connection":
-            await self._store.acknowledge_event(
-                self._connector_key,
-                event.cursor,
+            return _PendingEvent(
+                event=event,
+                rebootstrap=event.payload.get("status") == "disconnected",
             )
-            if event.payload.get("status") == "disconnected":
-                return "rebootstrap"
-            return None
 
         if event.name == "session_update":
-            await self._store.acknowledge_event(
-                self._connector_key,
-                event.cursor,
-            )
-            return "rebootstrap"
+            return _PendingEvent(event=event, rebootstrap=True)
 
         if event.name in {"chat", "chat_snapshot"}:
             await self._refresh_chats(generation)
-            await self._store.acknowledge_event(
-                self._connector_key,
-                event.cursor,
-            )
-            return None
+            return _PendingEvent(event=event)
 
         if event.name == "message":
             message = await self._store.project_event(self._connector_key, event)
             if message is None:
                 await self._refresh_chats(generation)
                 message = await self._store.project_event(self._connector_key, event)
-            processed = None
             if message is not None and _dispatchable(message):
                 if not await self._store.is_processed(message):
-                    await handler.handle(message)
-                    processed = message
-            await self._store.acknowledge_event(
-                self._connector_key,
-                event.cursor,
-                processed_message=processed,
-            )
-            return None
+                    return _PendingEvent(
+                        event=event,
+                        operation=asyncio.create_task(
+                            self._handle_message(handler, message)
+                        ),
+                    )
+            return _PendingEvent(event=event)
 
         if event.name == "message_remove":
             await self._store.project_event(self._connector_key, event)
 
-        await self._store.acknowledge_event(
-            self._connector_key,
-            event.cursor,
-        )
+        return _PendingEvent(event=event)
+
+    async def _ack_ready_events(
+        self,
+        pending: deque[_PendingEvent],
+    ) -> Literal["rebootstrap"] | None:
+        while pending:
+            current = pending[0]
+            operation = current.operation
+            if operation is not None and not operation.done():
+                return None
+            processed = operation.result() if operation is not None else None
+            if current.commit_cursor:
+                await self._store.acknowledge_event(
+                    self._connector_key,
+                    current.event.cursor,
+                    processed_message=processed,
+                )
+            pending.popleft()
+            if current.rebootstrap:
+                return "rebootstrap"
         return None
+
+    @staticmethod
+    async def _handle_message(
+        handler: WeChatInboundHandler,
+        message: WeChatMessage,
+    ) -> WeChatMessage:
+        await handler.handle(message)
+        return message
 
     async def _refresh_chats(self, generation: int) -> None:
         chats = await self._client.get_chats()
