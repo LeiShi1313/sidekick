@@ -2,10 +2,11 @@
 set -euo pipefail
 
 readonly HINDSIGHT_REVISION="92f433c90409636804c0797071a4abbe141f76c5"
-readonly DEFAULT_IMAGE="sidekick-hindsight-control-plane:0.8.4-bank-name.1"
+readonly DEFAULT_IMAGE="sidekick-hindsight-control-plane:0.8.4-bank-name.2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly PATCH_FILE="${SCRIPT_DIR}/patches/bee6f5d1-bank-name-search.patch"
+readonly BANK_NAME_PATCH_FILE="${SCRIPT_DIR}/patches/bee6f5d1-bank-name-search.patch"
+readonly BANK_ID_ENCODING_PATCH_FILE="${SCRIPT_DIR}/patches/hindsight-control-plane-bank-id-encoding.patch"
 
 if [[ $# -ne 1 ]]; then
   echo "Usage: $0 /path/to/hindsight" >&2
@@ -24,7 +25,8 @@ build_dir="$(mktemp -d "${TMPDIR:-/tmp}/sidekick-hindsight.XXXXXX")"
 trap 'rm -rf -- "${build_dir}"' EXIT
 
 git -C "${source_dir}" archive "${HINDSIGHT_REVISION}" | tar -x -C "${build_dir}"
-patch --batch --forward -d "${build_dir}" -p1 < "${PATCH_FILE}"
+patch --batch --forward -d "${build_dir}" -p1 < "${BANK_NAME_PATCH_FILE}"
+patch --batch --forward -d "${build_dir}" -p1 < "${BANK_ID_ENCODING_PATCH_FILE}"
 
 docker build \
   --file "${build_dir}/docker/standalone/Dockerfile" \
@@ -35,7 +37,8 @@ docker build \
   --build-arg PRELOAD_ML_MODELS=false \
   --label "org.opencontainers.image.source=https://github.com/vectorize-io/hindsight" \
   --label "org.opencontainers.image.revision=${HINDSIGHT_REVISION}" \
-  --label "org.opencontainers.image.version=0.8.4-bank-name.1" \
+  --label "org.opencontainers.image.version=0.8.4-bank-name.2" \
   --label "io.sidekick.hindsight.control-plane-patch=bee6f5d114c09a7bf51a2ef1d5357e0bdf0d9c2d" \
+  --label "io.sidekick.hindsight.control-plane-bank-id-encoding=v1" \
   --tag "${image}" \
   "${build_dir}"
