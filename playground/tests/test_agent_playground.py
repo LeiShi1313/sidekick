@@ -24,7 +24,9 @@ async def start(app: web.Application) -> tuple[web.AppRunner, str]:
     return runner, f"http://127.0.0.1:{port}"
 
 
-async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
+async def dependencies(
+    *, bank_id: str = "chat:engineering"
+) -> tuple[list[web.AppRunner], str, str, dict]:
     received = {
         "recalls": [],
         "runs": [],
@@ -43,7 +45,7 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
             {
                 "banks": [
                     {
-                        "bank_id": "chat:engineering",
+                        "bank_id": bank_id,
                         "name": "Engineering",
                         "fact_count": 12,
                     }
@@ -477,6 +479,59 @@ def test_settings_use_generic_environment_names(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_banks_accept_percent_escaped_hindsight_ids():
+    bank_id = "wechat:account:wxid_v11uy95lmdjh22:chat:49277108357%40chatroom"
+    dependency_runners, memory_url, pi_url, _ = await dependencies(bank_id=bank_id)
+    playground_runner, playground_url = await request_app(memory_url, pi_url)
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(f"{playground_url}/api/banks") as response,
+        ):
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["items"][0]["bank_id"] == bank_id
+    finally:
+        await playground_runner.cleanup()
+        for runner in dependency_runners:
+            await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_empty_system_prompt_uses_the_configured_default():
+    dependency_runners, memory_url, pi_url, received = await dependencies()
+    playground_runner, playground_url = await request_app(memory_url, pi_url)
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(
+                f"{playground_url}/api/runs",
+                json={
+                    "mode": "agent",
+                    "prompt": "Who owns deploys?",
+                    "bankId": "chat:engineering",
+                    "memoryQuery": None,
+                    "recallContext": "",
+                    "context": "",
+                    "systemPrompt": "",
+                    "sessionId": None,
+                    "parentEntryId": None,
+                },
+            ) as response,
+        ):
+            events = [json.loads(line) async for line in response.content]
+
+        assert response.status == 200
+        assert events[-1]["type"] == "run_completed"
+        assert received["runs"][0]["systemPrompt"] == "Use evidence carefully."
+    finally:
+        await playground_runner.cleanup()
+        for runner in dependency_runners:
+            await runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
     dependency_runners, memory_url, pi_url, received = await dependencies()
     playground_runner, playground_url = await request_app(memory_url, pi_url)
@@ -778,6 +833,33 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
 def test_playground_rejects_malformed_pi_memory_events(event):
     with pytest.raises(UpstreamUnavailable, match="malformed events"):
         _parse_pi_event(json.dumps(event).encode())
+
+
+def test_playground_accepts_wechat_memory_snapshot_source_ids():
+    bank_id = "wechat:account:wxid_v11uy95lmdjh22:chat:49277108357%40chatroom"
+    document_id = (
+        "wechat:memory-session:49277108357@chatroom:20260731T103229Z:670640216917235054"
+    )
+    chunk_id = f"{bank_id}_{document_id}_0"
+    event = {
+        "type": "memory_snapshot",
+        "primaryBankId": bank_id,
+        "queries": ["What happened today?"],
+        "memories": [
+            {
+                "id": "d94960ea-e1a2-4739-8435-4fca079e8870",
+                "text": "A remembered fact.",
+                "entities": [],
+                "documentId": document_id,
+                "chunkId": chunk_id,
+            }
+        ],
+    }
+
+    parsed = _parse_pi_event(json.dumps(event).encode())
+
+    assert parsed["memories"][0]["documentId"] == document_id
+    assert parsed["memories"][0]["chunkId"] == chunk_id
 
 
 def test_run_audit_requires_a_bounded_diagnostic_summary():
