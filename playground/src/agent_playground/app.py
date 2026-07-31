@@ -18,7 +18,7 @@ from aiohttp import web
 
 
 _STATIC_PATH = Path(__file__).with_name("assets")
-_BANK_RE = re.compile(r"^[A-Za-z0-9:_-]{1,256}$")
+_BANK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _RUN_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -901,7 +901,11 @@ def _validate_run_request(value: Any, default_system_prompt: str) -> dict[str, A
     memory_query = _optional_bounded_string(
         value.get("memoryQuery"), 8_000, "memory query"
     )
-    system_prompt = value.get("systemPrompt", default_system_prompt)
+    system_prompt = value.get("systemPrompt")
+    if system_prompt is None or (
+        isinstance(system_prompt, str) and not system_prompt.strip()
+    ):
+        system_prompt = default_system_prompt
     system_prompt = _bounded_string(system_prompt, 1, 32_000, "system prompt")
     bank_id = value.get("bankId")
     if bank_id is not None and (

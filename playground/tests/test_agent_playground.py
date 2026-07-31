@@ -24,7 +24,9 @@ async def start(app: web.Application) -> tuple[web.AppRunner, str]:
     return runner, f"http://127.0.0.1:{port}"
 
 
-async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
+async def dependencies(
+    *, bank_id: str = "chat:engineering"
+) -> tuple[list[web.AppRunner], str, str, dict]:
     received = {
         "recalls": [],
         "runs": [],
@@ -43,7 +45,7 @@ async def dependencies() -> tuple[list[web.AppRunner], str, str, dict]:
             {
                 "banks": [
                     {
-                        "bank_id": "chat:engineering",
+                        "bank_id": bank_id,
                         "name": "Engineering",
                         "fact_count": 12,
                     }
@@ -474,6 +476,59 @@ def test_settings_use_generic_environment_names(monkeypatch):
     assert settings.pi_url == "http://pi.internal:8790"
     assert settings.pi_token == "configured-token"
     assert settings.system_prompt.startswith("You are a helpful assistant")
+
+
+@pytest.mark.asyncio
+async def test_banks_accept_percent_escaped_hindsight_ids():
+    bank_id = "wechat:account:wxid_v11uy95lmdjh22:chat:49277108357%40chatroom"
+    dependency_runners, memory_url, pi_url, _ = await dependencies(bank_id=bank_id)
+    playground_runner, playground_url = await request_app(memory_url, pi_url)
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(f"{playground_url}/api/banks") as response,
+        ):
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload["items"][0]["bank_id"] == bank_id
+    finally:
+        await playground_runner.cleanup()
+        for runner in dependency_runners:
+            await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_empty_system_prompt_uses_the_configured_default():
+    dependency_runners, memory_url, pi_url, received = await dependencies()
+    playground_runner, playground_url = await request_app(memory_url, pi_url)
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(
+                f"{playground_url}/api/runs",
+                json={
+                    "mode": "agent",
+                    "prompt": "Who owns deploys?",
+                    "bankId": "chat:engineering",
+                    "memoryQuery": None,
+                    "recallContext": "",
+                    "context": "",
+                    "systemPrompt": "",
+                    "sessionId": None,
+                    "parentEntryId": None,
+                },
+            ) as response,
+        ):
+            events = [json.loads(line) async for line in response.content]
+
+        assert response.status == 200
+        assert events[-1]["type"] == "run_completed"
+        assert received["runs"][0]["systemPrompt"] == "Use evidence carefully."
+    finally:
+        await playground_runner.cleanup()
+        for runner in dependency_runners:
+            await runner.cleanup()
 
 
 @pytest.mark.asyncio
