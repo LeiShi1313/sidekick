@@ -68,6 +68,44 @@ test("streams a run as NDJSON", async () => {
   }
 });
 
+test("a rejected duplicate run does not cancel the existing owner", async () => {
+  const existingOwner = Symbol("existing-run-owner");
+  const cancelAttempts = [];
+  let originalActive = true;
+  const app = await listen({
+    async *run(_request, requestOwner) {
+      assert.notEqual(requestOwner, existingOwner);
+      throw new Error("Agent run is already active");
+    },
+    async cancel(_runId, requestOwner) {
+      cancelAttempts.push(requestOwner);
+      if (requestOwner === existingOwner) originalActive = false;
+      return requestOwner === existingOwner;
+    },
+  });
+  try {
+    const response = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify(validRun),
+    });
+    assert.equal(response.status, 200);
+    const events = (await response.text())
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(events.at(-1).type, "run_failed");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(cancelAttempts, []);
+    assert.equal(originalActive, true);
+  } finally {
+    await app.close();
+  }
+});
+
 test("rejects invalid run input before invoking the engine", async () => {
   let called = false;
   const app = await listen({
@@ -157,6 +195,58 @@ test("accepts a bounded model selection and rejects malformed model ids", async 
           authorization: "Bearer test-agent-token-that-is-long-enough",
         },
         body: JSON.stringify({ ...validRun, model }),
+      });
+      assert.equal(rejected.status, 400);
+    }
+    assert.equal(received.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
+test("accepts only a strict bounded run origin independent of memory", async () => {
+  const received = [];
+  const app = await listen({
+    async *run(request) {
+      received.push(request);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel() {
+      return false;
+    },
+  });
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer test-agent-token-that-is-long-enough",
+  };
+  const origin = {
+    scopeId: "wechat:account:wxid%40bridge:chat:room/42",
+    adapterInstanceId: "wechat-peer",
+  };
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...validRun, origin }),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.deepEqual(received[0].origin, origin);
+    assert.equal(received[0].memory, undefined);
+
+    for (const invalidOrigin of [
+      null,
+      { scopeId: "", adapterInstanceId: "wechat-peer" },
+      { scopeId: "scope", adapterInstanceId: "" },
+      { scopeId: "x".repeat(513), adapterInstanceId: "wechat-peer" },
+      { scopeId: "scope", adapterInstanceId: "x".repeat(129) },
+      { scopeId: "scope" },
+      { ...origin, debug: true },
+    ]) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ ...validRun, origin: invalidOrigin }),
       });
       assert.equal(rejected.status, 400);
     }
@@ -540,6 +630,64 @@ test("serves authenticated session history and run audits", async () => {
   }
 });
 
+test("serves active runs through the strict authenticated status query", async () => {
+  let activeCalls = 0;
+  let historyCalled = false;
+  const item = {
+    runId: validRun.runId,
+    sessionId: "session-1",
+    scopeId: "qq:group:42",
+    adapterInstanceId: "qq-primary",
+    modelId: "test-model",
+    startedAt: "2026-07-31T10:00:00.000Z",
+    updatedAt: "2026-07-31T10:00:01.000Z",
+    phase: "model_running",
+    currentTool: null,
+  };
+  const app = await listen({
+    async *run() {},
+    async cancel() {
+      return false;
+    },
+    listActiveRuns() {
+      activeCalls += 1;
+      return { items: [item], total: 1 };
+    },
+    async listRunAudits() {
+      historyCalled = true;
+      return { items: [], total: 0, nextCursor: null };
+    },
+  });
+  const headers = {
+    authorization: "Bearer test-agent-token-that-is-long-enough",
+  };
+  try {
+    const response = await fetch(`${app.baseUrl}/v1/runs?status=active`, {
+      headers,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { items: [item], total: 1 });
+
+    for (const query of [
+      "status=completed",
+      "status=active&limit=1",
+      "status=active&status=active",
+    ]) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs?${query}`, {
+        headers,
+      });
+      assert.equal(rejected.status, 400);
+      assert.deepEqual(await rejected.json(), {
+        error: { code: "INVALID_REQUEST", message: "Invalid run query" },
+      });
+    }
+    assert.equal(activeCalls, 1);
+    assert.equal(historyCalled, false);
+  } finally {
+    await app.close();
+  }
+});
+
 test("validates history queries and returns stable missing-resource errors", async () => {
   let called = false;
   const app = await listen({
@@ -622,6 +770,9 @@ test("rejects unauthenticated history requests", async () => {
     async getRunAudit() {
       called = true;
     },
+    async listActiveRuns() {
+      called = true;
+    },
   };
   const app = await listen(engine);
   try {
@@ -629,6 +780,7 @@ test("rejects unauthenticated history requests", async () => {
       "/v1/sessions",
       "/v1/sessions/session-1",
       "/v1/runs",
+      "/v1/runs?status=active",
       `/v1/runs/${validRun.runId}/audit`,
     ]) {
       const response = await fetch(`${app.baseUrl}${path}`);

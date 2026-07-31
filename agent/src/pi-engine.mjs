@@ -398,11 +398,35 @@ export class PiEngine {
     };
   }
 
-  async cancel(runId) {
-    const session = this.activeRuns.get(runId);
-    if (!session) return false;
-    await session.abort();
+  async cancel(runId, requestOwner = null) {
+    const activeRun = this.activeRuns.get(runId);
+    if (
+      !activeRun ||
+      (requestOwner !== null && activeRun.requestOwner !== requestOwner)
+    ) {
+      return false;
+    }
+    activeRun.cancelRequested = true;
+    this.#updateActiveRun(activeRun, {
+      phase: "cancelling",
+      currentTool: null,
+    });
+    if (activeRun.session) await activeRun.session.abort();
     return true;
+  }
+
+  listActiveRuns() {
+    const items = [...this.activeRuns.values()]
+      .map(
+        ({
+          session: _session,
+          cancelRequested: _cancelRequested,
+          requestOwner: _requestOwner,
+          ...summary
+        }) => ({ ...summary }),
+      )
+      .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+    return { items, total: items.length };
   }
 
   async listModels() {
@@ -505,20 +529,42 @@ export class PiEngine {
 
   async shutdown() {
     await Promise.allSettled(
-      [...this.activeRuns.values()].map((session) => session.abort()),
+      [...this.activeRuns.keys()].map((runId) => this.cancel(runId)),
     );
   }
 
-  async *run(request) {
-    const release = await this.locks.acquire(request.sessionId ?? request.runId);
+  async *run(request, requestOwner = null) {
+    if (this.activeRuns.has(request.runId)) {
+      throw new Error("Agent run is already active");
+    }
+    const startedAt = new Date().toISOString();
+    const activeRun = {
+      runId: request.runId,
+      sessionId: request.sessionId,
+      scopeId: request.origin?.scopeId ?? null,
+      adapterInstanceId: request.origin?.adapterInstanceId ?? null,
+      modelId: request.model ?? this.model.id,
+      startedAt,
+      updatedAt: startedAt,
+      phase: "queued",
+      currentTool: null,
+      session: null,
+      cancelRequested: false,
+      requestOwner,
+    };
+    this.activeRuns.set(request.runId, activeRun);
+    let release = null;
     try {
-      yield* this.#runLocked(request);
+      release = await this.locks.acquire(request.sessionId ?? request.runId);
+      this.#updateActiveRun(activeRun, { phase: "preparing" });
+      yield* this.#runLocked(request, activeRun);
     } finally {
-      release();
+      release?.();
+      this.#removeActiveRun(activeRun);
     }
   }
 
-  async *#runLocked(request) {
+  async *#runLocked(request, activeRun) {
     await this.#ensureDirectories();
     let audit = null;
     try {
@@ -546,10 +592,31 @@ export class PiEngine {
       systemPrompt: request.systemPrompt,
       toolPolicy: request.toolPolicy,
       model: request.model ?? null,
+      origin: request.origin ?? null,
       memory: request.memory ?? null,
       includeMemorySnapshot: Boolean(request.includeMemorySnapshot),
     });
+    const cancelledEvent = async (sessionId = null) => {
+      const failed = {
+        code: "CANCELLED",
+        message: "Agent run cancelled",
+        ...(sessionId ? { sessionId } : {}),
+      };
+      terminalRecorded = true;
+      await record("run.failed", failed);
+      this.#removeActiveRun(activeRun);
+      return {
+        type: "run_failed",
+        code: failed.code,
+        message: failed.message,
+      };
+    };
     try {
+      if (activeRun.cancelRequested) {
+        yield await cancelledEvent();
+        return;
+      }
+      this.#updateActiveRun(activeRun, { phase: "recalling" });
       const observeMemory = ({ type, data }) => record(type, data);
       const recalled = await retrieveMemoryContext({
         baseUrl: this.config.memoryUrl,
@@ -560,6 +627,11 @@ export class PiEngine {
         fetchImpl: this.config.memoryFetch,
         observe: observeMemory,
       });
+      if (activeRun.cancelRequested) {
+        yield await cancelledEvent();
+        return;
+      }
+      this.#updateActiveRun(activeRun, { phase: "preparing" });
       await record("memory.context", {
         primaryBankId: request.memory?.primaryBankId ?? null,
         queries: recalled.queries,
@@ -655,12 +727,24 @@ export class PiEngine {
         sessionManager,
         settingsManager,
       });
+      activeRun.session = session;
+      this.#updateActiveRun(activeRun, {
+        sessionId: session.sessionId,
+        phase: "preparing",
+      });
       await record("session.opened", {
         sessionId: session.sessionId,
         requestedSessionId: request.sessionId,
         parentEntryId: sessionManager.getLeafId(),
         requestedParentEntryId: request.parentEntryId,
       });
+      if (activeRun.cancelRequested) {
+        const event = await cancelledEvent(session.sessionId);
+        activeRun.session = null;
+        session.dispose();
+        yield event;
+        return;
+      }
       const accessWarning = continuationAccessWarning(
         session.messages,
         request.memory,
@@ -685,6 +769,10 @@ export class PiEngine {
           firstTextInTurn = true;
           turnNumber += 1;
           turnStartedAt = Date.now();
+          this.#updateActiveRun(activeRun, {
+            phase: "model_running",
+            currentTool: null,
+          });
           void record("model.turn.started", { turn: turnNumber });
         } else if (
           event.type === "message_update" &&
@@ -697,7 +785,14 @@ export class PiEngine {
           });
           firstTextInTurn = false;
         } else if (event.type === "tool_execution_start") {
-          toolStartedAt.set(event.toolCallId, Date.now());
+          toolStartedAt.set(event.toolCallId, {
+            startedAt: Date.now(),
+            toolName: event.toolName,
+          });
+          this.#updateActiveRun(activeRun, {
+            phase: "tool_running",
+            currentTool: event.toolName,
+          });
           void record("tool.started", {
             turn: turnNumber,
             toolCallId: event.toolCallId,
@@ -711,8 +806,13 @@ export class PiEngine {
             summary: toolStartSummary(event.toolName, event.args),
           });
         } else if (event.type === "tool_execution_end") {
-          const startedAt = toolStartedAt.get(event.toolCallId);
+          const started = toolStartedAt.get(event.toolCallId);
           toolStartedAt.delete(event.toolCallId);
+          const nextTool = toolStartedAt.values().next().value?.toolName ?? null;
+          this.#updateActiveRun(activeRun, {
+            phase: nextTool ? "tool_running" : "model_running",
+            currentTool: nextTool,
+          });
           void record("tool.completed", {
             turn: turnNumber,
             toolCallId: event.toolCallId,
@@ -721,7 +821,9 @@ export class PiEngine {
             result: event.result,
             isError: event.isError,
             durationMs:
-              startedAt === undefined ? null : Math.max(0, Date.now() - startedAt),
+              started === undefined
+                ? null
+                : Math.max(0, Date.now() - started.startedAt),
           });
           queue.push({
             type: "tool_snapshot",
@@ -776,12 +878,23 @@ export class PiEngine {
         tools: toolNames,
         sessionMessagesBeforePrompt: session.messages,
       });
+      if (activeRun.cancelRequested) {
+        const event = await cancelledEvent(session.sessionId);
+        unsubscribe();
+        activeRun.session = null;
+        session.dispose();
+        yield event;
+        return;
+      }
+      this.#updateActiveRun(activeRun, {
+        phase: "model_running",
+        currentTool: null,
+      });
       queue.push({
         type: "run_started",
         runId: request.runId,
         sessionId: session.sessionId,
       });
-      this.activeRuns.set(request.runId, session);
       const task = (async () => {
         try {
           await session.prompt(preparedPrompt, {
@@ -839,7 +952,7 @@ export class PiEngine {
         } catch (error) {
           queue.fail(error);
         } finally {
-          this.activeRuns.delete(request.runId);
+          this.#removeActiveRun(activeRun);
           unsubscribe();
           session.dispose();
         }
@@ -849,7 +962,7 @@ export class PiEngine {
         for await (const event of queue) yield event;
         await task;
       } finally {
-        if (this.activeRuns.get(request.runId) === session) {
+        if (activeRun.session === session) {
           await session.abort();
           await task.catch(() => {});
         }
@@ -869,6 +982,23 @@ export class PiEngine {
       } catch {
         // The run result remains authoritative if audit storage fails.
       }
+    }
+  }
+
+  #updateActiveRun(activeRun, changes) {
+    if (this.activeRuns.get(activeRun.runId) !== activeRun) return;
+    const next = { ...changes };
+    if (activeRun.cancelRequested && next.phase !== "cancelling") {
+      delete next.phase;
+      delete next.currentTool;
+    }
+    Object.assign(activeRun, next, { updatedAt: new Date().toISOString() });
+  }
+
+  #removeActiveRun(activeRun) {
+    activeRun.session = null;
+    if (this.activeRuns.get(activeRun.runId) === activeRun) {
+      this.activeRuns.delete(activeRun.runId);
     }
   }
 

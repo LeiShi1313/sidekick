@@ -99,12 +99,23 @@ function listOptions(url, kind) {
   return { limit, cursor, sessionId };
 }
 
+function isActiveRunQuery(url) {
+  const keys = [...url.searchParams.keys()];
+  return (
+    keys.length === 1 &&
+    keys[0] === "status" &&
+    url.searchParams.getAll("status").length === 1 &&
+    url.searchParams.get("status") === "active"
+  );
+}
+
 export function validateRunRequest(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const sessionId = value.sessionId;
   const parentEntryId = value.parentEntryId;
   const includeMemorySnapshot = value.includeMemorySnapshot;
   const model = value.model;
+  const suppliedOrigin = value.origin;
   const isRoot = sessionId === null && parentEntryId === null;
   const isContinuation =
     typeof sessionId === "string" &&
@@ -129,6 +140,26 @@ export function validateRunRequest(value) {
     value.context.length > 4
   ) {
     return null;
+  }
+  let origin;
+  if (suppliedOrigin !== undefined) {
+    if (
+      !suppliedOrigin ||
+      typeof suppliedOrigin !== "object" ||
+      Array.isArray(suppliedOrigin) ||
+      !hasOnlyKeys(
+        suppliedOrigin,
+        new Set(["scopeId", "adapterInstanceId"]),
+      ) ||
+      !isBoundedString(suppliedOrigin.scopeId, 1, 512) ||
+      !isBoundedString(suppliedOrigin.adapterInstanceId, 1, 128)
+    ) {
+      return null;
+    }
+    origin = {
+      scopeId: suppliedOrigin.scopeId,
+      adapterInstanceId: suppliedOrigin.adapterInstanceId,
+    };
   }
   const context = [];
   for (const item of value.context) {
@@ -272,6 +303,7 @@ export function validateRunRequest(value) {
     systemPrompt: value.systemPrompt,
     toolPolicy: value.toolPolicy,
     ...(model ? { model } : {}),
+    ...(origin ? { origin } : {}),
     ...(includeMemorySnapshot ? { includeMemorySnapshot: true } : {}),
     ...(memory ? { memory } : {}),
   };
@@ -429,6 +461,25 @@ export function createAgentServer({ engine, token, logger = console }) {
     }
 
     if (request.method === "GET" && url.pathname === "/v1/runs") {
+      if (url.searchParams.has("status")) {
+        if (!isActiveRunQuery(url)) {
+          json(response, 400, {
+            error: { code: "INVALID_REQUEST", message: "Invalid run query" },
+          });
+          return;
+        }
+        try {
+          json(response, 200, await engine.listActiveRuns());
+        } catch {
+          json(response, 500, {
+            error: {
+              code: "RUNS_UNAVAILABLE",
+              message: "Active runs unavailable",
+            },
+          });
+        }
+        return;
+      }
       const options = listOptions(url, "runs");
       if (!options) {
         json(response, 400, {
@@ -550,17 +601,19 @@ export function createAgentServer({ engine, token, logger = console }) {
       "content-type": "application/x-ndjson; charset=utf-8",
       "transfer-encoding": "chunked",
     });
+    const requestOwner = Symbol(run.runId);
     let completed = false;
     response.on("close", () => {
-      if (!completed) void engine.cancel(run.runId);
+      if (!completed) void engine.cancel(run.runId, requestOwner);
     });
     try {
-      for await (const event of engine.run(run)) {
+      for await (const event of engine.run(run, requestOwner)) {
         if (response.destroyed) break;
         writeNdjson(response, event);
       }
       completed = true;
     } catch (error) {
+      completed = true;
       logger.error("Agent run failed", {
         runId: run.runId,
         errorType: error instanceof Error ? error.name : "UnknownError",
