@@ -25,7 +25,7 @@ _RUN_ID_RE = re.compile(
     re.IGNORECASE,
 )
 _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
-_DOCUMENT_ID_RE = re.compile(r"^[A-Za-z0-9:_.-]{1,512}$")
+_DOCUMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:@_.%-]{0,511}$")
 _MAX_UPSTREAM_BYTES = 64 * 1024 * 1024
 _LOCALHOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _HOST_RE = re.compile(

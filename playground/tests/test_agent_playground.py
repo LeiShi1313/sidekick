@@ -835,6 +835,33 @@ def test_playground_rejects_malformed_pi_memory_events(event):
         _parse_pi_event(json.dumps(event).encode())
 
 
+def test_playground_accepts_wechat_memory_snapshot_source_ids():
+    bank_id = "wechat:account:wxid_v11uy95lmdjh22:chat:49277108357%40chatroom"
+    document_id = (
+        "wechat:memory-session:49277108357@chatroom:20260731T103229Z:670640216917235054"
+    )
+    chunk_id = f"{bank_id}_{document_id}_0"
+    event = {
+        "type": "memory_snapshot",
+        "primaryBankId": bank_id,
+        "queries": ["What happened today?"],
+        "memories": [
+            {
+                "id": "d94960ea-e1a2-4739-8435-4fca079e8870",
+                "text": "A remembered fact.",
+                "entities": [],
+                "documentId": document_id,
+                "chunkId": chunk_id,
+            }
+        ],
+    }
+
+    parsed = _parse_pi_event(json.dumps(event).encode())
+
+    assert parsed["memories"][0]["documentId"] == document_id
+    assert parsed["memories"][0]["chunkId"] == chunk_id
+
+
 def test_run_audit_requires_a_bounded_diagnostic_summary():
     run_id = "11111111-1111-4111-8111-111111111111"
     for summary in (
