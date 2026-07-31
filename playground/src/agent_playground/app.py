@@ -16,6 +16,14 @@ from uuid import uuid4
 import aiohttp
 from aiohttp import web
 
+from .channels import (
+    RESERVED_CHANNEL_SOURCE_IDS,
+    ChannelDashboard,
+    ChannelDashboardConfig,
+    page_snapshot,
+    parse_adapter_urls,
+)
+
 
 _STATIC_PATH = Path(__file__).with_name("assets")
 _BANK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$")
@@ -26,6 +34,7 @@ _RUN_ID_RE = re.compile(
 )
 _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _DOCUMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:@_.%-]{0,511}$")
+_CHANNEL_FILTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MAX_UPSTREAM_BYTES = 64 * 1024 * 1024
 _LOCALHOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _HOST_RE = re.compile(
@@ -79,6 +88,10 @@ class PlaygroundSettings:
     pi_token: str = ""
     request_timeout: float = 300
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    channel_adapter_urls: tuple[tuple[str, str], ...] = parse_adapter_urls(None)
+    channel_poll_interval: float = 2.0
+    channel_source_timeout: float = 5.0
+    channel_bank_cache_ttl: float = 15.0
 
     def __post_init__(self) -> None:
         for name, value in (("memory_url", self.memory_url), ("pi_url", self.pi_url)):
@@ -90,6 +103,22 @@ class PlaygroundSettings:
             raise ValueError("request_timeout must be positive")
         if not 1 <= len(self.system_prompt) <= 32_000:
             raise ValueError("system_prompt is outside supported bounds")
+        if not self.channel_adapter_urls:
+            raise ValueError("at least one channel adapter URL is required")
+        for source_id, url in self.channel_adapter_urls:
+            if not _CHANNEL_FILTER_RE.fullmatch(source_id):
+                raise ValueError("channel adapter source ID is invalid")
+            if source_id in RESERVED_CHANNEL_SOURCE_IDS:
+                raise ValueError(f"channel adapter source ID {source_id!r} is reserved")
+            if not url.startswith(("http://", "https://")):
+                raise ValueError("channel adapter URL must use http or https")
+        for name, value in (
+            ("channel_poll_interval", self.channel_poll_interval),
+            ("channel_source_timeout", self.channel_source_timeout),
+            ("channel_bank_cache_ttl", self.channel_bank_cache_ttl),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
 
     @classmethod
     def from_env(cls) -> PlaygroundSettings:
@@ -105,6 +134,18 @@ class PlaygroundSettings:
             system_prompt=(
                 os.environ.get("PLAYGROUND_SYSTEM_PROMPT", "").strip()
                 or cls.DEFAULT_SYSTEM_PROMPT
+            ),
+            channel_adapter_urls=parse_adapter_urls(
+                os.environ.get("PLAYGROUND_CHANNEL_ADAPTER_URLS")
+            ),
+            channel_poll_interval=float(
+                os.environ.get("PLAYGROUND_CHANNEL_POLL_INTERVAL", "2")
+            ),
+            channel_source_timeout=float(
+                os.environ.get("PLAYGROUND_CHANNEL_SOURCE_TIMEOUT", "5")
+            ),
+            channel_bank_cache_ttl=float(
+                os.environ.get("PLAYGROUND_CHANNEL_BANK_CACHE_TTL", "15")
             ),
         )
 
@@ -1105,6 +1146,7 @@ def _valid_host(value: str) -> bool:
 
 
 DATA_KEY = web.AppKey("playground_data", PlaygroundData)
+CHANNELS_KEY = web.AppKey("channel_dashboard", ChannelDashboard)
 
 
 @web.middleware
@@ -1120,13 +1162,30 @@ async def _private_headers(_: web.Request, response: web.StreamResponse) -> None
 
 
 async def _close_data(app: web.Application) -> None:
-    await app[DATA_KEY].close()
+    await asyncio.gather(app[CHANNELS_KEY].close(), app[DATA_KEY].close())
+
+
+async def _start_channels(app: web.Application) -> None:
+    await app[CHANNELS_KEY].start()
 
 
 def create_app(settings: PlaygroundSettings | None = None) -> web.Application:
+    resolved = settings or PlaygroundSettings.from_env()
     app = web.Application(client_max_size=64 * 1024, middlewares=[_private_request])
-    app[DATA_KEY] = PlaygroundData(settings or PlaygroundSettings.from_env())
+    app[DATA_KEY] = PlaygroundData(resolved)
+    app[CHANNELS_KEY] = ChannelDashboard(
+        ChannelDashboardConfig(
+            adapter_urls=resolved.channel_adapter_urls,
+            pi_url=resolved.pi_url,
+            memory_url=resolved.memory_url,
+            token=resolved.pi_token,
+            poll_interval=resolved.channel_poll_interval,
+            source_timeout=resolved.channel_source_timeout,
+            bank_cache_ttl=resolved.channel_bank_cache_ttl,
+        )
+    )
     app.on_response_prepare.append(_private_headers)
+    app.on_startup.append(_start_channels)
     app.on_cleanup.append(_close_data)
     app.router.add_get("/health", _health)
     app.router.add_get("/api/config", _config)
@@ -1138,6 +1197,8 @@ def create_app(settings: PlaygroundSettings | None = None) -> web.Application:
     app.router.add_get("/api/sessions/{session_id}", _session)
     app.router.add_get("/api/audits", _audits)
     app.router.add_get("/api/audits/{run_id}", _audit)
+    app.router.add_get("/api/channels", _channels)
+    app.router.add_get("/api/channel-events", _channel_events)
     app.router.add_get("/", _index)
     app.router.add_get("/app.js", _script)
     app.router.add_get("/styles.css", _styles)
@@ -1330,6 +1391,142 @@ async def _audit(request: web.Request) -> web.Response:
         return _error_response(404, "AUDIT_NOT_FOUND", "Run audit not found")
     except Exception:
         return _error_response(502, "HISTORY_UNAVAILABLE", "Run audit unavailable")
+
+
+def _channel_query(request: web.Request) -> dict[str, str]:
+    allowed = {"limit", "cursor", "q", "platform", "status"}
+    if any(key not in allowed for key in request.query):
+        raise InvalidRequest("Invalid channel query")
+    values: dict[str, str] = {}
+    for key in allowed:
+        supplied = request.query.getall(key, [])
+        if len(supplied) > 1:
+            raise InvalidRequest("Invalid channel query")
+        if supplied:
+            values[key] = supplied[0]
+    return values
+
+
+def _channel_limit(value: str | None) -> int:
+    if value is None:
+        return 100
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise InvalidRequest("Invalid channel limit") from exc
+    if not 1 <= limit <= 500:
+        raise InvalidRequest("Invalid channel limit")
+    return limit
+
+
+def _channel_cursor(value: str | None) -> int:
+    if value is None:
+        return 0
+    if not value.isascii() or not value.isdigit() or len(value) > 8:
+        raise InvalidRequest("Invalid channel cursor")
+    cursor = int(value)
+    if cursor > 10_000_000:
+        raise InvalidRequest("Invalid channel cursor")
+    return cursor
+
+
+async def _channels(request: web.Request) -> web.Response:
+    try:
+        query = _channel_query(request)
+        search = query.get("q", "").strip()
+        if len(search) > 200:
+            raise InvalidRequest("Invalid channel search")
+        platform = query.get("platform")
+        if platform is not None and not _CHANNEL_FILTER_RE.fullmatch(platform):
+            raise InvalidRequest("Invalid channel platform")
+        status = query.get("status", "all")
+        if status not in {
+            "all",
+            "healthy",
+            "active",
+            "error",
+            "disconnected",
+            "stale",
+            "attention",
+        }:
+            raise InvalidRequest("Invalid channel status")
+        snapshot = await request.app[CHANNELS_KEY].snapshot()
+        result = page_snapshot(
+            snapshot,
+            query=search,
+            platform=platform,
+            status=status,
+            cursor=_channel_cursor(query.get("cursor")),
+            limit=_channel_limit(query.get("limit")),
+        )
+        return web.json_response(result)
+    except InvalidRequest as exc:
+        return _error_response(400, "INVALID_REQUEST", str(exc))
+    except Exception:
+        return _error_response(
+            503, "CHANNELS_UNAVAILABLE", "Channel dashboard unavailable"
+        )
+
+
+async def _channel_events(request: web.Request) -> web.StreamResponse:
+    if request.query:
+        return _error_response(400, "INVALID_REQUEST", "Invalid channel event query")
+    dashboard = request.app[CHANNELS_KEY]
+    queue = dashboard.subscribe()
+    response: web.StreamResponse | None = None
+    try:
+        try:
+            snapshot = await dashboard.snapshot()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _error_response(
+                503, "CHANNELS_UNAVAILABLE", "Channel dashboard unavailable"
+            )
+        last_generation = snapshot["generation"]
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+        await response.write(b"retry: 3000\n\n")
+        await _write_sse_snapshot(response, snapshot)
+        while True:
+            try:
+                latest = await asyncio.wait_for(queue.get(), timeout=15)
+            except TimeoutError:
+                await response.write(b": keepalive\n\n")
+                continue
+            if latest["generation"] <= last_generation:
+                continue
+            await _write_sse_snapshot(response, latest)
+            last_generation = latest["generation"]
+    except asyncio.CancelledError:
+        raise
+    except OSError:
+        pass
+    finally:
+        dashboard.unsubscribe(queue)
+        if response is not None:
+            try:
+                await response.write_eof()
+            except OSError:
+                pass
+    return response
+
+
+async def _write_sse_snapshot(
+    response: web.StreamResponse, snapshot: dict[str, Any]
+) -> None:
+    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    event = (
+        f"event: snapshot\nid: {snapshot['generation']}\ndata: {payload}\n\n"
+    ).encode("utf-8")
+    await response.write(event)
 
 
 async def _request_json(request: web.Request) -> Any:

@@ -199,6 +199,8 @@ async def dependencies(
 
     async def audits(request):
         assert request.headers["Authorization"] == "Bearer private-pi-token"
+        if request.query.get("status") == "active":
+            return web.json_response({"items": [], "total": 0})
         received["audit_queries"].append(dict(request.query))
         return web.json_response(
             {
