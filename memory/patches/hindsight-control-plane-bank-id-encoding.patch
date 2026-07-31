@@ -1,0 +1,90 @@
+diff --git a/hindsight-control-plane/src/app/api/graph/route.ts b/hindsight-control-plane/src/app/api/graph/route.ts
+index 6009642..a307b89 100644
+--- a/hindsight-control-plane/src/app/api/graph/route.ts
++++ b/hindsight-control-plane/src/app/api/graph/route.ts
+@@ -1,6 +1,6 @@
+ import { NextRequest, NextResponse } from "next/server";
+ import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
+-import { DATAPLANE_URL, getDataplaneHeaders } from "@/lib/hindsight-client";
++import { dataplaneBankUrl, getDataplaneHeaders } from "@/lib/hindsight-client";
+ 
+ export async function GET(request: NextRequest) {
+   try {
+@@ -43,7 +43,7 @@ export async function GET(request: NextRequest) {
+     const chunkId = searchParams.get("chunk_id");
+     if (chunkId) params.append("chunk_id", chunkId);
+ 
+-    const response = await fetch(`${DATAPLANE_URL}/v1/default/banks/${bankId}/graph?${params}`, {
++    const response = await fetch(dataplaneBankUrl(bankId, `/graph?${params}`), {
+       headers: getDataplaneHeaders(),
+     });
+ 
+diff --git a/hindsight-control-plane/tests/app/api/graph/route.test.ts b/hindsight-control-plane/tests/app/api/graph/route.test.ts
+new file mode 100644
+index 0000000..2fe8d20
+--- /dev/null
++++ b/hindsight-control-plane/tests/app/api/graph/route.test.ts
+@@ -0,0 +1,44 @@
++import type { NextRequest } from "next/server";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const { dataplaneBankUrl } = vi.hoisted(() => ({
++  dataplaneBankUrl: vi.fn(
++    (bankId: string, suffix: string) =>
++      `http://localhost:8888/v1/default/banks/${encodeURIComponent(bankId)}${suffix}`
++  ),
++}));
++
++vi.mock("@/lib/hindsight-client", () => ({
++  dataplaneBankUrl,
++  getDataplaneHeaders: vi.fn(() => ({})),
++}));
++
++import { GET } from "@/app/api/graph/route";
++
++function makeRequest(bankId: string): NextRequest {
++  const query = new URLSearchParams({ bank_id: bankId, type: "world", limit: "1000" });
++  return { nextUrl: new URL(`http://localhost/api/graph?${query}`) } as unknown as NextRequest;
++}
++
++describe("GET /api/graph", () => {
++  beforeEach(() => {
++    vi.restoreAllMocks();
++  });
++
++  it("preserves percent escapes in bank IDs when building the dataplane path", async () => {
++    const bankId = "wechat:account:owner:chat:49277108357%40chatroom";
++    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
++      new Response(JSON.stringify({ nodes: [], edges: [] }), {
++        status: 200,
++        headers: { "Content-Type": "application/json" },
++      })
++    );
++
++    await GET(makeRequest(bankId));
++
++    expect(fetchSpy).toHaveBeenCalledWith(
++      `http://localhost:8888/v1/default/banks/${encodeURIComponent(bankId)}/graph?type=world&limit=1000`,
++      { headers: {} }
++    );
++  });
++});
+diff --git a/docker/standalone/Dockerfile b/docker/standalone/Dockerfile
+index 8173eda..2c8932e 100644
+--- a/docker/standalone/Dockerfile
++++ b/docker/standalone/Dockerfile
+@@ -99,8 +99,12 @@ COPY --from=sdk-builder /app/hindsight-clients/typescript ./node_modules/@vector
+ # Usage: docker build --build-arg NEXT_PUBLIC_BASE_PATH=/hindsight ...
+ ARG NEXT_PUBLIC_BASE_PATH=""
+ 
+-# Build Control Plane - run next build first, then custom standalone copy
+-# (The build:standalone script expects a specific path structure that differs in Docker)
++# Guard the proxy boundary because bank IDs can contain literal percent escapes;
++# a plain interpolation silently selects a different bank after URL decoding.
++RUN npm exec -- vitest run tests/app/api/graph/route.test.ts
++
++# Build the Control Plane before the custom standalone copy.
++# (The build:standalone script expects a specific path structure that differs in Docker)
+ RUN npm exec -- next build
+ 
+ # Create standalone directory structure manually

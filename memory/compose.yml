@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile.hindsight
       args:
-        HINDSIGHT_CONTROL_PLANE_IMAGE: ${HINDSIGHT_CONTROL_PLANE_IMAGE:-sidekick-hindsight-control-plane:0.8.4-bank-name.1}
-    image: sidekick-hindsight:0.8.4-bank-name.1-hardened-r2
+        HINDSIGHT_CONTROL_PLANE_IMAGE: ${HINDSIGHT_CONTROL_PLANE_IMAGE:-sidekick-hindsight-control-plane:0.8.4-bank-name.2}
+    image: sidekick-hindsight:0.8.4-bank-name.2-hardened-r2
     container_name: sidekick-memory-api
     # pg0 uses 512 MB maintenance_work_mem while creating vector indexes.
     shm_size: 1gb
