@@ -194,6 +194,12 @@ async def test_wechat_store_upserts_revisions_and_acks_processing_atomically(tmp
         assert command.chat_type == "group"
         assert command.scope_display_name == "Example group"
         assert await store.get_cursor(CONNECTOR_KEY) == "bootstrap-messages"
+        stored_chats = await store.list_chats(CONNECTOR_KEY)
+        assert len(stored_chats) == 1
+        assert stored_chats[0].chat_id == GROUP_ID
+        assert stored_chats[0].chat_type == "group"
+        assert stored_chats[0].display_name == "Example group"
+        assert stored_chats[0].last_observed_at > 0
 
         revision = event(
             {

@@ -9,6 +9,7 @@ from sidekick.ai import (
     AgentMemoryTarget,
     AgentModelCatalog,
     AgentParticipantAccess,
+    AgentRunOrigin,
     AgentRunRequest,
     PiAgentGateway,
 )
@@ -35,6 +36,10 @@ def run_request(*, model: str | None = None) -> AgentRunRequest:
         system_prompt="Answer directly.",
         tool_policy="delegated",
         model=model,
+        origin=AgentRunOrigin(
+            scope_id="telegram:chat:-1001",
+            adapter_instance_id="telegram-default",
+        ),
         memory=AgentMemoryTarget(
             primary_bank_id="telegram:chat:-1001",
             requester_id="telegram:user:40",
@@ -107,6 +112,10 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
         "systemPrompt": "Answer directly.",
         "toolPolicy": "delegated",
         "model": "gpt-5.4-mini",
+        "origin": {
+            "scopeId": "telegram:chat:-1001",
+            "adapterInstanceId": "telegram-default",
+        },
         "memory": {
             "primaryBankId": "telegram:chat:-1001",
             "requester": {

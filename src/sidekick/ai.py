@@ -55,6 +55,14 @@ from sidekick.chat.identity import (
     NamespacedIdentityCodec,
 )
 from sidekick.chat.transport import ChatTransport, ObjectChatTransport, SentMessage
+from sidekick.channel_status import (
+    ACTIVE_AI_RUN_STATUSES,
+    AIRunStateWriter,
+    AIRunStatus,
+    ActiveAIRun,
+    AgentRunOrigin,
+    StoredChannelState,
+)
 from sidekick.memory_directory import (
     DirectoryPublication,
     DirectorySource,
@@ -135,6 +143,7 @@ class AgentRunRequest:
     tool_policy: ToolPolicy
     memory: AgentMemoryTarget | None = None
     model: str | None = None
+    origin: AgentRunOrigin | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +232,11 @@ class PiAgentGateway:
         }
         if request.model is not None:
             payload["model"] = request.model
+        if request.origin is not None:
+            payload["origin"] = {
+                "scopeId": request.origin.scope_id,
+                "adapterInstanceId": request.origin.adapter_instance_id,
+            }
         if request.memory is not None:
             payload["memory"] = {
                 "primaryBankId": request.memory.primary_bank_id,
@@ -669,6 +683,7 @@ class AnswerResult:
     succeeded: bool
     session_id: str | None = None
     entry_id: str | None = None
+    failure_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -782,6 +797,7 @@ class AIResponder:
                             message=answer,
                             text=cancelled,
                             succeeded=False,
+                            failure_code="CANCELLED",
                         )
                     if event.code == "RATE_LIMITED":
                         rate_limited = (
@@ -796,6 +812,7 @@ class AIResponder:
                             message=answer,
                             text=rate_limited,
                             succeeded=False,
+                            failure_code="RATE_LIMITED",
                         )
                     raise RuntimeError(event.message or "Agent run failed")
                 if event.type == "run_completed":
@@ -817,13 +834,16 @@ class AIResponder:
                     message=answer,
                     text=final_text,
                     succeeded=False,
+                    failure_code="DELIVERY_FAILED",
                 )
+            succeeded = bool(text and session_id and entry_id)
             return AnswerResult(
                 message=answer,
                 text=final_text,
-                succeeded=bool(text and session_id and entry_id),
+                succeeded=succeeded,
                 session_id=session_id,
                 entry_id=entry_id,
+                failure_code=None if succeeded else "EMPTY_RESPONSE",
             )
         except Exception as exc:
             self._log_failure(exc)
@@ -833,7 +853,12 @@ class AIResponder:
                 failure,
                 wait=True,
             )
-            return AnswerResult(message=answer, text=failure, succeeded=False)
+            return AnswerResult(
+                message=answer,
+                text=failure,
+                succeeded=False,
+                failure_code="AGENT_ERROR",
+            )
 
     async def cancel(self, run_id: str) -> bool:
         return await self._gateway.cancel(run_id)
@@ -1397,7 +1422,51 @@ class AIStateRepository:
             )
             """
         )
+        await self._ensure_ai_runs_schema()
         await self._ensure_excluded_messages_schema()
+
+    async def _ensure_ai_runs_schema(self) -> None:
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_runs (
+                run_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                adapter_instance_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                session_id TEXT,
+                error_code TEXT,
+                started_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ai_runs_by_scope_status_updated
+            ON ai_runs (scope_id, status, updated_at DESC)
+            """
+        )
+        now = time.time()
+        await connection.execute(
+            """
+            UPDATE ai_runs
+            SET status = 'INTERRUPTED',
+                error_code = 'ADAPTER_RESTARTED',
+                updated_at = ?
+            WHERE status IN ('STARTING', 'RUNNING')
+            """,
+            (now,),
+        )
+        await connection.execute(
+            """
+            DELETE FROM ai_runs
+            WHERE status NOT IN ('STARTING', 'RUNNING')
+              AND updated_at < ?
+            """,
+            (now - 30 * 24 * 60 * 60,),
+        )
 
     async def _ensure_ai_answers_schema(self) -> None:
         connection = self._require_connection()
@@ -1783,6 +1852,280 @@ class AIStateRepository:
             ),
         )
         await connection.commit()
+
+    async def start_ai_run(
+        self,
+        *,
+        run_id: str,
+        scope_id: str,
+        actor_id: str,
+        adapter_instance_id: str,
+        started_at: float,
+    ) -> None:
+        _validate_ai_run_identity("run_id", run_id, maximum=128)
+        _validate_ai_run_identity("scope_id", scope_id, maximum=512)
+        _validate_ai_run_identity("actor_id", actor_id, maximum=512)
+        _validate_ai_run_identity(
+            "adapter_instance_id",
+            adapter_instance_id,
+            maximum=128,
+        )
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            INSERT INTO ai_runs (
+                run_id, scope_id, actor_id, adapter_instance_id, status,
+                started_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'STARTING', ?, ?)
+            """,
+            (
+                run_id,
+                scope_id,
+                actor_id,
+                adapter_instance_id,
+                started_at,
+                started_at,
+            ),
+        )
+        await connection.commit()
+
+    async def mark_ai_run_running(
+        self,
+        run_id: str,
+        *,
+        updated_at: float,
+    ) -> None:
+        _validate_ai_run_identity("run_id", run_id, maximum=128)
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            UPDATE ai_runs
+            SET status = 'RUNNING', updated_at = ?
+            WHERE run_id = ? AND status = 'STARTING'
+            """,
+            (updated_at, run_id),
+        )
+        await connection.commit()
+
+    async def finish_ai_run(
+        self,
+        run_id: str,
+        *,
+        status: AIRunStatus,
+        updated_at: float,
+        session_id: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        _validate_ai_run_identity("run_id", run_id, maximum=128)
+        if status in ACTIVE_AI_RUN_STATUSES:
+            raise ValueError("AI run terminal status is required")
+        safe_error_code = _safe_ai_run_error_code(error_code)
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            UPDATE ai_runs
+            SET status = ?, session_id = ?, error_code = ?, updated_at = ?
+            WHERE run_id = ? AND status IN ('STARTING', 'RUNNING')
+            """,
+            (
+                status,
+                session_id[:128] if session_id is not None else None,
+                safe_error_code,
+                updated_at,
+                run_id,
+            ),
+        )
+        await connection.commit()
+
+    async def list_channel_operational_states(
+        self,
+    ) -> tuple[StoredChannelState, ...]:
+        connection = self._require_connection()
+        active_by_scope: dict[str, list[ActiveAIRun]] = {}
+        active_cursor = await connection.execute(
+            """
+            SELECT run_id, scope_id, status, session_id, started_at, updated_at
+            FROM ai_runs
+            WHERE status IN ('STARTING', 'RUNNING')
+            ORDER BY scope_id, started_at, run_id
+            """
+        )
+        async for row in active_cursor:
+            scope_id = str(row["scope_id"])
+            active_by_scope.setdefault(scope_id, []).append(
+                ActiveAIRun(
+                    run_id=str(row["run_id"]),
+                    status=row["status"],
+                    session_id=(
+                        str(row["session_id"])
+                        if row["session_id"] is not None
+                        else None
+                    ),
+                    started_at=float(row["started_at"]),
+                    updated_at=float(row["updated_at"]),
+                )
+            )
+        cursor = await connection.execute(
+            """
+            WITH scope_ids AS (
+                SELECT scope_id FROM ai_model_overrides
+                UNION SELECT scope_id FROM ai_chat_access
+                UNION SELECT scope_id FROM ai_memory_scopes
+                UNION SELECT scope_id FROM ai_memory_scope_labels
+                UNION SELECT scope_id FROM ai_memory_documents
+                UNION SELECT scope_id FROM ai_memory_pending_documents
+                UNION SELECT scope_id FROM ai_memory_dream_state
+                UNION SELECT scope_id FROM ai_answers
+                UNION SELECT scope_id FROM ai_runs
+            ),
+            documents AS (
+                SELECT
+                    scope_id,
+                    COUNT(*) AS retained_document_count,
+                    MAX(retained_at) AS last_ingested_at
+                FROM ai_memory_documents
+                GROUP BY scope_id
+            ),
+            pending AS (
+                SELECT
+                    scope_id,
+                    COUNT(*) AS pending_count,
+                    MAX(updated_at) AS pending_updated_at
+                FROM ai_memory_pending_documents
+                GROUP BY scope_id
+            ),
+            latest_runs AS (
+                SELECT scope_id, run_id, status, error_code, updated_at
+                FROM (
+                    SELECT
+                        scope_id,
+                        run_id,
+                        status,
+                        error_code,
+                        updated_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope_id
+                            ORDER BY updated_at DESC, run_id DESC
+                        ) AS position
+                    FROM ai_runs
+                    WHERE status IN ('COMPLETED', 'FAILED', 'INTERRUPTED')
+                )
+                WHERE position = 1
+            )
+            SELECT
+                ids.scope_id,
+                COALESCE(
+                    NULLIF(memory.display_name, ''),
+                    NULLIF(labels.display_name, '')
+                ) AS display_name,
+                CASE WHEN access.scope_id IS NULL THEN 0 ELSE 1 END AS access_open,
+                model.model_id,
+                COALESCE(memory.continuous_enabled, 0) AS continuous_enabled,
+                COALESCE(memory.dream_enabled, 0) AS dream_enabled,
+                memory.continuous_last_attempt_at,
+                memory.continuous_last_success_at,
+                memory.continuous_last_error,
+                dream.last_attempt_at AS dream_last_attempt_at,
+                dream.last_success_at AS dream_last_success_at,
+                dream.last_error AS dream_last_error,
+                COALESCE(documents.retained_document_count, 0)
+                    AS retained_document_count,
+                COALESCE(pending.pending_count, 0) AS pending_count,
+                documents.last_ingested_at,
+                CASE
+                    WHEN latest_run.status IN ('FAILED', 'INTERRUPTED')
+                    THEN COALESCE(
+                        latest_run.error_code,
+                        CASE latest_run.status
+                            WHEN 'INTERRUPTED' THEN 'ADAPTER_RESTARTED'
+                            ELSE 'HANDLER_ERROR'
+                        END
+                    )
+                    ELSE NULL
+                END AS last_run_error,
+                CASE
+                    WHEN latest_run.status IN ('FAILED', 'INTERRUPTED')
+                    THEN latest_run.updated_at
+                    ELSE NULL
+                END AS last_run_error_at,
+                CASE
+                    WHEN latest_run.status IN ('FAILED', 'INTERRUPTED')
+                    THEN latest_run.run_id
+                    ELSE NULL
+                END AS last_run_id,
+                MAX(
+                    COALESCE(model.updated_at, 0),
+                    COALESCE(access.opened_at, 0),
+                    COALESCE(memory.updated_at, 0),
+                    COALESCE(labels.updated_at, 0),
+                    COALESCE(documents.last_ingested_at, 0),
+                    COALESCE(pending.pending_updated_at, 0),
+                    COALESCE(dream.last_attempt_at, 0),
+                    COALESCE(dream.last_success_at, 0),
+                    COALESCE(latest_run.updated_at, 0)
+                ) AS updated_at
+            FROM scope_ids AS ids
+            LEFT JOIN ai_model_overrides AS model
+                ON model.scope_id = ids.scope_id
+            LEFT JOIN ai_chat_access AS access
+                ON access.scope_id = ids.scope_id
+            LEFT JOIN ai_memory_scopes AS memory
+                ON memory.scope_id = ids.scope_id
+            LEFT JOIN ai_memory_scope_labels AS labels
+                ON labels.scope_id = ids.scope_id
+            LEFT JOIN ai_memory_dream_state AS dream
+                ON dream.scope_id = ids.scope_id
+            LEFT JOIN documents ON documents.scope_id = ids.scope_id
+            LEFT JOIN pending ON pending.scope_id = ids.scope_id
+            LEFT JOIN latest_runs AS latest_run
+                ON latest_run.scope_id = ids.scope_id
+            ORDER BY ids.scope_id
+            """
+        )
+        states: list[StoredChannelState] = []
+        async for row in cursor:
+            scope_id = str(row["scope_id"])
+            states.append(
+                StoredChannelState(
+                    scope_id=scope_id,
+                    display_name=(
+                        str(row["display_name"])
+                        if row["display_name"] is not None
+                        else None
+                    ),
+                    access_open=bool(row["access_open"]),
+                    model_override=(
+                        str(row["model_id"])
+                        if row["model_id"] is not None
+                        else None
+                    ),
+                    continuous_enabled=bool(row["continuous_enabled"]),
+                    dream_enabled=bool(row["dream_enabled"]),
+                    continuous_last_attempt_at=row[
+                        "continuous_last_attempt_at"
+                    ],
+                    continuous_last_success_at=row[
+                        "continuous_last_success_at"
+                    ],
+                    continuous_last_error=row["continuous_last_error"],
+                    dream_last_attempt_at=row["dream_last_attempt_at"],
+                    dream_last_success_at=row["dream_last_success_at"],
+                    dream_last_error=row["dream_last_error"],
+                    retained_document_count=int(row["retained_document_count"]),
+                    pending_count=int(row["pending_count"]),
+                    last_ingested_at=row["last_ingested_at"],
+                    active_runs=tuple(active_by_scope.get(scope_id, ())),
+                    last_run_error=row["last_run_error"],
+                    last_run_error_at=row["last_run_error_at"],
+                    last_run_id=row["last_run_id"],
+                    updated_at=(
+                        float(row["updated_at"])
+                        if row["updated_at"]
+                        else None
+                    ),
+                )
+            )
+        return tuple(states)
 
     async def get_model_override(self, scope_id: str) -> str | None:
         cursor = await self._require_connection().execute(
@@ -2778,12 +3121,24 @@ class AIConversationHandler:
         memory_command_delete_delay: float = 3.0,
         transport: ChatTransport | None = None,
         identity_codec: IdentityCodec | None = None,
+        run_store: AIRunStateWriter | None = None,
+        adapter_instance_id: str | None = None,
         logger: Any | None = None,
     ):
         if memory_command_delete_delay < 0:
             raise ValueError("memory_command_delete_delay cannot be negative")
         if memory_backfill_caveat is not None and not memory_backfill_caveat.strip():
             raise ValueError("memory_backfill_caveat cannot be blank")
+        if (run_store is None) != (adapter_instance_id is None):
+            raise ValueError(
+                "AI run store and adapter instance ID must be configured together"
+            )
+        if adapter_instance_id is not None:
+            _validate_ai_run_identity(
+                "adapter_instance_id",
+                adapter_instance_id,
+                maximum=128,
+            )
         self._owner_id = owner_id
         self._responder = responder
         self._store = store
@@ -2800,6 +3155,8 @@ class AIConversationHandler:
         self._transport = transport or responder.transport or ObjectChatTransport()
         self._identity_codec = identity_codec or prompt_builder.identity_codec
         self._owner_actor_id = self._identity_codec.actor_id(owner_id)
+        self._run_store = run_store
+        self._adapter_instance_id = adapter_instance_id
         self._active_runs: dict[str, str] = {}
 
     async def handle(self, message: ReplyTarget) -> bool:
@@ -2994,7 +3351,16 @@ class AIConversationHandler:
             return True
 
         rate_released = False
-        run_id: str | None = None
+        run_id = str(uuid4())
+        run_finished = False
+        terminal_status: AIRunStatus | None = None
+        terminal_session_id: str | None = None
+        terminal_error_code: str | None = None
+        await self._record_ai_run_start(
+            run_id=run_id,
+            scope_id=scope_id,
+            actor_id=actor_id,
+        )
         try:
             if ai_trigger is not None:
                 parent = await self._find_explicit_parent(message)
@@ -3048,7 +3414,6 @@ class AIConversationHandler:
                 current_mentions=current_mentions,
                 observations=anchor_observations,
             )
-            run_id = str(uuid4())
             request = AgentRunRequest(
                 run_id=run_id,
                 session_id=agent_session_id,
@@ -3066,9 +3431,34 @@ class AIConversationHandler:
                 tool_policy="owner" if is_owner else "delegated",
                 memory=memory_target,
                 model=await self._store.get_model_override(scope_id),
+                origin=(
+                    AgentRunOrigin(
+                        scope_id=scope_id,
+                        adapter_instance_id=self._adapter_instance_id,
+                    )
+                    if self._adapter_instance_id is not None
+                    else None
+                ),
             )
+            await self._record_ai_run_running(run_id)
             self._active_runs[actor_id] = run_id
             result = await self._responder.answer(message, request)
+            if result.succeeded:
+                terminal_status = "COMPLETED"
+            elif result.failure_code == "CANCELLED":
+                terminal_status = "CANCELLED"
+            else:
+                terminal_status = "FAILED"
+            terminal_session_id = result.session_id
+            terminal_error_code = (
+                None if result.succeeded else result.failure_code
+            )
+            run_finished = await self._record_ai_run_finish(
+                run_id,
+                status=terminal_status,
+                session_id=terminal_session_id,
+                error_code=terminal_error_code,
+            )
             await self._mark_memory_excluded(
                 scope_id,
                 result.message.id,
@@ -3123,12 +3513,42 @@ class AIConversationHandler:
                             tuple(retained_observations),
                         )
             return True
+        except asyncio.CancelledError:
+            if terminal_status is None:
+                terminal_status = "INTERRUPTED"
+                terminal_error_code = "ADAPTER_RESTARTED"
+            if not run_finished:
+                run_finished = await self._record_ai_run_finish(
+                    run_id,
+                    status=terminal_status,
+                    session_id=terminal_session_id,
+                    error_code=terminal_error_code,
+                )
+            raise
+        except Exception:
+            if terminal_status is None:
+                terminal_status = "FAILED"
+                terminal_error_code = "HANDLER_ERROR"
+            if not run_finished:
+                run_finished = await self._record_ai_run_finish(
+                    run_id,
+                    status=terminal_status,
+                    session_id=terminal_session_id,
+                    error_code=terminal_error_code,
+                )
+            raise
         finally:
-            if (
-                message.sender_id is not None
-                and run_id is not None
-                and self._active_runs.get(actor_id) == run_id
-            ):
+            if not run_finished:
+                if terminal_status is None:
+                    terminal_status = "FAILED"
+                    terminal_error_code = "PREPARATION_FAILED"
+                await self._record_ai_run_finish(
+                    run_id,
+                    status=terminal_status,
+                    session_id=terminal_session_id,
+                    error_code=terminal_error_code,
+                )
+            if self._active_runs.get(actor_id) == run_id:
                 self._active_runs.pop(actor_id, None)
             if not rate_released:
                 await self._rate_limiter.release(
@@ -3139,6 +3559,60 @@ class AIConversationHandler:
     async def remember_reply_chain(self, target: ReplyTarget) -> bool:
         retained = await self._retain_memory_chain(target)
         return retained is not None and bool(retained.observations)
+
+    async def _record_ai_run_start(
+        self,
+        *,
+        run_id: str,
+        scope_id: str,
+        actor_id: str,
+    ) -> None:
+        if self._run_store is None or self._adapter_instance_id is None:
+            return
+        try:
+            await self._run_store.start_ai_run(
+                run_id=run_id,
+                scope_id=scope_id,
+                actor_id=actor_id,
+                adapter_instance_id=self._adapter_instance_id,
+                started_at=time.time(),
+            )
+        except Exception as exc:
+            self._log_ai_run_state_failure("start", exc)
+
+    async def _record_ai_run_running(self, run_id: str) -> None:
+        if self._run_store is None:
+            return
+        try:
+            await self._run_store.mark_ai_run_running(
+                run_id,
+                updated_at=time.time(),
+            )
+        except Exception as exc:
+            self._log_ai_run_state_failure("mark running", exc)
+
+    async def _record_ai_run_finish(
+        self,
+        run_id: str,
+        *,
+        status: AIRunStatus,
+        session_id: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        if self._run_store is None:
+            return True
+        try:
+            await self._run_store.finish_ai_run(
+                run_id,
+                status=status,
+                session_id=session_id,
+                error_code=error_code,
+                updated_at=time.time(),
+            )
+        except Exception as exc:
+            self._log_ai_run_state_failure("finish", exc)
+            return False
+        return True
 
     async def _find_explicit_parent(
         self,
@@ -4184,6 +4658,15 @@ class AIConversationHandler:
                 exc,
             )
 
+    def _log_ai_run_state_failure(self, operation: str, exc: Exception) -> None:
+        if self._logger is not None:
+            self._logger.warning(
+                "AI run state %s failed (%s): %s",
+                operation,
+                type(exc).__name__,
+                exc,
+            )
+
 
 def _marker_from_row(row: aiosqlite.Row) -> AIAnswerMarker:
     return AIAnswerMarker(
@@ -4428,6 +4911,31 @@ async def _record_episode_labels(
 
 def _pluralize(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+_SAFE_AI_RUN_ERROR_CODES = frozenset(
+    {
+        "ADAPTER_RESTARTED",
+        "CANCELLED",
+        "RATE_LIMITED",
+        "DELIVERY_FAILED",
+        "EMPTY_RESPONSE",
+        "AGENT_ERROR",
+        "PREPARATION_FAILED",
+        "HANDLER_ERROR",
+    }
+)
+
+
+def _validate_ai_run_identity(name: str, value: str, *, maximum: int) -> None:
+    if not value or len(value) > maximum:
+        raise ValueError(f"AI run {name} is invalid")
+
+
+def _safe_ai_run_error_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value if value in _SAFE_AI_RUN_ERROR_CODES else "HANDLER_ERROR"
 
 
 def _parse_agent_event(raw: bytes) -> AgentEvent:

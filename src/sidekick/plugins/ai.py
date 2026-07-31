@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 
 from telethon import events
 from telethon import utils as telegram_utils
@@ -31,6 +32,14 @@ from sidekick.ai_memory_ingestion import (
     MemoryIngestionSettings,
 )
 from sidekick.chat.formatting import agent_system_prompt
+from sidekick.channel_status import (
+    AdapterRuntimeState,
+    CachedChannelInventory,
+    ChannelInventoryItem,
+    ChannelOpsServer,
+    ChannelOpsSettings,
+    ChannelSnapshotService,
+)
 from sidekick.plugins.base import PluginMount
 from sidekick.telegram import TelegramCommand
 from sidekick.telegram.ai_transport import (
@@ -94,6 +103,9 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         super().__init__(account=account, session=session, log_level=log_level)
         settings = AISettings.from_env()
         self._settings = settings
+        self._ops_settings = ChannelOpsSettings.from_env(
+            default_instance_id=f"telegram-{account}",
+        )
         self._edit_limiter = TelegramEditLimiter(
             settings.edit_cadence,
             logger=self.logger,
@@ -118,6 +130,27 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         self._continuous_memory_scheduler: ContinuousMemoryScheduler | None = None
         self._owner_id: int | None = None
         self._saved_memory_lock = asyncio.Lock()
+        self._adapter_status = AdapterRuntimeState(
+            id=self._ops_settings.instance_id,
+            platform="telegram",
+            connected_probe=self.client.is_connected,
+        )
+        self._telegram_inventory = CachedChannelInventory(
+            self._load_channel_inventory,
+            ttl_seconds=30.0,
+        )
+        self._ops_server = ChannelOpsServer(
+            snapshot_service=ChannelSnapshotService(
+                state_reader=self._store,
+                inventory_loader=self._telegram_inventory.list_channels,
+                adapter=self._adapter_status,
+                memory_available=self._memory is not None,
+                logger=self.logger,
+            ),
+            token=settings.agent_token,
+            settings=self._ops_settings,
+            logger=self.logger,
+        )
 
     def __call__(self) -> None:
         """Run the reply-based Pi-powered Telegram userbot."""
@@ -130,8 +163,11 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         await self.service.connect()
         try:
             await self._setup()
+            await self._ops_server.start()
             await self.service.wait_until_disconnected()
         finally:
+            self._adapter_status.update(connected=False)
+            await self._ops_server.close()
             if self._continuous_memory_scheduler is not None:
                 await self._continuous_memory_scheduler.close()
             if self._dream_scheduler is not None:
@@ -145,6 +181,10 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
     async def _setup(self) -> None:
         owner = await self.client.get_me()
         self._owner_id = owner.id
+        self._adapter_status.update(
+            account_id=str(owner.id),
+            connected=True,
+        )
         response_format = select_telegram_response_format(
             is_bot_account=bool(getattr(owner, "bot", False)),
             rich_messages_available=True,
@@ -237,6 +277,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             memory_command_delete_delay=(self._settings.memory_command_delete_delay),
             transport=transport,
             identity_codec=TELEGRAM_IDENTITY_CODEC,
+            run_store=self._store,
+            adapter_instance_id=self._ops_settings.instance_id,
             logger=self.logger,
         )
         self.client.add_event_handler(self._on_message, events.NewMessage())
@@ -245,6 +287,36 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         if self._dream_scheduler is not None:
             self._dream_scheduler.start()
         self.logger.info("Telegram AI userbot started")
+
+    async def _load_channel_inventory(self) -> tuple[ChannelInventoryItem, ...]:
+        items: list[ChannelInventoryItem] = []
+        async for dialog in self.client.iter_dialogs(limit=None):
+            chat_id = getattr(dialog, "id", None)
+            if not isinstance(chat_id, int):
+                continue
+            if bool(getattr(dialog, "is_group", False)):
+                chat_kind = "GROUP"
+            elif bool(getattr(dialog, "is_channel", False)):
+                chat_kind = "CHANNEL"
+            else:
+                chat_kind = "DIRECT"
+            name = getattr(dialog, "name", None)
+            observed = getattr(dialog, "date", None)
+            if isinstance(observed, datetime):
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=UTC)
+                observed_at = observed.timestamp()
+            else:
+                observed_at = None
+            items.append(
+                ChannelInventoryItem(
+                    scope_id=TELEGRAM_IDENTITY_CODEC.scope_id(chat_id),
+                    display_name=name if isinstance(name, str) else None,
+                    chat_kind=chat_kind,
+                    last_observed_at=observed_at,
+                )
+            )
+        return tuple(items)
 
     async def _on_message(self, event) -> None:
         if self._handler is not None:
