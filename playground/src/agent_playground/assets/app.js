@@ -21,6 +21,15 @@ const state = {
   selectedAuditId: null,
   auditDetail: null,
   historyLoading: false,
+  channelSnapshot: null,
+  channels: [],
+  channelLoading: false,
+  channelError: null,
+  channelConnection: "idle",
+  channelEventSource: null,
+  channelQuery: "",
+  channelPlatform: "",
+  channelStatus: "all",
 };
 
 const elements = {
@@ -40,7 +49,9 @@ const elements = {
   runStatus: document.querySelector("#run-status"),
   playgroundView: document.querySelector("#playground-view"),
   historyView: document.querySelector("#history-view"),
+  channelsView: document.querySelector("#channels-view"),
   refreshHistory: document.querySelector("#refresh-history"),
+  refreshChannels: document.querySelector("#refresh-channels"),
   resumeBanner: document.querySelector("#resume-banner"),
   resumeText: document.querySelector("#resume-text"),
   clearResume: document.querySelector("#clear-resume"),
@@ -57,6 +68,16 @@ const elements = {
   auditSelect: document.querySelector("#audit-select"),
   auditSummary: document.querySelector("#audit-summary"),
   auditEvents: document.querySelector("#audit-events"),
+  channelSummary: document.querySelector("#channel-summary"),
+  channelLiveStatus: document.querySelector("#channel-live-status"),
+  channelFilters: document.querySelector("#channel-filters"),
+  channelQuery: document.querySelector("#channel-query"),
+  channelPlatform: document.querySelector("#channel-platform"),
+  channelStatusFilter: document.querySelector("#channel-status-filter"),
+  channelSourceStatus: document.querySelector("#channel-source-status"),
+  channelNotice: document.querySelector("#channel-notice"),
+  channelTableWrap: document.querySelector("#channel-table-wrap"),
+  channelRows: document.querySelector("#channel-rows"),
 };
 
 function node(tag, text, className) {
@@ -398,21 +419,28 @@ function renderResume() {
 
 function renderView() {
   const history = state.view === "history";
-  elements.playgroundView.hidden = history;
+  const channels = state.view === "channels";
+  elements.playgroundView.hidden = history || channels;
   elements.historyView.hidden = !history;
+  elements.channelsView.hidden = !channels;
   elements.refreshHistory.hidden = !history;
-  elements.newChat.hidden = history;
+  elements.refreshChannels.hidden = !channels;
+  elements.newChat.hidden = history || channels;
   document.querySelectorAll("[data-view]").forEach((item) => {
     item.setAttribute("aria-pressed", String(item.dataset.view === state.view));
   });
 }
 
 function showView(view) {
-  if (!new Set(["playground", "history"]).has(view)) return;
+  if (!new Set(["playground", "history", "channels"]).has(view)) return;
   state.view = view;
   renderView();
   if (view === "history" && state.sessions.length === 0 && !state.historyLoading) {
     void loadSessions();
+  }
+  if (view === "channels") {
+    if (!state.channelSnapshot && !state.channelLoading) void loadChannels();
+    connectChannelEvents();
   }
 }
 
@@ -435,6 +463,333 @@ function currentRequest(value) {
 
 function pretty(value) {
   return JSON.stringify(value, null, 2) ?? "null";
+}
+
+async function loadChannels() {
+  state.channelLoading = true;
+  state.channelError = null;
+  renderChannels();
+  try {
+    applyChannelSnapshot(await loadCompleteChannelSnapshot());
+  } catch (error) {
+    state.channelError = error.message;
+  } finally {
+    state.channelLoading = false;
+    renderChannels();
+  }
+}
+
+async function loadCompleteChannelSnapshot() {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const first = await requestJson("/api/channels?limit=500");
+    const items = [...first.items];
+    let cursor = first.nextCursor;
+    let consistent = true;
+    const seenCursors = new Set();
+    while (cursor) {
+      if (seenCursors.has(cursor)) throw new Error("Channel pagination did not advance");
+      seenCursors.add(cursor);
+      const page = await requestJson(`/api/channels?limit=500&cursor=${encodeURIComponent(cursor)}`);
+      if (page.streamId !== first.streamId || page.generation !== first.generation) {
+        consistent = false;
+        break;
+      }
+      items.push(...page.items);
+      cursor = page.nextCursor;
+    }
+    if (consistent) {
+      if (items.length !== first.total) throw new Error("Channel pagination was incomplete");
+      return { ...first, items, nextCursor: null };
+    }
+  }
+  throw new Error("Channel inventory changed while loading; try again");
+}
+
+function connectChannelEvents() {
+  if (state.channelEventSource) return;
+  if (!("EventSource" in window)) {
+    state.channelConnection = "snapshot";
+    renderChannels();
+    return;
+  }
+  state.channelConnection = "connecting";
+  renderChannels();
+  const source = new EventSource("/api/channel-events");
+  state.channelEventSource = source;
+  source.addEventListener("open", () => {
+    if (state.channelEventSource !== source) return;
+    state.channelConnection = "live";
+    renderChannels();
+  });
+  source.addEventListener("snapshot", (event) => {
+    if (state.channelEventSource !== source) return;
+    try {
+      applyChannelSnapshot(JSON.parse(event.data));
+      state.channelError = null;
+    } catch {
+      state.channelError = "Live channel snapshot was malformed";
+      renderChannels();
+    }
+  });
+  source.addEventListener("error", () => {
+    if (state.channelEventSource !== source) return;
+    state.channelConnection = "reconnecting";
+    renderChannels();
+  });
+}
+
+function reconnectChannelEvents() {
+  state.channelEventSource?.close();
+  state.channelEventSource = null;
+  connectChannelEvents();
+}
+
+function applyChannelSnapshot(snapshot) {
+  if (
+    !snapshot
+    || typeof snapshot.streamId !== "string"
+    || !snapshot.streamId
+    || !Number.isInteger(snapshot.generation)
+    || !Array.isArray(snapshot.items)
+    || !Array.isArray(snapshot.sources)
+  ) {
+    throw new Error("Malformed channel snapshot");
+  }
+  const current = state.channelSnapshot;
+  const sameStream = current && snapshot.streamId === current.streamId;
+  if (sameStream && snapshot.generation < current.generation) return;
+  if (
+    sameStream
+    && snapshot.generation === current.generation
+    && current.items.length > snapshot.items.length
+  ) return;
+  state.channelSnapshot = snapshot;
+  state.channels = snapshot.items;
+  renderChannelPlatforms();
+  renderChannels();
+}
+
+function renderChannelPlatforms() {
+  const current = state.channelPlatform;
+  const all = node("option", "All platforms");
+  all.value = "";
+  const platforms = Array.isArray(state.channelSnapshot?.platforms)
+    ? state.channelSnapshot.platforms
+    : [...new Set(state.channels.map((item) => item.platform))].sort();
+  const options = platforms.map((platform) => {
+    const option = node("option", platform);
+    option.value = platform;
+    return option;
+  });
+  elements.channelPlatform.replaceChildren(all, ...options);
+  state.channelPlatform = platforms.includes(current) ? current : "";
+  elements.channelPlatform.value = state.channelPlatform;
+}
+
+function filteredChannels() {
+  const query = state.channelQuery.toLocaleLowerCase();
+  return state.channels.filter((item) => {
+    if (state.channelPlatform && item.platform !== state.channelPlatform) return false;
+    if (state.channelStatus === "attention") {
+      if (!new Set(["error", "disconnected", "stale"]).has(item.status)) return false;
+    } else if (state.channelStatus === "active") {
+      if (!Array.isArray(item.activeRuns) || item.activeRuns.length === 0) return false;
+    } else if (state.channelStatus !== "all" && item.status !== state.channelStatus) {
+      return false;
+    }
+    if (!query) return true;
+    return [
+      item.displayName,
+      item.scopeId,
+      item.accountId,
+      item.adapterInstanceId,
+      item.platform,
+    ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+  });
+}
+
+function statusBadge(text, status = text) {
+  const safeStatus = String(status || "unknown").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return node("span", text, `channel-badge ${safeStatus || "unknown"}`);
+}
+
+function channelCell(className, ...children) {
+  const cell = node("td", null, className);
+  cell.append(...children.filter(Boolean));
+  return cell;
+}
+
+function channelPrimary(text) {
+  return node("div", text, "channel-primary");
+}
+
+function channelMeta(text) {
+  return node("div", text, "channel-meta");
+}
+
+function renderChannelSources() {
+  const sources = state.channelSnapshot?.sources || [];
+  if (sources.length === 0) {
+    elements.channelSourceStatus.replaceChildren();
+    return;
+  }
+  elements.channelSourceStatus.replaceChildren(...sources.map((source) => {
+    const item = node("div", null, `channel-source ${source.status}`);
+    const heading = node("div", null, "channel-source-heading");
+    heading.append(node("strong", source.id), statusBadge(source.status, source.status));
+    item.append(heading);
+    if (source.adapter) {
+      item.append(channelMeta([
+        source.adapter.platform,
+        source.adapter.accountId || "account pending",
+        source.adapter.connected ? "connected" : "disconnected",
+      ].filter(Boolean).join(" · ")));
+    }
+    if (source.error) item.append(node("span", source.error, "channel-source-error"));
+    else if (source.lastSuccessAt) {
+      item.append(node("span", `Updated ${formatDate(source.lastSuccessAt)}`, "channel-source-time"));
+    }
+    return item;
+  }));
+}
+
+function channelErrorMessages(item) {
+  return [...new Set((item.errors || []).map((error) => [
+    error.component,
+    error.code,
+    error.message,
+  ].filter(Boolean).join(" · ")).filter(Boolean))];
+}
+
+function renderChannelRow(item) {
+  const row = node("tr");
+  const chat = channelCell(
+    "channel-chat",
+    channelPrimary(item.displayName || item.scopeId),
+    channelMeta(`${item.chatKind || "unknown"} · ${item.scopeId}`),
+    statusBadge(item.status, item.status),
+  );
+  const connection = item.adapter?.connected ? "connected" : "disconnected";
+  const instance = channelCell(
+    "channel-instance",
+    channelPrimary(item.platform),
+    channelMeta(item.adapterInstanceId),
+    channelMeta(item.accountId || item.adapter?.accountId || "Account unavailable"),
+    statusBadge(connection, connection),
+  );
+  const access = channelCell(
+    "channel-access",
+    statusBadge(item.accessMode || "unknown", item.accessMode),
+  );
+  const model = channelCell(
+    "channel-model",
+    channelPrimary(item.model || "Unavailable"),
+    channelMeta(item.modelSource === "override" ? "Chat override" : item.modelSource === "default" ? "Pi default" : "Catalog unavailable"),
+  );
+
+  const memory = item.memory || {};
+  const memoryCell = channelCell(
+    "channel-memory",
+    statusBadge(memory.effectiveMode || "unknown", memory.effectiveMode),
+    channelMeta(`Continuous ${memory.continuousEnabled ? "on" : "off"} · Dream ${memory.dreamEnabled ? "on" : "off"}`),
+    channelMeta(`${memory.pendingDocumentCount || 0} pending documents`),
+  );
+  const bank = item.bank || {};
+  const bankCell = channelCell(
+    "channel-bank",
+    statusBadge(bank.status || "UNAVAILABLE", bank.status),
+    channelMeta(bank.bankId || item.scopeId),
+    channelPrimary(bank.status === "PRESENT"
+      ? `${bank.factCount == null ? "Unknown" : bank.factCount} facts`
+      : bank.status === "MISSING" ? "No bank yet" : "Bank service unavailable"),
+  );
+  const ingestion = channelCell(
+    "channel-ingestion",
+    channelPrimary(memory.lastIngestedAt ? formatDate(memory.lastIngestedAt) : "Never ingested"),
+    bank.lastDocumentAt ? channelMeta(`Bank document ${formatDate(bank.lastDocumentAt)}`) : null,
+  );
+
+  const runCell = channelCell("channel-runs");
+  const runs = item.activeRuns || [];
+  if (runs.length === 0) {
+    runCell.append(channelMeta("None"));
+  } else {
+    runCell.append(channelPrimary(`${runs.length} active`));
+    for (const run of runs.slice(0, 3)) {
+      const label = `${run.phase || "active"} · ${short(run.runId, 18)}`;
+      if (run.sessionId) {
+        const link = button(label, "channel-run-link", () => void openRunTrace(run));
+        link.title = `Open session ${run.sessionId}, run ${run.runId}`;
+        runCell.append(link);
+      } else {
+        runCell.append(node("code", label, "channel-run-id"));
+      }
+    }
+    if (runs.length > 3) runCell.append(channelMeta(`+${runs.length - 3} more`));
+  }
+
+  const errors = channelErrorMessages(item);
+  const errorCell = channelCell("channel-errors");
+  if (errors.length === 0) {
+    errorCell.append(channelMeta("None"));
+  } else {
+    errorCell.append(statusBadge(`${errors.length} issue${errors.length === 1 ? "" : "s"}`, "error"));
+    for (const message of errors.slice(0, 2)) errorCell.append(node("p", message, "channel-error"));
+    if (errors.length > 2) errorCell.append(channelMeta(`+${errors.length - 2} more`));
+  }
+  const updated = channelCell(
+    "channel-updated",
+    channelPrimary(formatDate(item.updatedAt)),
+    item.lastObservedAt ? channelMeta(`Chat seen ${formatDate(item.lastObservedAt)}`) : channelMeta("No observed message"),
+  );
+  row.append(chat, instance, access, model, memoryCell, bankCell, ingestion, runCell, errorCell, updated);
+  return row;
+}
+
+function renderChannels() {
+  const visible = filteredChannels();
+  const snapshot = state.channelSnapshot;
+  const connectionLabels = {
+    idle: "Not connected",
+    connecting: "Connecting live updates",
+    live: "Live",
+    reconnecting: "Reconnecting",
+    snapshot: "Snapshot only",
+  };
+  elements.channelLiveStatus.textContent = connectionLabels[state.channelConnection] || "Not connected";
+  elements.channelLiveStatus.dataset.status = state.channelConnection;
+  const knownTotal = Number.isInteger(snapshot?.total) ? snapshot.total : state.channels.length;
+  elements.channelSummary.textContent = snapshot
+    ? `${visible.length} shown of ${knownTotal} chats · snapshot ${snapshot.generation} · ${formatDate(snapshot.generatedAt)}`
+    : "Waiting for a channel snapshot";
+  renderChannelSources();
+
+  const notices = [];
+  if (state.channelLoading && !snapshot) notices.push("Loading channels...");
+  if (state.channelError && !snapshot) {
+    notices.push(`Channels unavailable: ${state.channelError}`);
+  } else if (snapshot) {
+    if (state.channels.length === 0) notices.push("No channels have been observed yet.");
+    else if (visible.length === 0) notices.push("No channels match the current filters.");
+    if (snapshot.stale) notices.push("Showing last-known data because one or more sources are stale.");
+    else if (snapshot.degraded) notices.push("Live data is partial. Review the source errors above.");
+    if (state.channelConnection === "reconnecting") {
+      notices.push("Live updates disconnected. Reconnecting automatically...");
+    }
+    if (state.channelError) notices.push(state.channelError);
+  }
+  const notice = notices.join(" ");
+
+  elements.channelNotice.textContent = notice;
+  elements.channelNotice.hidden = !notice;
+  elements.channelTableWrap.hidden = visible.length === 0;
+  elements.channelRows.replaceChildren(...visible.map(renderChannelRow));
+}
+
+async function openRunTrace(run) {
+  if (!run.sessionId) return;
+  showView("history");
+  await selectSession(run.sessionId, run.runId);
 }
 
 async function loadSessions({ append = false } = {}) {
@@ -516,7 +871,7 @@ function clearSelectedSession() {
   renderAudits();
 }
 
-async function selectSession(sessionId) {
+async function selectSession(sessionId, preferredRunId = null) {
   state.selectedSessionId = sessionId;
   state.sessionDetail = null;
   state.sessionDetailError = null;
@@ -543,7 +898,12 @@ async function selectSession(sessionId) {
   }
   renderSessionDetail();
   renderAudits();
-  if (state.audits.length > 0) void selectAudit(state.audits[0].runId);
+  if (state.audits.length > 0) {
+    const selected = state.audits.some((audit) => audit.runId === preferredRunId)
+      ? preferredRunId
+      : state.audits[0].runId;
+    void selectAudit(selected);
+  }
 }
 
 function entryDepth(entry, byId, cache, trail = new Set()) {
@@ -1045,6 +1405,23 @@ elements.refreshHistory.addEventListener("click", () => {
   state.sessions = [];
   state.sessionCursor = null;
   void loadSessions();
+});
+elements.refreshChannels.addEventListener("click", () => {
+  void loadChannels();
+  reconnectChannelEvents();
+});
+elements.channelFilters.addEventListener("submit", (event) => event.preventDefault());
+elements.channelQuery.addEventListener("input", () => {
+  state.channelQuery = elements.channelQuery.value.trim();
+  renderChannels();
+});
+elements.channelPlatform.addEventListener("change", () => {
+  state.channelPlatform = elements.channelPlatform.value;
+  renderChannels();
+});
+elements.channelStatusFilter.addEventListener("change", () => {
+  state.channelStatus = elements.channelStatusFilter.value;
+  renderChannels();
 });
 elements.sessionSearch.addEventListener("submit", (event) => {
   event.preventDefault();

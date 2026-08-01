@@ -33,6 +33,12 @@ from sidekick.ai_memory_ingestion import (
     MemoryIngestionSettings,
 )
 from sidekick.chat.formatting import agent_system_prompt
+from sidekick.channel_status import (
+    AdapterRuntimeState,
+    ChannelOpsServer,
+    ChannelOpsSettings,
+    ChannelSnapshotService,
+)
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -90,6 +96,9 @@ class OneBotAI(metaclass=PluginMount):
     def __init__(self, log_level: str = "info"):
         self._runtime = OneBotRuntimeSettings.from_env()
         self._settings = AISettings.from_env()
+        self._ops_settings = ChannelOpsSettings.from_env(
+            default_instance_id="qq-default",
+        )
         self.logger = build_logger(__name__, log_level=log_level)
         self._gateway = PiAgentGateway(
             self._settings.agent_url,
@@ -115,6 +124,24 @@ class OneBotAI(metaclass=PluginMount):
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_scheduler: ContinuousMemoryScheduler | None = None
         self._seen_messages: OrderedDict[tuple[int, int], None] = OrderedDict()
+        self._adapter_status = AdapterRuntimeState(
+            id=self._ops_settings.instance_id,
+            platform="qq",
+            account_id=str(self._runtime.self_id),
+            connected_probe=lambda: self._bridge.connected,
+        )
+        self._ops_server = ChannelOpsServer(
+            snapshot_service=ChannelSnapshotService(
+                state_reader=self._store,
+                inventory_loader=self._directory.list_channels,
+                adapter=self._adapter_status,
+                memory_available=self._memory is not None,
+                logger=self.logger,
+            ),
+            token=self._settings.agent_token,
+            settings=self._ops_settings,
+            logger=self.logger,
+        )
 
     def __call__(self) -> None:
         """Run the Pi-powered OneBot 11/NapCat userbot."""
@@ -134,6 +161,7 @@ class OneBotAI(metaclass=PluginMount):
         try:
             await self._setup()
             await self._bridge.start(self._runtime.host, self._runtime.port)
+            await self._ops_server.start()
             self.logger.info(
                 "OneBot AI listening on %s:%s",
                 self._runtime.host,
@@ -141,6 +169,7 @@ class OneBotAI(metaclass=PluginMount):
             )
             await self._bridge.wait_connected()
             await self._verify_account()
+            self._adapter_status.update(connected=True)
             await self._refresh_directory()
             if self._continuous_scheduler is not None:
                 self._continuous_scheduler.start()
@@ -152,6 +181,8 @@ class OneBotAI(metaclass=PluginMount):
             )
             await stop.wait()
         finally:
+            self._adapter_status.update(connected=False)
+            await self._ops_server.close()
             if self._continuous_scheduler is not None:
                 await self._continuous_scheduler.close()
             if self._dream_scheduler is not None:
@@ -245,6 +276,8 @@ class OneBotAI(metaclass=PluginMount):
             memory_command_delete_delay=(self._settings.memory_command_delete_delay),
             transport=transport,
             identity_codec=QQ_IDENTITY_CODEC,
+            run_store=self._store,
+            adapter_instance_id=self._ops_settings.instance_id,
             logger=self.logger,
         )
         self._bridge.set_event_handler(self._on_event)

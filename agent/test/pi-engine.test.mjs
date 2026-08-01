@@ -147,9 +147,9 @@ function sendCodeToolCall(response) {
   ]);
 }
 
-async function collect(engine, request) {
+async function collect(engine, request, requestOwner = null) {
   const events = [];
-  for await (const event of engine.run(request)) events.push(event);
+  for await (const event of engine.run(request, requestOwner)) events.push(event);
   return events;
 }
 
@@ -721,6 +721,223 @@ test("records a correlated run audit with memory, model, and tool details", asyn
     assert.equal(completed.data.answer, result.answer);
     assert.doesNotMatch(JSON.stringify(audit), /test-key/);
   } finally {
+    await app.close();
+  }
+});
+
+test("tracks public active run state from recall through the model request", async () => {
+  const runId = "99999999-9999-4999-8999-999999999999";
+  let releaseRecall;
+  let signalRecallStarted;
+  let activeAtProvider = null;
+  const recallGate = new Promise((resolve) => {
+    releaseRecall = resolve;
+  });
+  const recallStarted = new Promise((resolve) => {
+    signalRecallStarted = resolve;
+  });
+  let recallSignalled = false;
+  let app;
+  app = await fixture(
+    (_body, response) => {
+      activeAtProvider = app.engine.listActiveRuns();
+      sendText(response, "Tracked answer.");
+    },
+    {
+      memoryUrl: "http://memory.internal:8888",
+      memoryFetch: async () => {
+        if (!recallSignalled) {
+          recallSignalled = true;
+          signalRecallStarted();
+        }
+        await recallGate;
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      },
+    },
+  );
+  const origin = {
+    scopeId: "wechat:account:wxid%40bridge:chat:room/42",
+    adapterInstanceId: "wechat-peer",
+  };
+  let running;
+  try {
+    running = collect(
+      app.engine,
+      request(runId, {
+        model: "alternate-model",
+        memory: memoryTarget(),
+        origin,
+      }),
+    );
+    await recallStarted;
+
+    const recalling = app.engine.listActiveRuns();
+    assert.equal(recalling.total, 1);
+    assert.deepEqual(Object.keys(recalling.items[0]).sort(), [
+      "adapterInstanceId",
+      "currentTool",
+      "modelId",
+      "phase",
+      "runId",
+      "scopeId",
+      "sessionId",
+      "startedAt",
+      "updatedAt",
+    ]);
+    assert.equal(recalling.items[0].runId, runId);
+    assert.equal(recalling.items[0].sessionId, null);
+    assert.equal(recalling.items[0].scopeId, origin.scopeId);
+    assert.equal(
+      recalling.items[0].adapterInstanceId,
+      origin.adapterInstanceId,
+    );
+    assert.equal(recalling.items[0].modelId, "alternate-model");
+    assert.equal(recalling.items[0].phase, "recalling");
+    assert.equal(recalling.items[0].currentTool, null);
+    assert(Number.isFinite(Date.parse(recalling.items[0].startedAt)));
+    assert(Number.isFinite(Date.parse(recalling.items[0].updatedAt)));
+    assert.doesNotMatch(JSON.stringify(recalling), /root prompt|Answer directly/);
+
+    releaseRecall();
+    const events = await running;
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(activeAtProvider.total, 1);
+    assert.equal(
+      activeAtProvider.items[0].sessionId,
+      events.at(-1).sessionId,
+    );
+    assert.equal(activeAtProvider.items[0].phase, "model_running");
+    assert.deepEqual(app.engine.listActiveRuns(), { items: [], total: 0 });
+
+    const audit = await app.engine.getRunAudit(runId);
+    const requestEvent = audit.events.find((event) => event.type === "run.request");
+    assert.deepEqual(requestEvent.data.origin, origin);
+  } finally {
+    releaseRecall();
+    await running?.catch(() => {});
+    await app.close();
+  }
+});
+
+test("cancels an active run before its session is created", async () => {
+  const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  let releaseRecall;
+  let signalRecallStarted;
+  const recallGate = new Promise((resolve) => {
+    releaseRecall = resolve;
+  });
+  const recallStarted = new Promise((resolve) => {
+    signalRecallStarted = resolve;
+  });
+  let recallSignalled = false;
+  const app = await fixture(
+    (_body, response) => sendText(response, "Should not be requested."),
+    {
+      memoryUrl: "http://memory.internal:8888",
+      memoryFetch: async () => {
+        if (!recallSignalled) {
+          recallSignalled = true;
+          signalRecallStarted();
+        }
+        await recallGate;
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      },
+    },
+  );
+  const requestOwner = Symbol("request-owner");
+  let running;
+  try {
+    running = collect(
+      app.engine,
+      request(runId, { memory: memoryTarget() }),
+      requestOwner,
+    );
+    await recallStarted;
+    assert.equal(await app.engine.cancel(runId, Symbol("other-owner")), false);
+    assert.equal(app.engine.listActiveRuns().items[0].phase, "recalling");
+    assert.equal(await app.engine.cancel(runId, requestOwner), true);
+    assert.equal(app.engine.listActiveRuns().items[0].phase, "cancelling");
+    releaseRecall();
+
+    const events = await running;
+    assert.deepEqual(events.at(-1), {
+      type: "run_failed",
+      code: "CANCELLED",
+      message: "Agent run cancelled",
+    });
+    assert.equal(app.provider.requests.length, 0);
+    assert.deepEqual(app.engine.listActiveRuns(), { items: [], total: 0 });
+  } finally {
+    releaseRecall();
+    await running?.catch(() => {});
+    await app.close();
+  }
+});
+
+test("removes a terminal run before a slow audit flush completes", async () => {
+  const runId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  let releaseFlush;
+  let signalFlushStarted;
+  const flushGate = new Promise((resolve) => {
+    releaseFlush = resolve;
+  });
+  const flushStarted = new Promise((resolve) => {
+    signalFlushStarted = resolve;
+  });
+  const app = await fixture(
+    (_body, response) => sendText(response, "Finished answer."),
+    {
+      auditStore: {
+        async start() {
+          return {
+            async record() {},
+            async flush() {
+              signalFlushStarted();
+              await flushGate;
+            },
+          };
+        },
+        async list() {
+          return { items: [], total: 0, nextCursor: null };
+        },
+        async get() {
+          return null;
+        },
+      },
+    },
+  );
+  const iterator = app.engine
+    .run(
+      request(runId, {
+        origin: {
+          scopeId: "qq:group:42",
+          adapterInstanceId: "onebot-main",
+        },
+      }),
+    )
+    [Symbol.asyncIterator]();
+  let finishing;
+  try {
+    let terminal;
+    while (!terminal || terminal.type !== "run_completed") {
+      const next = await iterator.next();
+      assert.equal(next.done, false);
+      terminal = next.value;
+    }
+
+    assert.deepEqual(app.engine.listActiveRuns(), { items: [], total: 0 });
+    assert.equal(await app.engine.cancel(runId), false);
+
+    finishing = iterator.next();
+    await flushStarted;
+    assert.deepEqual(app.engine.listActiveRuns(), { items: [], total: 0 });
+    assert.equal(await app.engine.cancel(runId), false);
+    releaseFlush();
+    assert.deepEqual(await finishing, { value: undefined, done: true });
+  } finally {
+    releaseFlush();
+    await finishing?.catch(() => {});
+    await iterator.return();
     await app.close();
   }
 });

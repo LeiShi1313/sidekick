@@ -16,9 +16,11 @@
       <nav class="view-tabs" aria-label="Workspace views">
         <button type="button" data-view="playground" aria-pressed="true">Playground</button>
         <button type="button" data-view="history" aria-pressed="false">Sessions</button>
+        <button type="button" data-view="channels" aria-pressed="false">Channels</button>
       </nav>
       <div class="topbar-actions">
         <button id="refresh-history" class="secondary-button" type="button" hidden>Refresh</button>
+        <button id="refresh-channels" class="secondary-button" type="button" hidden>Refresh</button>
         <button id="new-chat" class="secondary-button" type="button">New chat</button>
       </div>
     </header>
@@ -135,6 +137,65 @@
           <p class="history-empty">Detailed audit is unavailable until a session is selected.</p>
         </div>
       </aside>
+    </main>
+
+    <main id="channels-view" class="channels-workspace" hidden>
+      <header class="channels-header">
+        <div class="channels-heading">
+          <div>
+            <h2>Channels</h2>
+            <p id="channel-summary">Waiting for a channel snapshot</p>
+          </div>
+          <span id="channel-live-status" class="channel-live-status" role="status">Not connected</span>
+        </div>
+        <form id="channel-filters" class="channel-filters" role="search">
+          <label>
+            <span>Search</span>
+            <input id="channel-query" type="search" maxlength="200" placeholder="Chat, scope, account, or instance">
+          </label>
+          <label>
+            <span>Platform</span>
+            <select id="channel-platform">
+              <option value="">All platforms</option>
+            </select>
+          </label>
+          <label>
+            <span>Status</span>
+            <select id="channel-status-filter">
+              <option value="all">All statuses</option>
+              <option value="attention">Needs attention</option>
+              <option value="active">Active</option>
+              <option value="healthy">Healthy</option>
+              <option value="error">Error</option>
+              <option value="disconnected">Disconnected</option>
+              <option value="stale">Stale</option>
+            </select>
+          </label>
+        </form>
+      </header>
+
+      <section id="channel-source-status" class="channel-source-status" aria-label="Dashboard data sources"></section>
+      <p id="channel-notice" class="channel-notice" aria-live="polite">Loading channels...</p>
+      <div id="channel-table-wrap" class="channel-table-wrap" hidden>
+        <table class="channel-table">
+          <caption class="visually-hidden">Real-time AI and memory status for chat channels</caption>
+          <thead>
+            <tr>
+              <th scope="col">Chat</th>
+              <th scope="col">Instance</th>
+              <th scope="col">AI access</th>
+              <th scope="col">Model</th>
+              <th scope="col">Memory / dream</th>
+              <th scope="col">Hindsight bank / facts</th>
+              <th scope="col">Last ingestion</th>
+              <th scope="col">Active sessions</th>
+              <th scope="col">Errors</th>
+              <th scope="col">Updated</th>
+            </tr>
+          </thead>
+          <tbody id="channel-rows"></tbody>
+        </table>
+      </div>
     </main>
   </body>
 </html>

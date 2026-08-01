@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -24,6 +25,14 @@ from sidekick.wechat.message import WeChatMessage
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatStoredChat:
+    chat_id: str
+    chat_type: str
+    display_name: str | None
+    last_observed_at: float
 
 
 def _serialized(
@@ -306,6 +315,7 @@ class WeChatStateRepository:
                 connector_key,
                 account_id,
             )
+            now = time.time()
             await connection.execute(
                 """
                 UPDATE wechat_messages
@@ -322,12 +332,20 @@ class WeChatStateRepository:
                 (
                     memory_order,
                     event.cursor,
-                    time.time(),
+                    now,
                     connector_key,
                     account_id,
                     chat_id,
                     message_id,
                 ),
+            )
+            await connection.execute(
+                """
+                UPDATE wechat_chats
+                SET updated_at = MAX(updated_at, ?)
+                WHERE connector_key = ? AND account_id = ? AND chat_id = ?
+                """,
+                (now, connector_key, account_id, chat_id),
             )
             await connection.commit()
         return None
@@ -481,6 +499,42 @@ class WeChatStateRepository:
             display_name=(
                 str(row["display_name"]) if row["display_name"] is not None else None
             ),
+        )
+
+    @_serialized
+    async def list_chats(
+        self,
+        connector_key: str,
+    ) -> tuple[WeChatStoredChat, ...]:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT
+                chats.chat_id,
+                chats.chat_type,
+                chats.display_name,
+                chats.updated_at AS last_observed_at
+            FROM wechat_chats AS chats
+            JOIN wechat_connectors AS connectors
+              ON connectors.connector_key = chats.connector_key
+             AND connectors.account_id = chats.account_id
+            WHERE chats.connector_key = ?
+            ORDER BY chats.chat_id
+            """,
+            (connector_key,),
+        )
+        rows = await cursor.fetchall()
+        return tuple(
+            WeChatStoredChat(
+                chat_id=str(row["chat_id"]),
+                chat_type=str(row["chat_type"]),
+                display_name=(
+                    str(row["display_name"])
+                    if row["display_name"] is not None
+                    else None
+                ),
+                last_observed_at=float(row["last_observed_at"]),
+            )
+            for row in rows
         )
 
     @_serialized
@@ -759,6 +813,14 @@ class WeChatStateRepository:
                 cursor,
                 now,
             ),
+        )
+        await connection.execute(
+            """
+            UPDATE wechat_chats
+            SET updated_at = MAX(updated_at, ?)
+            WHERE connector_key = ? AND account_id = ? AND chat_id = ?
+            """,
+            (now, connector_key, account_id, message.chat_id),
         )
 
     async def _next_memory_order(

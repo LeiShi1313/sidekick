@@ -31,6 +31,13 @@ from sidekick.ai_memory_ingestion import (
 )
 from sidekick.chat.identity import IdentityCodec
 from sidekick.chat.formatting import agent_system_prompt
+from sidekick.channel_status import (
+    AdapterRuntimeState,
+    ChannelInventoryItem,
+    ChannelOpsServer,
+    ChannelOpsSettings,
+    ChannelSnapshotService,
+)
 from sidekick.plugins.base import PluginMount
 from sidekick.runtime import build_logger
 from sidekick.wechat.ai import (
@@ -110,6 +117,9 @@ class WeChatAI(metaclass=PluginMount):
     def __init__(self, log_level: str = "info"):
         self._runtime = WeChatRuntimeSettings.from_env()
         self._settings = AISettings.from_env()
+        self._ops_settings = ChannelOpsSettings.from_env(
+            default_instance_id="wechat-default",
+        )
         self.logger = build_logger(__name__, log_level=log_level)
         self._client = WeChatConnectorClient(
             self._runtime.connector_url,
@@ -131,6 +141,22 @@ class WeChatAI(metaclass=PluginMount):
             else None
         )
         self._channel_runtime: _WeChatChannelRuntime | None = None
+        self._adapter_status = AdapterRuntimeState(
+            id=self._ops_settings.instance_id,
+            platform="wechat",
+        )
+        self._ops_server = ChannelOpsServer(
+            snapshot_service=ChannelSnapshotService(
+                state_reader=self._ai_store,
+                inventory_loader=self._load_channel_inventory,
+                adapter=self._adapter_status,
+                memory_available=self._memory is not None,
+                logger=self.logger,
+            ),
+            token=self._settings.agent_token,
+            settings=self._ops_settings,
+            logger=self.logger,
+        )
 
     def __call__(self) -> None:
         """Run the Pi-powered WeChat Linux connector adapter."""
@@ -150,6 +176,15 @@ class WeChatAI(metaclass=PluginMount):
         await self._wechat_store.connect()
         await self._ai_store.connect()
         try:
+            try:
+                account_id = await self._wechat_store.get_account_id(
+                    self._client.base_url
+                )
+            except RuntimeError:
+                account_id = None
+            if account_id is not None:
+                self._adapter_status.update(account_id=account_id, connected=False)
+            await self._ops_server.start()
             while not stop.is_set():
                 try:
                     # Stop account-scoped ingestion before bootstrap can switch the
@@ -161,6 +196,10 @@ class WeChatAI(metaclass=PluginMount):
                         self._client.base_url,
                     )
                     handler = await self._activate_channel_runtime(bootstrap)
+                    self._adapter_status.update(
+                        account_id=bootstrap.session.self_id,
+                        connected=True,
+                    )
                     self.logger.info(
                         "WeChat AI connected (self_id=%s, generation=%s)",
                         bootstrap.session.self_id,
@@ -174,11 +213,13 @@ class WeChatAI(metaclass=PluginMount):
                     ).run(handler, stop)
                     if result == "stopped":
                         break
+                    self._adapter_status.update(connected=False)
                     self.logger.warning(
                         "WeChat event stream ended (%s); reconnecting",
                         result,
                     )
                 except Exception as exc:
+                    self._adapter_status.update(connected=False)
                     self.logger.exception(
                         "WeChat adapter cycle failed (%s): %s",
                         type(exc).__name__,
@@ -186,6 +227,8 @@ class WeChatAI(metaclass=PluginMount):
                     )
                 await _wait_or_stop(stop, self._runtime.reconnect_delay)
         finally:
+            self._adapter_status.update(connected=False)
+            await self._ops_server.close()
             await self._close_channel_runtime()
             await self._client.close()
             if self._memory is not None:
@@ -287,6 +330,8 @@ class WeChatAI(metaclass=PluginMount):
             memory_command_delete_delay=(self._settings.memory_command_delete_delay),
             transport=transport,
             identity_codec=identity_codec,
+            run_store=self._ai_store,
+            adapter_instance_id=self._ops_settings.instance_id,
             logger=self.logger,
         )
         return _WeChatChannelRuntime(
@@ -295,6 +340,22 @@ class WeChatAI(metaclass=PluginMount):
             memory_ingestor=memory_ingestor,
             dream_scheduler=dream_scheduler,
             continuous_scheduler=continuous_scheduler,
+        )
+
+    async def _load_channel_inventory(self) -> tuple[ChannelInventoryItem, ...]:
+        account_id = self._adapter_status.account_id
+        if account_id is None:
+            return ()
+        identity_codec = WeChatIdentityCodec(account_id=account_id)
+        chats = await self._wechat_store.list_chats(self._client.base_url)
+        return tuple(
+            ChannelInventoryItem(
+                scope_id=identity_codec.scope_id(chat.chat_id),
+                display_name=chat.display_name,
+                chat_kind="GROUP" if chat.chat_type == "group" else "DIRECT",
+                last_observed_at=chat.last_observed_at,
+            )
+            for chat in chats
         )
 
     async def _activate_channel_runtime(

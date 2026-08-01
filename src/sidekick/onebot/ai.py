@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -16,6 +17,7 @@ from sidekick.ai import (
 from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.chat.transport import ChatPresentation, SentMessage
+from sidekick.channel_status import ChannelInventoryItem
 from sidekick.onebot.client import OneBotActionError
 from sidekick.onebot.message import (
     OneBotActionClient,
@@ -104,6 +106,7 @@ class OneBotDirectory:
     def __init__(self):
         self._users: dict[int, str] = {}
         self._groups: dict[int, str] = {}
+        self._refreshed_at: float | None = None
 
     async def refresh(self, client: OneBotActionClient) -> None:
         friends, groups = await _gather_directory(client)
@@ -117,6 +120,7 @@ class OneBotDirectory:
             id_field="group_id",
             label_fields=("group_name",),
         )
+        self._refreshed_at = time.time()
 
     def user_name(self, user_id: int) -> str | None:
         return self._users.get(user_id)
@@ -125,6 +129,27 @@ class OneBotDirectory:
         if chat_id > 0:
             return self._groups.get(chat_id)
         return self._users.get(abs(chat_id))
+
+    async def list_channels(self) -> tuple[ChannelInventoryItem, ...]:
+        groups = (
+            ChannelInventoryItem(
+                scope_id=QQ_IDENTITY_CODEC.scope_id(group_id),
+                display_name=display_name,
+                chat_kind="GROUP",
+                last_observed_at=self._refreshed_at,
+            )
+            for group_id, display_name in self._groups.items()
+        )
+        users = (
+            ChannelInventoryItem(
+                scope_id=QQ_IDENTITY_CODEC.scope_id(-user_id),
+                display_name=display_name,
+                chat_kind="DIRECT",
+                last_observed_at=self._refreshed_at,
+            )
+            for user_id, display_name in self._users.items()
+        )
+        return (*groups, *users)
 
 
 @dataclass(slots=True)

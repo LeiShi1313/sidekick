@@ -700,3 +700,95 @@ async def test_reply_context_depth_and_size_are_bounded():
         if line.startswith("  ")
     )
     assert len(payload) <= 80
+
+
+@pytest.mark.asyncio
+async def test_handler_attributes_run_before_request_preparation() -> None:
+    order: list[str] = []
+
+    class OrderingAttachmentDescriber(FakeAttachmentDescriber):
+        async def describe(self, message):
+            order.append("prepare")
+            return await super().describe(message)
+
+    class RunStore:
+        def __init__(self):
+            self.started = None
+            self.finished = None
+
+        async def start_ai_run(self, **values):
+            order.append("start")
+            self.started = values
+
+        async def mark_ai_run_running(self, run_id, *, updated_at):
+            order.append("running")
+
+        async def finish_ai_run(self, run_id, **values):
+            order.append("finish")
+            self.finished = (run_id, values)
+
+    gateway = FakeGateway(["tracked"])
+    state = FakeStore()
+    runs = RunStore()
+    handler = AIConversationHandler(
+        owner_id=10,
+        responder=AIResponder(gateway),
+        store=state,
+        prompt_builder=PromptBuilder(
+            attachment_describer=OrderingAttachmentDescriber(),
+            identity_codec=TELEGRAM_IDENTITY_CODEC,
+        ),
+        run_store=runs,
+        adapter_instance_id="telegram-default",
+    )
+    trigger = FakeMessage("/ai track this", file=object())
+
+    assert await handler.handle(trigger) is True
+
+    assert order == ["start", "prepare", "running", "finish"]
+    assert runs.started["scope_id"] == "telegram:chat:-1001"
+    assert runs.started["actor_id"] == "telegram:user:10"
+    assert runs.started["adapter_instance_id"] == "telegram-default"
+    assert runs.finished[1]["status"] == "COMPLETED"
+    assert gateway.requests[0].origin is not None
+    assert gateway.requests[0].origin.scope_id == "telegram:chat:-1001"
+    assert gateway.requests[0].origin.adapter_instance_id == "telegram-default"
+
+
+@pytest.mark.asyncio
+async def test_handler_retries_terminal_run_persistence_with_original_intent() -> None:
+    class RunStore:
+        def __init__(self):
+            self.finish_attempts = 0
+            self.finished = None
+
+        async def start_ai_run(self, **values):
+            pass
+
+        async def mark_ai_run_running(self, run_id, *, updated_at):
+            pass
+
+        async def finish_ai_run(self, run_id, **values):
+            self.finish_attempts += 1
+            if self.finish_attempts == 1:
+                raise RuntimeError("temporary database busy")
+            self.finished = (run_id, values)
+
+    gateway = FakeGateway(["tracked"])
+    runs = RunStore()
+    handler = AIConversationHandler(
+        owner_id=10,
+        responder=AIResponder(gateway),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(identity_codec=TELEGRAM_IDENTITY_CODEC),
+        run_store=runs,
+        adapter_instance_id="telegram-default",
+    )
+
+    assert await handler.handle(FakeMessage("/ai retry terminal persistence")) is True
+
+    assert runs.finish_attempts == 2
+    assert runs.finished is not None
+    assert runs.finished[1]["status"] == "COMPLETED"
+    assert runs.finished[1]["session_id"] == "session-1"
+    assert runs.finished[1]["error_code"] is None

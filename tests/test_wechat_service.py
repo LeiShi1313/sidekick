@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from sidekick.ai import AISettings, AIStateRepository
+from sidekick.channel_status import ChannelOpsSettings
 from sidekick.wechat.api import (
     WeChatCapabilities,
     WeChatChat,
@@ -54,6 +55,7 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
         agent_token="test-token",
         state_path=tmp_path / "ai.db",
     )
+    plugin._ops_settings = ChannelOpsSettings(instance_id="wechat-test")
     plugin._client = SimpleNamespace(base_url=CONNECTOR_KEY)
     plugin._wechat_store = WeChatStateRepository(tmp_path / "wechat.db")
     plugin._ai_store = AIStateRepository(tmp_path / "ai.db")

@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestServer
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
     OneBotChatTransport,
+    OneBotDirectory,
     OneBotDirectorySourceResolver,
     OneBotHistorySource,
     OneBotMessageIdentityResolver,
@@ -103,6 +104,29 @@ def test_qq_identity_codec_separates_group_and_private_scopes():
     assert QQ_IDENTITY_CODEC.parse_scope_id("qq:group:700") == 700
     assert QQ_IDENTITY_CODEC.parse_scope_id("qq:private:42") == -42
     assert QQ_IDENTITY_CODEC.message_source_id(-42, 9) == "qq:message:private:42:9"
+
+
+@pytest.mark.asyncio
+async def test_onebot_directory_exposes_only_its_cached_channel_inventory() -> None:
+    directory = OneBotDirectory()
+    client = RecordingActionClient(
+        responses=[
+            [{"user_id": 42, "remark": "Cherry", "nickname": "Old name"}],
+            [{"group_id": 700, "group_name": "Dog Food Filter"}],
+        ]
+    )
+    await directory.refresh(client)
+
+    channels = await directory.list_channels()
+
+    assert [(item.scope_id, item.display_name, item.chat_kind) for item in channels] == [
+        ("qq:group:700", "Dog Food Filter", "GROUP"),
+        ("qq:private:42", "Cherry", "DIRECT"),
+    ]
+    assert all(item.last_observed_at is not None for item in channels)
+    assert len(client.calls) == 2
+    await directory.list_channels()
+    assert len(client.calls) == 2
 
 
 def test_onebot_transport_distinguishes_group_messages():
