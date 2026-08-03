@@ -72,6 +72,7 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
     assert runtime.handler._memory_scope_resolver is not None
     assert runtime.dream_scheduler is not None
     assert runtime.continuous_scheduler is not None
+    assert runtime.outbox_scheduler is not None
     assert runtime.identity_codec.scope_id(CHAT_ID) == (
         "wechat:account:wxid_self:chat:56825427596%40chatroom"
     )
@@ -94,12 +95,14 @@ async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
     old = SimpleNamespace(
         continuous_scheduler=Scheduler("old-continuous"),
         dream_scheduler=Scheduler("old-dream"),
+        outbox_scheduler=Scheduler("old-outbox"),
     )
     new_handler = object()
     new = SimpleNamespace(
         handler=new_handler,
         continuous_scheduler=Scheduler("new-continuous"),
         dream_scheduler=Scheduler("new-dream"),
+        outbox_scheduler=Scheduler("new-outbox"),
     )
     plugin = object.__new__(WeChatAI)
     plugin._channel_runtime = old
@@ -112,10 +115,13 @@ async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
     assert calls == [
         "close:old-continuous",
         "close:old-dream",
+        "close:old-outbox",
         "start:new-continuous",
         "start:new-dream",
+        "start:new-outbox",
         "close:new-continuous",
         "close:new-dream",
+        "close:new-outbox",
     ]
 
 
