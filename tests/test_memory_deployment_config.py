@@ -41,8 +41,11 @@ def render_memory_service_environment(
     }
     for key in (
         "MEMORY_RETAIN_LLM_MODEL",
+        "MEMORY_RETAIN_LLM_REASONING_EFFORT",
         "MEMORY_CONSOLIDATION_LLM_MODEL",
+        "MEMORY_CONSOLIDATION_LLM_REASONING_EFFORT",
         "MEMORY_REFLECT_LLM_MODEL",
+        "MEMORY_REFLECT_LLM_REASONING_EFFORT",
     ):
         environment.pop(key, None)
     environment.update(overrides or {})
@@ -71,12 +74,15 @@ def render_memory_service_environment(
 
 
 @pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
-def test_memory_compose_renders_per_operation_models_with_shared_effort():
+def test_memory_compose_renders_per_operation_models_and_effort():
     service_environment = render_memory_service_environment(
         {
             "MEMORY_RETAIN_LLM_MODEL": "retain-model",
+            "MEMORY_RETAIN_LLM_REASONING_EFFORT": "xhigh",
             "MEMORY_CONSOLIDATION_LLM_MODEL": "consolidation-model",
+            "MEMORY_CONSOLIDATION_LLM_REASONING_EFFORT": "medium",
             "MEMORY_REFLECT_LLM_MODEL": "reflect-model",
+            "MEMORY_REFLECT_LLM_REASONING_EFFORT": "high",
         }
     )
 
@@ -88,6 +94,18 @@ def test_memory_compose_renders_per_operation_models_with_shared_effort():
     )
     assert service_environment["HINDSIGHT_API_REFLECT_LLM_MODEL"] == "reflect-model"
     assert service_environment["HINDSIGHT_API_LLM_REASONING_EFFORT"] == "low"
+    assert (
+        service_environment["HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT"]
+        == "xhigh"
+    )
+    assert (
+        service_environment["HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT"]
+        == "medium"
+    )
+    assert (
+        service_environment["HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT"]
+        == "high"
+    )
 
 
 @pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
@@ -100,3 +118,13 @@ def test_memory_operation_models_fall_back_to_the_global_model():
         == "global-model"
     )
     assert service_environment["HINDSIGHT_API_REFLECT_LLM_MODEL"] == "global-model"
+    assert (
+        service_environment["HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT"] == "low"
+    )
+    assert (
+        service_environment["HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT"]
+        == "low"
+    )
+    assert (
+        service_environment["HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT"] == "low"
+    )

@@ -1,0 +1,154 @@
+diff --git a/hindsight_api/config.py b/hindsight_api/config.py
+--- a/hindsight_api/config.py
++++ b/hindsight_api/config.py
+@@ -253,6 +253,7 @@
+ ENV_RETAIN_LLM_API_KEY = "HINDSIGHT_API_RETAIN_LLM_API_KEY"
+ ENV_RETAIN_LLM_MODEL = "HINDSIGHT_API_RETAIN_LLM_MODEL"
+ ENV_RETAIN_LLM_BASE_URL = "HINDSIGHT_API_RETAIN_LLM_BASE_URL"
++ENV_RETAIN_LLM_REASONING_EFFORT = "HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT"
+ ENV_RETAIN_LLM_MAX_CONCURRENT = "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT"
+ ENV_RETAIN_LLM_MAX_RETRIES = "HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES"
+ ENV_RETAIN_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_RETAIN_LLM_INITIAL_BACKOFF"
+@@ -275,6 +276,7 @@
+ ENV_REFLECT_LLM_API_KEY = "HINDSIGHT_API_REFLECT_LLM_API_KEY"
+ ENV_REFLECT_LLM_MODEL = "HINDSIGHT_API_REFLECT_LLM_MODEL"
+ ENV_REFLECT_LLM_BASE_URL = "HINDSIGHT_API_REFLECT_LLM_BASE_URL"
++ENV_REFLECT_LLM_REASONING_EFFORT = "HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT"
+ ENV_REFLECT_LLM_MAX_CONCURRENT = "HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT"
+ ENV_REFLECT_LLM_MAX_RETRIES = "HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES"
+ ENV_REFLECT_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_REFLECT_LLM_INITIAL_BACKOFF"
+@@ -286,6 +288,7 @@
+ ENV_CONSOLIDATION_LLM_API_KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY"
+ ENV_CONSOLIDATION_LLM_MODEL = "HINDSIGHT_API_CONSOLIDATION_LLM_MODEL"
+ ENV_CONSOLIDATION_LLM_BASE_URL = "HINDSIGHT_API_CONSOLIDATION_LLM_BASE_URL"
++ENV_CONSOLIDATION_LLM_REASONING_EFFORT = "HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT"
+ ENV_CONSOLIDATION_LLM_MAX_CONCURRENT = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT"
+ ENV_CONSOLIDATION_LLM_MAX_RETRIES = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES"
+ ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_INITIAL_BACKOFF"
+@@ -1617,6 +1620,7 @@
+     retain_llm_api_key: str | None
+     retain_llm_model: str | None
+     retain_llm_base_url: str | None
++    retain_llm_reasoning_effort: str
+     retain_llm_max_concurrent: int | None
+     retain_llm_max_retries: int | None
+     retain_llm_initial_backoff: float | None
+@@ -1633,6 +1637,7 @@
+     reflect_llm_api_key: str | None
+     reflect_llm_model: str | None
+     reflect_llm_base_url: str | None
++    reflect_llm_reasoning_effort: str
+     reflect_llm_max_concurrent: int | None
+     reflect_llm_max_retries: int | None
+     reflect_llm_initial_backoff: float | None
+@@ -1644,6 +1649,7 @@
+     consolidation_llm_api_key: str | None
+     consolidation_llm_model: str | None
+     consolidation_llm_base_url: str | None
++    consolidation_llm_reasoning_effort: str
+     consolidation_llm_max_concurrent: int | None
+     consolidation_llm_max_retries: int | None
+     consolidation_llm_initial_backoff: float | None
+@@ -2361,6 +2367,10 @@
+                 else None
+             ),
+             retain_llm_base_url=os.getenv(ENV_RETAIN_LLM_BASE_URL) or None,
++            retain_llm_reasoning_effort=(
++                os.getenv(ENV_RETAIN_LLM_REASONING_EFFORT)
++                or os.getenv(ENV_LLM_REASONING_EFFORT, DEFAULT_LLM_REASONING_EFFORT)
++            ),
+             fireworks_account_id=os.getenv(ENV_FIREWORKS_ACCOUNT_ID) or None,
+             fireworks_batch_base_url=os.getenv(ENV_FIREWORKS_BATCH_BASE_URL) or DEFAULT_FIREWORKS_BATCH_BASE_URL,
+             fireworks_batch_max_wait_seconds=int(
+@@ -2389,6 +2399,10 @@
+                 else None
+             ),
+             reflect_llm_base_url=os.getenv(ENV_REFLECT_LLM_BASE_URL) or None,
++            reflect_llm_reasoning_effort=(
++                os.getenv(ENV_REFLECT_LLM_REASONING_EFFORT)
++                or os.getenv(ENV_LLM_REASONING_EFFORT, DEFAULT_LLM_REASONING_EFFORT)
++            ),
+             reflect_llm_max_concurrent=int(os.getenv(ENV_REFLECT_LLM_MAX_CONCURRENT))
+             if os.getenv(ENV_REFLECT_LLM_MAX_CONCURRENT)
+             else None,
+@@ -2414,6 +2428,10 @@
+                 else None
+             ),
+             consolidation_llm_base_url=os.getenv(ENV_CONSOLIDATION_LLM_BASE_URL) or None,
++            consolidation_llm_reasoning_effort=(
++                os.getenv(ENV_CONSOLIDATION_LLM_REASONING_EFFORT)
++                or os.getenv(ENV_LLM_REASONING_EFFORT, DEFAULT_LLM_REASONING_EFFORT)
++            ),
+             consolidation_llm_max_concurrent=int(os.getenv(ENV_CONSOLIDATION_LLM_MAX_CONCURRENT))
+             if os.getenv(ENV_CONSOLIDATION_LLM_MAX_CONCURRENT)
+             else None,
+diff --git a/hindsight_api/engine/memory_engine.py b/hindsight_api/engine/memory_engine.py
+--- a/hindsight_api/engine/memory_engine.py
++++ b/hindsight_api/engine/memory_engine.py
+@@ -414,7 +414,12 @@
+         }
+ 
+ 
+-def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults: _LLMCallDefaults) -> LLMConfig:
++def _member_to_llm(
++    member: "LLMMemberConfig",
++    config: HindsightConfig,
++    defaults: _LLMCallDefaults,
++    reasoning_effort: str,
++) -> LLMConfig:
+     """Build an LLMProvider from one indexed multi-LLM member.
+ 
+     ``LLMProvider`` uses its arguments verbatim (it no longer reads global config),
+@@ -435,7 +440,7 @@
+         api_key=member.api_key or "",
+         base_url=member.base_url,
+         model=member.model,
+-        reasoning_effort=member.reasoning_effort or config.llm_reasoning_effort,
++        reasoning_effort=member.reasoning_effort or reasoning_effort,
+         extra_body=member.extra_body,
+         default_headers=member.default_headers or config.llm_default_headers,
+         bedrock_service_tier=member.bedrock_service_tier,
+@@ -477,7 +482,15 @@
+ 
+     if not strategy or not members:
+         return base
+-    extra = [_member_to_llm(m, config, defaults) for m in members]
++    extra = [
++        _member_to_llm(
++            member,
++            config,
++            defaults,
++            base.reasoning_effort or config.llm_reasoning_effort,
++        )
++        for member in members
++    ]
+     return MultiLLMProvider([base, *extra], strategy)
+ 
+ 
+@@ -1126,7 +1139,7 @@
+             api_key=retain_api_key,
+             base_url=retain_base_url,
+             model=retain_model,
+-            reasoning_effort=config.llm_reasoning_effort,
++            reasoning_effort=config.retain_llm_reasoning_effort,
+             extra_body=config.llm_extra_body,
+             default_headers=config.llm_default_headers,
+             litellmrouter_config=config.retain_llm_litellmrouter_config or config.llm_litellmrouter_config,
+@@ -1164,7 +1177,7 @@
+             api_key=reflect_api_key,
+             base_url=reflect_base_url,
+             model=reflect_model,
+-            reasoning_effort=config.llm_reasoning_effort,
++            reasoning_effort=config.reflect_llm_reasoning_effort,
+             extra_body=config.llm_extra_body,
+             default_headers=config.llm_default_headers,
+             litellmrouter_config=config.reflect_llm_litellmrouter_config or config.llm_litellmrouter_config,
+@@ -1202,7 +1215,7 @@
+             api_key=consolidation_api_key,
+             base_url=consolidation_base_url,
+             model=consolidation_model,
+-            reasoning_effort=config.llm_reasoning_effort,
++            reasoning_effort=config.consolidation_llm_reasoning_effort,
+             extra_body=config.llm_extra_body,
+             default_headers=config.llm_default_headers,
+             litellmrouter_config=config.consolidation_llm_litellmrouter_config or config.llm_litellmrouter_config,
