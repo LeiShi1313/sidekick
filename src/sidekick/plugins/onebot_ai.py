@@ -32,6 +32,10 @@ from sidekick.ai_memory_ingestion import (
     ChatMemoryIngestor,
     MemoryIngestionSettings,
 )
+from sidekick.ai_memory_outbox import (
+    MemoryOutboxScheduler,
+    MemoryOutboxSchedulerSettings,
+)
 from sidekick.chat.formatting import agent_system_prompt
 from sidekick.channel_status import (
     AdapterRuntimeState,
@@ -123,6 +127,7 @@ class OneBotAI(metaclass=PluginMount):
         self._handler: AIConversationHandler | None = None
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_scheduler: ContinuousMemoryScheduler | None = None
+        self._memory_outbox_scheduler: MemoryOutboxScheduler | None = None
         self._seen_messages: OrderedDict[tuple[int, int], None] = OrderedDict()
         self._adapter_status = AdapterRuntimeState(
             id=self._ops_settings.instance_id,
@@ -175,6 +180,8 @@ class OneBotAI(metaclass=PluginMount):
                 self._continuous_scheduler.start()
             if self._dream_scheduler is not None:
                 self._dream_scheduler.start()
+            if self._memory_outbox_scheduler is not None:
+                self._memory_outbox_scheduler.start()
             self.logger.info(
                 "OneBot AI connected (self_id=%s)",
                 self._runtime.self_id,
@@ -187,6 +194,8 @@ class OneBotAI(metaclass=PluginMount):
                 await self._continuous_scheduler.close()
             if self._dream_scheduler is not None:
                 await self._dream_scheduler.close()
+            if self._memory_outbox_scheduler is not None:
+                await self._memory_outbox_scheduler.close()
             await self._bridge.close()
             if self._memory is not None:
                 await self._memory.close()
@@ -258,6 +267,12 @@ class OneBotAI(metaclass=PluginMount):
                 store=self._store,
                 identity_codec=QQ_IDENTITY_CODEC,
                 settings=ContinuousMemorySchedulerSettings.from_env(),
+                logger=self.logger,
+            )
+            self._memory_outbox_scheduler = MemoryOutboxScheduler(
+                runner=memory_ingestor,
+                store=self._store,
+                settings=MemoryOutboxSchedulerSettings.from_env(),
                 logger=self.logger,
             )
         self._handler = AIConversationHandler(

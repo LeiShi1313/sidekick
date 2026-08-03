@@ -29,6 +29,10 @@ from sidekick.ai_memory_ingestion import (
     ChatMemoryIngestor,
     MemoryIngestionSettings,
 )
+from sidekick.ai_memory_outbox import (
+    MemoryOutboxScheduler,
+    MemoryOutboxSchedulerSettings,
+)
 from sidekick.chat.identity import IdentityCodec
 from sidekick.chat.formatting import agent_system_prompt
 from sidekick.channel_status import (
@@ -108,6 +112,7 @@ class _WeChatChannelRuntime:
     memory_ingestor: ChatMemoryIngestor | None
     dream_scheduler: DreamScheduler | None
     continuous_scheduler: ContinuousMemoryScheduler | None
+    outbox_scheduler: MemoryOutboxScheduler | None
 
 
 class WeChatAI(metaclass=PluginMount):
@@ -307,6 +312,16 @@ class WeChatAI(metaclass=PluginMount):
             if memory_ingestor is not None
             else None
         )
+        outbox_scheduler = (
+            MemoryOutboxScheduler(
+                runner=memory_ingestor,
+                store=self._ai_store,
+                settings=MemoryOutboxSchedulerSettings.from_env(),
+                logger=self.logger,
+            )
+            if memory_ingestor is not None
+            else None
+        )
         handler = AIConversationHandler(
             owner_id=bootstrap.session.self_id,
             responder=responder,
@@ -340,6 +355,7 @@ class WeChatAI(metaclass=PluginMount):
             memory_ingestor=memory_ingestor,
             dream_scheduler=dream_scheduler,
             continuous_scheduler=continuous_scheduler,
+            outbox_scheduler=outbox_scheduler,
         )
 
     async def _load_channel_inventory(self) -> tuple[ChannelInventoryItem, ...]:
@@ -369,6 +385,8 @@ class WeChatAI(metaclass=PluginMount):
             runtime.continuous_scheduler.start()
         if runtime.dream_scheduler is not None:
             runtime.dream_scheduler.start()
+        if runtime.outbox_scheduler is not None:
+            runtime.outbox_scheduler.start()
         return runtime.handler
 
     async def _close_channel_runtime(self) -> None:
@@ -380,6 +398,8 @@ class WeChatAI(metaclass=PluginMount):
             await runtime.continuous_scheduler.close()
         if runtime.dream_scheduler is not None:
             await runtime.dream_scheduler.close()
+        if runtime.outbox_scheduler is not None:
+            await runtime.outbox_scheduler.close()
 
 
 async def _wait_or_stop(stop: asyncio.Event, delay: float) -> None:

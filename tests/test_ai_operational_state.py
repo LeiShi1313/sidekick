@@ -38,10 +38,11 @@ async def test_operational_state_aggregates_config_ingestion_and_active_runs(
             ),
             staged_source_ids=(event.source_id,),
         )
-        await store.stage_continuous_memory_documents(
+        await store.stage_continuous_memory_scan(
             scope_id,
             (pending,),
             cursor_message_id=1,
+            scanned_until_at=1_800_000_000,
             succeeded_at=1_800_000_000,
         )
         await store.save_memory_document_receipt(

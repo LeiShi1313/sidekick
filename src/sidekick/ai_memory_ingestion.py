@@ -88,6 +88,10 @@ class MemoryIngestionSettings:
     lease_seconds: float = 3_600
     retry_attempts: int = 3
     max_retry_delay: float = 30
+    delivery_max_attempts: int = 5
+    delivery_retry_base_delay: float = 30
+    delivery_retry_max_delay: float = 3_600
+    delivery_cycle_documents: int = 100
 
     def __post_init__(self) -> None:
         if self.settlement_delay < timedelta(0):
@@ -103,6 +107,13 @@ class MemoryIngestionSettings:
             raise ValueError("Memory ingestion lease duration must be positive")
         if self.retry_attempts < 1 or self.max_retry_delay < 0:
             raise ValueError("Memory ingestion retry settings are invalid")
+        if (
+            self.delivery_max_attempts < 1
+            or self.delivery_retry_base_delay < 0
+            or self.delivery_retry_max_delay < self.delivery_retry_base_delay
+            or self.delivery_cycle_documents < 1
+        ):
+            raise ValueError("Memory outbox delivery settings are invalid")
 
     @classmethod
     def from_env(cls) -> MemoryIngestionSettings:
@@ -149,6 +160,18 @@ class MemoryIngestionSettings:
                     "30",
                 )
             ),
+            delivery_max_attempts=int(
+                os.environ.get("SIDEKICK_MEMORY_OUTBOX_MAX_ATTEMPTS", "5")
+            ),
+            delivery_retry_base_delay=float(
+                os.environ.get("SIDEKICK_MEMORY_OUTBOX_RETRY_BASE_SECONDS", "30")
+            ),
+            delivery_retry_max_delay=float(
+                os.environ.get("SIDEKICK_MEMORY_OUTBOX_RETRY_MAX_SECONDS", "3600")
+            ),
+            delivery_cycle_documents=int(
+                os.environ.get("SIDEKICK_MEMORY_OUTBOX_CYCLE_DOCUMENTS", "100")
+            ),
         )
 
 
@@ -159,6 +182,16 @@ class ContinuousMemoryResult:
     documents_created: int
     documents_unchanged: int
     caught_up: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryOutboxDrainResult:
+    documents_attempted: int = 0
+    messages_retained: int = 0
+    documents_created: int = 0
+    documents_unchanged: int = 0
+    documents_failed: int = 0
+    documents_dead_lettered: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,7 +312,7 @@ class ChatMemoryIngestor:
         self._sleep = sleep
         self._monotonic = monotonic
         self._logger = logger
-        self._locks: dict[ExternalId, asyncio.Lock] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
         self._lease_owner = uuid4().hex
 
     @property
@@ -347,14 +380,32 @@ class ChatMemoryIngestor:
             lambda: self._run_continuous_scope(chat_id),
         )
 
+    async def run_memory_outbox_scope(
+        self,
+        scope_id: str,
+    ) -> MemoryOutboxDrainResult:
+        return await self._run_scope_exclusive(
+            scope_id,
+            lambda: self._drain_memory_outbox(scope_id),
+        )
+
     async def _run_exclusive(
         self,
         chat_id: ExternalId,
         operation: Callable[[], Awaitable[Any]],
     ) -> Any:
-        lock = self._locks.setdefault(chat_id, asyncio.Lock())
+        return await self._run_scope_exclusive(
+            self._identity_codec.scope_id(chat_id),
+            operation,
+        )
+
+    async def _run_scope_exclusive(
+        self,
+        scope_id: str,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        lock = self._locks.setdefault(scope_id, asyncio.Lock())
         async with lock:
-            scope_id = self._identity_codec.scope_id(chat_id)
             acquired_at = self._clock()
             acquired = await self._store.acquire_memory_dream_lease(
                 scope_id,
@@ -408,20 +459,26 @@ class ChatMemoryIngestor:
         )
 
         try:
-            pending = await self._store.list_pending_memory_documents(scope_id)
-            # A sealed document already crossed a proven segment boundary. Drain it
-            # before reading more source messages so an outage cannot grow the local
-            # queue by another fetch window on every poll.
-            sealed_pending = tuple(document for document in pending if document.sealed)
-            (
-                earlier_messages_retained,
-                earlier_documents_created,
-                earlier_documents_unchanged,
-            ) = await self._retain_pending_documents(
-                scope_id,
-                sealed_pending,
+            earlier = await self._drain_memory_outbox(scope_id)
+            # Back off source scanning while a retryable sealed document remains.
+            # Dead letters are explicitly excluded, so one poison document never
+            # prevents later chat history from progressing.
+            if await self._store.has_retryable_memory_outbox_documents(scope_id):
+                return ContinuousMemoryResult(
+                    messages_seen=0,
+                    messages_retained=earlier.messages_retained,
+                    documents_created=earlier.documents_created,
+                    documents_unchanged=earlier.documents_unchanged,
+                    caught_up=True,
+                )
+            pending = tuple(
+                item.document
+                for item in await self._store.list_memory_outbox_documents(
+                    scope_id,
+                    pipeline="continuous",
+                )
+                if not item.document.sealed
             )
-            pending = tuple(document for document in pending if not document.sealed)
             messages = await self._retry_source(
                 lambda: self._source.fetch_after(
                     chat_id,
@@ -442,25 +499,30 @@ class ChatMemoryIngestor:
             )
             # Persist the boundary before the remote write so retries cannot reopen a
             # document that was already quiet (or full) when retention failed.
-            await self._store.stage_continuous_memory_documents(
+            scanned_until_at = (
+                _message_datetime(messages[-1]).timestamp()
+                if len(messages) >= self._ingestion_settings.max_messages
+                else until.timestamp()
+            )
+            await self._store.stage_continuous_memory_scan(
                 scope_id,
                 pending,
                 cursor_message_id=_memory_cursor(messages[-1]) if messages else None,
+                scanned_until_at=scanned_until_at,
                 succeeded_at=self._clock(),
             )
-            (
-                messages_retained,
-                documents_created,
-                documents_unchanged,
-            ) = await self._retain_pending_documents(
-                scope_id,
-                tuple(document for document in pending if document.sealed),
-            )
+            delivered = await self._drain_memory_outbox(scope_id)
             return ContinuousMemoryResult(
                 messages_seen=len(messages),
-                messages_retained=(earlier_messages_retained + messages_retained),
-                documents_created=(earlier_documents_created + documents_created),
-                documents_unchanged=(earlier_documents_unchanged + documents_unchanged),
+                messages_retained=(
+                    earlier.messages_retained + delivered.messages_retained
+                ),
+                documents_created=(
+                    earlier.documents_created + delivered.documents_created
+                ),
+                documents_unchanged=(
+                    earlier.documents_unchanged + delivered.documents_unchanged
+                ),
                 caught_up=len(messages) < self._ingestion_settings.max_messages,
             )
         except Exception as exc:
@@ -550,6 +612,30 @@ class ChatMemoryIngestor:
 
         return tuple(by_id[document_id] for document_id in ordered_ids)
 
+    def _sealed_outbox_documents(
+        self,
+        chat_id: ExternalId,
+        prepared: tuple[PreparedMemoryDocument, ...],
+    ) -> tuple[PendingMemoryDocument, ...]:
+        documents: list[PendingMemoryDocument] = []
+        for prepared_document in prepared:
+            window_source_ids = {
+                self._identity_codec.message_source_id(chat_id, message_id)
+                for message_id in prepared_document.window_message_ids
+            }
+            documents.append(
+                PendingMemoryDocument(
+                    episode=prepared_document.episode,
+                    staged_source_ids=tuple(
+                        event.source_id
+                        for event in prepared_document.episode.events
+                        if event.source_id in window_source_ids
+                    ),
+                    sealed=True,
+                )
+            )
+        return tuple(documents)
+
     def _seal_due_pending_documents(
         self,
         pending: tuple[PendingMemoryDocument, ...],
@@ -571,51 +657,113 @@ class ChatMemoryIngestor:
             for document in pending
         )
 
-    async def _retain_pending_documents(
+    async def _drain_memory_outbox(
         self,
         scope_id: str,
-        pending: tuple[PendingMemoryDocument, ...],
-    ) -> tuple[int, int, int]:
+        *,
+        deadline: float | None = None,
+    ) -> MemoryOutboxDrainResult:
+        documents_attempted = 0
         messages_retained = 0
         documents_created = 0
         documents_unchanged = 0
-        for start in range(
-            0,
-            len(pending),
-            self._ingestion_settings.retain_concurrency,
+        documents_failed = 0
+        documents_dead_lettered = 0
+        while (
+            documents_attempted
+            < self._ingestion_settings.delivery_cycle_documents
         ):
-            batch = pending[start : start + self._ingestion_settings.retain_concurrency]
+            if deadline is not None and self._monotonic() >= deadline:
+                break
+            batch = await self._store.list_due_memory_outbox_documents(
+                scope_id,
+                due_at=self._clock(),
+                limit=min(
+                    self._ingestion_settings.retain_concurrency,
+                    self._ingestion_settings.delivery_cycle_documents
+                    - documents_attempted,
+                ),
+            )
+            if not batch:
+                break
             results = await asyncio.gather(
                 *(
                     self._retry_memory(
-                        lambda document=document: retain_episodes_once(
+                        lambda item=item: retain_episodes_once(
                             self._memory,
                             self._store,
-                            (document.episode,),
+                            (item.document.episode,),
                         )
                     )
-                    for document in batch
+                    for item in batch
                 ),
                 return_exceptions=True,
             )
-            completed_ids: list[str] = []
-            first_error: BaseException | None = None
-            for document, created in zip(batch, results, strict=True):
+            documents_attempted += len(batch)
+            completed: list[tuple[str, float]] = []
+            for item, created in zip(batch, results, strict=True):
                 if isinstance(created, BaseException):
-                    if first_error is None:
-                        first_error = created
+                    if not isinstance(created, Exception):
+                        raise created
+                    failed_at = self._clock()
+                    attempt_count = item.attempt_count + 1
+                    dead_lettered_at = (
+                        failed_at
+                        if attempt_count
+                        >= self._ingestion_settings.delivery_max_attempts
+                        else None
+                    )
+                    retry_delay = min(
+                        self._ingestion_settings.delivery_retry_base_delay
+                        * (2 ** min(attempt_count - 1, 30)),
+                        self._ingestion_settings.delivery_retry_max_delay,
+                    )
+                    await self._store.record_memory_outbox_failure(
+                        scope_id,
+                        item.document.episode.document_id,
+                        attempt_count=attempt_count,
+                        attempted_at=failed_at,
+                        next_attempt_at=failed_at + retry_delay,
+                        dead_lettered_at=dead_lettered_at,
+                        error=f"{type(created).__name__}: {created}",
+                    )
+                    documents_failed += 1
+                    documents_dead_lettered += dead_lettered_at is not None
+                    if self._logger is not None:
+                        self._logger.warning(
+                            "Memory outbox delivery failed "
+                            "(scope_id=%s, document_id=%s, attempt=%s, "
+                            "dead_lettered=%s, error=%s): %s",
+                            scope_id,
+                            item.document.episode.document_id,
+                            attempt_count,
+                            dead_lettered_at is not None,
+                            type(created).__name__,
+                            created,
+                        )
                     continue
-                completed_ids.append(document.episode.document_id)
-                messages_retained += len(document.staged_source_ids)
+                completed.append(
+                    (
+                        item.document.episode.document_id,
+                        item.document.last_event_at.timestamp(),
+                    )
+                )
+                messages_retained += len(item.document.staged_source_ids)
                 documents_created += int(created[0])
                 documents_unchanged += int(not created[0])
-            await self._store.delete_pending_memory_documents(
+            await self._store.complete_memory_outbox_documents(
                 scope_id,
-                tuple(completed_ids),
+                tuple(completed),
+                retained_at=self._clock(),
             )
-            if first_error is not None:
-                raise first_error
-        return messages_retained, documents_created, documents_unchanged
+        return MemoryOutboxDrainResult(
+            documents_attempted=documents_attempted,
+            messages_retained=messages_retained,
+            documents_created=documents_created,
+            documents_unchanged=documents_unchanged,
+            documents_failed=documents_failed,
+            documents_dead_lettered=documents_dead_lettered,
+        )
 
     def _is_session_document(self, document_id: str) -> bool:
         return _is_memory_session_document(
@@ -638,8 +786,24 @@ class ChatMemoryIngestor:
                 _legacy_memory_session_prefix(self._identity_codec, chat_id),
             ),
         )
-        available = tuple(
-            candidate for candidate in candidates if candidate is not None
+        prefixes = (
+            _memory_session_prefix(self._identity_codec, chat_id),
+            _legacy_memory_session_prefix(self._identity_codec, chat_id),
+        )
+        outbox_candidates = tuple(
+            (
+                item.document.episode.document_id,
+                MemoryDocumentReceipt(
+                    content_hash=item.document.episode.content_hash,
+                    event_versions=item.document.episode.event_versions,
+                ),
+            )
+            for item in await self._store.list_memory_outbox_documents(scope_id)
+            if item.document.episode.document_id.startswith(prefixes)
+        )
+        available = (
+            *(candidate for candidate in candidates if candidate is not None),
+            *outbox_candidates,
         )
         if not available:
             return None
@@ -713,26 +877,6 @@ class ChatMemoryIngestor:
             if state.scanned_until_at is not None
             else until - self._dream_settings.lookback
         )
-        checkpoint_scanned_at = state.scanned_until_at
-
-        async def checkpoint(
-            cursor_message_id: ExternalId | None,
-            scanned_until_at: float,
-        ) -> None:
-            nonlocal checkpoint_scanned_at
-            if (
-                checkpoint_scanned_at is not None
-                and scanned_until_at <= checkpoint_scanned_at
-            ):
-                return
-            succeeded_at = self._clock()
-            await self._store.record_memory_dream_success(
-                scope_id,
-                cursor_message_id=cursor_message_id,
-                scanned_until_at=scanned_until_at,
-                succeeded_at=succeeded_at,
-            )
-            checkpoint_scanned_at = scanned_until_at
 
         try:
             messages = await self._retry_source(
@@ -743,18 +887,42 @@ class ChatMemoryIngestor:
                     limit=self._ingestion_settings.max_messages,
                 )
             )
-            result, _, _ = await self._retain_threads(
-                chat_id,
-                messages,
-                deadline=deadline,
-                checkpoint=checkpoint,
-            )
-            await self._store.record_memory_dream_success(
+            documents = await self._prepare_documents(chat_id, messages)
+            pending = self._sealed_outbox_documents(chat_id, documents)
+            scanned_until_at = until.timestamp()
+            # The source checkpoint and sealed documents commit together before
+            # Hindsight is called. A remote outage can delay retention, but it can
+            # no longer force Dream to rescan or block later history.
+            await self._store.stage_dream_memory_scan(
                 scope_id,
+                pending,
                 cursor_message_id=_memory_cursor(messages[-1]) if messages else None,
-                scanned_until_at=until.timestamp(),
+                scanned_until_at=scanned_until_at,
                 succeeded_at=self._clock(),
             )
+            delivered = await self._drain_memory_outbox(
+                scope_id,
+                deadline=deadline,
+            )
+            result = MemoryDreamResult(
+                messages_seen=len(messages),
+                messages_retained=delivered.messages_retained,
+                documents_created=delivered.documents_created,
+                documents_unchanged=delivered.documents_unchanged,
+            )
+            if self._logger is not None and result.messages_seen:
+                self._logger.info(
+                    "Dream scan staged "
+                    "(chat_id=%s, messages=%s, documents=%s, retained=%s, "
+                    "failed=%s, dead_lettered=%s)",
+                    chat_id,
+                    result.messages_seen,
+                    len(pending),
+                    delivered.documents_created
+                    + delivered.documents_unchanged,
+                    delivered.documents_failed,
+                    delivered.documents_dead_lettered,
+                )
             return result
         except Exception as exc:
             await self._store.record_memory_dream_failure(
@@ -932,6 +1100,14 @@ class ChatMemoryIngestor:
             scope_id,
             assigned_document_ids,
         )
+        assigned_ids = set(assigned_document_ids)
+        for item in await self._store.list_memory_outbox_documents(scope_id):
+            episode = item.document.episode
+            if episode.document_id in assigned_ids:
+                receipts[episode.document_id] = MemoryDocumentReceipt(
+                    content_hash=episode.content_hash,
+                    event_versions=episode.event_versions,
+                )
 
         document_groups: dict[str, dict[ExternalId, ReplyTarget]] = {}
         for root_id, document_id in assigned_documents.items():
