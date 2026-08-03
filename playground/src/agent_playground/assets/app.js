@@ -627,6 +627,14 @@ function channelMeta(text) {
   return node("div", text, "channel-meta");
 }
 
+function channelPipelineStage(label, value, detail = null, tone = null) {
+  const stage = node("div", null, `channel-pipeline-stage${tone ? ` ${tone}` : ""}`);
+  stage.append(node("span", label, "channel-pipeline-label"));
+  stage.append(node("span", value, "channel-pipeline-value"));
+  if (detail) stage.append(node("span", detail, "channel-pipeline-detail"));
+  return stage;
+}
+
 function renderChannelSources() {
   const sources = state.channelSnapshot?.sources || [];
   if (sources.length === 0) {
@@ -688,25 +696,71 @@ function renderChannelRow(item) {
   );
 
   const memory = item.memory || {};
+  const queueSummary = [
+    `${memory.pendingDocumentCount || 0} queued`,
+    `${memory.retryingDocumentCount || 0} retrying`,
+    `${memory.deadLetterDocumentCount || 0} dead-lettered`,
+  ].join(" · ");
   const memoryCell = channelCell(
     "channel-memory",
     statusBadge(memory.effectiveMode || "unknown", memory.effectiveMode),
     channelMeta(`Continuous ${memory.continuousEnabled ? "on" : "off"} · Dream ${memory.dreamEnabled ? "on" : "off"}`),
-    channelMeta(`${memory.pendingDocumentCount || 0} pending documents`),
+    channelMeta(queueSummary),
+    memory.nextRetryAt ? channelMeta(`Next retry ${formatDate(memory.nextRetryAt)}`) : null,
   );
   const bank = item.bank || {};
+  const bankCounts = bank.status === "PRESENT"
+    ? `${bank.factCount == null ? "Unknown" : bank.factCount} facts · ${bank.observationCount == null ? "Unknown" : bank.observationCount} observations`
+    : bank.status === "MISSING" ? "No bank yet" : "Bank service unavailable";
   const bankCell = channelCell(
     "channel-bank",
     statusBadge(bank.status || "UNAVAILABLE", bank.status),
     channelMeta(bank.bankId || item.scopeId),
-    channelPrimary(bank.status === "PRESENT"
-      ? `${bank.factCount == null ? "Unknown" : bank.factCount} facts`
-      : bank.status === "MISSING" ? "No bank yet" : "Bank service unavailable"),
+    channelPrimary(bankCounts),
   );
-  const ingestion = channelCell(
-    "channel-ingestion",
-    channelPrimary(memory.lastIngestedAt ? formatDate(memory.lastIngestedAt) : "Never ingested"),
-    bank.lastDocumentAt ? channelMeta(`Bank document ${formatDate(bank.lastDocumentAt)}`) : null,
+  const scanDetail = memory.scanCursor == null
+    ? null
+    : `Cursor ${short(String(memory.scanCursor), 24)}`;
+  const retainedAt = memory.retainWatermarkAt || memory.lastIngestedAt;
+  const retainDetail = memory.retainedSourceAt
+    ? `Latest source ${formatDate(memory.retainedSourceAt)}`
+    : null;
+  const consolidationCounts = [
+    bank.pendingConsolidationCount == null ? null : `${bank.pendingConsolidationCount} pending`,
+    bank.failedConsolidationCount ? `${bank.failedConsolidationCount} failed` : null,
+    bank.pendingOperationCount == null ? null : `${bank.pendingOperationCount} async`,
+    bank.failedOperationCount ? `${bank.failedOperationCount} async failed` : null,
+  ].filter(Boolean).join(" · ") || null;
+  const hasConsolidationStats = [
+    bank.lastConsolidatedAt,
+    bank.pendingConsolidationCount,
+    bank.failedConsolidationCount,
+    bank.pendingOperationCount,
+    bank.failedOperationCount,
+  ].some((value) => value != null);
+  const consolidationValue = bank.status !== "PRESENT"
+    ? bank.status === "MISSING" ? "No bank" : "Bank unavailable"
+    : !hasConsolidationStats ? "Stats unavailable"
+    : bank.lastConsolidatedAt ? formatDate(bank.lastConsolidatedAt) : "Not consolidated";
+  const pipeline = channelCell(
+    "channel-pipeline",
+    channelPipelineStage(
+      "Scan",
+      memory.scanWatermarkAt ? formatDate(memory.scanWatermarkAt) : "Not scanned",
+      scanDetail,
+    ),
+    channelPipelineStage(
+      "Retain",
+      retainedAt ? formatDate(retainedAt) : "Not retained",
+      retainDetail,
+      memory.deadLetterDocumentCount ? "error" : memory.retryingDocumentCount ? "warning" : null,
+    ),
+    channelPipelineStage(
+      "Consolidate",
+      consolidationValue,
+      consolidationCounts,
+      (bank.failedConsolidationCount || bank.failedOperationCount) ? "warning" : null,
+    ),
   );
 
   const runCell = channelCell("channel-runs");
@@ -742,7 +796,7 @@ function renderChannelRow(item) {
     channelPrimary(formatDate(item.updatedAt)),
     item.lastObservedAt ? channelMeta(`Chat seen ${formatDate(item.lastObservedAt)}`) : channelMeta("No observed message"),
   );
-  row.append(chat, instance, access, model, memoryCell, bankCell, ingestion, runCell, errorCell, updated);
+  row.append(chat, instance, access, model, memoryCell, bankCell, pipeline, runCell, errorCell, updated);
   return row;
 }
 

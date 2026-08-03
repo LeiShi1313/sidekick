@@ -38,6 +38,7 @@ async def _channel_dependencies():
         "memory_available": True,
         "continuous_error": None,
         "model_requests": 0,
+        "stats_requests": 0,
     }
     adapter = web.Application()
 
@@ -73,6 +74,13 @@ async def _channel_dependencies():
                             "dreamLastSuccessAt": None,
                             "dreamLastError": None,
                             "pendingDocumentCount": 2,
+                            "retryingDocumentCount": 1,
+                            "deadLetterDocumentCount": 0,
+                            "nextRetryAt": "2026-07-31T12:00:30Z",
+                            "scanCursor": 101,
+                            "scanWatermarkAt": "2026-07-31T11:59:30Z",
+                            "retainWatermarkAt": "2026-07-31T11:59:01Z",
+                            "retainedSourceAt": "2026-07-31T11:58:58Z",
                             "lastIngestedAt": "2026-07-31T11:59:01Z",
                         },
                         "lastObservedAt": None,
@@ -156,7 +164,22 @@ async def _channel_dependencies():
             }
         )
 
+    async def stats(request: web.Request) -> web.Response:
+        assert request.match_info["bank_id"] == "qq:group:42"
+        state["stats_requests"] += 1
+        return web.json_response(
+            {
+                "bank_id": "qq:group:42",
+                "last_consolidated_at": "2026-07-31T11:59:04Z",
+                "pending_consolidation": 2,
+                "failed_consolidation": 0,
+                "pending_operations": 1,
+                "failed_operations": 0,
+            }
+        )
+
     memory.router.add_get("/v1/default/banks", banks)
+    memory.router.add_get("/v1/default/banks/{bank_id}/stats", stats)
     memory_runner, memory_url = await _start(memory)
     return (
         [adapter_runner, pi_runner, memory_runner],
@@ -205,7 +228,10 @@ def test_adapter_url_configuration_accepts_json_and_mapping():
         parse_adapter_urls("http://onebot:8781/v1/channels")
 
 
-@pytest.mark.parametrize("source_id", ["pi-models", "pi-runs", "hindsight"])
+@pytest.mark.parametrize(
+    "source_id",
+    ["pi-models", "pi-runs", "hindsight", "hindsight-stats"],
+)
 def test_adapter_url_configuration_rejects_internal_source_ids(source_id: str):
     with pytest.raises(ValueError, match="reserved"):
         parse_adapter_urls(f"{source_id}=http://adapter:8781/v1/channels")
@@ -310,6 +336,51 @@ async def test_source_response_stops_reading_at_size_limit(monkeypatch):
     assert content.consumed == 2
 
 
+@pytest.mark.asyncio
+async def test_hindsight_bank_stats_keep_last_good_value_after_refresh_failure(
+    monkeypatch,
+):
+    dashboard = ChannelDashboard(
+        ChannelDashboardConfig(
+            adapter_urls=(("adapter", "http://adapter/v1/channels"),),
+            pi_url="http://pi",
+            memory_url="http://memory",
+            token="token",
+            bank_cache_ttl=15,
+        )
+    )
+    calls = []
+
+    async def load(url, *, authenticated):
+        calls.append((url, authenticated))
+        if len(calls) > 1:
+            raise RuntimeError("stats unavailable")
+        return {
+            "bank_id": "wechat:account:wx/id:chat:group",
+            "last_consolidated_at": "2026-07-31T11:59:04Z",
+            "pending_consolidation": 0,
+            "failed_consolidation": 0,
+            "pending_operations": 0,
+            "failed_operations": 0,
+        }
+
+    monkeypatch.setattr(dashboard, "_json", load)
+    banks = [{"bankId": "wechat:account:wx/id:chat:group"}]
+
+    first, first_status = await dashboard._load_bank_stats(banks)
+    dashboard._bank_stats_deadlines[banks[0]["bankId"]] = 0
+    second, second_status = await dashboard._load_bank_stats(banks)
+
+    assert calls[0] == (
+        "http://memory/v1/default/banks/"
+        "wechat%3Aaccount%3Awx%2Fid%3Achat%3Agroup/stats",
+        False,
+    )
+    assert second == first
+    assert first_status["status"] == "ok"
+    assert second_status["status"] == "stale"
+
+
 class _BlockingDashboard:
     def __init__(self):
         self.subscribers: set[asyncio.Queue[dict[str, object]]] = set()
@@ -373,11 +444,20 @@ async def test_channels_aggregate_sources_filter_and_stream_changes():
                 "factCount": 37,
                 "observationCount": 9,
                 "lastDocumentAt": "2026-07-31T11:59:01Z",
+                "lastConsolidatedAt": "2026-07-31T11:59:04Z",
+                "pendingConsolidationCount": 2,
+                "failedConsolidationCount": 0,
+                "pendingOperationCount": 1,
+                "failedOperationCount": 0,
             }
+            assert item["memory"]["scanCursor"] == 101
+            assert item["memory"]["scanWatermarkAt"] == "2026-07-31T11:59:30Z"
+            assert item["memory"]["retryingDocumentCount"] == 1
             assert [run["sessionId"] for run in item["activeRuns"]] == ["session-live"]
             sources = {source["id"]: source for source in payload["sources"]}
             assert sources["onebot"]["status"] == "ok"
             assert sources["offline"]["status"] == "unavailable"
+            assert sources["hindsight-stats"]["status"] == "ok"
 
             async with session.get(
                 f"{playground_url}/api/channels?platform=qq&q=operations&limit=1&cursor=0"
@@ -421,11 +501,13 @@ async def test_channels_aggregate_sources_filter_and_stream_changes():
                 assert streamed["generation"] > payload["generation"]
                 assert streamed["items"][0]["displayName"] == state["name"]
                 assert state["model_requests"] == 1
+                assert state["stats_requests"] == 1
 
             async with session.get(f"{playground_url}/") as response:
                 markup = await response.text()
             assert 'id="channels-view"' in markup
             assert "Hindsight bank / facts" in markup
+            assert "Pipeline progress" in markup
             async with session.get(f"{playground_url}/app.js") as response:
                 script = await response.text()
             assert "new EventSource" in script
@@ -458,6 +540,12 @@ async def test_channel_bank_is_unavailable_without_hindsight_cache():
             source for source in payload["sources"] if source["id"] == "hindsight"
         )
         assert hindsight["status"] == "unavailable"
+        stats = next(
+            source
+            for source in payload["sources"]
+            if source["id"] == "hindsight-stats"
+        )
+        assert stats["status"] == "unavailable"
     finally:
         await playground_runner.cleanup()
         for runner in runners:

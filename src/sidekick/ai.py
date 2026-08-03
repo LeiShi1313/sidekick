@@ -2043,10 +2043,54 @@ class AIStateRepository:
             pending AS (
                 SELECT
                     scope_id,
-                    COUNT(*) AS pending_count,
+                    SUM(
+                        CASE WHEN dead_lettered_at IS NULL THEN 1 ELSE 0 END
+                    ) AS pending_count,
+                    SUM(
+                        CASE
+                            WHEN dead_lettered_at IS NULL AND attempt_count > 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS retrying_count,
+                    SUM(
+                        CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END
+                    ) AS dead_letter_count,
+                    MIN(
+                        CASE
+                            WHEN dead_lettered_at IS NULL
+                                 AND sealed = 1
+                                 AND attempt_count > 0
+                            THEN next_attempt_at ELSE NULL
+                        END
+                    ) AS next_retry_at,
                     MAX(updated_at) AS pending_updated_at
                 FROM ai_memory_outbox
                 GROUP BY scope_id
+            ),
+            latest_outbox_errors AS (
+                SELECT
+                    scope_id,
+                    last_error,
+                    last_attempt_at,
+                    dead_lettered_at
+                FROM (
+                    SELECT
+                        scope_id,
+                        document_id,
+                        last_error,
+                        last_attempt_at,
+                        dead_lettered_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope_id
+                            ORDER BY
+                                (dead_lettered_at IS NOT NULL) DESC,
+                                last_attempt_at DESC,
+                                document_id DESC
+                        ) AS position
+                    FROM ai_memory_outbox
+                    WHERE last_error IS NOT NULL
+                )
+                WHERE position = 1
             ),
             latest_runs AS (
                 SELECT scope_id, run_id, status, error_code, updated_at
@@ -2076,16 +2120,32 @@ class AIStateRepository:
                 model.model_id,
                 COALESCE(memory.continuous_enabled, 0) AS continuous_enabled,
                 COALESCE(memory.dream_enabled, 0) AS dream_enabled,
+                memory.continuous_cursor_message_id,
+                memory.continuous_scanned_until_at,
                 memory.continuous_last_attempt_at,
                 memory.continuous_last_success_at,
                 memory.continuous_last_error,
+                dream.cursor_message_id AS dream_cursor_message_id,
+                dream.scanned_until_at AS dream_scanned_until_at,
                 dream.last_attempt_at AS dream_last_attempt_at,
                 dream.last_success_at AS dream_last_success_at,
                 dream.last_error AS dream_last_error,
                 COALESCE(documents.retained_document_count, 0)
                     AS retained_document_count,
                 COALESCE(pending.pending_count, 0) AS pending_count,
+                COALESCE(pending.retrying_count, 0) AS retrying_count,
+                COALESCE(pending.dead_letter_count, 0) AS dead_letter_count,
+                pending.next_retry_at,
+                outbox_error.last_error AS outbox_last_error,
+                outbox_error.last_attempt_at AS outbox_last_error_at,
+                outbox_error.dead_lettered_at
+                    AS outbox_last_dead_lettered_at,
                 documents.last_ingested_at,
+                memory.last_retained_source_at,
+                COALESCE(
+                    memory.last_retained_at,
+                    documents.last_ingested_at
+                ) AS last_retained_at,
                 CASE
                     WHEN latest_run.status IN ('FAILED', 'INTERRUPTED')
                     THEN COALESCE(
@@ -2131,6 +2191,8 @@ class AIStateRepository:
                 ON dream.scope_id = ids.scope_id
             LEFT JOIN documents ON documents.scope_id = ids.scope_id
             LEFT JOIN pending ON pending.scope_id = ids.scope_id
+            LEFT JOIN latest_outbox_errors AS outbox_error
+                ON outbox_error.scope_id = ids.scope_id
             LEFT JOIN latest_runs AS latest_run
                 ON latest_run.scope_id = ids.scope_id
             ORDER BY ids.scope_id
@@ -2155,6 +2217,12 @@ class AIStateRepository:
                     ),
                     continuous_enabled=bool(row["continuous_enabled"]),
                     dream_enabled=bool(row["dream_enabled"]),
+                    continuous_cursor_message_id=row[
+                        "continuous_cursor_message_id"
+                    ],
+                    continuous_scanned_until_at=row[
+                        "continuous_scanned_until_at"
+                    ],
                     continuous_last_attempt_at=row[
                         "continuous_last_attempt_at"
                     ],
@@ -2162,12 +2230,24 @@ class AIStateRepository:
                         "continuous_last_success_at"
                     ],
                     continuous_last_error=row["continuous_last_error"],
+                    dream_cursor_message_id=row["dream_cursor_message_id"],
+                    dream_scanned_until_at=row["dream_scanned_until_at"],
                     dream_last_attempt_at=row["dream_last_attempt_at"],
                     dream_last_success_at=row["dream_last_success_at"],
                     dream_last_error=row["dream_last_error"],
                     retained_document_count=int(row["retained_document_count"]),
                     pending_count=int(row["pending_count"]),
+                    retrying_count=int(row["retrying_count"]),
+                    dead_letter_count=int(row["dead_letter_count"]),
+                    next_retry_at=row["next_retry_at"],
+                    outbox_last_error=row["outbox_last_error"],
+                    outbox_last_error_at=row["outbox_last_error_at"],
+                    outbox_last_dead_lettered_at=row[
+                        "outbox_last_dead_lettered_at"
+                    ],
                     last_ingested_at=row["last_ingested_at"],
+                    last_retained_source_at=row["last_retained_source_at"],
+                    last_retained_at=row["last_retained_at"],
                     active_runs=tuple(active_by_scope.get(scope_id, ())),
                     last_run_error=row["last_run_error"],
                     last_run_error_at=row["last_run_error_at"],
