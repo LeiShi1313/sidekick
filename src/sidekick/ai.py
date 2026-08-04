@@ -24,6 +24,8 @@ from sidekick.ai_memory import (
     retain_episode_once,
 )
 from sidekick.ai_memory_segments import (
+    MemoryOutboxItem,
+    MemoryOutboxPipeline,
     PendingMemoryDocument,
     decode_memory_episode,
 )
@@ -568,10 +570,13 @@ class MemoryScopeState:
     continuous_enabled: bool = False
     dream_enabled: bool = False
     continuous_cursor_message_id: ExternalId | None = None
+    continuous_scanned_until_at: float | None = None
     continuous_last_attempt_at: float | None = None
     continuous_last_success_at: float | None = None
     continuous_last_error: str | None = None
     dream_last_error: str | None = None
+    last_retained_source_at: float | None = None
+    last_retained_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1356,22 +1361,7 @@ class AIStateRepository:
                 "ALTER TABLE ai_memory_documents "
                 "ADD COLUMN event_versions TEXT NOT NULL DEFAULT '[]'"
             )
-        await self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ai_memory_pending_documents (
-                scope_id TEXT NOT NULL,
-                document_id TEXT NOT NULL,
-                source TEXT NOT NULL,
-                content TEXT NOT NULL,
-                staged_source_ids TEXT NOT NULL,
-                sealed INTEGER NOT NULL DEFAULT 0,
-                first_event_at REAL NOT NULL,
-                last_event_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                PRIMARY KEY (scope_id, document_id)
-            )
-            """
-        )
+        await self._ensure_memory_outbox_schema()
         await self._ensure_memory_scope_schema()
         await self._ensure_memory_dream_schema()
         await self._connection.commit()
@@ -1668,6 +1658,57 @@ class AIStateRepository:
             )
         }
 
+    async def _ensure_memory_outbox_schema(self) -> None:
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_memory_outbox (
+                scope_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                pipeline TEXT NOT NULL
+                    CHECK (pipeline IN ('continuous', 'dream')),
+                source TEXT NOT NULL,
+                content TEXT NOT NULL,
+                staged_source_ids TEXT NOT NULL,
+                sealed INTEGER NOT NULL DEFAULT 0,
+                first_event_at REAL NOT NULL,
+                last_event_at REAL NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                last_attempt_at REAL,
+                last_error TEXT,
+                dead_lettered_at REAL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (scope_id, document_id)
+            )
+            """
+        )
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ai_memory_outbox_due_idx
+            ON ai_memory_outbox (
+                dead_lettered_at, sealed, next_attempt_at,
+                first_event_at, scope_id
+            )
+            """
+        )
+        if await self._table_columns("ai_memory_pending_documents"):
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO ai_memory_outbox (
+                    scope_id, document_id, pipeline, source, content,
+                    staged_source_ids, sealed, first_event_at, last_event_at,
+                    attempt_count, next_attempt_at, updated_at
+                )
+                SELECT
+                    scope_id, document_id, 'continuous', source, content,
+                    staged_source_ids, sealed, first_event_at, last_event_at,
+                    0, updated_at, updated_at
+                FROM ai_memory_pending_documents
+                """
+            )
+            await connection.execute("DROP TABLE ai_memory_pending_documents")
+
     async def _ensure_memory_scope_schema(self) -> None:
         connection = self._require_connection()
         column_types = await self._table_column_types("ai_memory_scopes")
@@ -1679,6 +1720,16 @@ class AIStateRepository:
             "enabled" not in columns
             and column_types.get("continuous_cursor_message_id") == "BLOB"
         ):
+            for column, definition in (
+                ("continuous_scanned_until_at", "REAL"),
+                ("last_retained_source_at", "REAL"),
+                ("last_retained_at", "REAL"),
+            ):
+                if column not in columns:
+                    await connection.execute(
+                        f"ALTER TABLE ai_memory_scopes "  # nosec B608
+                        f"ADD COLUMN {column} {definition}"
+                    )
             return
         await connection.execute(
             "ALTER TABLE ai_memory_scopes RENAME TO ai_memory_scopes_legacy"
@@ -1724,9 +1775,12 @@ class AIStateRepository:
                 dream_enabled INTEGER NOT NULL DEFAULT 0,
                 display_name TEXT,
                 continuous_cursor_message_id BLOB,
+                continuous_scanned_until_at REAL,
                 continuous_last_attempt_at REAL,
                 continuous_last_success_at REAL,
                 continuous_last_error TEXT,
+                last_retained_source_at REAL,
+                last_retained_at REAL,
                 updated_at REAL NOT NULL
             )
             """
@@ -1973,7 +2027,7 @@ class AIStateRepository:
                 UNION SELECT scope_id FROM ai_memory_scopes
                 UNION SELECT scope_id FROM ai_memory_scope_labels
                 UNION SELECT scope_id FROM ai_memory_documents
-                UNION SELECT scope_id FROM ai_memory_pending_documents
+                UNION SELECT scope_id FROM ai_memory_outbox
                 UNION SELECT scope_id FROM ai_memory_dream_state
                 UNION SELECT scope_id FROM ai_answers
                 UNION SELECT scope_id FROM ai_runs
@@ -1989,10 +2043,54 @@ class AIStateRepository:
             pending AS (
                 SELECT
                     scope_id,
-                    COUNT(*) AS pending_count,
+                    SUM(
+                        CASE WHEN dead_lettered_at IS NULL THEN 1 ELSE 0 END
+                    ) AS pending_count,
+                    SUM(
+                        CASE
+                            WHEN dead_lettered_at IS NULL AND attempt_count > 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS retrying_count,
+                    SUM(
+                        CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END
+                    ) AS dead_letter_count,
+                    MIN(
+                        CASE
+                            WHEN dead_lettered_at IS NULL
+                                 AND sealed = 1
+                                 AND attempt_count > 0
+                            THEN next_attempt_at ELSE NULL
+                        END
+                    ) AS next_retry_at,
                     MAX(updated_at) AS pending_updated_at
-                FROM ai_memory_pending_documents
+                FROM ai_memory_outbox
                 GROUP BY scope_id
+            ),
+            latest_outbox_errors AS (
+                SELECT
+                    scope_id,
+                    last_error,
+                    last_attempt_at,
+                    dead_lettered_at
+                FROM (
+                    SELECT
+                        scope_id,
+                        document_id,
+                        last_error,
+                        last_attempt_at,
+                        dead_lettered_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope_id
+                            ORDER BY
+                                (dead_lettered_at IS NOT NULL) DESC,
+                                last_attempt_at DESC,
+                                document_id DESC
+                        ) AS position
+                    FROM ai_memory_outbox
+                    WHERE last_error IS NOT NULL
+                )
+                WHERE position = 1
             ),
             latest_runs AS (
                 SELECT scope_id, run_id, status, error_code, updated_at
@@ -2022,16 +2120,32 @@ class AIStateRepository:
                 model.model_id,
                 COALESCE(memory.continuous_enabled, 0) AS continuous_enabled,
                 COALESCE(memory.dream_enabled, 0) AS dream_enabled,
+                memory.continuous_cursor_message_id,
+                memory.continuous_scanned_until_at,
                 memory.continuous_last_attempt_at,
                 memory.continuous_last_success_at,
                 memory.continuous_last_error,
+                dream.cursor_message_id AS dream_cursor_message_id,
+                dream.scanned_until_at AS dream_scanned_until_at,
                 dream.last_attempt_at AS dream_last_attempt_at,
                 dream.last_success_at AS dream_last_success_at,
                 dream.last_error AS dream_last_error,
                 COALESCE(documents.retained_document_count, 0)
                     AS retained_document_count,
                 COALESCE(pending.pending_count, 0) AS pending_count,
+                COALESCE(pending.retrying_count, 0) AS retrying_count,
+                COALESCE(pending.dead_letter_count, 0) AS dead_letter_count,
+                pending.next_retry_at,
+                outbox_error.last_error AS outbox_last_error,
+                outbox_error.last_attempt_at AS outbox_last_error_at,
+                outbox_error.dead_lettered_at
+                    AS outbox_last_dead_lettered_at,
                 documents.last_ingested_at,
+                memory.last_retained_source_at,
+                COALESCE(
+                    memory.last_retained_at,
+                    documents.last_ingested_at
+                ) AS last_retained_at,
                 CASE
                     WHEN latest_run.status IN ('FAILED', 'INTERRUPTED')
                     THEN COALESCE(
@@ -2077,6 +2191,8 @@ class AIStateRepository:
                 ON dream.scope_id = ids.scope_id
             LEFT JOIN documents ON documents.scope_id = ids.scope_id
             LEFT JOIN pending ON pending.scope_id = ids.scope_id
+            LEFT JOIN latest_outbox_errors AS outbox_error
+                ON outbox_error.scope_id = ids.scope_id
             LEFT JOIN latest_runs AS latest_run
                 ON latest_run.scope_id = ids.scope_id
             ORDER BY ids.scope_id
@@ -2101,6 +2217,12 @@ class AIStateRepository:
                     ),
                     continuous_enabled=bool(row["continuous_enabled"]),
                     dream_enabled=bool(row["dream_enabled"]),
+                    continuous_cursor_message_id=row[
+                        "continuous_cursor_message_id"
+                    ],
+                    continuous_scanned_until_at=row[
+                        "continuous_scanned_until_at"
+                    ],
                     continuous_last_attempt_at=row[
                         "continuous_last_attempt_at"
                     ],
@@ -2108,12 +2230,24 @@ class AIStateRepository:
                         "continuous_last_success_at"
                     ],
                     continuous_last_error=row["continuous_last_error"],
+                    dream_cursor_message_id=row["dream_cursor_message_id"],
+                    dream_scanned_until_at=row["dream_scanned_until_at"],
                     dream_last_attempt_at=row["dream_last_attempt_at"],
                     dream_last_success_at=row["dream_last_success_at"],
                     dream_last_error=row["dream_last_error"],
                     retained_document_count=int(row["retained_document_count"]),
                     pending_count=int(row["pending_count"]),
+                    retrying_count=int(row["retrying_count"]),
+                    dead_letter_count=int(row["dead_letter_count"]),
+                    next_retry_at=row["next_retry_at"],
+                    outbox_last_error=row["outbox_last_error"],
+                    outbox_last_error_at=row["outbox_last_error_at"],
+                    outbox_last_dead_lettered_at=row[
+                        "outbox_last_dead_lettered_at"
+                    ],
                     last_ingested_at=row["last_ingested_at"],
+                    last_retained_source_at=row["last_retained_source_at"],
+                    last_retained_at=row["last_retained_at"],
                     active_runs=tuple(active_by_scope.get(scope_id, ())),
                     last_run_error=row["last_run_error"],
                     last_run_error_at=row["last_run_error_at"],
@@ -2384,6 +2518,22 @@ class AIStateRepository:
             )
             async for row in cursor:
                 documents[str(row["source_id"])] = str(row["document_id"])
+            outbox_query = f"""
+                SELECT outbox.document_id,
+                       json_extract(event.value, '$.source_id') AS source_id
+                FROM ai_memory_outbox AS outbox,
+                     json_each(json_extract(outbox.content, '$.events')) AS event
+                WHERE outbox.scope_id = ?
+                  AND json_extract(event.value, '$.source_id')
+                      IN ({placeholders})
+                ORDER BY outbox.updated_at
+            """  # nosec B608
+            outbox_cursor = await connection.execute(
+                outbox_query,
+                (scope_id, *batch),
+            )
+            async for row in outbox_cursor:
+                documents[str(row["source_id"])] = str(row["document_id"])
         return documents
 
     async def get_latest_memory_document_receipt(
@@ -2435,98 +2585,112 @@ class AIStateRepository:
         )
         await connection.commit()
 
-    async def list_pending_memory_documents(
+    async def list_memory_outbox_documents(
         self,
         scope_id: str,
-    ) -> tuple[PendingMemoryDocument, ...]:
+        *,
+        pipeline: MemoryOutboxPipeline | None = None,
+    ) -> tuple[MemoryOutboxItem, ...]:
         connection = self._require_connection()
-        cursor = await connection.execute(
-            """
-            SELECT document_id, source, content, staged_source_ids, sealed
-            FROM ai_memory_pending_documents
+        query = """
+            SELECT *
+            FROM ai_memory_outbox
             WHERE scope_id = ?
-            ORDER BY first_event_at, document_id
+        """
+        parameters: tuple[Any, ...] = (scope_id,)
+        if pipeline is not None:
+            query += " AND pipeline = ?"
+            parameters = (scope_id, pipeline)
+        query += " ORDER BY first_event_at, document_id"
+        cursor = await connection.execute(query, parameters)
+        return tuple([_memory_outbox_item_from_row(row) async for row in cursor])
+
+    async def list_due_memory_outbox_documents(
+        self,
+        scope_id: str,
+        *,
+        due_at: float,
+        limit: int,
+    ) -> tuple[MemoryOutboxItem, ...]:
+        if limit < 1:
+            raise ValueError("Memory outbox delivery limit must be positive")
+        cursor = await self._require_connection().execute(
+            """
+            SELECT *
+            FROM ai_memory_outbox
+            WHERE scope_id = ?
+              AND sealed = 1
+              AND dead_lettered_at IS NULL
+              AND next_attempt_at <= ?
+            ORDER BY next_attempt_at, first_event_at, document_id
+            LIMIT ?
+            """,
+            (scope_id, due_at, limit),
+        )
+        return tuple([_memory_outbox_item_from_row(row) async for row in cursor])
+
+    async def list_due_memory_outbox_scopes(
+        self,
+        *,
+        due_at: float,
+        limit: int,
+    ) -> tuple[str, ...]:
+        if limit < 1:
+            raise ValueError("Memory outbox scope limit must be positive")
+        cursor = await self._require_connection().execute(
+            """
+            SELECT scope_id, MIN(next_attempt_at) AS first_due_at
+            FROM ai_memory_outbox
+            WHERE sealed = 1
+              AND dead_lettered_at IS NULL
+              AND next_attempt_at <= ?
+            GROUP BY scope_id
+            ORDER BY first_due_at, scope_id
+            LIMIT ?
+            """,
+            (due_at, limit),
+        )
+        return tuple([str(row["scope_id"]) async for row in cursor])
+
+    async def has_retryable_memory_outbox_documents(self, scope_id: str) -> bool:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT 1
+            FROM ai_memory_outbox
+            WHERE scope_id = ?
+              AND sealed = 1
+              AND dead_lettered_at IS NULL
+            LIMIT 1
             """,
             (scope_id,),
         )
-        documents: list[PendingMemoryDocument] = []
-        async for row in cursor:
-            try:
-                raw_source_ids = json.loads(row["staged_source_ids"])
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise ValueError("Malformed pending memory source IDs") from exc
-            if not isinstance(raw_source_ids, list) or not all(
-                isinstance(source_id, str) and source_id for source_id in raw_source_ids
-            ):
-                raise ValueError("Malformed pending memory source IDs")
-            documents.append(
-                PendingMemoryDocument(
-                    episode=decode_memory_episode(
-                        document_id=str(row["document_id"]),
-                        source=str(row["source"]),
-                        content=str(row["content"]),
-                    ),
-                    staged_source_ids=tuple(raw_source_ids),
-                    sealed=bool(row["sealed"]),
-                )
-            )
-        return tuple(documents)
+        return await cursor.fetchone() is not None
 
-    async def stage_continuous_memory_documents(
+    async def stage_continuous_memory_scan(
         self,
         scope_id: str,
         documents: tuple[PendingMemoryDocument, ...],
         *,
         cursor_message_id: ExternalId | None,
+        scanned_until_at: float,
         succeeded_at: float,
     ) -> None:
-        if any(document.episode.scope_id != scope_id for document in documents):
-            raise ValueError("One continuous memory stage cannot span scopes")
         connection = self._require_connection()
-        await connection.executemany(
-            """
-            INSERT INTO ai_memory_pending_documents (
-                scope_id, document_id, source, content, staged_source_ids,
-                sealed, first_event_at, last_event_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scope_id, document_id) DO UPDATE SET
-                source = excluded.source,
-                content = excluded.content,
-                staged_source_ids = excluded.staged_source_ids,
-                sealed = excluded.sealed,
-                first_event_at = excluded.first_event_at,
-                last_event_at = excluded.last_event_at,
-                updated_at = excluded.updated_at
-            """,
-            (
-                (
-                    scope_id,
-                    document.episode.document_id,
-                    document.episode.source,
-                    document.episode.content,
-                    json.dumps(
-                        document.staged_source_ids,
-                        separators=(",", ":"),
-                    ),
-                    int(document.sealed),
-                    min(
-                        _memory_event_timestamp(event.occurred_at)
-                        for event in document.episode.events
-                    ),
-                    max(
-                        _memory_event_timestamp(event.occurred_at)
-                        for event in document.episode.events
-                    ),
-                    succeeded_at,
-                )
-                for document in documents
-            ),
+        await self._upsert_memory_outbox_documents(
+            connection,
+            scope_id,
+            documents,
+            pipeline="continuous",
+            staged_at=succeeded_at,
         )
         await connection.execute(
             """
             UPDATE ai_memory_scopes
             SET continuous_cursor_message_id = COALESCE(
                     ?, continuous_cursor_message_id
+                ),
+                continuous_scanned_until_at = MAX(
+                    COALESCE(continuous_scanned_until_at, 0), ?
                 ),
                 continuous_last_attempt_at = ?,
                 continuous_last_success_at = ?,
@@ -2536,6 +2700,7 @@ class AIStateRepository:
             """,
             (
                 cursor_message_id,
+                scanned_until_at,
                 succeeded_at,
                 succeeded_at,
                 succeeded_at,
@@ -2544,24 +2709,240 @@ class AIStateRepository:
         )
         await connection.commit()
 
-    async def delete_pending_memory_documents(
+    async def stage_dream_memory_scan(
         self,
         scope_id: str,
-        document_ids: tuple[str, ...],
+        documents: tuple[PendingMemoryDocument, ...],
+        *,
+        cursor_message_id: ExternalId | None,
+        scanned_until_at: float,
+        succeeded_at: float,
     ) -> None:
-        unique_ids = tuple(dict.fromkeys(document_ids))
-        if not unique_ids:
+        connection = self._require_connection()
+        await self._upsert_memory_outbox_documents(
+            connection,
+            scope_id,
+            documents,
+            pipeline="dream",
+            staged_at=succeeded_at,
+        )
+        await connection.execute(
+            """
+            INSERT INTO ai_memory_dream_state (
+                scope_id, cursor_message_id, scanned_until_at, last_attempt_at,
+                last_success_at, last_error
+            ) VALUES (?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(scope_id) DO UPDATE SET
+                cursor_message_id = COALESCE(
+                    excluded.cursor_message_id,
+                    ai_memory_dream_state.cursor_message_id
+                ),
+                scanned_until_at = MAX(
+                    COALESCE(ai_memory_dream_state.scanned_until_at, 0),
+                    excluded.scanned_until_at
+                ),
+                last_attempt_at = excluded.last_attempt_at,
+                last_success_at = excluded.last_success_at,
+                last_error = NULL
+            """,
+            (
+                scope_id,
+                cursor_message_id,
+                scanned_until_at,
+                succeeded_at,
+                succeeded_at,
+            ),
+        )
+        await connection.commit()
+
+    async def _upsert_memory_outbox_documents(
+        self,
+        connection: aiosqlite.Connection,
+        scope_id: str,
+        documents: tuple[PendingMemoryDocument, ...],
+        *,
+        pipeline: MemoryOutboxPipeline,
+        staged_at: float,
+    ) -> None:
+        if any(document.episode.scope_id != scope_id for document in documents):
+            raise ValueError("One memory outbox stage cannot span scopes")
+        await connection.executemany(
+            """
+            INSERT INTO ai_memory_outbox (
+                scope_id, document_id, pipeline, source, content,
+                staged_source_ids, sealed, first_event_at, last_event_at,
+                attempt_count, next_attempt_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(scope_id, document_id) DO UPDATE SET
+                pipeline = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN excluded.pipeline ELSE ai_memory_outbox.pipeline END,
+                source = excluded.source,
+                content = excluded.content,
+                staged_source_ids = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN excluded.staged_source_ids
+                    ELSE ai_memory_outbox.staged_source_ids END,
+                sealed = MAX(ai_memory_outbox.sealed, excluded.sealed),
+                first_event_at = excluded.first_event_at,
+                last_event_at = excluded.last_event_at,
+                attempt_count = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN 0 ELSE ai_memory_outbox.attempt_count END,
+                next_attempt_at = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN excluded.next_attempt_at
+                    ELSE ai_memory_outbox.next_attempt_at END,
+                last_attempt_at = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN NULL ELSE ai_memory_outbox.last_attempt_at END,
+                last_error = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN NULL ELSE ai_memory_outbox.last_error END,
+                dead_lettered_at = CASE
+                    WHEN ai_memory_outbox.content <> excluded.content
+                    THEN NULL ELSE ai_memory_outbox.dead_lettered_at END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                (
+                    scope_id,
+                    document.episode.document_id,
+                    pipeline,
+                    document.episode.source,
+                    document.episode.content,
+                    json.dumps(document.staged_source_ids, separators=(",", ":")),
+                    int(document.sealed),
+                    min(
+                        _memory_event_timestamp(event.occurred_at)
+                        for event in document.episode.events
+                    ),
+                    max(
+                        _memory_event_timestamp(event.occurred_at)
+                        for event in document.episode.events
+                    ),
+                    staged_at,
+                    staged_at,
+                )
+                for document in documents
+            ),
+        )
+
+    async def complete_memory_outbox_documents(
+        self,
+        scope_id: str,
+        documents: tuple[tuple[str, float], ...],
+        *,
+        retained_at: float,
+    ) -> None:
+        source_at_by_document: dict[str, float] = {}
+        for document_id, source_at in documents:
+            source_at_by_document[document_id] = max(
+                source_at_by_document.get(document_id, source_at),
+                source_at,
+            )
+        unique_documents = tuple(source_at_by_document.items())
+        if not unique_documents:
             return
         connection = self._require_connection()
-        for start in range(0, len(unique_ids), 500):
-            batch = unique_ids[start : start + 500]
+        document_ids = tuple(document_id for document_id, _ in unique_documents)
+        for start in range(0, len(document_ids), 500):
+            batch = document_ids[start : start + 500]
             placeholders = ",".join("?" for _ in batch)
             await connection.execute(
-                "DELETE FROM ai_memory_pending_documents "  # nosec B608
+                "DELETE FROM ai_memory_outbox "  # nosec B608
                 f"WHERE scope_id = ? AND document_id IN ({placeholders})",
                 (scope_id, *batch),
             )
+        last_source_at = max(source_at for _, source_at in unique_documents)
+        await connection.execute(
+            """
+            INSERT INTO ai_memory_scopes (
+                scope_id, last_retained_source_at, last_retained_at, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(scope_id) DO UPDATE SET
+                last_retained_source_at = MAX(
+                    COALESCE(ai_memory_scopes.last_retained_source_at, 0),
+                    excluded.last_retained_source_at
+                ),
+                last_retained_at = MAX(
+                    COALESCE(ai_memory_scopes.last_retained_at, 0),
+                    excluded.last_retained_at
+                ),
+                updated_at = MAX(
+                    ai_memory_scopes.updated_at, excluded.updated_at
+                )
+            """,
+            (scope_id, last_source_at, retained_at, retained_at),
+        )
         await connection.commit()
+
+    async def record_memory_outbox_failure(
+        self,
+        scope_id: str,
+        document_id: str,
+        *,
+        attempt_count: int,
+        attempted_at: float,
+        next_attempt_at: float,
+        dead_lettered_at: float | None,
+        error: str,
+    ) -> None:
+        if attempt_count < 1:
+            raise ValueError("Memory outbox failure requires an attempt")
+        await self._require_connection().execute(
+            """
+            UPDATE ai_memory_outbox
+            SET attempt_count = ?, next_attempt_at = ?, last_attempt_at = ?,
+                last_error = ?, dead_lettered_at = ?, updated_at = ?
+            WHERE scope_id = ? AND document_id = ?
+            """,
+            (
+                attempt_count,
+                next_attempt_at,
+                attempted_at,
+                error[:1_000],
+                dead_lettered_at,
+                attempted_at,
+                scope_id,
+                document_id,
+            ),
+        )
+        await self._require_connection().commit()
+
+    async def requeue_memory_dead_letters(
+        self,
+        scope_id: str,
+        *,
+        queued_at: float,
+        document_ids: tuple[str, ...] = (),
+    ) -> int:
+        connection = self._require_connection()
+        if document_ids:
+            unique_ids = tuple(dict.fromkeys(document_ids))
+            placeholders = ",".join("?" for _ in unique_ids)
+            cursor = await connection.execute(
+                "UPDATE ai_memory_outbox "  # nosec B608
+                "SET attempt_count = 0, next_attempt_at = ?, "
+                "last_attempt_at = NULL, last_error = NULL, "
+                "dead_lettered_at = NULL, updated_at = ? "
+                f"WHERE scope_id = ? AND document_id IN ({placeholders}) "
+                "AND dead_lettered_at IS NOT NULL",
+                (queued_at, queued_at, scope_id, *unique_ids),
+            )
+        else:
+            cursor = await connection.execute(
+                """
+                UPDATE ai_memory_outbox
+                SET attempt_count = 0, next_attempt_at = ?,
+                    last_attempt_at = NULL, last_error = NULL,
+                    dead_lettered_at = NULL, updated_at = ?
+                WHERE scope_id = ? AND dead_lettered_at IS NOT NULL
+                """,
+                (queued_at, queued_at, scope_id),
+            )
+        await connection.commit()
+        return cursor.rowcount
 
     async def find_memory_document_id_for_source(
         self,
@@ -2599,9 +2980,12 @@ class AIStateRepository:
             continuous_enabled=bool(row["continuous_enabled"]),
             dream_enabled=bool(row["dream_enabled"]),
             continuous_cursor_message_id=row["continuous_cursor_message_id"],
+            continuous_scanned_until_at=row["continuous_scanned_until_at"],
             continuous_last_attempt_at=row["continuous_last_attempt_at"],
             continuous_last_success_at=row["continuous_last_success_at"],
             continuous_last_error=row["continuous_last_error"],
+            last_retained_source_at=row["last_retained_source_at"],
+            last_retained_at=row["last_retained_at"],
         )
 
     async def list_enabled_memory_scope_states(
@@ -2679,6 +3063,7 @@ class AIStateRepository:
         cursor_message_id: ExternalId | None = None,
     ) -> None:
         connection = self._require_connection()
+        updated_at = time.time()
         await connection.execute(
             """
             INSERT INTO ai_memory_scopes (
@@ -2701,13 +3086,20 @@ class AIStateRepository:
                 int(enabled),
                 display_name,
                 cursor_message_id,
-                time.time(),
+                updated_at,
             ),
         )
         if not enabled:
             await connection.execute(
-                "DELETE FROM ai_memory_pending_documents WHERE scope_id = ?",
-                (scope_id,),
+                """
+                UPDATE ai_memory_outbox
+                SET sealed = 1,
+                    next_attempt_at = MIN(next_attempt_at, ?),
+                    updated_at = ?
+                WHERE scope_id = ? AND pipeline = 'continuous'
+                  AND dead_lettered_at IS NULL
+                """,
+                (updated_at, updated_at, scope_id),
             )
         await connection.commit()
 
@@ -4690,10 +5082,13 @@ def _memory_scope_state_from_row(row: aiosqlite.Row) -> MemoryScopeState:
         continuous_enabled=bool(row["continuous_enabled"]),
         dream_enabled=bool(row["dream_enabled"]),
         continuous_cursor_message_id=row["continuous_cursor_message_id"],
+        continuous_scanned_until_at=row["continuous_scanned_until_at"],
         continuous_last_attempt_at=row["continuous_last_attempt_at"],
         continuous_last_success_at=row["continuous_last_success_at"],
         continuous_last_error=row["continuous_last_error"],
         dream_last_error=row["dream_last_error"],
+        last_retained_source_at=row["last_retained_source_at"],
+        last_retained_at=row["last_retained_at"],
     )
 
 
@@ -4714,6 +5109,47 @@ def _memory_document_receipt_from_row(
     return MemoryDocumentReceipt(
         content_hash=str(row["content_hash"]),
         event_versions=event_versions,
+    )
+
+
+def _memory_outbox_item_from_row(row: aiosqlite.Row) -> MemoryOutboxItem:
+    try:
+        raw_source_ids = json.loads(row["staged_source_ids"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Malformed memory outbox source IDs") from exc
+    if not isinstance(raw_source_ids, list) or not all(
+        isinstance(source_id, str) and source_id for source_id in raw_source_ids
+    ):
+        raise ValueError("Malformed memory outbox source IDs")
+    pipeline = str(row["pipeline"])
+    if pipeline not in {"continuous", "dream"}:
+        raise ValueError("Malformed memory outbox pipeline")
+    return MemoryOutboxItem(
+        document=PendingMemoryDocument(
+            episode=decode_memory_episode(
+                document_id=str(row["document_id"]),
+                source=str(row["source"]),
+                content=str(row["content"]),
+            ),
+            staged_source_ids=tuple(raw_source_ids),
+            sealed=bool(row["sealed"]),
+        ),
+        pipeline=pipeline,
+        attempt_count=int(row["attempt_count"]),
+        next_attempt_at=float(row["next_attempt_at"]),
+        last_attempt_at=(
+            float(row["last_attempt_at"])
+            if row["last_attempt_at"] is not None
+            else None
+        ),
+        last_error=(
+            str(row["last_error"]) if row["last_error"] is not None else None
+        ),
+        dead_lettered_at=(
+            float(row["dead_lettered_at"])
+            if row["dead_lettered_at"] is not None
+            else None
+        ),
     )
 
 

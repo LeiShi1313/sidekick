@@ -56,15 +56,27 @@ class StoredChannelState:
     model_override: str | None = None
     continuous_enabled: bool = False
     dream_enabled: bool = False
+    continuous_cursor_message_id: str | int | None = None
+    continuous_scanned_until_at: float | None = None
     continuous_last_attempt_at: float | None = None
     continuous_last_success_at: float | None = None
     continuous_last_error: str | None = None
+    dream_cursor_message_id: str | int | None = None
+    dream_scanned_until_at: float | None = None
     dream_last_attempt_at: float | None = None
     dream_last_success_at: float | None = None
     dream_last_error: str | None = None
     retained_document_count: int = 0
     pending_count: int = 0
+    retrying_count: int = 0
+    dead_letter_count: int = 0
+    next_retry_at: float | None = None
+    outbox_last_error: str | None = None
+    outbox_last_error_at: float | None = None
+    outbox_last_dead_lettered_at: float | None = None
     last_ingested_at: float | None = None
+    last_retained_source_at: float | None = None
+    last_retained_at: float | None = None
     active_runs: tuple[ActiveAIRun, ...] = ()
     last_run_error: str | None = None
     last_run_error_at: float | None = None
@@ -335,6 +347,11 @@ class ChannelSnapshotService:
             memory_mode = "DREAM"
         else:
             memory_mode = "OFF"
+        scan_cursor, scan_watermark_at = _memory_scan_progress(
+            state,
+            continuous_enabled=continuous_enabled,
+            dream_enabled=dream_enabled,
+        )
         errors = _channel_errors(state)
         updated_at = _latest_timestamp(
             inventory.last_observed_at if inventory is not None else None,
@@ -344,6 +361,9 @@ class ChannelSnapshotService:
             state.continuous_last_success_at if state is not None else None,
             state.dream_last_attempt_at if state is not None else None,
             state.dream_last_success_at if state is not None else None,
+            scan_watermark_at,
+            state.last_retained_at if state is not None else None,
+            state.outbox_last_error_at if state is not None else None,
             *(
                 (run.updated_at for run in state.active_runs)
                 if state is not None
@@ -385,6 +405,23 @@ class ChannelSnapshotService:
                 ),
                 "pendingDocumentCount": (
                     state.pending_count if state is not None else 0
+                ),
+                "retryingDocumentCount": (
+                    state.retrying_count if state is not None else 0
+                ),
+                "deadLetterDocumentCount": (
+                    state.dead_letter_count if state is not None else 0
+                ),
+                "nextRetryAt": _timestamp(
+                    state.next_retry_at if state is not None else None
+                ),
+                "scanCursor": scan_cursor,
+                "scanWatermarkAt": _timestamp(scan_watermark_at),
+                "retainWatermarkAt": _timestamp(
+                    state.last_retained_at if state is not None else None
+                ),
+                "retainedSourceAt": _timestamp(
+                    state.last_retained_source_at if state is not None else None
                 ),
                 "lastIngestedAt": _timestamp(
                     state.last_ingested_at if state is not None else None
@@ -555,6 +592,32 @@ def _timestamp(value: float | None) -> str | None:
     return datetime.fromtimestamp(value, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
+def _memory_scan_progress(
+    state: StoredChannelState | None,
+    *,
+    continuous_enabled: bool,
+    dream_enabled: bool,
+) -> tuple[str | int | None, float | None]:
+    if state is None:
+        return None, None
+    continuous = (
+        state.continuous_cursor_message_id,
+        state.continuous_scanned_until_at,
+    )
+    dream = (state.dream_cursor_message_id, state.dream_scanned_until_at)
+    if continuous_enabled:
+        return continuous
+    if dream_enabled:
+        return dream
+    return max(
+        (continuous, dream),
+        key=lambda progress: (
+            progress[1] is not None,
+            progress[1] if progress[1] is not None else 0,
+        ),
+    )
+
+
 def _display_name(
     scope_id: str,
     inventory: ChannelInventoryItem | None,
@@ -631,6 +694,17 @@ def _channel_errors(state: StoredChannelState | None) -> list[dict[str, Any]]:
             "MEMORY_INGESTION_ERROR",
             state.dream_last_error,
             state.dream_last_attempt_at,
+            None,
+        ),
+        (
+            "MEMORY_OUTBOX",
+            (
+                "MEMORY_DELIVERY_DEAD_LETTER"
+                if state.outbox_last_dead_lettered_at is not None
+                else "MEMORY_DELIVERY_RETRY"
+            ),
+            state.outbox_last_error,
+            state.outbox_last_error_at,
             None,
         ),
         (

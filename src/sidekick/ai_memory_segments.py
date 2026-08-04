@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from sidekick.ai_memory import MemoryEpisode, MemoryEvent
 
@@ -68,6 +68,26 @@ class PendingMemoryDocument:
     @property
     def last_event_at(self) -> datetime:
         return max(event.occurred_at for event in self.episode.events)
+
+
+MemoryOutboxPipeline = Literal["continuous", "dream"]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryOutboxItem:
+    document: PendingMemoryDocument
+    pipeline: MemoryOutboxPipeline
+    attempt_count: int = 0
+    next_attempt_at: float = 0
+    last_attempt_at: float | None = None
+    last_error: str | None = None
+    dead_lettered_at: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.attempt_count < 0:
+            raise ValueError("Memory outbox attempt count cannot be negative")
+        if self.next_attempt_at < 0:
+            raise ValueError("Memory outbox retry timestamp cannot be negative")
 
 
 def segment_accepts(

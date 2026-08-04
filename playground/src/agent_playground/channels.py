@@ -9,6 +9,7 @@ import json
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 import aiohttp
@@ -27,7 +28,10 @@ _MAX_CHANNELS = 20_000
 _MAX_RUNS = 10_000
 _MAX_ERRORS = 100
 _MODEL_CACHE_TTL_SECONDS = 60.0
-RESERVED_CHANNEL_SOURCE_IDS = frozenset({"pi-models", "pi-runs", "hindsight"})
+_BANK_STATS_CONCURRENCY = 8
+RESERVED_CHANNEL_SOURCE_IDS = frozenset(
+    {"pi-models", "pi-runs", "hindsight", "hindsight-stats"}
+)
 
 
 def parse_adapter_urls(value: str | None) -> tuple[tuple[str, str], ...]:
@@ -103,6 +107,9 @@ class ChannelDashboard:
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._cache: dict[str, _CachedSource] = {}
         self._bank_cache_deadline = 0.0
+        self._bank_stats_cache: dict[str, _CachedSource] = {}
+        self._bank_stats_deadlines: dict[str, float] = {}
+        self._bank_stats_errors: dict[str, str] = {}
         self._model_cache_deadline = 0.0
         self._model_cache_status: dict[str, Any] | None = None
         self._fingerprint: str | None = None
@@ -235,6 +242,29 @@ class ChannelDashboard:
                     time.monotonic() + self._config.bank_cache_ttl
                 )
 
+            banks = results["hindsight"][0]
+            channel_bank_ids = {
+                item["scopeId"]
+                for source_id, _url in self._config.adapter_urls
+                if results[source_id][0] is not None
+                for item in results[source_id][0]["items"]
+            }
+            stats_banks = (
+                [bank for bank in banks if bank["bankId"] in channel_bank_ids]
+                if banks is not None
+                else None
+            )
+            bank_stats, bank_stats_status = await self._load_bank_stats(stats_banks)
+            if banks is not None:
+                banks = [
+                    {
+                        **bank,
+                        **_empty_bank_stats(),
+                        **bank_stats.get(bank["bankId"], {}),
+                    }
+                    for bank in banks
+                ]
+
             adapters = [
                 results[source_id][0]
                 for source_id, _url in self._config.adapter_urls
@@ -242,13 +272,13 @@ class ChannelDashboard:
             ]
             models = results["pi-models"][0]
             runs = results["pi-runs"][0]
-            banks = results["hindsight"][0]
             statuses = [
                 results[source_id][1] for source_id, _url in self._config.adapter_urls
             ] + [
                 results["pi-models"][1],
                 results["pi-runs"][1],
                 results["hindsight"][1],
+                bank_stats_status,
             ]
             content = _build_snapshot_content(
                 adapters=adapters,
@@ -326,6 +356,109 @@ class ChannelDashboard:
                     message,
                 )
             return None, _source_status(source_id, kind, "unavailable", None, message)
+
+    async def _load_bank_stats(
+        self,
+        banks: list[dict[str, Any]] | None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        source_id = "hindsight-stats"
+        if banks is None:
+            return {}, _source_status(
+                source_id,
+                "memory",
+                "unavailable",
+                None,
+                "Hindsight bank list is unavailable",
+            )
+        bank_ids = tuple(dict.fromkeys(bank["bankId"] for bank in banks))
+        active_ids = set(bank_ids)
+        for bank_id in set(self._bank_stats_cache) - active_ids:
+            self._bank_stats_cache.pop(bank_id, None)
+            self._bank_stats_deadlines.pop(bank_id, None)
+            self._bank_stats_errors.pop(bank_id, None)
+        if not bank_ids:
+            succeeded_at = _now()
+            return {}, _source_status(
+                source_id,
+                "memory",
+                "ok",
+                succeeded_at,
+            )
+        semaphore = asyncio.Semaphore(_BANK_STATS_CONCURRENCY)
+
+        async def load(
+            bank_id: str,
+        ) -> tuple[str, dict[str, Any] | None, str, str | None]:
+            now = time.monotonic()
+            cached = self._bank_stats_cache.get(bank_id)
+            if now < self._bank_stats_deadlines.get(bank_id, 0):
+                error = self._bank_stats_errors.get(bank_id)
+                if cached is not None:
+                    return (
+                        bank_id,
+                        cached.value,
+                        "stale" if error else "ok",
+                        cached.succeeded_at,
+                    )
+                if error:
+                    return bank_id, None, "unavailable", None
+            async with semaphore:
+                try:
+                    payload = await self._json(
+                        f"{self._config.memory_url}/v1/default/banks/"
+                        f"{quote(bank_id, safe='')}/stats",
+                        authenticated=False,
+                    )
+                    value = _parse_bank_stats(payload, bank_id)
+                    succeeded_at = _now()
+                    self._bank_stats_cache[bank_id] = _CachedSource(
+                        value,
+                        succeeded_at,
+                    )
+                    self._bank_stats_errors.pop(bank_id, None)
+                    status = "ok"
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._bank_stats_errors[bank_id] = _safe_error(exc)
+                    cached = self._bank_stats_cache.get(bank_id)
+                    value = cached.value if cached is not None else None
+                    succeeded_at = cached.succeeded_at if cached is not None else None
+                    status = "stale" if cached is not None else "unavailable"
+                self._bank_stats_deadlines[bank_id] = (
+                    time.monotonic() + self._config.bank_cache_ttl
+                )
+                return bank_id, value, status, succeeded_at
+
+        loaded = await asyncio.gather(*(load(bank_id) for bank_id in bank_ids))
+        values = {
+            bank_id: value
+            for bank_id, value, _status, _succeeded_at in loaded
+            if value is not None
+        }
+        unavailable = sum(status == "unavailable" for _, _, status, _ in loaded)
+        stale = sum(status == "stale" for _, _, status, _ in loaded)
+        succeeded = [
+            succeeded_at
+            for _, _, _, succeeded_at in loaded
+            if succeeded_at is not None
+        ]
+        if unavailable:
+            status = "degraded" if values else "unavailable"
+            error = f"{unavailable} of {len(bank_ids)} bank stats unavailable"
+        elif stale:
+            status = "stale"
+            error = f"Using cached stats for {stale} of {len(bank_ids)} banks"
+        else:
+            status = "ok"
+            error = None
+        return values, _source_status(
+            source_id,
+            "memory",
+            status,
+            max(succeeded) if succeeded else None,
+            error,
+        )
 
     async def _json(self, url: str, *, authenticated: bool) -> dict[str, Any]:
         headers = (
@@ -481,6 +614,24 @@ def _parse_channel(
             "pendingDocumentCount": _nonnegative_int(
                 memory, "pendingDocumentCount", maximum=1_000_000
             ),
+            "retryingDocumentCount": _optional_nonnegative_int(
+                memory,
+                "retryingDocumentCount",
+                maximum=1_000_000,
+            ),
+            "deadLetterDocumentCount": _optional_nonnegative_int(
+                memory,
+                "deadLetterDocumentCount",
+                maximum=1_000_000,
+            ),
+            "nextRetryAt": _optional_timestamp(memory, "nextRetryAt"),
+            "scanCursor": _optional_external_id(memory, "scanCursor"),
+            "scanWatermarkAt": _optional_timestamp(memory, "scanWatermarkAt"),
+            "retainWatermarkAt": _optional_timestamp(
+                memory,
+                "retainWatermarkAt",
+            ),
+            "retainedSourceAt": _optional_timestamp(memory, "retainedSourceAt"),
             "lastIngestedAt": _optional_timestamp(memory, "lastIngestedAt"),
         },
         "lastObservedAt": _optional_timestamp(value, "lastObservedAt"),
@@ -608,6 +759,49 @@ def _parse_banks(payload: dict[str, Any], _source_id: str) -> list[dict[str, Any
     return result
 
 
+def _empty_bank_stats() -> dict[str, Any]:
+    return {
+        "lastConsolidatedAt": None,
+        "pendingConsolidationCount": None,
+        "failedConsolidationCount": None,
+        "pendingOperationCount": None,
+        "failedOperationCount": None,
+    }
+
+
+def _parse_bank_stats(payload: dict[str, Any], bank_id: str) -> dict[str, Any]:
+    supplied_bank_id = payload.get("bank_id", payload.get("bankId"))
+    if supplied_bank_id != bank_id:
+        raise ValueError("bank stats are malformed")
+    return {
+        "lastConsolidatedAt": _first_optional_timestamp(
+            payload,
+            "last_consolidated_at",
+            "lastConsolidatedAt",
+        ),
+        "pendingConsolidationCount": _nested_count(
+            payload,
+            "pending_consolidation",
+            "pendingConsolidation",
+        ),
+        "failedConsolidationCount": _nested_count(
+            payload,
+            "failed_consolidation",
+            "failedConsolidation",
+        ),
+        "pendingOperationCount": _nested_count(
+            payload,
+            "pending_operations",
+            "pendingOperations",
+        ),
+        "failedOperationCount": _nested_count(
+            payload,
+            "failed_operations",
+            "failedOperations",
+        ),
+    }
+
+
 def _build_snapshot_content(
     *,
     adapters: list[dict[str, Any]],
@@ -658,6 +852,7 @@ def _build_snapshot_content(
                     "factCount": None,
                     "observationCount": None,
                     "lastDocumentAt": None,
+                    **_empty_bank_stats(),
                 }
             )
             source = source_by_id.get(item["adapterSourceId"], {})
@@ -802,6 +997,31 @@ def _nonnegative_int(value: Mapping[str, Any], key: str, *, maximum: int) -> int
         or isinstance(supplied, bool)
         or not 0 <= supplied <= maximum
     ):
+        raise ValueError(f"{key} is malformed")
+    return supplied
+
+
+def _optional_nonnegative_int(
+    value: Mapping[str, Any],
+    key: str,
+    *,
+    maximum: int,
+) -> int:
+    if value.get(key) is None:
+        return 0
+    return _nonnegative_int(value, key, maximum=maximum)
+
+
+def _optional_external_id(
+    value: Mapping[str, Any],
+    key: str,
+) -> str | int | None:
+    supplied = value.get(key)
+    if supplied is None:
+        return None
+    if isinstance(supplied, bool) or not isinstance(supplied, (str, int)):
+        raise ValueError(f"{key} is malformed")
+    if isinstance(supplied, str) and not 1 <= len(supplied) <= 512:
         raise ValueError(f"{key} is malformed")
     return supplied
 

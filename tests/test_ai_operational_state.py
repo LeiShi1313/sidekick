@@ -37,12 +37,48 @@ async def test_operational_state_aggregates_config_ingestion_and_active_runs(
                 events=(event,),
             ),
             staged_source_ids=(event.source_id,),
+            sealed=True,
         )
-        await store.stage_continuous_memory_documents(
+        dead_event = MemoryEvent(
+            source_id="qq:message:group:700:0",
+            actor_id="qq:user:42",
+            actor_display_name="Alice",
+            occurred_at=datetime(2026, 7, 31, 11, 59, tzinfo=UTC),
+            text="This delivery exhausted its retries",
+        )
+        dead = PendingMemoryDocument(
+            episode=MemoryEpisode(
+                scope_id=scope_id,
+                document_id="qq:thread:group:700:0",
+                events=(dead_event,),
+            ),
+            staged_source_ids=(dead_event.source_id,),
+            sealed=True,
+        )
+        await store.stage_continuous_memory_scan(
             scope_id,
-            (pending,),
+            (dead, pending),
             cursor_message_id=1,
+            scanned_until_at=1_800_000_000,
             succeeded_at=1_800_000_000,
+        )
+        await store.record_memory_outbox_failure(
+            scope_id,
+            dead.episode.document_id,
+            attempt_count=5,
+            attempted_at=1_800_000_004,
+            next_attempt_at=1_800_000_004,
+            dead_lettered_at=1_800_000_004,
+            error="ValueError: poison document",
+        )
+        await store.record_memory_outbox_failure(
+            scope_id,
+            pending.episode.document_id,
+            attempt_count=1,
+            attempted_at=1_800_000_005,
+            next_attempt_at=1_800_000_035,
+            dead_lettered_at=None,
+            error="ConnectionError: retry later",
         )
         await store.save_memory_document_receipt(
             scope_id,
@@ -68,8 +104,17 @@ async def test_operational_state_aggregates_config_ingestion_and_active_runs(
         assert state.access_open is True
         assert state.model_override == "openai/gpt-5"
         assert state.continuous_enabled is True
+        assert state.continuous_cursor_message_id == 1
+        assert state.continuous_scanned_until_at == 1_800_000_000
         assert state.retained_document_count == 1
         assert state.pending_count == 1
+        assert state.retrying_count == 1
+        assert state.dead_letter_count == 1
+        assert state.next_retry_at == 1_800_000_035
+        assert state.outbox_last_error == "ValueError: poison document"
+        assert state.outbox_last_error_at == 1_800_000_004
+        assert state.outbox_last_dead_lettered_at == 1_800_000_004
+        assert state.last_retained_at == state.last_ingested_at
         assert state.last_ingested_at is not None
         assert [run.status for run in state.active_runs] == ["RUNNING"]
     finally:

@@ -68,6 +68,10 @@ def scanner_settings(
     lease_seconds=3_600,
     retry_attempts=3,
     max_retry_delay=30,
+    delivery_max_attempts=5,
+    delivery_retry_base_delay=30,
+    delivery_retry_max_delay=3_600,
+    delivery_cycle_documents=100,
 ):
     return {
         "dream_settings": DreamSettings(
@@ -91,6 +95,10 @@ def scanner_settings(
             lease_seconds=lease_seconds,
             retry_attempts=retry_attempts,
             max_retry_delay=max_retry_delay,
+            delivery_max_attempts=delivery_max_attempts,
+            delivery_retry_base_delay=delivery_retry_base_delay,
+            delivery_retry_max_delay=delivery_retry_max_delay,
+            delivery_cycle_documents=delivery_cycle_documents,
         ),
     }
 
@@ -384,6 +392,9 @@ async def make_scanner(
     max_events=1,
     settlement_delay=timedelta(0),
     lease_seconds=3_600,
+    delivery_max_attempts=5,
+    delivery_retry_base_delay=30,
+    delivery_retry_max_delay=3_600,
     clock=lambda: NOW.timestamp(),
     identity_resolver=None,
 ):
@@ -412,6 +423,9 @@ async def make_scanner(
             max_events=max_events,
             retain_concurrency=retain_concurrency,
             lease_seconds=lease_seconds,
+            delivery_max_attempts=delivery_max_attempts,
+            delivery_retry_base_delay=delivery_retry_base_delay,
+            delivery_retry_max_delay=delivery_retry_max_delay,
         ),
         clock=clock,
     )
@@ -1578,17 +1592,18 @@ async def test_continuous_memory_retries_a_sealed_buffer_without_replaying_sourc
         await scanner.run_continuous_scope(-1001)
         clock.value = (NOW + timedelta(minutes=5)).timestamp()
 
-        with pytest.raises(ConnectionError, match="synthetic retain failure"):
-            await scanner.run_continuous_scope(-1001)
+        await scanner.run_continuous_scope(-1001)
 
         assert (
             await store.get_memory_scope_state("telegram:chat:-1001")
         ).continuous_cursor_message_id == 42
-        pending = await store.list_pending_memory_documents(
+        outbox = await store.list_memory_outbox_documents(
             "telegram:chat:-1001"
         )
-        assert len(pending) == 1
-        assert pending[0].sealed is True
+        assert len(outbox) == 1
+        assert outbox[0].document.sealed is True
+        assert outbox[0].attempt_count == 1
+        assert outbox[0].dead_lettered_at is None
 
         newer = FakeMessage(
             43,
@@ -1599,14 +1614,14 @@ async def test_continuous_memory_retries_a_sealed_buffer_without_replaying_sourc
         source.by_id[newer.id] = newer
         fetches_before_retry = len(source.window_calls)
 
-        with pytest.raises(ConnectionError, match="synthetic retain failure"):
-            await scanner.run_continuous_scope(-1001)
+        await scanner.run_continuous_scope(-1001)
 
         assert len(source.window_calls) == fetches_before_retry
         assert (
             await store.get_memory_scope_state("telegram:chat:-1001")
         ).continuous_cursor_message_id == 42
         source.window = (message,)
+        clock.value += 31
 
         healthy = FakeMemory()
         resumed = ChatMemoryIngestor(
@@ -1696,13 +1711,18 @@ async def test_continuous_memory_advances_staged_cursor_before_retain_failure(
         cursor_message_id=41,
     )
     try:
-        with pytest.raises(ConnectionError, match="synthetic"):
-            await scanner.run_continuous_scope(-1001)
+        await scanner.run_continuous_scope(-1001)
 
         state = await store.get_memory_scope_state("telegram:chat:-1001")
         assert state.continuous_cursor_message_id == 43
         assert state.continuous_last_success_at == NOW.timestamp()
-        assert "ConnectionError" in (state.continuous_last_error or "")
+        assert state.continuous_last_error is None
+        outbox = await store.list_memory_outbox_documents(
+            "telegram:chat:-1001"
+        )
+        assert len(outbox) == 2
+        assert outbox[0].attempt_count == 1
+        assert "ConnectionError" in (outbox[0].last_error or "")
     finally:
         await store.close()
 
@@ -2076,7 +2096,9 @@ async def test_next_scan_starts_from_scanned_watermark_not_slow_completion(tmp_p
         await scanner.run_scope(-1001)
         state = await store.get_memory_dream_state("telegram:chat:-1001")
         assert state.scanned_until_at == NOW.timestamp()
-        assert state.last_success_at == NOW.timestamp() + 30 * 60
+        assert state.last_success_at == NOW.timestamp()
+        scope = await store.get_memory_scope_state("telegram:chat:-1001")
+        assert scope.last_retained_at == NOW.timestamp() + 30 * 60
 
         arrived_during_run = FakeMessage(
             91,
@@ -2688,13 +2710,19 @@ async def test_partial_failure_keeps_cursor_and_retries_only_missing_document(tm
         retain_concurrency=1,
     )
     try:
-        with pytest.raises(ConnectionError, match="synthetic"):
-            await scanner.run_scope(-1001)
+        await scanner.run_scope(-1001)
         failed_state = await store.get_memory_dream_state("telegram:chat:-1001")
-        assert failed_state.cursor_message_id == 30
-        assert failed_state.scanned_until_at == first.date.timestamp()
+        assert failed_state.cursor_message_id == 31
+        assert failed_state.scanned_until_at == NOW.timestamp()
         assert failed_state.last_success_at == NOW.timestamp()
-        assert "ConnectionError" in failed_state.last_error
+        assert failed_state.last_error is None
+        outbox = await store.list_memory_outbox_documents(
+            "telegram:chat:-1001"
+        )
+        assert len(outbox) == 1
+        assert outbox[0].document.episode.document_id.endswith(":31")
+        assert outbox[0].attempt_count == 1
+        assert "ConnectionError" in (outbox[0].last_error or "")
 
         healthy = FakeMemory()
         resumed = ChatMemoryIngestor(
@@ -2707,7 +2735,7 @@ async def test_partial_failure_keeps_cursor_and_retries_only_missing_document(tm
             prompt_builder=PromptBuilder(identity_resolver=FakeIdentityResolver()),
             dream_settings=scanner._dream_settings,
             ingestion_settings=scanner._ingestion_settings,
-            clock=lambda: NOW.timestamp(),
+            clock=lambda: NOW.timestamp() + 31,
         )
         result = await resumed.run_scope(-1001)
         assert result.documents_created == 1
@@ -2718,5 +2746,70 @@ async def test_partial_failure_keeps_cursor_and_retries_only_missing_document(tm
         succeeded = await store.get_memory_dream_state("telegram:chat:-1001")
         assert succeeded.cursor_message_id == 31
         assert succeeded.last_error is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poison_dream_document_dead_letters_without_blocking_later_history(
+    tmp_path,
+):
+    first = FakeMessage(30, "Poison document")
+    source = FakeSource([first])
+    failed_document_id = "telegram:memory-session:-1001:20260713T115500Z:30"
+    memory = FakeMemory(fail_document=failed_document_id)
+    store, scanner = await make_scanner(
+        tmp_path,
+        source,
+        memory,
+        max_events=1,
+        delivery_max_attempts=2,
+        delivery_retry_base_delay=0,
+        delivery_retry_max_delay=0,
+    )
+    try:
+        await scanner.run_scope(-1001)
+
+        outbox = await store.list_memory_outbox_documents(
+            "telegram:chat:-1001"
+        )
+        assert len(outbox) == 1
+        assert outbox[0].document.episode.document_id == failed_document_id
+        assert outbox[0].attempt_count == 2
+        assert outbox[0].dead_lettered_at == NOW.timestamp()
+
+        second = FakeMessage(
+            31,
+            "Later history still progresses",
+            date=NOW - timedelta(minutes=4),
+        )
+        source.window = (first, second)
+        source.by_id[second.id] = second
+
+        result = await scanner.run_scope(-1001)
+
+        assert result.documents_created == 1
+        state = await store.get_memory_dream_state("telegram:chat:-1001")
+        assert state.cursor_message_id == 31
+        outbox = await store.list_memory_outbox_documents(
+            "telegram:chat:-1001"
+        )
+        assert len(outbox) == 1
+        assert outbox[0].document.episode.document_id == failed_document_id
+        assert outbox[0].dead_lettered_at is not None
+
+        assert (
+            await store.requeue_memory_dead_letters(
+                "telegram:chat:-1001",
+                queued_at=NOW.timestamp() + 1,
+            )
+            == 1
+        )
+        replayed = (
+            await store.list_memory_outbox_documents("telegram:chat:-1001")
+        )[0]
+        assert replayed.attempt_count == 0
+        assert replayed.last_error is None
+        assert replayed.dead_lettered_at is None
     finally:
         await store.close()

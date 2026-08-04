@@ -31,6 +31,10 @@ from sidekick.ai_memory_ingestion import (
     ChatMemoryIngestor,
     MemoryIngestionSettings,
 )
+from sidekick.ai_memory_outbox import (
+    MemoryOutboxScheduler,
+    MemoryOutboxSchedulerSettings,
+)
 from sidekick.chat.formatting import agent_system_prompt
 from sidekick.channel_status import (
     AdapterRuntimeState,
@@ -128,6 +132,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         self._handler: AIConversationHandler | None = None
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_memory_scheduler: ContinuousMemoryScheduler | None = None
+        self._memory_outbox_scheduler: MemoryOutboxScheduler | None = None
         self._owner_id: int | None = None
         self._saved_memory_lock = asyncio.Lock()
         self._adapter_status = AdapterRuntimeState(
@@ -172,6 +177,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 await self._continuous_memory_scheduler.close()
             if self._dream_scheduler is not None:
                 await self._dream_scheduler.close()
+            if self._memory_outbox_scheduler is not None:
+                await self._memory_outbox_scheduler.close()
             if self._memory is not None:
                 await self._memory.close()
             await self._gateway.close()
@@ -255,6 +262,12 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 settings=ContinuousMemorySchedulerSettings.from_env(),
                 logger=self.logger,
             )
+            self._memory_outbox_scheduler = MemoryOutboxScheduler(
+                runner=memory_ingestor,
+                store=self._store,
+                settings=MemoryOutboxSchedulerSettings.from_env(),
+                logger=self.logger,
+            )
         self._handler = AIConversationHandler(
             owner_id=owner.id,
             responder=responder,
@@ -286,6 +299,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             self._continuous_memory_scheduler.start()
         if self._dream_scheduler is not None:
             self._dream_scheduler.start()
+        if self._memory_outbox_scheduler is not None:
+            self._memory_outbox_scheduler.start()
         self.logger.info("Telegram AI userbot started")
 
     async def _load_channel_inventory(self) -> tuple[ChannelInventoryItem, ...]:

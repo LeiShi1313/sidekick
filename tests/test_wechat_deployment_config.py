@@ -112,3 +112,21 @@ def test_compose_declares_isolated_workers_for_both_wechat_bridges() -> None:
     networks = rendered["networks"]
     assert networks["wechat-host"]["name"] == "wechat-host_default"
     assert networks["wechat-peer"]["name"] == "wechat-peer_default"
+
+
+@pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
+def test_compose_passes_memory_outbox_settings_to_every_ai_worker() -> None:
+    services = render_compose()["services"]
+    expected = {
+        "SIDEKICK_MEMORY_OUTBOX_MAX_ATTEMPTS": "5",
+        "SIDEKICK_MEMORY_OUTBOX_RETRY_BASE_SECONDS": "30",
+        "SIDEKICK_MEMORY_OUTBOX_RETRY_MAX_SECONDS": "3600",
+        "SIDEKICK_MEMORY_OUTBOX_CYCLE_DOCUMENTS": "100",
+        "SIDEKICK_MEMORY_OUTBOX_POLL_SECONDS": "10",
+        "SIDEKICK_MEMORY_OUTBOX_CONCURRENCY": "2",
+        "SIDEKICK_MEMORY_OUTBOX_SCOPE_BATCH_SIZE": "20",
+    }
+
+    for service_name in ("ai", "onebot-ai", "wechat-host-ai", "wechat-peer-ai"):
+        environment = services[service_name]["environment"]
+        assert {key: environment[key] for key in expected} == expected
