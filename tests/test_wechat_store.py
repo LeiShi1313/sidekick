@@ -454,6 +454,7 @@ async def test_wechat_store_persists_images_for_direct_reply_lookup_only(tmp_pat
                         image_id,
                         "",
                         message_type="image",
+                        content_redacted=True,
                         media_id=media_id,
                     ),
                 ),

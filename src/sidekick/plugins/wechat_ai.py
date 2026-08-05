@@ -51,6 +51,7 @@ from sidekick.wechat.ai import (
     WeChatMemoryScopeTargetResolver,
     WeChatMessageIdentityResolver,
     WeChatMessageMentionResolver,
+    WeChatQuotedImageDescriber,
 )
 from sidekick.wechat.api import WeChatConnectorClient
 from sidekick.wechat.service import (
@@ -270,6 +271,13 @@ class WeChatAI(metaclass=PluginMount):
             system_prompt=agent_system_prompt(self._settings.system_prompt),
             max_context_messages=self._settings.max_context_messages,
             max_context_chars=self._settings.max_context_chars,
+            quoted_attachment_describer=WeChatQuotedImageDescriber(
+                self._client,
+                self._gateway,
+                request_original=bootstrap.capabilities.request_original_image,
+                download_preview=bootstrap.capabilities.inbound_image_download,
+                logger=self.logger,
+            ),
             identity_resolver=WeChatMessageIdentityResolver(identity_codec),
             mention_resolver=WeChatMessageMentionResolver(),
             history_source=history,

@@ -309,7 +309,7 @@ class _WeChatOriginalImage:
             request_id=_required_id(payload, "requestId"),
             chat_id=_required_wechat_id(payload, "chatId"),
             message_id=_required_native_message_id(payload, "messageId"),
-            media_id=_required_media_id(media, "media.id"),
+            media_id=_required_media_id(media),
             mime_type=_required_image_mime_type(media, "mimeType"),
             size=size,
             download_url=_required_text(media, "downloadUrl"),
@@ -475,6 +475,8 @@ class WeChatConnectorClient:
         message_id: str,
         media_id: str,
     ) -> WeChatDownloadedImage:
+        # Connector contract: exact tuple, separate original variant, fixed URL.
+        # https://github.com/LeiShi1313/wechat-linux-bridge/blob/cc208c06d41bd3c3d1ec8e60bf22b58d2300099d/docs/wechat-connector-api.md#L2117-L2173
         if REQUEST_ID_RE.fullmatch(request_id) is None:
             raise ValueError("WeChat request ID must be 1-128 URL-safe characters")
         target_chat = _canonical_wechat_id(chat_id, "chat_id")
@@ -686,6 +688,8 @@ class WeChatConnectorClient:
         expected_mime_type: str | None = None,
         expected_size: int | None = None,
     ) -> WeChatDownloadedImage:
+        # Successful binary media intentionally has no API-version header.
+        # https://github.com/LeiShi1313/wechat-linux-bridge/blob/cc208c06d41bd3c3d1ec8e60bf22b58d2300099d/docs/wechat-connector-api.md#L1052-L1063
         session = self._get_session()
         async with session.get(
             f"{self.base_url}{path}",
@@ -699,6 +703,14 @@ class WeChatConnectorClient:
                 and response.content_length > MAX_MEDIA_BYTES
             ):
                 raise WeChatAPIContractError("WeChat connector image is oversized")
+            if (
+                expected_size is not None
+                and response.content_length is not None
+                and response.content_length != expected_size
+            ):
+                raise WeChatAPIContractError(
+                    "WeChat connector image size differs from its metadata"
+                )
             mime_type = response.content_type.lower()
             if mime_type not in IMAGE_MIME_TYPES:
                 raise WeChatAPIContractError(
@@ -856,15 +868,15 @@ def _media_id(value: Any, field: str) -> str:
     return value
 
 
-def _required_media_id(payload: Mapping[str, Any], field: str) -> str:
-    return _media_id(payload.get("id"), field)
+def _required_media_id(payload: Mapping[str, Any]) -> str:
+    return _media_id(payload.get("id"), "media.id")
 
 
 def _optional_message_media_id(payload: Mapping[str, Any]) -> str | None:
     value = payload.get("media")
     if value is None:
         return None
-    return _required_media_id(_object(value, "media"), "media.id")
+    return _required_media_id(_object(value, "media"))
 
 
 def _required_image_mime_type(

@@ -7,11 +7,18 @@ from typing import Any, Protocol
 from urllib.parse import quote, unquote
 
 from sidekick.ai import MemoryScopeTarget, MessageIdentity, MentionedUser, ReplyTarget
+from sidekick.ai_attachments import (
+    AttachmentAnalysisGateway,
+    ChatAttachmentDescriber,
+)
+from sidekick.chat.attachments import AttachmentDescription
 from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.chat.transport import ChatPresentation, SentMessage
 from sidekick.wechat.api import (
+    MAX_MEDIA_BYTES,
     MAX_TEXT_BYTES,
+    WeChatDownloadedImage,
     WeChatSendFailed,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
@@ -114,6 +121,99 @@ class WeChatTextSender(Protocol):
     ) -> WeChatSendOperation: ...
 
 
+class WeChatImageDownloader(Protocol):
+    async def download_original_image(
+        self,
+        *,
+        request_id: str,
+        chat_id: str,
+        message_id: str,
+        media_id: str,
+    ) -> WeChatDownloadedImage: ...
+
+    async def download_image_preview(
+        self,
+        *,
+        media_id: str,
+    ) -> WeChatDownloadedImage: ...
+
+
+class WeChatQuotedImageDescriber:
+    def __init__(
+        self,
+        client: WeChatImageDownloader,
+        gateway: AttachmentAnalysisGateway,
+        *,
+        request_original: bool,
+        download_preview: bool,
+        logger: Any | None = None,
+    ):
+        self._client = client
+        self._request_original = request_original
+        self._download_preview = download_preview
+        self._logger = logger
+        self._content_describer = ChatAttachmentDescriber(
+            gateway,
+            max_file_bytes=MAX_MEDIA_BYTES,
+            logger=logger,
+        )
+
+    def has_attachment(self, message: Any) -> bool:
+        return (
+            isinstance(message, WeChatMessage)
+            and message.message_type == "image"
+            and message.media_id is not None
+        )
+
+    async def describe(self, message: Any) -> AttachmentDescription | None:
+        if not self.has_attachment(message):
+            return None
+        assert isinstance(message, WeChatMessage)
+        assert message.media_id is not None
+
+        downloaded: WeChatDownloadedImage | None = None
+        if self._request_original:
+            try:
+                downloaded = await self._client.download_original_image(
+                    request_id=_request_id(message, "original"),
+                    chat_id=message.chat_id,
+                    message_id=message.id,
+                    media_id=message.media_id,
+                )
+            except Exception as exc:
+                self._log_unavailable("original", exc)
+        if downloaded is None and self._download_preview:
+            try:
+                downloaded = await self._client.download_image_preview(
+                    media_id=message.media_id,
+                )
+            except Exception as exc:
+                self._log_unavailable("preview", exc)
+        if downloaded is None:
+            return AttachmentDescription(
+                context_text=(
+                    "Quoted image content is unavailable; neither the original "
+                    "nor low-resolution preview could be downloaded."
+                ),
+                memory_text=(
+                    "The subject shared an image, but its original and "
+                    "low-resolution preview were unavailable for analysis."
+                ),
+            )
+        return await self._content_describer.describe_image_bytes(
+            downloaded.data,
+            mime_type=downloaded.mime_type,
+        )
+
+    def _log_unavailable(self, variant: str, exc: Exception) -> None:
+        if self._logger is not None:
+            self._logger.debug(
+                "WeChat quoted %s image unavailable (%s)",
+                variant,
+                type(exc).__name__,
+            )
+
+
 @dataclass(slots=True)
 class WeChatSentMessage:
     id: str
@@ -153,7 +253,7 @@ class WeChatChatTransport:
         if not isinstance(message, WeChatMessage) or message.reply_to_msg_id is None:
             return None
         try:
-            return await self._store.get_message(
+            return await self._store.get_reply_message(
                 self._connector_key,
                 message.chat_id,
                 message.reply_to_msg_id,

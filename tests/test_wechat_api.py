@@ -78,6 +78,7 @@ def test_wechat_client_parses_image_media_identity() -> None:
         **connector_message_payload("4159667620982040828"),
         "messageType": "image",
         "content": "",
+        "contentRedacted": True,
         "media": {
             "id": "0123456789abcdef0123456789abcdef",
             "state": "available",
@@ -87,6 +88,7 @@ def test_wechat_client_parses_image_media_identity() -> None:
     message = WeChatConnectorMessage.parse(payload)
 
     assert message.media_id == "0123456789abcdef0123456789abcdef"
+    assert message.content_redacted is True
 
 
 @pytest.mark.parametrize(
