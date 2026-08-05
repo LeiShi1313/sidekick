@@ -149,6 +149,8 @@ class FakeConnectorClient:
             text_send_ready=True,
             connection_generation=41,
             history=False,
+            inbound_image_download=True,
+            request_original_image=True,
         )
         self.chats = WeChatChatList(
             chats=(WeChatChat(id=CHAT_ID, type="group", display_name="Example"),),
@@ -479,6 +481,8 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
             text_send_ready=True,
             connection_generation=42,
             history=False,
+            inbound_image_download=True,
+            request_original_image=True,
         )
         client.chats = WeChatChatList(
             chats=client.chats.chats,

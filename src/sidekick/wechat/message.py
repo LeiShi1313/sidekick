@@ -25,6 +25,7 @@ class WeChatMessage:
     scope_display_name: str | None
     source: str | None
     sequence: str | None
+    media_id: str | None = None
     file: None = None
     post: bool = False
     grouped_id: None = None
@@ -59,6 +60,9 @@ class WeChatMessage:
             source=(str(values["source"]) if values["source"] is not None else None),
             sequence=(
                 str(values["sequence"]) if values["sequence"] is not None else None
+            ),
+            media_id=(
+                str(values["media_id"]) if values["media_id"] is not None else None
             ),
         )
 

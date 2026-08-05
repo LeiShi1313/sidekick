@@ -106,6 +106,7 @@ class WeChatStateRepository:
                 message_id TEXT NOT NULL,
                 direction TEXT NOT NULL,
                 message_type TEXT NOT NULL,
+                media_id TEXT,
                 sender_id TEXT NOT NULL,
                 reply_to_message_id TEXT,
                 content TEXT NOT NULL,
@@ -147,6 +148,10 @@ class WeChatStateRepository:
         if "memory_order" not in message_columns:
             await connection.execute(
                 "ALTER TABLE wechat_messages ADD COLUMN memory_order INTEGER"
+            )
+        if "media_id" not in message_columns:
+            await connection.execute(
+                "ALTER TABLE wechat_messages ADD COLUMN media_id TEXT"
             )
         await connection.execute(
             "UPDATE wechat_messages SET memory_order = local_order "
@@ -457,6 +462,21 @@ class WeChatStateRepository:
             include_unsupported=False,
         )
 
+    @_serialized
+    async def get_reply_message(
+        self,
+        connector_key: str,
+        chat_id: str,
+        message_id: str,
+    ) -> WeChatMessage | None:
+        return await self._get_message(
+            connector_key,
+            chat_id,
+            message_id,
+            include_unsupported=False,
+            include_quoted_images=True,
+        )
+
     async def _get_message(
         self,
         connector_key: str,
@@ -464,9 +484,13 @@ class WeChatStateRepository:
         message_id: str,
         *,
         include_unsupported: bool,
+        include_quoted_images: bool = False,
     ) -> WeChatMessage | None:
         cursor = await self._require_connection().execute(
-            self._message_select(include_unsupported=include_unsupported)
+            self._message_select(
+                include_unsupported=include_unsupported,
+                include_quoted_images=include_quoted_images,
+            )
             + " AND messages.chat_id = ? AND messages.message_id = ?",
             (connector_key, chat_id, message_id),
         )
@@ -727,15 +751,19 @@ class WeChatStateRepository:
             """
             INSERT INTO wechat_messages (
                 memory_order, connector_key, account_id, chat_id, message_id,
-                direction, message_type, sender_id, reply_to_message_id, content,
-                content_redacted, timestamp, source, sequence,
-                last_event_cursor, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                direction, message_type, media_id, sender_id,
+                reply_to_message_id, content, content_redacted, timestamp,
+                source, sequence, last_event_cursor, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(connector_key, account_id, chat_id, message_id)
             DO UPDATE SET
                 memory_order = CASE
                     WHEN wechat_messages.direction IS NOT excluded.direction
                       OR wechat_messages.message_type IS NOT excluded.message_type
+                      OR (
+                          excluded.media_id IS NOT NULL
+                          AND wechat_messages.media_id IS NOT excluded.media_id
+                      )
                       OR wechat_messages.sender_id IS NOT excluded.sender_id
                       OR (
                           excluded.reply_to_message_id IS NOT NULL
@@ -771,6 +799,7 @@ class WeChatStateRepository:
                 END,
                 direction = excluded.direction,
                 message_type = excluded.message_type,
+                media_id = COALESCE(excluded.media_id, wechat_messages.media_id),
                 sender_id = excluded.sender_id,
                 reply_to_message_id = COALESCE(
                     excluded.reply_to_message_id,
@@ -803,6 +832,7 @@ class WeChatStateRepository:
                 message.id,
                 message.direction,
                 message.message_type,
+                message.media_id,
                 message.sender_id,
                 message.reply_to_message_id,
                 message.content,
@@ -855,7 +885,11 @@ class WeChatStateRepository:
         return row
 
     @staticmethod
-    def _message_select(*, include_unsupported: bool = False) -> str:
+    def _message_select(
+        *,
+        include_unsupported: bool = False,
+        include_quoted_images: bool = False,
+    ) -> str:
         query = """
             SELECT
                 messages.*,
@@ -874,6 +908,14 @@ class WeChatStateRepository:
         """
         if include_unsupported:
             return query
+        if include_quoted_images:
+            return (
+                query
+                + " AND ((messages.content_redacted = 0"
+                + " AND messages.message_type = 'text')"
+                + " OR (messages.message_type = 'image'"
+                + " AND messages.media_id IS NOT NULL))"
+            )
         return (
             query
             + " AND messages.content_redacted = 0"
