@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import timedelta
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from sidekick.ai import (
     AIConversationHandler,
@@ -15,6 +17,7 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_continuous_memory import ContinuousMemoryScheduler
+from sidekick.ai_attachments import AttachmentAnalysisRequest
 from sidekick.ai_dream import DreamSettings
 from sidekick.ai_memory import MemoryRetainResult
 from sidekick.ai_memory_ingestion import (
@@ -30,12 +33,15 @@ from sidekick.wechat.ai import (
     WeChatIdentityCodec,
     WeChatMessageIdentityResolver,
     WeChatMessageMentionResolver,
+    WeChatQuotedImageDescriber,
 )
 from sidekick.wechat.api import (
+    WeChatAPIError,
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
     WeChatConnectorMessage,
+    WeChatDownloadedImage,
     WeChatEvent,
     WeChatMessageList,
     WeChatSendOperation,
@@ -66,6 +72,42 @@ class RecordingConnectorClient:
         return response
 
 
+class RecordingMediaConnectorClient(RecordingConnectorClient):
+    def __init__(
+        self,
+        responses: tuple[object, ...],
+        *,
+        original: object,
+        preview: object,
+    ):
+        super().__init__(responses)
+        self.original = original
+        self.preview = preview
+        self.media_calls: list[tuple[str, str]] = []
+
+    async def download_original_image(
+        self,
+        *,
+        request_id,
+        chat_id,
+        message_id,
+        media_id,
+    ):
+        assert request_id.startswith("sidekick.wechat.original.")
+        assert chat_id == GROUP_ID
+        assert message_id == "4159667620982040828"
+        self.media_calls.append(("original", media_id))
+        if isinstance(self.original, Exception):
+            raise self.original
+        return self.original
+
+    async def download_image_preview(self, *, media_id):
+        self.media_calls.append(("preview", media_id))
+        if isinstance(self.preview, Exception):
+            raise self.preview
+        return self.preview
+
+
 class FinalGateway:
     def __init__(self, answer: str = "final answer"):
         self.answer = answer
@@ -90,6 +132,17 @@ class FinalGateway:
         return True
 
 
+class ImageFinalGateway(FinalGateway):
+    def __init__(self, description: str = "A sign says high resolution."):
+        super().__init__("I used the quoted image.")
+        self.description = description
+        self.attachment_requests: list[AttachmentAnalysisRequest] = []
+
+    async def describe_attachment(self, request: AttachmentAnalysisRequest) -> str:
+        self.attachment_requests.append(request)
+        return self.description
+
+
 class RecordingMemory:
     def __init__(self):
         self.episodes = []
@@ -112,20 +165,29 @@ def submitted(
     )
 
 
-async def bootstrap_store(path, *, trigger_text="/ai hello", direction="out"):
+async def bootstrap_store(
+    path,
+    *,
+    trigger_text="/ai hello",
+    direction="out",
+    message_type="text",
+    media_id=None,
+    content_redacted=False,
+):
     store = await WeChatStateRepository(path).connect()
     trigger = WeChatConnectorMessage(
         id="4159667620982040828",
         chat_id=GROUP_ID,
         direction=direction,
-        message_type="text",
+        message_type=message_type,
         sender_id=ACCOUNT_ID if direction == "out" else "wxid_alice",
         reply_to_message_id=None,
         content=trigger_text,
-        content_redacted=False,
+        content_redacted=content_redacted,
         timestamp=1_783_772_734,
         source="wechat+localdb",
         sequence=None,
+        media_id=media_id,
     )
     await store.bootstrap(
         connector_key=CONNECTOR_KEY,
@@ -158,9 +220,19 @@ async def bootstrap_store(path, *, trigger_text="/ai hello", direction="out"):
         ),
         messages=WeChatMessageList(messages=(trigger,), cursor="10"),
     )
-    observed = await store.get_message(CONNECTOR_KEY, GROUP_ID, trigger.id)
+    observed = await (
+        store.get_reply_message(CONNECTOR_KEY, GROUP_ID, trigger.id)
+        if message_type == "image"
+        else store.get_message(CONNECTOR_KEY, GROUP_ID, trigger.id)
+    )
     assert observed is not None
     return store, observed
+
+
+def image_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2_000, 1_000), (255, 255, 255)).save(output, format="PNG")
+    return output.getvalue()
 
 
 async def project_quoted_reply(
@@ -489,6 +561,187 @@ async def test_wechat_conversation_handler_uses_quoted_message_as_context(
 
 
 @pytest.mark.asyncio
+async def test_wechat_conversation_handler_uses_quoted_original_image_as_context(
+    tmp_path,
+) -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+    raw_image = image_bytes()
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="",
+        direction="in",
+        message_type="image",
+        media_id=media_id,
+        content_redacted=True,
+    )
+    command = await project_quoted_reply(wechat_store, reply_to=target.id)
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingMediaConnectorClient(
+        (submitted(),),
+        original=WeChatDownloadedImage(
+            data=raw_image,
+            mime_type="image/png",
+            variant="original",
+        ),
+        preview=AssertionError("preview should not be requested"),
+    )
+    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    gateway = ImageFinalGateway()
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(gateway, initial_status=None, transport=transport),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            quoted_attachment_describer=WeChatQuotedImageDescriber(
+                client,
+                gateway,
+                request_original=True,
+                download_preview=True,
+            ),
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    try:
+        handled = await handler.handle(command)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert client.media_calls == [("original", media_id)]
+    assert len(gateway.attachment_requests) == 1
+    attachment_request = gateway.attachment_requests[0]
+    assert attachment_request.kind == "image"
+    assert attachment_request.mime_type == "image/jpeg"
+    assert attachment_request.data is not None
+    with Image.open(BytesIO(attachment_request.data)) as normalized:
+        assert max(normalized.size) == 1_600
+    assert len(gateway.requests[0].context) == 1
+    assert "A sign says high resolution." in gateway.requests[0].context[0].text
+
+
+@pytest.mark.asyncio
+async def test_wechat_quoted_image_falls_back_to_preview_when_original_fails(
+    tmp_path,
+) -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="",
+        direction="in",
+        message_type="image",
+        media_id=media_id,
+    )
+    gateway = ImageFinalGateway("A readable low-resolution sign.")
+    client = RecordingMediaConnectorClient(
+        (),
+        original=WeChatAPIError(404, "ORIGINAL_IMAGE_NOT_FOUND", "not found"),
+        preview=WeChatDownloadedImage(
+            data=image_bytes(),
+            mime_type="image/png",
+            variant="preview",
+        ),
+    )
+    describer = WeChatQuotedImageDescriber(
+        client,
+        gateway,
+        request_original=True,
+        download_preview=True,
+    )
+    try:
+        result = await describer.describe(target)
+    finally:
+        await wechat_store.close()
+
+    assert result is not None
+    assert "readable low-resolution sign" in result.context_text
+    assert client.media_calls == [
+        ("original", media_id),
+        ("preview", media_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_quoted_image_uses_preview_without_original_capability(
+    tmp_path,
+) -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="",
+        direction="in",
+        message_type="image",
+        media_id=media_id,
+    )
+    gateway = ImageFinalGateway("A preview-only description.")
+    client = RecordingMediaConnectorClient(
+        (),
+        original=AssertionError("original should be capability-gated"),
+        preview=WeChatDownloadedImage(
+            data=image_bytes(),
+            mime_type="image/png",
+            variant="preview",
+        ),
+    )
+    describer = WeChatQuotedImageDescriber(
+        client,
+        gateway,
+        request_original=False,
+        download_preview=True,
+    )
+    try:
+        result = await describer.describe(target)
+    finally:
+        await wechat_store.close()
+
+    assert result is not None
+    assert "preview-only description" in result.context_text
+    assert client.media_calls == [("preview", media_id)]
+
+
+@pytest.mark.asyncio
+async def test_wechat_quoted_image_reports_when_no_image_variant_is_available(
+    tmp_path,
+) -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="",
+        direction="in",
+        message_type="image",
+        media_id=media_id,
+    )
+    gateway = ImageFinalGateway()
+    client = RecordingMediaConnectorClient(
+        (),
+        original=AssertionError("original should be capability-gated"),
+        preview=AssertionError("preview should be capability-gated"),
+    )
+    describer = WeChatQuotedImageDescriber(
+        client,
+        gateway,
+        request_original=False,
+        download_preview=False,
+    )
+    try:
+        result = await describer.describe(target)
+    finally:
+        await wechat_store.close()
+
+    assert result is not None
+    assert "quoted image content is unavailable" in result.context_text.lower()
+    assert client.media_calls == []
+    assert gateway.attachment_requests == []
+
+
+@pytest.mark.asyncio
 async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
     tmp_path,
     monkeypatch,
@@ -502,7 +755,7 @@ async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
     async def unavailable_reply(*_args, **_kwargs):
         raise RuntimeError("projection unavailable")
 
-    monkeypatch.setattr(wechat_store, "get_message", unavailable_reply)
+    monkeypatch.setattr(wechat_store, "get_reply_message", unavailable_reply)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
     transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)

@@ -100,12 +100,20 @@ class ChatAttachmentDescriber:
         gateway: AttachmentAnalysisGateway,
         *,
         download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
+        max_file_bytes: int = MAX_FILE_BYTES,
         logger: Any | None = None,
     ):
         if download_timeout <= 0:
             raise ValueError("Attachment download timeout must be positive")
+        if (
+            isinstance(max_file_bytes, bool)
+            or not isinstance(max_file_bytes, int)
+            or max_file_bytes < 1
+        ):
+            raise ValueError("Attachment byte limit must be positive")
         self._gateway = gateway
         self._download_timeout = download_timeout
+        self._max_file_bytes = max_file_bytes
         self._logger = logger
 
     def has_attachment(self, message: Any) -> bool:
@@ -121,7 +129,7 @@ class ChatAttachmentDescriber:
         size = _safe_size(getattr(file, "size", None))
         metadata = _render_metadata(filename, mime_type, size)
 
-        if size is None or size > self.MAX_FILE_BYTES:
+        if size is None or size > self._max_file_bytes:
             return _metadata_only(
                 metadata,
                 "content exceeds the analysis limit",
@@ -138,12 +146,60 @@ class ChatAttachmentDescriber:
             )
             if not isinstance(raw, bytes) or not raw:
                 raise ValueError("Chat transport returned no attachment bytes")
-            if len(raw) > self.MAX_FILE_BYTES:
-                return _metadata_only(
-                    metadata,
-                    "content exceeds the analysis limit",
-                )
+        except Exception as exc:
+            return self._analysis_unavailable(metadata, exc)
+        if len(raw) > self._max_file_bytes:
+            return _metadata_only(
+                metadata,
+                "content exceeds the analysis limit",
+            )
+        return await self._describe_downloaded(
+            raw,
+            kind=kind,
+            mime_type=mime_type,
+            filename=filename,
+            metadata=metadata,
+        )
 
+    async def describe_image_bytes(
+        self,
+        data: bytes,
+        *,
+        mime_type: str,
+        filename: str | None = None,
+    ) -> AttachmentDescription:
+        safe_filename = _safe_filename(filename)
+        safe_mime_type = _resolve_mime_type(mime_type, safe_filename)
+        size = len(data) if isinstance(data, bytes) else None
+        metadata = _render_metadata(safe_filename, safe_mime_type, size)
+        if not isinstance(data, bytes) or not data:
+            return self._analysis_unavailable(
+                metadata,
+                ValueError("Chat transport returned no attachment bytes"),
+            )
+        if len(data) > self._max_file_bytes:
+            return _metadata_only(
+                metadata,
+                "content exceeds the analysis limit",
+            )
+        return await self._describe_downloaded(
+            data,
+            kind="image",
+            mime_type=safe_mime_type,
+            filename=safe_filename,
+            metadata=metadata,
+        )
+
+    async def _describe_downloaded(
+        self,
+        raw: bytes,
+        *,
+        kind: AttachmentKind,
+        mime_type: str,
+        filename: str | None,
+        metadata: str,
+    ) -> AttachmentDescription:
+        try:
             if kind == "image":
                 normalized = await asyncio.to_thread(
                     _normalize_image,
@@ -188,12 +244,19 @@ class ChatAttachmentDescriber:
                 ),
             )
         except Exception as exc:
-            if self._logger is not None:
-                self._logger.warning(
-                    "Attachment analysis failed (%s)",
-                    type(exc).__name__,
-                )
-            return _metadata_only(metadata, "content description is unavailable")
+            return self._analysis_unavailable(metadata, exc)
+
+    def _analysis_unavailable(
+        self,
+        metadata: str,
+        exc: Exception,
+    ) -> AttachmentDescription:
+        if self._logger is not None:
+            self._logger.warning(
+                "Attachment analysis failed (%s)",
+                type(exc).__name__,
+            )
+        return _metadata_only(metadata, "content description is unavailable")
 
 
 def _classify_attachment(

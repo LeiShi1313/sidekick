@@ -937,6 +937,7 @@ class PromptBuilder:
         max_context_messages: int = 20,
         max_context_chars: int = 12_000,
         attachment_describer: AttachmentDescriber | None = None,
+        quoted_attachment_describer: AttachmentDescriber | None = None,
         identity_resolver: MessageIdentityResolver | None = None,
         mention_resolver: MessageMentionResolver | None = None,
         history_source: MessageHistorySource | None = None,
@@ -953,6 +954,7 @@ class PromptBuilder:
         self.max_context_messages = max_context_messages
         self.max_context_chars = max_context_chars
         self.attachment_describer = attachment_describer
+        self.quoted_attachment_describer = quoted_attachment_describer
         self.identity_resolver = identity_resolver
         self.mention_resolver = mention_resolver
         self.history_source = history_source
@@ -981,6 +983,22 @@ class PromptBuilder:
             return await self.attachment_describer.describe(message)
         except Exception:
             return None
+
+    async def _describe_context_attachment(
+        self,
+        message: ReplyTarget,
+        *,
+        directly_quoted: bool,
+    ) -> AttachmentDescription | None:
+        if directly_quoted and self.quoted_attachment_describer is not None:
+            try:
+                if self.quoted_attachment_describer.has_attachment(message):
+                    described = await self.quoted_attachment_describer.describe(message)
+                    if described is not None:
+                        return described
+            except Exception:
+                pass
+        return await self.describe_attachment(message)
 
     async def resolve_identity(self, message: ReplyTarget) -> MessageIdentity:
         if self.identity_resolver is None:
@@ -1133,7 +1151,13 @@ class PromptBuilder:
             text = (message.raw_text or "").strip()
             attachment = None
             if attachment_count < self.max_attachments:
-                attachment = await self.describe_attachment(message)
+                attachment = await self._describe_context_attachment(
+                    message,
+                    directly_quoted=(
+                        current_reply_to_message_id is not None
+                        and message.id == current_reply_to_message_id
+                    ),
+                )
                 if attachment is not None:
                     attachment_count += 1
             content = [text] if text else []

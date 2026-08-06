@@ -9,6 +9,7 @@ from aiohttp.test_utils import TestServer
 import pytest
 
 from sidekick.wechat.api import (
+    MAX_MEDIA_BYTES,
     WeChatAPIContractError,
     WeChatConnectorMessage,
     WeChatConnectorClient,
@@ -70,6 +71,43 @@ def test_wechat_client_preserves_maximum_uint64_message_id_as_text() -> None:
 
     assert message.id == message_id
     assert operation.message_id == message_id
+
+
+def test_wechat_client_parses_image_media_identity() -> None:
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "image",
+        "content": "",
+        "contentRedacted": True,
+        "media": {
+            "id": "0123456789abcdef0123456789abcdef",
+            "state": "available",
+        },
+    }
+
+    message = WeChatConnectorMessage.parse(payload)
+
+    assert message.media_id == "0123456789abcdef0123456789abcdef"
+    assert message.content_redacted is True
+
+
+@pytest.mark.parametrize(
+    "media_id",
+    (
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef",
+        "../../0123456789abcdef0123456789ab",
+    ),
+)
+def test_wechat_client_rejects_noncanonical_media_ids(media_id: str) -> None:
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "image",
+        "media": {"id": media_id, "state": "available"},
+    }
+
+    with pytest.raises(WeChatAPIContractError, match="media.id"):
+        WeChatConnectorMessage.parse(payload)
 
 
 @pytest.mark.parametrize(
@@ -176,6 +214,10 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
                     "connectionGeneration": 41,
                     "sessionStatus": "logged_in",
                     "textSendReady": True,
+                },
+                "media": {
+                    "inboundImageDownload": True,
+                    "requestOriginalImage": True,
                 },
                 "sync": {"history": False},
             }
@@ -288,6 +330,8 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
     assert observed_session.self_id == "wxid_self"
     assert observed_session.connection_generation == 41
     observed_capabilities.require_ai_channel()
+    assert observed_capabilities.inbound_image_download is True
+    assert observed_capabilities.request_original_image is True
     assert observed_chats.snapshot.id == "snapshot-41"
     assert observed_chats.chats[0].id == "56825427596@chatroom"
     assert observed_messages.messages[0].id == "4159667620982040828"
@@ -300,6 +344,91 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
             "content": "final answer",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_client_downloads_exact_original_image() -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+    image_bytes = b"full-resolution-image"
+    posted: list[dict[str, object]] = []
+
+    async def request_original(request: web.Request) -> web.Response:
+        assert request.match_info["media_id"] == media_id
+        assert request.headers["Authorization"] == "Bearer bridge-secret"
+        posted.append(await request.json())
+        return json_response(
+            {
+                "requestId": "sidekick.wechat.original.request-1",
+                "status": "available",
+                "chatId": "56825427596@chatroom",
+                "messageId": "4159667620982040828",
+                "media": {
+                    "id": media_id,
+                    "variant": "original",
+                    "mimeType": "image/png",
+                    "size": len(image_bytes),
+                    "downloadUrl": f"/media/{media_id}/original",
+                },
+            }
+        )
+
+    async def download_original(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == "Bearer bridge-secret"
+        return web.Response(body=image_bytes, content_type="image/png")
+
+    app = web.Application()
+    app.router.add_post("/media/{media_id}/original", request_original)
+    app.router.add_get("/media/{media_id}/original", download_original)
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(
+            str(server.make_url("/")),
+            token="bridge-secret",
+        )
+        try:
+            image = await client.download_original_image(
+                request_id="sidekick.wechat.original.request-1",
+                chat_id="56825427596@chatroom",
+                message_id="4159667620982040828",
+                media_id=media_id,
+            )
+        finally:
+            await client.close()
+
+    assert image.data == image_bytes
+    assert image.mime_type == "image/png"
+    assert image.variant == "original"
+    assert posted == [
+        {
+            "requestId": "sidekick.wechat.original.request-1",
+            "chatId": "56825427596@chatroom",
+            "messageId": "4159667620982040828",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_client_rejects_oversized_preview_before_reading_body() -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+
+    async def oversized_preview(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(
+            headers={
+                "Content-Type": "image/jpeg",
+                "Content-Length": str(MAX_MEDIA_BYTES + 1),
+            }
+        )
+        await response.prepare(request)
+        return response
+
+    app = web.Application()
+    app.router.add_get("/media/{media_id}", oversized_preview)
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(str(server.make_url("/")))
+        try:
+            with pytest.raises(WeChatAPIContractError, match="oversized"):
+                await client.download_image_preview(media_id=media_id)
+        finally:
+            await client.close()
 
 
 @pytest.mark.asyncio

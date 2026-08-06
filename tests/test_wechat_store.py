@@ -70,6 +70,7 @@ def connector_message(
     timestamp: int = 1_783_772_734,
     message_type: str = "text",
     content_redacted: bool = False,
+    media_id: str | None = None,
 ) -> WeChatConnectorMessage:
     return WeChatConnectorMessage(
         id=message_id,
@@ -83,6 +84,7 @@ def connector_message(
         timestamp=timestamp,
         source="wechat+localdb",
         sequence=None,
+        media_id=media_id,
     )
 
 
@@ -436,6 +438,53 @@ async def test_wechat_history_excludes_redacted_and_unsupported_messages(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_wechat_store_persists_images_for_direct_reply_lookup_only(tmp_path):
+    path = tmp_path / "wechat.db"
+    image_id = "5159667620982040828"
+    media_id = "0123456789abcdef0123456789abcdef"
+    store = await WeChatStateRepository(path).connect()
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=chat_list(),
+            messages=WeChatMessageList(
+                messages=(
+                    connector_message(
+                        image_id,
+                        "",
+                        message_type="image",
+                        content_redacted=True,
+                        media_id=media_id,
+                    ),
+                ),
+                cursor="bootstrap-messages",
+            ),
+        )
+
+        assert await store.get_message(CONNECTOR_KEY, GROUP_ID, image_id) is None
+        quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, image_id)
+
+        assert quoted is not None
+        assert quoted.message_type == "image"
+        assert quoted.media_id == media_id
+    finally:
+        await store.close()
+
+    restarted = await WeChatStateRepository(path).connect()
+    try:
+        quoted = await restarted.get_reply_message(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            image_id,
+        )
+        assert quoted is not None
+        assert quoted.media_id == media_id
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
 async def test_wechat_store_applies_empty_redaction_revision(tmp_path):
     message_id = "3159667620982040828"
     store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
@@ -539,6 +588,7 @@ async def test_wechat_store_migrates_existing_messages_to_memory_order(tmp_path)
 
         assert message is not None
         assert message.memory_cursor == 1
+        assert message.media_id is None
     finally:
         await store.close()
 

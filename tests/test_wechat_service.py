@@ -8,6 +8,9 @@ import pytest
 
 from sidekick.ai import AISettings, AIStateRepository
 from sidekick.channel_status import ChannelOpsSettings
+from sidekick.plugins.base import command_registry
+from sidekick.plugins.wechat_ai import WeChatAI, WeChatRuntimeSettings
+from sidekick.wechat.ai import WeChatQuotedImageDescriber
 from sidekick.wechat.api import (
     WeChatCapabilities,
     WeChatChat,
@@ -17,8 +20,6 @@ from sidekick.wechat.api import (
     WeChatMessageList,
     WeChatSession,
 )
-from sidekick.plugins.base import command_registry
-from sidekick.plugins.wechat_ai import WeChatAI, WeChatRuntimeSettings
 from sidekick.wechat.service import (
     WeChatEventPump,
     bootstrap_wechat_channel,
@@ -63,8 +64,12 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
     plugin._memory = memory
     plugin.logger = logging.getLogger("test-wechat-memory-runtime")
 
+    connector = FakeConnectorClient()
     runtime = plugin._build_channel_runtime(
-        SimpleNamespace(session=FakeConnectorClient().session)
+        SimpleNamespace(
+            session=connector.session,
+            capabilities=connector.capabilities,
+        )
     )
 
     assert runtime.handler._memory is memory
@@ -75,6 +80,10 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
     assert runtime.outbox_scheduler is not None
     assert runtime.identity_codec.scope_id(CHAT_ID) == (
         "wechat:account:wxid_self:chat:56825427596%40chatroom"
+    )
+    assert isinstance(
+        runtime.handler._prompt_builder.quoted_attachment_describer,
+        WeChatQuotedImageDescriber,
     )
 
 
@@ -149,6 +158,8 @@ class FakeConnectorClient:
             text_send_ready=True,
             connection_generation=41,
             history=False,
+            inbound_image_download=True,
+            request_original_image=True,
         )
         self.chats = WeChatChatList(
             chats=(WeChatChat(id=CHAT_ID, type="group", display_name="Example"),),
@@ -479,6 +490,8 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
             text_send_ready=True,
             connection_generation=42,
             history=False,
+            inbound_image_download=True,
+            request_original_image=True,
         )
         client.chats = WeChatChatList(
             chats=client.chats.chats,

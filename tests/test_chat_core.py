@@ -365,6 +365,15 @@ class OpaqueAttachmentDescriber:
         )
 
 
+class RecordingQuotedAttachmentDescriber(OpaqueAttachmentDescriber):
+    def __init__(self):
+        self.described: list[object] = []
+
+    async def describe(self, message):
+        self.described.append(message.id)
+        return await super().describe(message)
+
+
 @pytest.mark.asyncio
 async def test_attachment_detection_does_not_require_telegram_file_attributes():
     transport = FakeTransport()
@@ -385,6 +394,39 @@ async def test_attachment_detection_does_not_require_telegram_file_attributes():
 
     assert handled is True
     assert transport.updates[-1] == ("final", "agent", True)
+
+
+@pytest.mark.asyncio
+async def test_quote_attachment_strategy_only_describes_the_direct_reply() -> None:
+    transport = FakeTransport()
+    quoted = MinimalMessage("", message_id=2, reply_to_message_id=None)
+    ambient = MinimalMessage("", message_id=3, reply_to_message_id=None)
+    trigger = MinimalMessage(
+        "/ai2 explain this",
+        message_id=4,
+        reply_to_message_id=quoted.id,
+    )
+    transport.reply_targets[trigger] = quoted
+
+    class History:
+        async def fetch_recent(self, _trigger, *, before, limit):
+            assert before is quoted
+            assert limit == 1
+            return (ambient,)
+
+    describer = RecordingQuotedAttachmentDescriber()
+    builder = PromptBuilder(
+        transport=transport,
+        history_source=History(),
+        quoted_attachment_describer=describer,
+    )
+
+    context = await builder.load_chat_context(trigger, recent_messages=2)
+    background_description = await builder.describe_attachment(quoted)
+
+    assert describer.described == [quoted.id]
+    assert background_description is None
+    assert [message.message_id for message in context.messages] == [quoted.id]
 
 
 @pytest.mark.asyncio
