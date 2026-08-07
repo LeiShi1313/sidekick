@@ -1,6 +1,8 @@
 services:
   dashboard-proxy:
-    image: nginx:1.30.4-alpine
+    build:
+      context: .
+    image: sidekick-dashboard-proxy:local
     container_name: sidekick-dashboard-proxy
     user: "101:101"
     entrypoint: ["nginx"]
@@ -10,8 +12,6 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:${DASHBOARD_PROXY_EXPOSE_PORT:-18865}:8080"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - agent-platform
     cap_drop:
