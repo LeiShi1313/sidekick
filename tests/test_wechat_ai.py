@@ -63,10 +63,24 @@ GROUP_ID = "56825427596@chatroom"
 class RecordingConnectorClient:
     def __init__(self, responses: tuple[object, ...]):
         self.responses = list(responses)
-        self.calls: list[dict[str, str]] = []
+        self.calls: list[dict[str, str | None]] = []
 
-    async def send_text_and_wait(self, *, request_id, to, content):
-        self.calls.append({"request_id": request_id, "to": to, "content": content})
+    async def send_text_and_wait(
+        self,
+        *,
+        request_id,
+        to,
+        content,
+        reply_to_message_id,
+    ):
+        self.calls.append(
+            {
+                "request_id": request_id,
+                "to": to,
+                "content": content,
+                "reply_to_message_id": reply_to_message_id,
+            }
+        )
         if not self.responses:
             raise AssertionError("No WeChat send response prepared")
         response = self.responses.pop(0)
@@ -273,7 +287,12 @@ async def test_wechat_responder_defers_placeholder_and_sends_one_bounded_final(
     store, trigger = await bootstrap_store(tmp_path / "wechat.db")
     answer = "你" * 2_000
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     responder = AIResponder(
         FinalGateway(answer),
         initial_status=None,
@@ -318,7 +337,12 @@ async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
             submitted(message_id="7158246912028861544"),
         )
     )
-    transport = WeChatChatTransport(client, store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     try:
         first = await transport.reply(trigger, "Access is open.", presentation="plain")
         second = await transport.reply(trigger, "Access is open.", presentation="plain")
@@ -328,6 +352,67 @@ async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
     assert first.id == second.id == "7158246912028861544"
     assert client.calls[0]["request_id"] == client.calls[1]["request_id"]
     assert client.calls[0]["request_id"].startswith("sidekick.wechat.reply.")
+
+
+@pytest.mark.asyncio
+async def test_wechat_transport_quotes_eligible_trigger_when_reply_is_ready(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        await transport.reply(trigger, "Quoted answer.", presentation="plain")
+    finally:
+        await store.close()
+
+    assert client.calls[0]["reply_to_message_id"] == trigger.id
+
+
+@pytest.mark.asyncio
+async def test_wechat_transport_sends_plain_text_when_reply_is_not_ready(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        await transport.reply(trigger, "Plain answer.", presentation="plain")
+    finally:
+        await store.close()
+
+    assert client.calls[0]["reply_to_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_wechat_transport_does_not_quote_ineligible_trigger(tmp_path) -> None:
+    store, trigger = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="/ai hello\nwith more detail",
+    )
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        await transport.reply(trigger, "Plain answer.", presentation="plain")
+    finally:
+        await store.close()
+
+    assert client.calls[0]["reply_to_message_id"] is None
 
 
 @pytest.mark.asyncio
@@ -341,7 +426,12 @@ async def test_wechat_transport_sends_followup_when_reply_cannot_be_edited(
             submitted(message_id="8158246912028861544"),
         )
     )
-    transport = WeChatChatTransport(client, store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     try:
         progress = await transport.reply(
             trigger,
@@ -381,7 +471,12 @@ async def test_wechat_responder_does_not_resubmit_unknown_outcome(tmp_path) -> N
     responder = AIResponder(
         FinalGateway(),
         initial_status=None,
-        transport=WeChatChatTransport(client, store, CONNECTOR_KEY),
+        transport=WeChatChatTransport(
+            client,
+            store,
+            CONNECTOR_KEY,
+            native_reply_ready=False,
+        ),
     )
     request = AgentRunRequest(
         run_id="run-1",
@@ -416,7 +511,12 @@ async def test_wechat_responder_does_not_change_payload_after_transport_error(
     responder = AIResponder(
         FinalGateway(),
         initial_status=None,
-        transport=WeChatChatTransport(client, store, CONNECTOR_KEY),
+        transport=WeChatChatTransport(
+            client,
+            store,
+            CONNECTOR_KEY,
+            native_reply_ready=False,
+        ),
     )
     request = AgentRunRequest(
         run_id="run-1",
@@ -448,7 +548,12 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
     wechat_store, trigger = await bootstrap_store(tmp_path / "wechat.db")
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
     gateway = FinalGateway("hello from Sidekick")
     memory = RecordingMemory()
@@ -534,7 +639,12 @@ async def test_wechat_conversation_handler_uses_quoted_message_as_context(
     command = await project_quoted_reply(wechat_store, reply_to=target.id)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     gateway = FinalGateway("Here is how it works.")
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(
@@ -601,7 +711,12 @@ async def test_wechat_conversation_handler_uses_quoted_original_image_as_context
         ),
         preview=AssertionError("preview should not be requested"),
     )
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     gateway = ImageFinalGateway()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(
@@ -774,7 +889,12 @@ async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
     monkeypatch.setattr(wechat_store, "get_reply_message", unavailable_reply)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     gateway = FinalGateway("Answer without quoted context.")
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(
@@ -837,7 +957,12 @@ async def test_wechat_manual_memory_command_retains_stored_reply_chain(
     assert command is not None
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
@@ -913,7 +1038,12 @@ async def test_wechat_backfill_reports_and_ingests_only_locally_stored_history(
             submitted(message_id="8158246912028861544"),
         )
     )
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
@@ -991,7 +1121,12 @@ async def test_wechat_memory_enable_starts_after_command_projection_cursor(
     )
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
@@ -1044,7 +1179,12 @@ async def test_wechat_memory_enable_reports_when_hindsight_is_disabled(
     )
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
-    transport = WeChatChatTransport(client, wechat_store, CONNECTOR_KEY)
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
     history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(

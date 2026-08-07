@@ -88,6 +88,7 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
         runtime.handler._prompt_builder.quoted_attachment_describer,
         WeChatQuotedImageDescriber,
     )
+    assert runtime.handler._transport._native_reply_ready is True
 
 
 @pytest.mark.asyncio
@@ -153,6 +154,8 @@ class FakeConnectorClient:
             receive_shared_chat_history=True,
             stable_inbound_message_ids=True,
             send_text=True,
+            send_reply=True,
+            send_native_reply=True,
             request_idempotency=True,
             outbound_stable_message_id=True,
             websocket=True,
@@ -160,6 +163,7 @@ class FakeConnectorClient:
             replay=True,
             durable_cursor=True,
             text_send_ready=True,
+            reply_send_ready=True,
             connection_generation=41,
             history=False,
             inbound_image_download=True,
@@ -529,6 +533,8 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
             receive_shared_chat_history=True,
             stable_inbound_message_ids=True,
             send_text=True,
+            send_reply=True,
+            send_native_reply=True,
             request_idempotency=True,
             outbound_stable_message_id=True,
             websocket=True,
@@ -536,6 +542,7 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
             replay=True,
             durable_cursor=True,
             text_send_ready=True,
+            reply_send_ready=True,
             connection_generation=42,
             history=False,
             inbound_image_download=True,

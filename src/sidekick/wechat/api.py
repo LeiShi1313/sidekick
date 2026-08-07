@@ -112,6 +112,8 @@ class WeChatCapabilities:
     receive_shared_chat_history: bool
     stable_inbound_message_ids: bool
     send_text: bool
+    send_reply: bool
+    send_native_reply: bool
     request_idempotency: bool
     outbound_stable_message_id: bool
     websocket: bool
@@ -119,6 +121,7 @@ class WeChatCapabilities:
     replay: bool
     durable_cursor: bool
     text_send_ready: bool
+    reply_send_ready: bool
     connection_generation: int
     history: bool
     inbound_image_download: bool
@@ -146,6 +149,8 @@ class WeChatCapabilities:
                 "stableInboundMessageIds",
             ),
             send_text=_required_bool(messages, "sendText"),
+            send_reply=_required_bool(messages, "sendReply"),
+            send_native_reply=_required_bool(messages, "sendNativeReply"),
             request_idempotency=_required_bool(messages, "requestIdempotency"),
             outbound_stable_message_id=_required_bool(
                 messages,
@@ -156,6 +161,7 @@ class WeChatCapabilities:
             replay=_required_bool(events, "replay"),
             durable_cursor=_required_bool(events, "durableCursor"),
             text_send_ready=_required_bool(runtime, "textSendReady"),
+            reply_send_ready=_required_bool(runtime, "replySendReady"),
             connection_generation=_required_positive_int(
                 runtime,
                 "connectionGeneration",
@@ -167,6 +173,10 @@ class WeChatCapabilities:
             ),
             request_original_image=_required_bool(media, "requestOriginalImage"),
         )
+
+    @property
+    def native_reply_ready(self) -> bool:
+        return self.send_reply and self.send_native_reply and self.reply_send_ready
 
     def require_ai_channel(self) -> None:
         required = {
@@ -685,6 +695,7 @@ class WeChatConnectorClient:
         request_id: str,
         to: str,
         content: str,
+        reply_to_message_id: str | None,
     ) -> WeChatSendOperation:
         if REQUEST_ID_RE.fullmatch(request_id) is None:
             raise ValueError("WeChat request ID must be 1-128 URL-safe characters")
@@ -693,14 +704,20 @@ class WeChatConnectorClient:
             raise ValueError("WeChat text content cannot be empty")
         if len(content.encode("utf-8")) > MAX_TEXT_BYTES:
             raise ValueError("WeChat text content exceeds 4095 UTF-8 bytes")
+        body = {
+            "requestId": request_id,
+            "to": target,
+            "content": content,
+        }
+        if reply_to_message_id is not None:
+            body["replyToMessageId"] = _native_message_id(
+                _external_id(reply_to_message_id, "reply_to_message_id"),
+                "reply_to_message_id",
+            )
         payload = await self._request_json(
             "POST",
             "/messages/text",
-            json_body={
-                "requestId": request_id,
-                "to": target,
-                "content": content,
-            },
+            json_body=body,
             expected_statuses=frozenset({200, 202}),
         )
         operation = WeChatSendOperation.parse(payload)
