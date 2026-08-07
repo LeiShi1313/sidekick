@@ -86,12 +86,13 @@ def test_compose_routes_dashboard_and_playground_by_name() -> None:
     assert set(dashboard_proxy["networks"]) == {
         "agent-platform"
     }
-    assert dashboard_proxy["image"] == "nginx:1.30.4-alpine"
+    assert dashboard_proxy["image"] == "sidekick-dashboard-proxy:local"
+    assert dashboard_proxy["build"]["context"] == str(ROOT / "proxy")
     assert dashboard_proxy["user"] == "101:101"
-    assert all(
-        volume.get("source") != "/var/run/docker.sock"
-        for volume in dashboard_proxy.get("volumes", [])
-    )
+    assert "volumes" not in dashboard_proxy
+    proxy_dockerfile = (ROOT / "proxy" / "Dockerfile").read_text()
+    assert "FROM nginx:1.30.4-alpine" in proxy_dockerfile
+    assert "COPY --chmod=0444 nginx.conf /etc/nginx/nginx.conf" in proxy_dockerfile
     nginx_config = (ROOT / "proxy" / "nginx.conf").read_text()
     assert "sidekick.localhost" in nginx_config
     assert "playground.sidekick.localhost" in nginx_config
