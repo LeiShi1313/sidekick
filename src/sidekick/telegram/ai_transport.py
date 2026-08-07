@@ -29,6 +29,9 @@ _TELEGRAM_MARKDOWN_DELIMITERS = {
     "`": telegram_types.MessageEntityCode,
 }
 
+_COLLAPSE_AFTER_CHARS = 700
+_COLLAPSE_AFTER_NEWLINES = 10
+
 
 @dataclass(frozen=True, slots=True)
 class _TelegramUpdateSnapshot:
@@ -434,6 +437,18 @@ class TelegramChatTransport:
             rendered, entities = _parse_agent_markdown(snapshot.text)
             if not rendered.strip():
                 return
+            if (
+                len(rendered) > _COLLAPSE_AFTER_CHARS
+                or rendered.count("\n") >= _COLLAPSE_AFTER_NEWLINES
+            ):
+                entities.insert(
+                    0,
+                    telegram_types.MessageEntityBlockquote(
+                        offset=0,
+                        length=len(rendered.encode("utf-16-le")) // 2,
+                        collapsed=True,
+                    ),
+                )
             await message.edit(
                 rendered,
                 parse_mode=None,

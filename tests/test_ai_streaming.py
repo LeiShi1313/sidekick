@@ -143,7 +143,7 @@ def make_telegram_responder(
     edit_cadence=0,
     clock=None,
     sleep=None,
-    initial_status="琢磨中。。。",
+    initial_status="🤔 Thinking...",
     response_format="regular_entities",
     **kwargs,
 ):
@@ -394,13 +394,16 @@ def test_ai_command_is_registered_under_telegram():
 
 
 @pytest.mark.asyncio
-async def test_telegram_answer_starts_with_localized_thinking_status():
-    responder = make_telegram_responder(FakeGateway(["answer"]))
+async def test_telegram_answer_starts_with_thinking_status():
+    responder = make_telegram_responder(
+        FakeGateway(["answer"]),
+        initial_status=sidekick.plugins.ai.TelegramAI.THINKING_REPLY,
+    )
     trigger = FakeMessage("/ai answer")
 
     await responder.answer(trigger, make_request("answer"))
 
-    assert trigger.replies[0].initial_text == "琢磨中。。。"
+    assert trigger.replies[0].initial_text == "🤔 Thinking..."
 
 
 @pytest.mark.asyncio
@@ -1059,6 +1062,60 @@ async def test_streamed_markdown_is_sent_as_native_telegram_entities():
         if isinstance(entity, telegram_types.MessageEntityTextUrl)
     )
     assert link.url == "https://example.com/docs"
+
+
+@pytest.mark.asyncio
+async def test_short_telegram_answer_is_not_collapsed():
+    responder = make_telegram_responder(FakeGateway(["A short answer."]))
+    trigger = FakeMessage("/ai answer briefly")
+
+    await responder.answer(trigger, make_request("answer briefly"))
+
+    entities = trigger.replies[0].edit_calls[-1][1]["formatting_entities"]
+    assert not any(
+        isinstance(entity, telegram_types.MessageEntityBlockquote)
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_telegram_answer_is_collapsed_with_existing_formatting():
+    formatted = "**🙂 Result**\n" + ("Detailed explanation. " * 40)
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai explain this")
+
+    await responder.answer(trigger, make_request("explain this"))
+
+    answer = trigger.replies[0]
+    entities = answer.edit_calls[-1][1]["formatting_entities"]
+    quote = next(
+        entity
+        for entity in entities
+        if isinstance(entity, telegram_types.MessageEntityBlockquote)
+    )
+    assert quote.collapsed is True
+    assert quote.offset == 0
+    assert quote.length == len(answer.text.encode("utf-16-le")) // 2
+    assert any(
+        isinstance(entity, telegram_types.MessageEntityBold)
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiline_telegram_answer_is_collapsed_before_character_limit():
+    formatted = "\n".join(f"Line {index}" for index in range(11))
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai list this")
+
+    await responder.answer(trigger, make_request("list this"))
+
+    entities = trigger.replies[0].edit_calls[-1][1]["formatting_entities"]
+    assert any(
+        isinstance(entity, telegram_types.MessageEntityBlockquote)
+        and entity.collapsed is True
+        for entity in entities
+    )
 
 
 @pytest.mark.asyncio
