@@ -1041,7 +1041,7 @@ test("redacts sensitive tool results before the next model turn", async () => {
       sendToolCall(response, {
         id: "call-sensitive-result",
         name: "code_exec",
-        args: { code: '"203.0.113.42"' },
+        args: { code: '["203", "0", "113", "42"].join(".")' },
       });
       return;
     }
@@ -1062,6 +1062,13 @@ test("redacts sensitive tool results before the next model turn", async () => {
     assert.match(JSON.stringify(toolResult), /REDACTED_IP_ADDRESS/);
     assert.doesNotMatch(JSON.stringify(toolResult), /203\.0\.113\.42/);
     assert.equal(events.at(-1).answer, "The sensitive result was withheld.");
+    const sessionFiles = await readdir(app.engine.config.sessionDir);
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    assert.match(rawSession, /REDACTED_IP_ADDRESS/);
+    assert.doesNotMatch(rawSession, /203\.0\.113\.42/);
   } finally {
     await app.close();
   }
