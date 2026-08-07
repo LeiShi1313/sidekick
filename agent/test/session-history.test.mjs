@@ -178,6 +178,8 @@ test("returns the complete branchable session tree with bounded redaction", asyn
     assert.equal(toolCall.arguments.authorization, "[REDACTED]");
     assert.match(JSON.stringify(detail), /Alice owns deployment/);
     assert.doesNotMatch(JSON.stringify(detail), /must-not-leak/);
+    assert.match(JSON.stringify(detail), /"thinking":"\[OMITTED\]"/);
+    assert.doesNotMatch(JSON.stringify(detail), /inspect the records/);
     assert.match(JSON.stringify(detail), /REDACTED_IP_ADDRESS/);
     assert.match(JSON.stringify(detail), /REDACTED_RUNTIME_PATH/);
     assert.doesNotMatch(

@@ -224,6 +224,9 @@ test("withholds reflected requester metadata from fetched page results", async (
       details: {
         endpoint: "http://memory-api:8888/private",
         address: reflectedAddress,
+        hostname: "runtime-node",
+        city: "Example City",
+        org: "Example Network",
       },
     })),
   ], { lookup: publicLookup, fetch: noRedirectFetch });

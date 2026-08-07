@@ -189,19 +189,19 @@ export function redactSensitiveText(value, options = {}) {
 }
 
 function reflectedMetadataCount(text) {
-  const fields = [
-    /(?:^|[\s{,])["']?(?:asn|autonomous[_ -]?system)["']?\s*[:=]/im,
-    /(?:^|[\s{,])["']?(?:city|country|latitude|longitude|postal|region|timezone)["']?\s*[:=]/im,
-    /(?:^|[\s{,])["']?(?:host|hostname|server)["']?\s*[:=]/im,
-    /(?:^|[\s{,])["']?(?:isp|network[_ -]?provider|org|organization)["']?\s*[:=]/im,
-  ];
-  return fields.filter((pattern) => pattern.test(text)).length;
+  const fields = new Set();
+  const pattern =
+    /(?:^|[\s{,])["']?(asn|autonomous[_ -]?system|city|country(?:[_ -]?(?:code|name))?|host|hostname|isp|latitude|loc|longitude|network[_ -]?provider|org|organization|postal(?:[_ -]?code)?|region|server|state|timezone)["']?\s*[:=]/gim;
+  for (const match of text.matchAll(pattern)) {
+    fields.add(match[1].replace(/[^a-z0-9]/gi, "").toLowerCase());
+  }
+  return fields.size;
 }
 
 function reflectsRequestMetadata(text) {
   const hasNetworkLiteral = networkLiterals(text).size > 0;
   const labeledNetwork =
-    /(?:^|[\s{,])["']?(?:client[_ -]?ip|ip|ip[_ -]?address|origin|remote[_ -]?(?:addr|address))["']?\s*[:=]/im.test(
+    /(?:^|[\s{,])["']?(?:address|client[_ -]?ip|ip|ip[_ -]?address|ipv4|ipv6|origin|remote[_ -]?(?:addr|address))["']?\s*[:=]/im.test(
       text,
     );
   const saysRequesterAddress =
@@ -212,12 +212,12 @@ function reflectsRequestMetadata(text) {
     /(?:user-agent|x-forwarded-for|x-real-ip|forwarded:|request headers?)/i.test(
       text,
     );
+  const metadataCount = reflectedMetadataCount(text);
   return (
     requestHeaders ||
+    metadataCount >= 3 ||
     (hasNetworkLiteral &&
-      (labeledNetwork ||
-        saysRequesterAddress ||
-        reflectedMetadataCount(text) >= 2))
+      (labeledNetwork || saysRequesterAddress || metadataCount >= 1))
   );
 }
 
@@ -240,6 +240,63 @@ function isPrivateKey(key) {
   );
 }
 
+function normalizedKey(key) {
+  return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function reflectsStructuredRequestMetadata(value) {
+  const keys = new Set(Object.keys(value).map(normalizedKey));
+  const hasNetworkKey = [
+    "address",
+    "clientip",
+    "ip",
+    "ipaddress",
+    "ipv4",
+    "ipv6",
+    "origin",
+    "remoteaddr",
+    "remoteaddress",
+  ].some((key) => keys.has(key));
+  const hasRequestHeaderKey = [
+    "headers",
+    "requestheaders",
+    "useragent",
+    "xforwardedfor",
+    "xrealip",
+  ].some((key) => keys.has(key));
+  const metadataKeys = [
+    "asn",
+    "autonomoussystem",
+    "city",
+    "country",
+    "countrycode",
+    "countryname",
+    "host",
+    "hostname",
+    "isp",
+    "latitude",
+    "loc",
+    "longitude",
+    "networkprovider",
+    "org",
+    "organization",
+    "postal",
+    "postalcode",
+    "region",
+    "server",
+    "state",
+    "timezone",
+  ].filter((key) => keys.has(key));
+  const hasNetworkLiteral = stringValues(value).some(
+    (text) => networkLiterals(text).size > 0,
+  );
+  return (
+    hasRequestHeaderKey ||
+    metadataKeys.length >= 3 ||
+    ((hasNetworkKey || hasNetworkLiteral) && metadataKeys.length >= 1)
+  );
+}
+
 export function sanitizeSensitiveValue(
   value,
   options = {},
@@ -259,6 +316,13 @@ export function sanitizeSensitiveValue(
   if (seen.has(value)) return "[CIRCULAR]";
   if (value.type === "image" && typeof value.data === "string") {
     return { ...value, data: "[OMITTED]" };
+  }
+  if (
+    options.externalText &&
+    !Array.isArray(value) &&
+    reflectsStructuredRequestMetadata(value)
+  ) {
+    return WITHHELD_REQUEST_METADATA;
   }
   seen.add(value);
   try {

@@ -5,6 +5,7 @@ import {
   SensitiveTextStream,
   redactSensitiveText,
   sanitizeFetchedText,
+  sanitizeSensitiveValue,
 } from "../src/privacy-redaction.mjs";
 
 const DOCUMENTATION_IPV4 = "203.0.113.42";
@@ -47,6 +48,23 @@ test("withholds fetched content that reflects requester metadata", () => {
       city: "Example City",
       org: "Example Network",
     }),
+  );
+
+  assert.equal(
+    result,
+    "[Content withheld because the page reflected request or runtime metadata.]",
+  );
+});
+
+test("withholds structured request metadata even without an address literal", () => {
+  const result = sanitizeSensitiveValue(
+    {
+      hostname: "runtime-node",
+      city: "Example City",
+      org: "Example Network",
+      timezone: "Example/Zone",
+    },
+    { externalText: true },
   );
 
   assert.equal(
