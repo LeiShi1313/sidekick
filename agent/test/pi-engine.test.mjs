@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -75,6 +75,10 @@ async function fakeProvider(handler) {
 }
 
 function sendText(response, text) {
+  sendTextChunks(response, [text]);
+}
+
+function sendTextChunks(response, chunks) {
   writeSse(response, [
     {
       id: "chatcmpl-test",
@@ -83,13 +87,13 @@ function sendText(response, text) {
       model: "test-model",
       choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
     },
-    {
+    ...chunks.map((content) => ({
       id: "chatcmpl-test",
       object: "chat.completion.chunk",
       created: 1,
       model: "test-model",
-      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-    },
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    })),
     {
       id: "chatcmpl-test",
       object: "chat.completion.chunk",
@@ -889,7 +893,14 @@ test("continues a recovered session created under an older workspace path", asyn
     });
     const parentEntryId = legacy.appendMessage({
       role: "assistant",
-      content: [{ type: "text", text: "legacy answer" }],
+      content: [
+        {
+          type: "text",
+          text:
+            "legacy answer from 203.0.113.42 at " +
+            "/home/example-service/private/workspace",
+        },
+      ],
       api: "openai-completions",
       provider: "openai-compatible",
       model: "test-model",
@@ -917,6 +928,75 @@ test("continues a recovered session created under an older workspace path", asyn
     assert.equal(events.at(-1).type, "run_completed");
     assert.equal(events.at(-1).sessionId, legacy.getSessionId());
     assert.match(JSON.stringify(app.provider.requests[0].messages), /legacy prompt/);
+    assert.match(
+      JSON.stringify(app.provider.requests[0].messages),
+      /REDACTED_IP_ADDRESS/,
+    );
+    assert.match(
+      JSON.stringify(app.provider.requests[0].messages),
+      /REDACTED_RUNTIME_PATH/,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(app.provider.requests[0].messages),
+      /203\.0\.113\.42|example-service/,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("redacts sensitive metadata across stream deltas, persistence, and audits", async () => {
+  const runId = "67676767-6767-4767-8767-676767676767";
+  const app = await fixture((_body, response) => {
+    sendTextChunks(response, [
+      "Runtime address 203.0.",
+      "113.42 path /home/example-",
+      "service/private/workspace credential test-",
+      "key",
+    ]);
+  });
+  try {
+    const events = await collect(app.engine, request(runId));
+    const serializedEvents = JSON.stringify(events);
+    assert.match(serializedEvents, /REDACTED_IP_ADDRESS/);
+    assert.match(serializedEvents, /REDACTED_RUNTIME_PATH/);
+    assert.match(serializedEvents, /REDACTED_SECRET/);
+    assert.doesNotMatch(
+      serializedEvents,
+      /203\.0\.113\.42|example-service|test-key/,
+    );
+    const systemPrompt = app.provider.requests[0].messages.find(
+      (message) => message.role === "system",
+    ).content;
+    assert.match(systemPrompt, /runtime privacy is a hard boundary/i);
+    assert.match(systemPrompt, /Current working directory: \/workspace/);
+    assert.doesNotMatch(systemPrompt, /sidekick-pi-test-/);
+
+    const result = events.at(-1);
+    const session = await app.engine.getSession(result.sessionId);
+    assert.doesNotMatch(
+      JSON.stringify(session),
+      /203\.0\.113\.42|example-service|test-key/,
+    );
+
+    const sessionFiles = await readdir(app.engine.config.sessionDir);
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    assert.doesNotMatch(
+      rawSession,
+      /203\.0\.113\.42|example-service|test-key/,
+    );
+
+    const rawAudit = await readFile(
+      join(app.engine.config.auditDir, `${runId}.jsonl`),
+      "utf8",
+    );
+    assert.doesNotMatch(
+      rawAudit,
+      /203\.0\.113\.42|example-service|test-key/,
+    );
   } finally {
     await app.close();
   }
@@ -942,6 +1022,39 @@ test("executes a delegated calculation and emits transient tool snapshots", asyn
     assert.equal(events.at(-1).type, "run_completed");
     assert.equal(events.at(-1).answer, "The result is 42.");
     assert.match(JSON.stringify(app.provider.requests[1].messages), /42/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("redacts sensitive tool results before the next model turn", async () => {
+  let secondRequest;
+  const app = await fixture((body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendToolCall(response, {
+        id: "call-sensitive-result",
+        name: "code_exec",
+        args: { code: '"203.0.113.42"' },
+      });
+      return;
+    }
+    secondRequest = body;
+    sendText(response, "The sensitive result was withheld.");
+  });
+  try {
+    const events = await collect(
+      app.engine,
+      request("68686868-6868-4868-8868-686868686868", {
+        prompt: "Run the calculation",
+      }),
+    );
+
+    const toolResult = secondRequest.messages.find(
+      (message) => message.role === "tool",
+    );
+    assert.match(JSON.stringify(toolResult), /REDACTED_IP_ADDRESS/);
+    assert.doesNotMatch(JSON.stringify(toolResult), /203\.0\.113\.42/);
+    assert.equal(events.at(-1).answer, "The sensitive result was withheld.");
   } finally {
     await app.close();
   }

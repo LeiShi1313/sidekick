@@ -15,10 +15,10 @@ RUN npm ci --omit=dev --ignore-scripts \
 COPY agent/src ./src
 
 RUN useradd --create-home --home-dir /agent-data --uid 10001 agent \
-    && mkdir -p /agent-data/.pi-agent \
+    && mkdir -p /agent-data/.pi-agent /workspace \
     && chmod a+r package.json package-lock.json \
     && chmod -R a+rX /app/src \
-    && chown -R agent:agent /agent-data
+    && chown -R agent:agent /agent-data /workspace
 
 USER agent
 EXPOSE 8790
