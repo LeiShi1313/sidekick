@@ -143,7 +143,7 @@ def make_telegram_responder(
     edit_cadence=0,
     clock=None,
     sleep=None,
-    initial_status="琢磨中。。。",
+    initial_status="🤔 Thinking...",
     response_format="regular_entities",
     **kwargs,
 ):
@@ -394,13 +394,16 @@ def test_ai_command_is_registered_under_telegram():
 
 
 @pytest.mark.asyncio
-async def test_telegram_answer_starts_with_localized_thinking_status():
-    responder = make_telegram_responder(FakeGateway(["answer"]))
+async def test_telegram_answer_starts_with_thinking_status():
+    responder = make_telegram_responder(
+        FakeGateway(["answer"]),
+        initial_status=sidekick.plugins.ai.TelegramAI.THINKING_REPLY,
+    )
     trigger = FakeMessage("/ai answer")
 
     await responder.answer(trigger, make_request("answer"))
 
-    assert trigger.replies[0].initial_text == "琢磨中。。。"
+    assert trigger.replies[0].initial_text == "🤔 Thinking..."
 
 
 @pytest.mark.asyncio

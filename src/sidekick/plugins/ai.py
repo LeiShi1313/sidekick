@@ -80,7 +80,7 @@ class _SavedMemoryLinkUnavailable(RuntimeError):
 
 class TelegramAI(TelegramCommand, metaclass=PluginMount):
     command_name = "ai"
-    THINKING_REPLY = "琢磨中。。。"
+    THINKING_REPLY = "🤔 Thinking..."
     MEMORY_STORED_REACTION = "✍"
     MEMORY_FAILED_REACTION = "👎"
     MEMORY_PROCESSING_REPLY = "Remembering..."
