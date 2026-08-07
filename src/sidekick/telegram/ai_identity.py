@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import unicodedata
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,6 +13,7 @@ from telethon.tl import types as telegram_types
 
 from sidekick.ai import (
     DirectoryPublicationTarget,
+    MessageAttribution,
     MemoryScopeTarget,
     MentionedUser,
     MessageIdentity,
@@ -30,6 +34,97 @@ _TELEGRAM_CHANNEL_CODEC = NamespacedIdentityCodec(
     actor_kind="channel",
     scope_kind="chat",
 )
+_TELEGRAM_MATRIX_BRIDGE_CODEC = NamespacedIdentityCodec(
+    source="telegram",
+    actor_kind="matrix-bridge",
+    scope_kind="chat",
+)
+
+
+class TelegramMatrixBridgeResolver:
+    def __init__(
+        self,
+        bridge_bot_ids: Collection[int],
+        *,
+        codec: IdentityCodec = _TELEGRAM_MATRIX_BRIDGE_CODEC,
+    ):
+        if any(
+            isinstance(bot_id, bool) or not isinstance(bot_id, int) or bot_id <= 0
+            for bot_id in bridge_bot_ids
+        ):
+            raise ValueError("Matrix bridge bot IDs must be positive integers")
+        self._bridge_bot_ids = frozenset(bridge_bot_ids)
+        self._codec = codec
+
+    def resolve(self, message: ReplyTarget) -> MessageAttribution | None:
+        sender_id = getattr(message, "sender_id", None)
+        chat_id = getattr(message, "chat_id", None)
+        if (
+            isinstance(sender_id, bool)
+            or not isinstance(sender_id, int)
+            or sender_id not in self._bridge_bot_ids
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, (int, str))
+            or (isinstance(chat_id, str) and not chat_id.strip())
+        ):
+            return None
+        parsed = _parse_matrix_bridge_envelope(message)
+        if parsed is None:
+            return None
+        display_name, text = parsed
+        alias_digest = hashlib.sha256(display_name.encode("utf-8")).hexdigest()[:32]
+        return MessageAttribution(
+            actor_id=self._codec.actor_id(f"{sender_id}:{chat_id}:{alias_digest}"),
+            actor_display_name=display_name,
+            text=text,
+        )
+
+
+def _parse_matrix_bridge_envelope(
+    message: ReplyTarget,
+) -> tuple[str, str] | None:
+    raw_text = getattr(message, "raw_text", None)
+    if not isinstance(raw_text, str) or not raw_text:
+        return None
+    surrogate_text = telegram_helpers.add_surrogate(raw_text)
+    for entity in getattr(message, "entities", None) or ():
+        if not isinstance(entity, telegram_types.MessageEntityBold):
+            continue
+        start = entity.offset
+        length = entity.length
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or length <= 0
+        ):
+            continue
+        end = start + length
+        if start not in {0, 2} or end > len(surrogate_text):
+            continue
+        prefix = surrogate_text[:start]
+        suffix = surrogate_text[end:]
+        if prefix == "" and suffix.startswith(": "):
+            body = suffix[2:]
+        elif prefix == "* " and suffix.startswith(" "):
+            body = suffix[1:]
+        else:
+            continue
+        display_name = unicodedata.normalize(
+            "NFC",
+            telegram_helpers.del_surrogate(surrogate_text[start:end]),
+        ).strip()
+        if (
+            not display_name
+            or len(display_name) > 256
+            or "\n" in display_name
+            or "\r" in display_name
+            or "\x00" in display_name
+        ):
+            return None
+        return display_name, telegram_helpers.del_surrogate(body)
+    return None
 
 
 class TelegramMessageIdentityResolver:
@@ -37,12 +132,27 @@ class TelegramMessageIdentityResolver:
         self,
         *,
         codec: IdentityCodec = TELEGRAM_IDENTITY_CODEC,
+        bridge_resolver: TelegramMatrixBridgeResolver | None = None,
         logger: Any | None = None,
     ):
         self._codec = codec
+        self._bridge_resolver = bridge_resolver
         self._logger = logger
 
     async def resolve(self, message: ReplyTarget) -> MessageIdentity:
+        bridge_attribution = (
+            self._bridge_resolver.resolve(message)
+            if self._bridge_resolver is not None
+            else None
+        )
+        if bridge_attribution is not None:
+            chat = await self._load_entity(message, "get_chat")
+            return MessageIdentity(
+                subject_id=bridge_attribution.actor_id,
+                subject_display_name=bridge_attribution.actor_display_name,
+                scope_display_name=telegram_display_name(chat),
+                is_human=True,
+            )
         sender, chat = await asyncio.gather(
             self._load_entity(message, "get_sender"),
             self._load_entity(message, "get_chat"),

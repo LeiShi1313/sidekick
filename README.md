@@ -52,7 +52,12 @@ secret values are placeholders.
 The Telegram adapter accepts a comma-separated list of trusted Matrix relay bot
 IDs in `SIDEKICK_TELEGRAM_MATRIX_BRIDGE_BOT_IDS`. The equivalent global
 `[telegram]` setting is `matrix_bridge_bot_ids = [6332621450]`. Always use
-numeric Telegram IDs; usernames are mutable.
+numeric Telegram IDs; usernames are mutable. Messages from those bots are
+decoded from the bridge's bold-name envelope before command parsing. Because
+Telegram does not expose the Matrix MXID, each display name becomes a
+non-canonical alias scoped to that bridge and Telegram chat. The alias can be
+retained in the room memory bank, but it cannot receive private-bank grants or
+merge across rooms.
 
 The WeChat adapter reads `SIDEKICK_WECHAT_URL` (default
 `http://127.0.0.1:18188`) and the optional `SIDEKICK_WECHAT_TOKEN`. It requires

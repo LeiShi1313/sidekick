@@ -402,6 +402,29 @@ class MessageIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageAttribution:
+    actor_id: str
+    actor_display_name: str | None
+    text: str | None
+
+    def __post_init__(self) -> None:
+        if not is_canonical_bank_id(self.actor_id):
+            raise ValueError("Message attribution actor ID is invalid")
+        if self.actor_display_name is not None and (
+            not isinstance(self.actor_display_name, str)
+            or not self.actor_display_name.strip()
+            or len(self.actor_display_name) > 256
+        ):
+            raise ValueError("Message attribution display name is invalid")
+        if self.text is not None and not isinstance(self.text, str):
+            raise ValueError("Message attribution text is invalid")
+
+
+class MessageAttributionResolver(Protocol):
+    def resolve(self, message: ReplyTarget) -> MessageAttribution | None: ...
+
+
+@dataclass(frozen=True, slots=True)
 class MentionedUser:
     user_id: ExternalId
     display_name: str | None = None
@@ -973,6 +996,7 @@ class PromptBuilder:
         history_source: MessageHistorySource | None = None,
         max_attachments: int = 3,
         transport: ChatTransport | None = None,
+        attribution_resolver: MessageAttributionResolver | None = None,
         identity_codec: IdentityCodec | None = None,
         metadata_resolver: Callable[[ReplyTarget], dict[str, Any]] | None = None,
     ):
@@ -990,12 +1014,36 @@ class PromptBuilder:
         self.history_source = history_source
         self.max_attachments = max_attachments
         self._transport = transport or ObjectChatTransport()
+        self._attribution_resolver = attribution_resolver
         self.identity_codec = identity_codec or NamespacedIdentityCodec(
             source="chat",
             actor_kind="actor",
             scope_kind="scope",
         )
         self._metadata_resolver = metadata_resolver
+
+    def resolve_attribution(
+        self,
+        message: ReplyTarget,
+    ) -> MessageAttribution | None:
+        if self._attribution_resolver is None:
+            return None
+        try:
+            return self._attribution_resolver.resolve(message)
+        except Exception:
+            return None
+
+    def message_text(self, message: ReplyTarget) -> str | None:
+        attribution = self.resolve_attribution(message)
+        return attribution.text if attribution is not None else message.raw_text
+
+    def message_actor_id(self, message: ReplyTarget) -> str | None:
+        attribution = self.resolve_attribution(message)
+        if attribution is not None:
+            return attribution.actor_id
+        if message.sender_id is None:
+            return None
+        return self.identity_codec.actor_id(message.sender_id)
 
     def has_attachment(self, message: ReplyTarget) -> bool:
         return (
@@ -1178,7 +1226,7 @@ class PromptBuilder:
         for key in priority:
             candidate = candidates[key]
             message = candidate.message
-            text = (message.raw_text or "").strip()
+            text = (self.message_text(message) or "").strip()
             attachment = None
             if attachment_count < self.max_attachments:
                 attachment = await self._describe_context_attachment(
@@ -3628,9 +3676,12 @@ class AIConversationHandler:
     async def handle(self, message: ReplyTarget) -> bool:
         if message.sender_id is None or message.chat_id is None:
             return False
-        actor_id = self._identity_codec.actor_id(message.sender_id)
+        actor_id = self._prompt_builder.message_actor_id(message)
+        if actor_id is None:
+            return False
+        message_text = self._prompt_builder.message_text(message)
         scope_id = self._identity_codec.scope_id(message.chat_id)
-        command = parse_chat_command(message.raw_text)
+        command = parse_chat_command(message_text)
         is_owner = actor_id == self._owner_actor_id
         is_owner_control = is_owner or self._transport.is_outgoing(message)
         if command is not None and not isinstance(command, AIAskCommand):
@@ -3799,7 +3850,7 @@ class AIConversationHandler:
                 return True
             agent_session_id = parent.agent_session_id
             parent_entry_id = parent.agent_entry_id
-            authored_prompt = (message.raw_text or "").strip()
+            authored_prompt = (message_text or "").strip()
             if not authored_prompt and not has_current_attachment:
                 return False
             prompt = authored_prompt or "Describe the attached content."
@@ -4868,6 +4919,8 @@ class AIConversationHandler:
         )
 
     async def _load_bank_grants(self, actor_id: str) -> tuple[str, ...]:
+        if not is_canonical_actor_id(actor_id):
+            return ()
         try:
             grants = await self._store.list_bank_grants(actor_id)
         except Exception as exc:
@@ -4942,11 +4995,20 @@ class AIConversationHandler:
             return True
 
         if instruction:
+            target_actor_id = (
+                target_identity.subject_id
+                or self._prompt_builder.message_actor_id(target)
+            )
+            assert target_actor_id is not None
             target_display_name = next(
                 (
                     observation.identity.subject_display_name
                     for observation in reversed(observations)
-                    if observation.sender_id == target.sender_id
+                    if (
+                        observation.identity.subject_id
+                        or self._identity_codec.actor_id(observation.sender_id)
+                    )
+                    == target_actor_id
                     and observation.identity.subject_display_name
                 ),
                 target_identity.subject_display_name,
@@ -4959,7 +5021,7 @@ class AIConversationHandler:
                 owner_display_name=(
                     await self._prompt_builder.resolve_identity(message)
                 ).subject_display_name,
-                target_id=target.sender_id,
+                target_actor_id=target_actor_id,
                 target_display_name=target_display_name,
                 instruction=instruction,
                 occurred_at=_message_datetime(message),
@@ -4984,7 +5046,7 @@ class AIConversationHandler:
             try:
                 await self._memory.revise(
                     scope_id=self._identity_codec.scope_id(message.chat_id),
-                    subject_id=self._identity_codec.actor_id(target.sender_id),
+                    subject_id=target_actor_id,
                     instruction=instruction,
                 )
             except Exception as exc:
@@ -5371,15 +5433,16 @@ def _chat_revision_episode(
     command_message_id: ExternalId,
     owner_id: ExternalId,
     owner_display_name: str | None,
-    target_id: ExternalId,
+    target_actor_id: str,
     target_display_name: str | None,
     instruction: str,
     occurred_at: datetime,
     target_message_id: ExternalId,
 ) -> MemoryEpisode:
-    target_key = identity_codec.actor_id(target_id)
     target_label = (
-        f"{target_display_name} ({target_key})" if target_display_name else target_key
+        f"{target_display_name} ({target_actor_id})"
+        if target_display_name
+        else target_actor_id
     )
     return MemoryEpisode(
         scope_id=identity_codec.scope_id(chat_id),
@@ -5404,7 +5467,7 @@ def _chat_revision_episode(
                     chat_id,
                     target_message_id,
                 ),
-                mentioned_actors=((target_key, target_display_name),),
+                mentioned_actors=((target_actor_id, target_display_name),),
                 mentioned_at=occurred_at,
             ),
         ),
