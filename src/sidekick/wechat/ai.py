@@ -118,6 +118,7 @@ class WeChatTextSender(Protocol):
         request_id: str,
         to: str,
         content: str,
+        reply_to_message_id: str | None,
     ) -> WeChatSendOperation: ...
 
 
@@ -332,6 +333,7 @@ class WeChatChatTransport:
                 request_id=message.request_id,
                 to=message.trigger.chat_id,
                 content=text,
+                reply_to_message_id=None,
             )
         except WeChatSendOutcomeUnknown:
             message.uncertain = True

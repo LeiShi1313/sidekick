@@ -314,6 +314,8 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
                     "receiveSharedChatHistory": True,
                     "stableInboundMessageIds": True,
                     "sendText": True,
+                    "sendReply": True,
+                    "sendNativeReply": True,
                     "requestIdempotency": True,
                     "outboundStableMessageId": True,
                 },
@@ -328,6 +330,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
                     "connectionGeneration": 41,
                     "sessionStatus": "logged_in",
                     "textSendReady": True,
+                    "replySendReady": True,
                 },
                 "media": {
                     "inboundImageDownload": True,
@@ -437,6 +440,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
                 request_id="sidekick.wechat.request-1",
                 to="56825427596@chatroom",
                 content="final answer",
+                reply_to_message_id="4159667620982040828",
             )
         finally:
             await client.close()
@@ -447,6 +451,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
     assert observed_capabilities.inbound_image_download is True
     assert observed_capabilities.request_original_image is True
     assert observed_capabilities.receive_shared_chat_history is True
+    assert observed_capabilities.native_reply_ready is True
     assert observed_chats.snapshot.id == "snapshot-41"
     assert observed_chats.chats[0].id == "56825427596@chatroom"
     assert observed_messages.messages[0].id == "4159667620982040828"
@@ -457,6 +462,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
             "requestId": "sidekick.wechat.request-1",
             "to": "56825427596@chatroom",
             "content": "final answer",
+            "replyToMessageId": "4159667620982040828",
         }
     ]
 
@@ -645,6 +651,7 @@ async def test_wechat_client_never_retries_unknown_send_under_a_new_id() -> None
                     request_id="sidekick.wechat.unknown-1",
                     to="filehelper",
                     content="possibly sent",
+                    reply_to_message_id=None,
                 )
         finally:
             await client.close()

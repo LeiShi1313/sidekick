@@ -63,10 +63,24 @@ GROUP_ID = "56825427596@chatroom"
 class RecordingConnectorClient:
     def __init__(self, responses: tuple[object, ...]):
         self.responses = list(responses)
-        self.calls: list[dict[str, str]] = []
+        self.calls: list[dict[str, str | None]] = []
 
-    async def send_text_and_wait(self, *, request_id, to, content):
-        self.calls.append({"request_id": request_id, "to": to, "content": content})
+    async def send_text_and_wait(
+        self,
+        *,
+        request_id,
+        to,
+        content,
+        reply_to_message_id,
+    ):
+        self.calls.append(
+            {
+                "request_id": request_id,
+                "to": to,
+                "content": content,
+                "reply_to_message_id": reply_to_message_id,
+            }
+        )
         if not self.responses:
             raise AssertionError("No WeChat send response prepared")
         response = self.responses.pop(0)
