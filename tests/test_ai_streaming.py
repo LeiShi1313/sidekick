@@ -1062,6 +1062,60 @@ async def test_streamed_markdown_is_sent_as_native_telegram_entities():
 
 
 @pytest.mark.asyncio
+async def test_short_telegram_answer_is_not_collapsed():
+    responder = make_telegram_responder(FakeGateway(["A short answer."]))
+    trigger = FakeMessage("/ai answer briefly")
+
+    await responder.answer(trigger, make_request("answer briefly"))
+
+    entities = trigger.replies[0].edit_calls[-1][1]["formatting_entities"]
+    assert not any(
+        isinstance(entity, telegram_types.MessageEntityBlockquote)
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_telegram_answer_is_collapsed_with_existing_formatting():
+    formatted = "**🙂 Result**\n" + ("Detailed explanation. " * 40)
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai explain this")
+
+    await responder.answer(trigger, make_request("explain this"))
+
+    answer = trigger.replies[0]
+    entities = answer.edit_calls[-1][1]["formatting_entities"]
+    quote = next(
+        entity
+        for entity in entities
+        if isinstance(entity, telegram_types.MessageEntityBlockquote)
+    )
+    assert quote.collapsed is True
+    assert quote.offset == 0
+    assert quote.length == len(answer.text.encode("utf-16-le")) // 2
+    assert any(
+        isinstance(entity, telegram_types.MessageEntityBold)
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiline_telegram_answer_is_collapsed_before_character_limit():
+    formatted = "\n".join(f"Line {index}" for index in range(11))
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai list this")
+
+    await responder.answer(trigger, make_request("list this"))
+
+    entities = trigger.replies[0].edit_calls[-1][1]["formatting_entities"]
+    assert any(
+        isinstance(entity, telegram_types.MessageEntityBlockquote)
+        and entity.collapsed is True
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
 async def test_streaming_waits_for_visible_text_when_markdown_is_split():
     gateway = FakeGateway(["**", "Result", "**"])
     responder = make_telegram_responder(gateway)
