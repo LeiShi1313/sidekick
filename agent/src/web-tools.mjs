@@ -1,6 +1,8 @@
 import { lookup as dnsLookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 
+import { sanitizeSensitiveValue } from "./privacy-redaction.mjs";
+
 const FORBIDDEN_HOSTS = new Set([
   "github.com",
   "www.github.com",
@@ -216,7 +218,21 @@ function constrainFetch(definition, options) {
         ),
       );
       const safe = Array.isArray(params?.urls) ? { urls } : { url: urls[0] };
-      return await definition.execute(toolCallId, safe, signal, onUpdate, ctx);
+      const safeOnUpdate =
+        typeof onUpdate === "function"
+          ? (update) =>
+              onUpdate(
+                sanitizeSensitiveValue(update, { externalText: true }),
+              )
+          : onUpdate;
+      const result = await definition.execute(
+        toolCallId,
+        safe,
+        signal,
+        safeOnUpdate,
+        ctx,
+      );
+      return sanitizeSensitiveValue(result, { externalText: true });
     },
   };
 }

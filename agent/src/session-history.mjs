@@ -1,5 +1,7 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { redactSensitiveText } from "./privacy-redaction.mjs";
+
 const IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_LIST_LIMIT = 100;
 const MAX_STRING_CHARS = 64_000;
@@ -55,20 +57,25 @@ function sanitizedUrl(value) {
         parsed.searchParams.set(key, "[REDACTED]");
       }
     }
-    return bounded(parsed.toString(), MAX_STRING_CHARS);
+    return redactSensitiveText(bounded(parsed.toString(), MAX_STRING_CHARS));
   } catch {
-    return bounded(value, MAX_STRING_CHARS);
+    return redactSensitiveText(bounded(value, MAX_STRING_CHARS));
   }
 }
 
 export function sanitizeSessionValue(value, depth = 0, seen = new WeakSet()) {
   if (value === null || value === undefined) return value ?? null;
-  if (typeof value === "string") return bounded(value, MAX_STRING_CHARS);
+  if (typeof value === "string") {
+    return redactSensitiveText(bounded(value, MAX_STRING_CHARS));
+  }
   if (typeof value === "number" || typeof value === "boolean") return value;
   if (typeof value === "bigint") return value.toString();
   if (typeof value !== "object") return bounded(value, 1_000);
   if (depth >= MAX_DEPTH) return "[DEPTH_LIMIT]";
   if (seen.has(value)) return "[CIRCULAR]";
+  if (value.type === "thinking") {
+    return { type: "thinking", thinking: "[OMITTED]" };
+  }
   seen.add(value);
   try {
     if (value.type === "image" && "data" in value) return imageMetadata(value);
@@ -106,13 +113,14 @@ function iso(value) {
 function currentRequest(value) {
   const text = String(value ?? "");
   const match = text.match(/<current_request>\s*([\s\S]*?)\s*<\/current_request>/);
-  return bounded(match?.[1]?.trim() || text, 500);
+  return redactSensitiveText(bounded(match?.[1]?.trim() || text, 500));
 }
 
 function summary(info) {
   return {
     id: info.id,
-    name: info.name ?? null,
+    name:
+      typeof info.name === "string" ? redactSensitiveText(info.name) : null,
     createdAt: iso(info.created),
     modifiedAt: iso(info.modified),
     messageCount: info.messageCount,

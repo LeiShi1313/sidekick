@@ -7,6 +7,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 
+import { redactSensitiveText } from "./privacy-redaction.mjs";
+
 const RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_LIST_LIMIT = 100;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
@@ -48,9 +50,9 @@ function sanitizedUrl(value) {
         parsed.searchParams.set(key, "[REDACTED]");
       }
     }
-    return bounded(parsed.toString());
+    return redactSensitiveText(bounded(parsed.toString()));
   } catch {
-    return bounded(value);
+    return redactSensitiveText(bounded(value));
   }
 }
 
@@ -61,6 +63,18 @@ function bounded(value, max = MAX_STRING_CHARS) {
 
 function imageMetadata(value) {
   const supplied = typeof value.data === "string" ? value.data : "";
+  if (
+    supplied === "[OMITTED]" &&
+    Number.isInteger(value.sizeBytes) &&
+    value.sizeBytes >= 0
+  ) {
+    return {
+      type: "image",
+      mimeType: bounded(value.mimeType, 256),
+      sizeBytes: value.sizeBytes,
+      data: "[OMITTED]",
+    };
+  }
   const padding = supplied.endsWith("==") ? 2 : supplied.endsWith("=") ? 1 : 0;
   return {
     type: "image",
@@ -72,12 +86,15 @@ function imageMetadata(value) {
 
 export function sanitizeAuditValue(value, depth = 0, seen = new WeakSet()) {
   if (value === null || value === undefined) return value ?? null;
-  if (typeof value === "string") return bounded(value);
+  if (typeof value === "string") return redactSensitiveText(bounded(value));
   if (typeof value === "number" || typeof value === "boolean") return value;
   if (typeof value === "bigint") return value.toString();
   if (typeof value !== "object") return bounded(value, 1_000);
   if (depth >= MAX_DEPTH) return "[DEPTH_LIMIT]";
   if (seen.has(value)) return "[CIRCULAR]";
+  if (value.type === "thinking") {
+    return { type: "thinking", thinking: "[OMITTED]" };
+  }
   seen.add(value);
   try {
     if (value.type === "image" && "data" in value) return imageMetadata(value);
@@ -172,7 +189,7 @@ function parseAudit(content, expectedRunId) {
     ) {
       throw new Error("Malformed run audit");
     }
-    events.push(event);
+    events.push({ ...event, data: sanitizeAuditValue(event.data) });
   }
   events.sort((left, right) => left.sequence - right.sequence);
   return events;

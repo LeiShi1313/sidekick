@@ -204,3 +204,47 @@ test("allows redirects between public destinations", async () => {
   ]);
   assert.deepEqual(received, { url: "https://www.example.org/final" });
 });
+
+test("withholds reflected requester metadata from fetched page results", async () => {
+  const reflectedAddress = "203.0.113.42";
+  const [, fetchContent] = constrainWebTools([
+    tool("web_search", async () => ({ content: [], details: {} })),
+    tool("fetch_content", async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            ip: reflectedAddress,
+            hostname: "runtime-node",
+            city: "Example City",
+            org: "Example Network",
+          }),
+        },
+      ],
+      details: {
+        endpoint: "http://memory-api:8888/private",
+        address: reflectedAddress,
+        hostname: "runtime-node",
+        city: "Example City",
+        org: "Example Network",
+      },
+    })),
+  ], { lookup: publicLookup, fetch: noRedirectFetch });
+
+  const result = await fetchContent.execute(
+    "call-7",
+    { url: "https://example.com/reflect" },
+    undefined,
+    undefined,
+    {},
+  );
+
+  assert.equal(
+    result.content[0].text,
+    "[Content withheld because the page reflected request or runtime metadata.]",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(result),
+    /203\.0\.113\.42|runtime-node|Example City|Example Network|memory-api/,
+  );
+});

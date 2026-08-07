@@ -53,7 +53,9 @@ test("records ordered append-only events and redacts credential-shaped fields", 
     await audit.record("run.completed", {
       sessionId: "session-1",
       entryId: "entry-1",
-      answer: "Alice owns deploys.",
+      answer:
+        "Alice owns deploys from 203.0.113.42 at " +
+        "/home/example-service/private/workspace.",
     });
     await audit.flush();
 
@@ -84,8 +86,41 @@ test("records ordered append-only events and redacts credential-shaped fields", 
     );
     assert.doesNotMatch(
       JSON.stringify(result),
-      /Bearer secret|secret-key|provider credential detail|query-secret|user:pass/,
+      /Bearer secret|secret-key|provider credential detail|query-secret|user:pass|203\.0\.113\.42|example-service/,
     );
+    assert.match(JSON.stringify(result), /REDACTED_IP_ADDRESS/);
+    assert.match(JSON.stringify(result), /REDACTED_RUNTIME_PATH/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("redacts sensitive values while reading legacy audit events", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", { prompt: "Inspect the run" });
+    await audit.flush();
+    await appendFile(
+      `${app.root}/${RUN_ID}.jsonl`,
+      `${JSON.stringify({
+        version: 1,
+        sequence: 2,
+        timestamp: new Date().toISOString(),
+        runId: RUN_ID,
+        type: "run.completed",
+        data: {
+          answer:
+            "Legacy 203.0.113.42 at /home/example-service/private/workspace",
+        },
+      })}\n`,
+    );
+
+    const result = await app.store.get(RUN_ID);
+    const serialized = JSON.stringify(result);
+    assert.match(serialized, /REDACTED_IP_ADDRESS/);
+    assert.match(serialized, /REDACTED_RUNTIME_PATH/);
+    assert.doesNotMatch(serialized, /203\.0\.113\.42|example-service/);
   } finally {
     await app.close();
   }
