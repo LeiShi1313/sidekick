@@ -438,6 +438,77 @@ async def test_wechat_history_excludes_redacted_and_unsupported_messages(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_wechat_store_promotes_shared_history_enrichment_in_place(tmp_path):
+    message_id = "5159667620982040828"
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=chat_list(),
+            messages=WeChatMessageList(
+                messages=(
+                    connector_message(
+                        message_id,
+                        "[Chat history] Team history",
+                        message_type="app",
+                    ),
+                ),
+                cursor="bootstrap-messages",
+            ),
+        )
+        correction = event(
+            {
+                "id": message_id,
+                "chatId": GROUP_ID,
+                "direction": "in",
+                "messageType": "chat_history",
+                "senderId": "wxid_alice",
+                "content": "Team history",
+                "sharedChatHistory": {
+                    "title": "Team history",
+                    "itemCount": 2,
+                    "items": [
+                        {"kind": "text", "senderName": "Alice", "content": "Hi"},
+                        {"kind": "image", "senderName": "Bob"},
+                    ],
+                },
+                "timestamp": 1_783_772_734,
+                "source": "wechat+localdb",
+            },
+            cursor="shared-history-correction",
+        )
+
+        revised = await store.project_event(CONNECTOR_KEY, correction)
+        visible = await store.get_message(CONNECTOR_KEY, GROUP_ID, message_id)
+        quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, message_id)
+        memory_window = await WeChatHistorySource(
+            store,
+            CONNECTOR_KEY,
+        ).fetch_window(
+            GROUP_ID,
+            since=datetime.fromtimestamp(1_783_772_700, UTC),
+            until=datetime.fromtimestamp(1_783_772_735, UTC),
+            limit=10,
+        )
+
+        assert revised is not None
+        assert revised.message_type == "chat_history"
+        assert revised.raw_text == (
+            "[Forwarded chat history]\n"
+            "Team history\n"
+            "Alice: Hi\n"
+            "Bob: [Image]"
+        )
+        assert visible is not None
+        assert quoted is not None
+        assert [message.id for message in memory_window] == [message_id]
+        assert await store.count_messages(CONNECTOR_KEY) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_wechat_store_persists_images_for_direct_reply_lookup_only(tmp_path):
     path = tmp_path / "wechat.db"
     image_id = "5159667620982040828"
