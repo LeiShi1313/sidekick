@@ -261,9 +261,8 @@ class WeChatChatTransport:
         except Exception as exc:
             if self._logger is not None:
                 self._logger.debug(
-                    "WeChat reply lookup failed (%s): %s",
+                    "WeChat reply lookup failed (%s)",
                     type(exc).__name__,
-                    exc,
                 )
             return None
 

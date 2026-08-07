@@ -4,8 +4,10 @@ import test from "node:test";
 
 import {
   buildMemoryQueries,
-  retrieveMemoryContext,
+  retrieveMemoryContext as retrieveMemoryContextRaw,
 } from "../src/memory-context.mjs";
+
+const MEMORY_TOKEN = "memory-api-token-that-is-long-enough";
 
 function response(results, status = 200) {
   return new Response(JSON.stringify({ results }), {
@@ -17,12 +19,27 @@ function response(results, status = 200) {
 function memoryTarget(overrides = {}) {
   return {
     primaryBankId: "workspace:engineering",
-    requester: { id: "chat:user:alice", label: "Alice", owner: false },
+    requesterIsOwner: false,
     grantedBankIds: [],
     participants: [],
+    ...overrides,
+  };
+}
+
+function requestIdentity(overrides = {}) {
+  return {
+    requester: { id: "chat:user:alice", label: "Alice" },
     anchors: [],
     ...overrides,
   };
+}
+
+function retrieveMemoryContext(options) {
+  return retrieveMemoryContextRaw({
+    identity: requestIdentity(),
+    token: MEMORY_TOKEN,
+    ...options,
+  });
 }
 
 function bankTag(bankId) {
@@ -56,9 +73,10 @@ test("builds chat-agnostic unanchored and identity-anchored recall queries", () 
     context: [
       { kind: "reference", text: "Earlier conversation about telecom pricing." },
     ],
-    memory: memoryTarget({
+    identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
     }),
+    memory: memoryTarget(),
   });
 
   assert.equal(queries.length, 2);
@@ -73,9 +91,10 @@ test("preserves identity anchors when reference context fills the query budget",
   const queries = buildMemoryQueries({
     prompt: "Who does this refer to?",
     context: [{ kind: "reference", text: "x".repeat(16_000) }],
-    memory: memoryTarget({
+    identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
     }),
+    memory: memoryTarget(),
   });
 
   assert.equal(queries.length, 2);
@@ -88,7 +107,11 @@ test("recalls query variants concurrently and merges their evidence by rank", as
   let active = 0;
   let peak = 0;
   const fetchImpl = async (url, options) => {
-    calls.push({ url, body: JSON.parse(options.body) });
+    calls.push({
+      url,
+      body: JSON.parse(options.body),
+      authorization: options.headers.authorization,
+    });
     active += 1;
     peak = Math.max(peak, active);
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -125,14 +148,16 @@ test("recalls query variants concurrently and merges their evidence by rank", as
     baseUrl: "http://memory.internal:8888",
     prompt: "What did Richard say?",
     context: [{ kind: "reference", text: "A telecom discussion." }],
-    memory: memoryTarget({
+    identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
     }),
+    memory: memoryTarget(),
     fetchImpl,
   });
 
   assert.equal(calls.length, 3);
   assert.equal(peak, 3);
+  assert(calls.every(({ authorization }) => authorization === `Bearer ${MEMORY_TOKEN}`));
   assert(
     calls
       .filter(({ url }) => !url.includes("system%3Aknowledge-directory"))
@@ -208,9 +233,10 @@ test("keeps the surviving recall variant when the other one fails", async () => 
     baseUrl: "http://memory.internal:8888",
     prompt: "Who is Rocket?",
     context: [],
-    memory: memoryTarget({
+    identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
     }),
+    memory: memoryTarget(),
     fetchImpl: async (_url, options) =>
       options.body.includes("Identity anchors")
         ? response([{ id: "memory-1", text: "Rocket is Alice.", entities: [] }])
@@ -267,9 +293,10 @@ test("disables memory tools when every initial recall attempt fails", async () =
     baseUrl: "http://memory.internal:8888",
     prompt: "Who is Rocket?",
     context: [],
-    memory: memoryTarget({
+    identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
     }),
+    memory: memoryTarget(),
     fetchImpl: async () => response([], 503),
   });
 
@@ -509,9 +536,7 @@ test("owner directory recall is unfiltered while malformed references fail close
     baseUrl: "http://memory.internal:8888",
     prompt: "Find the news source",
     context: [],
-    memory: memoryTarget({
-      requester: { id: "chat:user:owner", label: "Owner", owner: true },
-    }),
+    memory: memoryTarget({ requesterIsOwner: true }),
     fetchImpl: async (url, options) => {
       calls.push({ url, body: JSON.parse(options.body) });
       if (url.includes("system%3Aknowledge-directory")) {
@@ -538,7 +563,7 @@ test("participant access cannot revoke an owner's issued source capability", asy
     prompt: "What did Bob discuss in the other group today?",
     context: [],
     memory: memoryTarget({
-      requester: { id: "chat:user:owner", label: "Owner", owner: true },
+      requesterIsOwner: true,
       participants: [
         {
           id: "chat:user:bob",
@@ -603,9 +628,7 @@ test("skips an observation whose source fact was omitted by the recall budget", 
     baseUrl: "http://memory.internal:8888",
     prompt: "Find a source",
     context: [],
-    memory: memoryTarget({
-      requester: { id: "chat:user:owner", label: "Owner", owner: true },
-    }),
+    memory: memoryTarget({ requesterIsOwner: true }),
     fetchImpl: async (url) =>
       url.includes("system%3Aknowledge-directory")
         ? response([directoryResult(validBank, "Valid"), omitted, unproven])

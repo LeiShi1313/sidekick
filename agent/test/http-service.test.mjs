@@ -11,12 +11,29 @@ const validRun = {
   context: [],
   systemPrompt: "Answer concisely.",
   toolPolicy: "delegated",
+  identity: {
+    requester: { id: "telegram:user:40", label: "Alice" },
+    anchors: [{ id: "telegram:user:40", label: "Alice" }],
+  },
+  origin: {
+    scopeId: "telegram:chat:-1001",
+    adapterInstanceId: "telegram-default",
+  },
 };
 
-async function listen(engine) {
+const OPERATOR_TOKEN = "test-agent-token-that-is-long-enough";
+
+const OPERATOR_CLIENT = {
+  id: "operator",
+  token: OPERATOR_TOKEN,
+  capabilities: ["models", "runs", "attachments", "history", "status"],
+  cancelAny: true,
+};
+
+async function listen(engine, clients = [OPERATOR_CLIENT]) {
   const server = createAgentServer({
     engine,
-    token: "test-agent-token-that-is-long-enough",
+    clients,
     logger: { info() {}, error() {} },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -66,6 +83,190 @@ test("streams a run as NDJSON", async () => {
   } finally {
     await app.close();
   }
+});
+
+test("isolates adapter credentials by capability and instance identity", async () => {
+  const owners = [];
+  const origins = [];
+  const clients = [
+    {
+      id: "telegram",
+      token: "telegram-agent-token-that-is-long-enough",
+      capabilities: ["models", "runs", "attachments"],
+      adapterInstanceId: "telegram-default",
+    },
+    {
+      id: "operator",
+      token: "operator-agent-token-that-is-long-enough",
+      capabilities: ["models", "runs", "attachments", "history", "status"],
+      cancelAny: true,
+    },
+  ];
+  const app = await listen({
+    async *run(request, owner) {
+      origins.push(request.origin);
+      owners.push(owner);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel(_runId, owner) {
+      owners.push(owner);
+      return true;
+    },
+    async listSessions() {
+      return { items: [], total: 0, nextCursor: null };
+    },
+  }, clients);
+  const adapterHeaders = {
+    "content-type": "application/json",
+    authorization: "Bearer telegram-agent-token-that-is-long-enough",
+  };
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: adapterHeaders,
+      body: JSON.stringify({
+        ...validRun,
+        origin: {
+          scopeId: "telegram:chat:-1001",
+          adapterInstanceId: "telegram-default",
+        },
+      }),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+
+    const impersonation = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: adapterHeaders,
+      body: JSON.stringify({
+        ...validRun,
+        runId: "22222222-2222-4222-8222-222222222222",
+        origin: {
+          scopeId: "qq:group:42",
+          adapterInstanceId: "qq-default",
+        },
+      }),
+    });
+    assert.equal(impersonation.status, 403);
+
+    const history = await fetch(`${app.baseUrl}/v1/sessions`, {
+      headers: { authorization: adapterHeaders.authorization },
+    });
+    assert.equal(history.status, 403);
+
+    const cancel = await fetch(
+      `${app.baseUrl}/v1/runs/${validRun.runId}/cancel`,
+      { method: "POST", headers: { authorization: adapterHeaders.authorization } },
+    );
+    assert.equal(cancel.status, 200);
+    assert.deepEqual(origins, [
+      {
+        scopeId: "telegram:chat:-1001",
+        adapterInstanceId: "telegram-default",
+      },
+    ]);
+    assert.deepEqual(owners, ["telegram", "telegram"]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("restricts a WeChat credential to its exact connector account", async () => {
+  let calls = 0;
+  const app = await listen(
+    {
+      async *run() {
+        calls += 1;
+        yield {
+          type: "run_completed",
+          sessionId: "s",
+          entryId: "e",
+          answer: "ok",
+        };
+      },
+      async cancel() {
+        return false;
+      },
+    },
+    [
+      {
+        id: "wechat-host",
+        token: "wechat-host-token-that-is-long-enough",
+        capabilities: ["runs"],
+        adapterInstanceId: "wechat-host",
+        scopePrefix: "wechat:account:wxid_host:",
+      },
+    ],
+  );
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer wechat-host-token-that-is-long-enough",
+  };
+  const requestFor = (account, runId) => ({
+    ...validRun,
+    runId,
+    origin: {
+      scopeId: `wechat:account:${account}:chat:room%40chatroom`,
+      adapterInstanceId: "wechat-host",
+    },
+    identity: {
+      requester: {
+        id: `wechat:account:${account}:user:alice`,
+        label: "Alice",
+      },
+      anchors: [
+        {
+          id: `wechat:account:${account}:user:alice`,
+          label: "Alice",
+        },
+      ],
+    },
+  });
+  try {
+    const own = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(
+        requestFor("wxid_host", "22222222-2222-4222-8222-222222222222"),
+      ),
+    });
+    assert.equal(own.status, 200);
+    await own.text();
+
+    const peer = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(
+        requestFor("wxid_peer", "33333333-3333-4333-8333-333333333333"),
+      ),
+    });
+    assert.equal(peer.status, 403);
+    assert.equal(calls, 1);
+  } finally {
+    await app.close();
+  }
+});
+
+test("rejects duplicate service credentials", () => {
+  assert.throws(
+    () =>
+      createAgentServer({
+        engine: {},
+        clients: [
+          {
+            id: "first",
+            token: "duplicate-agent-token-that-is-long-enough",
+            capabilities: ["runs"],
+          },
+          {
+            id: "second",
+            token: "duplicate-agent-token-that-is-long-enough",
+            capabilities: ["history"],
+          },
+        ],
+      }),
+    /unique/i,
+  );
 });
 
 test("a rejected duplicate run does not cancel the existing owner", async () => {
@@ -329,11 +530,7 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
   });
   const memory = {
     primaryBankId: "telegram:chat:-1001",
-    requester: {
-      id: "telegram:user:40",
-      label: "Alice",
-      owner: false,
-    },
+    requesterIsOwner: false,
     grantedBankIds: ["qq:group:686743769"],
     participants: [
       {
@@ -344,12 +541,6 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
       },
     ],
     query: "What does Alice prefer?",
-    anchors: [
-      {
-        id: "telegram:user:40",
-        label: "Alice",
-      },
-    ],
   };
   try {
     const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
@@ -433,9 +624,9 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
       },
       body: JSON.stringify({
         ...validRun,
-        memory: {
-          ...memory,
-          requester: { ...memory.requester, id: 40 },
+        identity: {
+          ...validRun.identity,
+          requester: { ...validRun.identity.requester, id: 40 },
         },
       }),
     });
@@ -794,6 +985,7 @@ test("rejects unauthenticated history requests", async () => {
 
 test("describes one bounded attachment through the authenticated API", async () => {
   let received;
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
   const app = await listen({
     async *run() {},
     async cancel() {
@@ -815,7 +1007,7 @@ test("describes one bounded attachment through the authenticated API", async () 
         kind: "image",
         mimeType: "image/jpeg",
         filename: "sample.jpg",
-        data: Buffer.from("bounded-image").toString("base64"),
+        data: jpeg.toString("base64"),
       }),
     });
 
@@ -826,7 +1018,7 @@ test("describes one bounded attachment through the authenticated API", async () 
     assert.equal(received.kind, "image");
     assert.equal(received.mimeType, "image/jpeg");
     assert.equal(received.filename, "sample.jpg");
-    assert.deepEqual(received.data, Buffer.from("bounded-image"));
+    assert.deepEqual(received.data, jpeg);
   } finally {
     await app.close();
   }
@@ -853,6 +1045,21 @@ test("rejects invalid or unauthenticated attachment analysis", async () => {
       },
       body: JSON.stringify({ kind: "audio", text: "not supported" }),
     });
+    const mislabeledImage = await fetch(
+      `${app.baseUrl}/v1/attachments/describe`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify({
+          kind: "image",
+          mimeType: "image/jpeg",
+          data: Buffer.from("not-an-image").toString("base64"),
+        }),
+      },
+    );
     const unauthenticated = await fetch(
       `${app.baseUrl}/v1/attachments/describe`,
       {
@@ -867,6 +1074,7 @@ test("rejects invalid or unauthenticated attachment analysis", async () => {
     );
 
     assert.equal(invalid.status, 400);
+    assert.equal(mislabeledImage.status, 400);
     assert.equal(unauthenticated.status, 401);
     assert.equal(called, false);
   } finally {

@@ -321,13 +321,16 @@ class MemoryClientError(RuntimeError):
 
 
 class HindsightMemoryClient:
-    def __init__(self, base_url: str, *, timeout: float = 10.0):
+    def __init__(self, base_url: str, *, token: str, timeout: float = 10.0):
         if timeout <= 0:
             raise ValueError("Memory timeout must be positive")
+        if len(token) < 24:
+            raise ValueError("Memory API token must contain at least 24 characters")
         self._base_url = base_url.rstrip("/")
         if not self._base_url.startswith(("http://", "https://")):
             raise ValueError("Hindsight URL must use http or https")
         self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._headers = {"Authorization": f"Bearer {token}"}
         self._session: aiohttp.ClientSession | None = None
         self._bank_names: dict[str, str] = {}
         self._bank_name_lock = asyncio.Lock()
@@ -723,6 +726,7 @@ class HindsightMemoryClient:
             f"{self._base_url}{path}",
             json=payload,
             params=params,
+            headers=self._headers,
         ) as response:
             if response.status < 200 or response.status >= 300:
                 retry_after = response.headers.get("Retry-After")

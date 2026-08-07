@@ -162,7 +162,7 @@ class OneBotMemoryAdminClient:
             ) from exc
         except error.URLError as exc:
             raise OneBotMemoryAdminError(
-                f"Unable to reach OneBot memory admin at {self._base_url}: {exc.reason}"
+                "Unable to reach OneBot memory admin"
             ) from exc
         if not isinstance(decoded, dict):
             raise OneBotMemoryAdminError("OneBot memory admin returned invalid JSON")
@@ -209,12 +209,17 @@ def _optional_display_name(value: Any) -> str | None:
 def _error_response(exc: Exception) -> web.Response:
     if isinstance(exc, (ValueError, TypeError)):
         status = 400
+        code = "INVALID_REQUEST"
+        message = "Invalid memory administration request."
     elif isinstance(exc, MemoryIngestionBusyError):
         status = 409
+        code = "BUSY"
+        message = "Memory ingestion is already running."
     else:
         status = 500
-    message = " ".join(str(exc).split())[:500] or type(exc).__name__
+        code = "INTERNAL_ERROR"
+        message = "Memory administration failed."
     return web.json_response(
-        {"error": message, "type": type(exc).__name__},
+        {"error": message, "code": code},
         status=status,
     )

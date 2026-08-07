@@ -31,7 +31,7 @@ const PRIVATE_QUERY_NAMES =
 const PRIVATE_ENV_NAME =
   /(?:api[_-]?key|credential|password|private[_-]?key|secret|token)/i;
 const CANONICAL_ACTOR_ID_RE =
-  /(?<![A-Za-z0-9:_.%-])([A-Za-z0-9][A-Za-z0-9:_.%-]{0,191}:user:[A-Za-z0-9][A-Za-z0-9:_.%-]{0,191})(?![A-Za-z0-9:_.%-])/g;
+  /(?<![A-Za-z0-9:_.%-])([A-Za-z0-9][A-Za-z0-9:_.%-]{0,191}:(?:user|channel):[A-Za-z0-9][A-Za-z0-9:_.%-]{0,191})(?![A-Za-z0-9:_.%-])/g;
 const NETWORK_IDENTITY_KEYS = new Set([
   "address",
   "clientip",
@@ -183,16 +183,43 @@ function replaceSensitiveValues(text, values) {
   return result;
 }
 
-export function pseudonymizeActorIdentities(value, key) {
+function requirePseudonymContext(key, scope) {
+  if (typeof key !== "string" || Buffer.byteLength(key) < 32) {
+    throw new Error("Identity alias key must contain at least 32 bytes");
+  }
+  if (typeof scope !== "string" || scope.length < 1 || scope.length > 512) {
+    throw new Error("Identity alias scope is invalid");
+  }
+}
+
+export function pseudonymizeIdentity(identity, key, scope) {
+  requirePseudonymContext(key, scope);
+  const digest = createHmac("sha256", key)
+    .update("sidekick:model-actor:v2\0")
+    .update(scope)
+    .update("\0")
+    .update(String(identity ?? ""))
+    .digest("hex");
+  return `actor_${digest.slice(0, 16)}`;
+}
+
+export function pseudonymizeAccessBank(bankId, key, scope) {
+  requirePseudonymContext(key, scope);
+  const digest = createHmac("sha256", key)
+    .update("sidekick:session-bank-access:v1\0")
+    .update(scope)
+    .update("\0")
+    .update(String(bankId ?? ""))
+    .digest("hex");
+  return `bank_${digest.slice(0, 32)}`;
+}
+
+export function pseudonymizeActorIdentities(value, key, scope) {
   const text = String(value ?? "");
-  if (typeof key !== "string" || key.length < 8) return text;
-  return text.replace(CANONICAL_ACTOR_ID_RE, (identity) => {
-    const digest = createHmac("sha256", key)
-      .update("sidekick:model-actor:v1\0")
-      .update(identity)
-      .digest("hex");
-    return `actor_${digest.slice(0, 16)}`;
-  });
+  requirePseudonymContext(key, scope);
+  return text.replace(CANONICAL_ACTOR_ID_RE, (identity) =>
+    pseudonymizeIdentity(identity, key, scope),
+  );
 }
 
 function redactNetworkLiterals(text, allowed) {
@@ -226,7 +253,13 @@ export function redactSensitiveText(value, options = {}) {
     ...(options.sensitiveValues ?? []),
   ];
   let text = String(value ?? "");
-  text = pseudonymizeActorIdentities(text, options.identityAliasKey);
+  if (options.identityAliasKey !== undefined) {
+    text = pseudonymizeActorIdentities(
+      text,
+      options.identityAliasKey,
+      options.identityScope,
+    );
+  }
   text = replaceSensitiveValues(text, sensitiveValues);
   text = text.replace(
     /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi,

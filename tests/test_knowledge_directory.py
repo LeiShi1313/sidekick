@@ -69,7 +69,7 @@ async def test_directory_publication_uses_one_trusted_reference_scope():
         app.router.add_post("/v1/default/banks/{bank_id}/memories", retain)
 
     runner, url = await _start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     publication = _publication()
     tag = bank_reference_tag(publication.source.bank_id)
     try:
@@ -143,7 +143,7 @@ async def test_directory_recall_uses_exact_or_filters_and_validates_references()
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", recall)
 
     runner, url = await _start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         result = await client.recall_directory(
             query="Coder OT 群最近在聊什么？",
@@ -213,7 +213,7 @@ async def test_directory_recall_uses_source_fact_provenance_for_observations():
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", recall)
 
     runner, url = await _start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         result = await client.recall_directory(
             query="Coder OT",
@@ -256,7 +256,7 @@ async def test_directory_recall_skips_result_without_verifiable_provenance(
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", recall)
 
     runner, url = await _start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         result = await client.recall_directory(
             query="Coder OT",
@@ -318,7 +318,7 @@ async def test_directory_recall_rejects_untrusted_reference_shapes(mutation):
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", recall)
 
     runner, url = await _start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         with pytest.raises(MemoryClientError, match="directory reference"):
             await client.recall_directory(
@@ -398,7 +398,7 @@ async def test_directory_publication_existence_requires_matching_document_contra
         )
 
     runner, url = await _start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         assert await client.is_directory_source_published(bank_id) is True
         assert received["query"].getall("tags") == [tag]

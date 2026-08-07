@@ -186,9 +186,8 @@ class OneBotChatTransport:
         except (OneBotActionError, OneBotMessageError) as exc:
             self._log(
                 "debug",
-                "OneBot reply lookup failed (%s): %s",
+                "OneBot reply lookup failed (%s)",
                 type(exc).__name__,
-                exc,
             )
             return None
 
@@ -234,9 +233,8 @@ class OneBotChatTransport:
         except OneBotActionError as exc:
             self._log(
                 "warning",
-                "OneBot placeholder recall failed (%s): %s",
+                "OneBot placeholder recall failed (%s)",
                 type(exc).__name__,
-                exc,
             )
         return True
 

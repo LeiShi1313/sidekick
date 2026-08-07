@@ -35,7 +35,12 @@ def render_compose() -> dict[str, object]:
         "TELEGRAM_API_HASH": "test-hash",
         "SIDEKICK_ONEBOT_TOKEN": "test-onebot-token",
         "SIDEKICK_ONEBOT_SELF_ID": "123456789",
-        "SIDEKICK_PI_TOKEN": "test-pi-token",
+        "SIDEKICK_TELEGRAM_PI_TOKEN": "telegram-pi-token-that-is-long-enough",
+        "SIDEKICK_ONEBOT_PI_TOKEN": "onebot-pi-token-that-is-long-enough",
+        "SIDEKICK_WECHAT_HOST_PI_TOKEN": "wechat-host-pi-token-that-is-long-enough",
+        "SIDEKICK_WECHAT_PEER_PI_TOKEN": "wechat-peer-pi-token-that-is-long-enough",
+        "SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough",
+        "MEMORY_API_TOKEN": "memory-api-token-that-is-long-enough",
     }
     completed = subprocess.run(
         [
@@ -91,6 +96,15 @@ def test_compose_declares_isolated_workers_for_both_wechat_bridges() -> None:
         assert environment["SIDEKICK_WECHAT_URL"] == "http://wechat:18088"
         assert environment["SIDEKICK_WECHAT_STATE_PATH"] == settings["wechat_state"]
         assert environment["SIDEKICK_AI_STATE_PATH"] == settings["ai_state"]
+        assert environment["SIDEKICK_HINDSIGHT_URL"] == (
+            "http://memory-gateway:8888"
+        )
+        assert environment["SIDEKICK_HINDSIGHT_TOKEN"] == (
+            "memory-api-token-that-is-long-enough"
+        )
+        assert environment["SIDEKICK_OPS_TOKEN"] == (
+            "channel-ops-token-that-is-long-enough"
+        )
         assert set(service["networks"]) == {
             "agent-platform",
             "memory-platform",

@@ -172,12 +172,15 @@ class CachedChannelInventory:
 @dataclass(frozen=True, slots=True)
 class ChannelOpsSettings:
     instance_id: str
+    token: str
     host: str = "127.0.0.1"
     port: int = 8781
 
     def __post_init__(self) -> None:
         if not self.instance_id or len(self.instance_id) > 128:
             raise ValueError("Channel adapter instance ID is invalid")
+        if len(self.token) < 24:
+            raise ValueError("Channel ops token must contain at least 24 characters")
         if not self.host:
             raise ValueError("Channel ops host cannot be empty")
         if not 1 <= self.port <= 65_535:
@@ -198,6 +201,7 @@ class ChannelOpsSettings:
             default_instance_id,
         ).strip()
         host = values.get("SIDEKICK_OPS_HOST", "127.0.0.1").strip()
+        token = values.get("SIDEKICK_OPS_TOKEN", "").strip()
         raw_port = values.get("SIDEKICK_OPS_PORT", "8781").strip()
         if not instance_id or len(instance_id) > 128:
             raise ValueError(
@@ -205,13 +209,17 @@ class ChannelOpsSettings:
             )
         if not host:
             raise ValueError("SIDEKICK_OPS_HOST cannot be empty")
+        if len(token) < 24:
+            raise ValueError(
+                "SIDEKICK_OPS_TOKEN must contain at least 24 characters"
+            )
         try:
             port = int(raw_port)
         except ValueError as exc:
             raise ValueError("SIDEKICK_OPS_PORT must be an integer") from exc
         if not 1 <= port <= 65_535:
             raise ValueError("SIDEKICK_OPS_PORT must be between 1 and 65535")
-        return cls(instance_id=instance_id, host=host, port=port)
+        return cls(instance_id=instance_id, token=token, host=host, port=port)
 
 
 @dataclass(slots=True)
@@ -459,9 +467,8 @@ class ChannelSnapshotService:
         log = getattr(self._logger, "warning", None)
         if callable(log):
             log(
-                "Channel inventory refresh failed (%s): %s",
+                "Channel inventory refresh failed (%s)",
                 type(exc).__name__,
-                exc,
             )
 
 
@@ -470,14 +477,11 @@ class ChannelOpsServer:
         self,
         *,
         snapshot_service: ChannelSnapshotService,
-        token: str,
         settings: ChannelOpsSettings,
         logger: Any | None = None,
     ) -> None:
-        if not token:
-            raise ValueError("Channel ops server requires a bearer token")
         self._snapshot_service = snapshot_service
-        self._token = token
+        self._token = settings.token
         self._settings = settings
         self._logger = logger
         self._runner: web.AppRunner | None = None
@@ -552,12 +556,11 @@ class ChannelOpsServer:
     def _log_snapshot_error(self, exc: Exception) -> None:
         if self._logger is None:
             return
-        log = getattr(self._logger, "exception", None)
+        log = getattr(self._logger, "error", None)
         if callable(log):
             log(
-                "Channel status snapshot failed (%s): %s",
+                "Channel status snapshot failed (%s)",
                 type(exc).__name__,
-                exc,
             )
 
 

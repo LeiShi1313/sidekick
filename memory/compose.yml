@@ -30,15 +30,13 @@ services:
       HINDSIGHT_API_RERANKER_PROVIDER: rrf
       HINDSIGHT_API_RETAIN_ENTITY_LOOKUP: full
       HINDSIGHT_API_WORKER_ID: memory-api
-      VIRTUAL_HOST: hindsight.sidekick.localhost
-      VIRTUAL_PORT: "9999"
     networks:
-      - default
+      - memory-backend
       - ollama-embedding
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports:
-      - "127.0.0.1:${MEMORY_API_EXPOSE_PORT:-18888}:8888"
+    expose:
+      - "8888"
     volumes:
       - memory-data:/home/hindsight/.pg0
     cap_drop:
@@ -49,6 +47,11 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
     pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
     healthcheck:
       test:
@@ -62,6 +65,52 @@ services:
       retries: 30
       start_period: 30s
 
+  memory-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sidekick-memory-gateway:local
+    container_name: sidekick-memory-gateway
+    command: ["python", "-m", "sidekick.memory_gateway"]
+    depends_on:
+      memory-api:
+        condition: service_healthy
+    environment:
+      MEMORY_GATEWAY_HOST: 0.0.0.0
+      MEMORY_GATEWAY_PORT: "8888"
+      MEMORY_GATEWAY_UPSTREAM_URL: http://memory-api:8888
+      MEMORY_GATEWAY_TIMEOUT: ${MEMORY_GATEWAY_TIMEOUT:-300}
+      MEMORY_API_TOKEN: ${MEMORY_API_TOKEN}
+    networks:
+      - default
+      - memory-backend
+    ports:
+      - "127.0.0.1:${MEMORY_API_EXPOSE_PORT:-18888}:8888"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   memory-data:
     name: memory-hindsight-data
@@ -69,6 +118,9 @@ volumes:
 networks:
   default:
     name: memory-platform
+  memory-backend:
+    name: sidekick-memory-backend
+    internal: true
   ollama-embedding:
     external: true
     name: ollama-embedding

@@ -86,6 +86,8 @@ class PlaygroundSettings:
     memory_url: str = "http://127.0.0.1:18888"
     pi_url: str = "http://127.0.0.1:18790"
     pi_token: str = ""
+    memory_token: str = ""
+    channel_token: str = ""
     request_timeout: float = 300
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     channel_adapter_urls: tuple[tuple[str, str], ...] = parse_adapter_urls(None)
@@ -97,8 +99,13 @@ class PlaygroundSettings:
         for name, value in (("memory_url", self.memory_url), ("pi_url", self.pi_url)):
             if not value.rstrip("/").startswith(("http://", "https://")):
                 raise ValueError(f"{name} must use http or https")
-        if not self.pi_token:
-            raise ValueError("pi_token is required")
+        for name, token in (
+            ("pi_token", self.pi_token),
+            ("memory_token", self.memory_token),
+            ("channel_token", self.channel_token),
+        ):
+            if len(token) < 24:
+                raise ValueError(f"{name} must contain at least 24 characters")
         if self.request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
         if not 1 <= len(self.system_prompt) <= 32_000:
@@ -130,6 +137,8 @@ class PlaygroundSettings:
             .strip()
             .rstrip("/"),
             pi_token=os.environ.get("PI_AGENT_TOKEN", "").strip(),
+            memory_token=os.environ.get("MEMORY_API_TOKEN", "").strip(),
+            channel_token=os.environ.get("PLAYGROUND_CHANNEL_TOKEN", "").strip(),
             request_timeout=float(os.environ.get("PLAYGROUND_REQUEST_TIMEOUT", "300")),
             system_prompt=(
                 os.environ.get("PLAYGROUND_SYSTEM_PROMPT", "").strip()
@@ -181,8 +190,8 @@ class PlaygroundData:
         }
 
     async def banks(self) -> dict[str, Any]:
-        payload = await self._json(
-            "GET", f"{self._settings.memory_url}/v1/default/banks"
+        payload = await self._memory_json(
+            "GET", "/v1/default/banks"
         )
         supplied = payload.get("banks")
         if not isinstance(supplied, list) or len(supplied) > 10_000:
@@ -205,9 +214,9 @@ class PlaygroundData:
         if not 1 <= len(query) <= 8_000:
             raise InvalidRequest("Invalid memory query")
         encoded = quote(bank_id, safe="")
-        payload = await self._json(
+        payload = await self._memory_json(
             "POST",
-            f"{self._settings.memory_url}/v1/default/banks/{encoded}/memories/recall",
+            f"/v1/default/banks/{encoded}/memories/recall",
             payload={
                 "query": query,
                 "budget": "mid",
@@ -279,18 +288,29 @@ class PlaygroundData:
             "context": context,
             "systemPrompt": request["systemPrompt"],
             "toolPolicy": tool_policy,
+            "identity": {
+                "requester": {
+                    "id": "playground:user:owner",
+                    "label": "Playground owner",
+                },
+                "anchors": [
+                    {
+                        "id": "playground:user:owner",
+                        "label": "Playground owner",
+                    }
+                ],
+            },
+            "origin": {
+                "scopeId": "playground:owner",
+                "adapterInstanceId": "playground",
+            },
         }
         if memory is not None:
             pi_request["memory"] = {
                 "primaryBankId": bank_id,
-                "requester": {
-                    "id": "playground:user:owner",
-                    "label": "Playground owner",
-                    "owner": True,
-                },
+                "requesterIsOwner": True,
                 "grantedBankIds": [],
                 "participants": [],
-                "anchors": [],
             }
             pi_request["includeMemorySnapshot"] = True
             if request["memoryQuery"]:
@@ -403,6 +423,20 @@ class PlaygroundData:
             method,
             f"{self._settings.pi_url}{path}{suffix}",
             headers={"Authorization": f"Bearer {self._settings.pi_token}"},
+        )
+
+    async def _memory_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await self._json(
+            method,
+            f"{self._settings.memory_url}{path}",
+            payload=payload,
+            headers={"Authorization": f"Bearer {self._settings.memory_token}"},
         )
 
     def _get_session(self) -> aiohttp.ClientSession:
@@ -629,6 +663,9 @@ def _parse_audit_page(payload: dict[str, Any]) -> dict[str, Any]:
         status = value.get("status")
         if status not in {"in_progress", "completed", "failed"}:
             raise UpstreamUnavailable("Pi agent returned malformed audits")
+        memory_enabled = value.get("memoryEnabled")
+        if not isinstance(memory_enabled, bool):
+            raise UpstreamUnavailable("Pi agent returned malformed audits")
         items.append(
             {
                 "runId": value["runId"],
@@ -638,6 +675,7 @@ def _parse_audit_page(payload: dict[str, Any]) -> dict[str, Any]:
                 "startedAt": _optional_history_string(value, "startedAt", 64),
                 "finishedAt": _optional_history_string(value, "finishedAt", 64),
                 "prompt": _optional_history_string(value, "prompt", 300) or "",
+                "memoryEnabled": memory_enabled,
                 "memoryScopeId": _optional_history_string(value, "memoryScopeId", 512),
                 "eventCount": event_count,
             }
@@ -665,7 +703,7 @@ def _parse_run_audit(payload: dict[str, Any], expected_run_id: str) -> dict[str,
     for event in events:
         if (
             not isinstance(event, dict)
-            or event.get("version") != 1
+            or event.get("version") != 2
             or event.get("runId") != expected_run_id
             or not isinstance(event.get("sequence"), int)
             or isinstance(event.get("sequence"), bool)
@@ -769,6 +807,9 @@ def _parse_run_summary(
         memory = value.get("memory")
         if not isinstance(memory, dict):
             fail()
+        memory_enabled = memory.get("enabled")
+        if not isinstance(memory_enabled, bool):
+            fail()
         route = memory.get("route")
         if route not in {
             "off",
@@ -780,7 +821,7 @@ def _parse_run_summary(
         }:
             fail()
         primary_bank_id = optional_string(memory, "primaryBankId", 512)
-        if (route == "off") != (primary_bank_id is None):
+        if (route == "off") == memory_enabled:
             fail()
 
         initial_recall = memory.get("initialRecall")
@@ -811,6 +852,7 @@ def _parse_run_summary(
             parsed_initial_recall = {
                 "status": recall_status,
                 "queries": queries,
+                "queryCount": count(initial_recall.get("queryCount"), 5_000),
                 "memoryCount": count(initial_recall.get("memoryCount"), 5_000),
                 "eventSequence": event_sequence(initial_recall.get("eventSequence")),
             }
@@ -913,6 +955,7 @@ def _parse_run_summary(
             "session": parsed_session,
             "model": parsed_model,
             "memory": {
+                "enabled": memory_enabled,
                 "primaryBankId": primary_bank_id,
                 "route": route,
                 "initialRecall": parsed_initial_recall,
@@ -1178,7 +1221,9 @@ def create_app(settings: PlaygroundSettings | None = None) -> web.Application:
             adapter_urls=resolved.channel_adapter_urls,
             pi_url=resolved.pi_url,
             memory_url=resolved.memory_url,
-            token=resolved.pi_token,
+            pi_token=resolved.pi_token,
+            channel_token=resolved.channel_token,
+            memory_token=resolved.memory_token,
             poll_interval=resolved.channel_poll_interval,
             source_timeout=resolved.channel_source_timeout,
             bank_cache_ttl=resolved.channel_bank_cache_ttl,

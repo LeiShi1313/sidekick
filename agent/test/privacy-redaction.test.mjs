@@ -9,7 +9,10 @@ import {
 } from "../src/privacy-redaction.mjs";
 
 test("pseudonymizes platform actor identifiers with a stable keyed alias", () => {
-  const options = { identityAliasKey: "test-identity-alias-key" };
+  const options = {
+    identityAliasKey: "test-identity-alias-key-that-is-strong",
+    identityScope: "telegram:chat:-1001",
+  };
   const first = redactSensitiveText(
     "Requester telegram:user:419540347 replied to qq:user:12345678",
     options,
@@ -24,6 +27,17 @@ test("pseudonymizes platform actor identifiers with a stable keyed alias", () =>
   assert.equal(
     first.match(/actor_[a-f0-9]{16}/)?.[0],
     repeated.match(/actor_[a-f0-9]{16}/)?.[0],
+  );
+  assert.notEqual(
+    first.match(/actor_[a-f0-9]{16}/)?.[0],
+    redactSensitiveText("Again telegram:user:419540347", {
+      ...options,
+      identityScope: "telegram:chat:-1002",
+    }).match(/actor_[a-f0-9]{16}/)?.[0],
+  );
+  assert.doesNotMatch(
+    redactSensitiveText("Post by telegram:channel:998877", options),
+    /telegram:channel:998877/,
   );
 });
 

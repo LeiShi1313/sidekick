@@ -111,7 +111,7 @@ async def test_operational_state_aggregates_config_ingestion_and_active_runs(
         assert state.retrying_count == 1
         assert state.dead_letter_count == 1
         assert state.next_retry_at == 1_800_000_035
-        assert state.outbox_last_error == "ValueError: poison document"
+        assert state.outbox_last_error == "ValueError"
         assert state.outbox_last_error_at == 1_800_000_004
         assert state.outbox_last_dead_lettered_at == 1_800_000_004
         assert state.last_retained_at == state.last_ingested_at

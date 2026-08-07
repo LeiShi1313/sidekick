@@ -332,7 +332,7 @@ class ChatMemoryIngestor:
             await self._store.record_memory_dream_failure(
                 self._identity_codec.scope_id(chat_id),
                 failed_at=self._clock(),
-                error=f"{type(exc).__name__}: {exc}",
+                error=type(exc).__name__,
             )
             raise
 
@@ -529,7 +529,7 @@ class ChatMemoryIngestor:
             await self._store.record_continuous_memory_failure(
                 scope_id,
                 failed_at=self._clock(),
-                error=f"{type(exc).__name__}: {exc}",
+                error=type(exc).__name__,
             )
             raise
 
@@ -725,21 +725,17 @@ class ChatMemoryIngestor:
                         attempted_at=failed_at,
                         next_attempt_at=failed_at + retry_delay,
                         dead_lettered_at=dead_lettered_at,
-                        error=f"{type(created).__name__}: {created}",
+                        error=type(created).__name__,
                     )
                     documents_failed += 1
                     documents_dead_lettered += dead_lettered_at is not None
                     if self._logger is not None:
                         self._logger.warning(
                             "Memory outbox delivery failed "
-                            "(scope_id=%s, document_id=%s, attempt=%s, "
-                            "dead_lettered=%s, error=%s): %s",
-                            scope_id,
-                            item.document.episode.document_id,
+                            "(attempt=%s, dead_lettered=%s, error=%s)",
                             attempt_count,
                             dead_lettered_at is not None,
                             type(created).__name__,
-                            created,
                         )
                     continue
                 completed.append(
@@ -913,9 +909,8 @@ class ChatMemoryIngestor:
             if self._logger is not None and result.messages_seen:
                 self._logger.info(
                     "Dream scan staged "
-                    "(chat_id=%s, messages=%s, documents=%s, retained=%s, "
+                    "(messages=%s, documents=%s, retained=%s, "
                     "failed=%s, dead_lettered=%s)",
-                    chat_id,
                     result.messages_seen,
                     len(pending),
                     delivered.documents_created
@@ -928,7 +923,7 @@ class ChatMemoryIngestor:
             await self._store.record_memory_dream_failure(
                 scope_id,
                 failed_at=self._clock(),
-                error=f"{type(exc).__name__}: {exc}",
+                error=type(exc).__name__,
             )
             raise
 
@@ -1018,10 +1013,9 @@ class ChatMemoryIngestor:
             finished_at = self._monotonic()
             self._logger.info(
                 "Dream retention complete "
-                "(chat_id=%s, messages=%s, documents=%s, created=%s, "
+                "(messages=%s, documents=%s, created=%s, "
                 "unchanged=%s, complete=%s, prepare_seconds=%.3f, "
                 "retain_seconds=%.3f)",
-                chat_id,
                 result.messages_seen,
                 len(documents),
                 result.documents_created,

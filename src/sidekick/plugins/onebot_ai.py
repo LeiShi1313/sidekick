@@ -113,6 +113,7 @@ class OneBotAI(metaclass=PluginMount):
         self._memory = (
             HindsightMemoryClient(
                 self._settings.hindsight_url,
+                token=self._settings.hindsight_token or "",
                 timeout=self._settings.hindsight_timeout,
             )
             if self._settings.hindsight_url
@@ -143,7 +144,6 @@ class OneBotAI(metaclass=PluginMount):
                 memory_available=self._memory is not None,
                 logger=self.logger,
             ),
-            token=self._settings.agent_token,
             settings=self._ops_settings,
             logger=self.logger,
         )
@@ -167,11 +167,7 @@ class OneBotAI(metaclass=PluginMount):
             await self._setup()
             await self._bridge.start(self._runtime.host, self._runtime.port)
             await self._ops_server.start()
-            self.logger.info(
-                "OneBot AI listening on %s:%s",
-                self._runtime.host,
-                self._runtime.port,
-            )
+            self.logger.info("OneBot AI listening")
             await self._bridge.wait_connected()
             await self._verify_account()
             self._adapter_status.update(connected=True)
@@ -182,10 +178,7 @@ class OneBotAI(metaclass=PluginMount):
                 self._dream_scheduler.start()
             if self._memory_outbox_scheduler is not None:
                 self._memory_outbox_scheduler.start()
-            self.logger.info(
-                "OneBot AI connected (self_id=%s)",
-                self._runtime.self_id,
-            )
+            self.logger.info("OneBot AI connected")
             await stop.wait()
         finally:
             self._adapter_status.update(connected=False)
@@ -308,9 +301,8 @@ class OneBotAI(metaclass=PluginMount):
             await self._directory.refresh(self._bridge)
         except Exception as exc:
             self.logger.warning(
-                "OneBot directory refresh failed (%s): %s",
+                "OneBot directory refresh failed (%s)",
                 type(exc).__name__,
-                exc,
             )
 
     async def _on_event(self, payload: dict[str, Any]) -> None:
@@ -321,8 +313,8 @@ class OneBotAI(metaclass=PluginMount):
                 payload,
                 action_client=self._bridge,
             )
-        except OneBotMessageError as exc:
-            self.logger.warning("Ignoring malformed OneBot message: %s", exc)
+        except OneBotMessageError:
+            self.logger.warning("Ignoring malformed OneBot message")
             return
         if message.scope_display_name is None:
             message.scope_display_name = self._directory.scope_name(message.chat_id)
@@ -337,11 +329,10 @@ class OneBotAI(metaclass=PluginMount):
             return
         try:
             await self._handler.handle(message)
-        except Exception:
-            self.logger.exception(
-                "OneBot AI message handling failed (chat_id=%s, message_id=%s)",
-                message.chat_id,
-                message.id,
+        except Exception as exc:
+            self.logger.error(
+                "OneBot AI message handling failed (%s)",
+                type(exc).__name__,
             )
 
 

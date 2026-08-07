@@ -1,14 +1,17 @@
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 
 import {
-  AuthStorage,
   DefaultResourceLoader,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
   createAgentSession,
   defineTool,
 } from "@earendil-works/pi-coding-agent";
+import {
+  InMemoryCredentialStore,
+  InMemoryModelsStore,
+} from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 
@@ -19,13 +22,19 @@ import { isModelId } from "./model-id.mjs";
 import {
   SensitiveTextStream,
   collectSensitiveLiterals,
-  pseudonymizeActorIdentities,
+  pseudonymizeAccessBank,
+  pseudonymizeIdentity,
   redactSensitiveText,
   sanitizeConversationHistoryInPlace,
   sanitizeMessageInPlace,
 } from "./privacy-redaction.mjs";
 import { RunAuditStore } from "./run-audit.mjs";
-import { hardenSessionPersistence } from "./session-persistence.mjs";
+import {
+  assertSessionBinding,
+  bindSession,
+  hardenSessionPersistence,
+  scrubSessionDirectory,
+} from "./session-persistence.mjs";
 import { SessionHistory } from "./session-history.mjs";
 import { TAIBU_MCP_GUIDANCE } from "./taibu-mcp-config.mjs";
 import { constrainWebTools } from "./web-tools.mjs";
@@ -119,20 +128,15 @@ function contextTag(kind) {
     : "untrusted_reference_context";
 }
 
-function modelIdentityAliases(memory, key) {
-  if (!memory) return new Map();
-  if (typeof key !== "string" || key.length < 8) {
-    throw new Error("Model identity alias key is unavailable");
-  }
+function modelIdentityAliases(identity, key, scope) {
   const identities = [
-    memory.requester?.id,
-    ...(memory.anchors ?? []).map((anchor) => anchor?.id),
-    ...(memory.participants ?? []).map((participant) => participant?.id),
+    identity.requester.id,
+    ...identity.anchors.map((anchor) => anchor?.id),
   ];
   return new Map(
     identities
       .filter((identity) => typeof identity === "string" && identity.length > 0)
-      .map((identity) => [identity, pseudonymizeActorIdentities(identity, key)]),
+      .map((identity) => [identity, pseudonymizeIdentity(identity, key, scope)]),
   );
 }
 
@@ -146,10 +150,24 @@ function replaceModelIdentityIds(value, aliases) {
   return result;
 }
 
-export function continuationAccessWarning(messages, memory) {
-  if (memory?.requester?.owner) return null;
+export function continuationAccessWarning(
+  entries,
+  memory,
+  { identityAliasKey, scopeId },
+) {
+  if (memory?.requesterIsOwner) return null;
   const historical = new Set();
-  for (const message of messages ?? []) {
+  for (const entry of entries ?? []) {
+    if (
+      entry?.type === "custom" &&
+      entry.customType === "sidekick-access-manifest"
+    ) {
+      for (const digest of entry.data?.bankDigests ?? []) {
+        if (/^bank_[a-f0-9]{32}$/.test(digest)) historical.add(digest);
+      }
+      continue;
+    }
+    const message = entry?.type === "message" ? entry.message : null;
     if (
       message?.role !== "toolResult" ||
       message.isError ||
@@ -158,51 +176,49 @@ export function continuationAccessWarning(messages, memory) {
     ) {
       continue;
     }
-    const details = message.details;
-    const candidates = [
-      details?.bankId,
-      ...(Array.isArray(details?.bankIds) ? details.bankIds : []),
-      ...(Array.isArray(details?.references)
-        ? details.references.map((reference) => reference?.bankId)
-        : []),
-    ];
-    for (const bankId of candidates) {
-      if (typeof bankId === "string" && bankId.length <= 256) {
-        historical.add(bankId);
-      }
+    for (const digest of message.details?.accessBankDigests ?? []) {
+      if (/^bank_[a-f0-9]{32}$/.test(digest)) historical.add(digest);
     }
   }
   if (historical.size === 0) return null;
   const effective = new Set(
     memory
-      ? [memory.primaryBankId, ...(memory.grantedBankIds ?? [])]
+      ? [memory.primaryBankId, ...(memory.grantedBankIds ?? [])].map((bankId) =>
+          pseudonymizeAccessBank(bankId, identityAliasKey, scopeId),
+        )
       : [],
   );
-  const unavailableBankIds = [...historical].filter(
-    (bankId) => !effective.has(bankId),
+  const unavailable = [...historical].filter(
+    (digest) => !effective.has(digest),
   );
-  if (unavailableBankIds.length === 0) return null;
+  if (unavailable.length === 0) return null;
   return {
-    historicalBankIds: [...historical],
-    unavailableBankIds,
+    historicalSourceCount: historical.size,
+    unavailableSourceCount: unavailable.length,
   };
 }
 
 export function buildRunPrompt({
   prompt,
   context,
+  identity,
+  origin,
   memory,
   continuation = false,
   identityAliasKey,
 }) {
   const sections = [];
-  const identityAliases = modelIdentityAliases(memory, identityAliasKey);
-  if (memory?.requester) {
+  const identityAliases = modelIdentityAliases(
+    identity,
+    identityAliasKey,
+    origin.scopeId,
+  );
+  if (identity?.requester) {
     const actorId = promptXmlText(
-      identityAliases.get(memory.requester.id),
+      identityAliases.get(identity.requester.id),
       256,
     );
-    const label = promptXmlText(memory.requester.label ?? "not provided", 256);
+    const label = promptXmlText(identity.requester.label ?? "not provided", 256);
     sections.push(
       "<host_request_identity>\n" +
         `Host-resolved current requester actor ID: ${actorId}\n` +
@@ -214,7 +230,7 @@ export function buildRunPrompt({
     );
   }
   if (continuation) {
-    const continuityGuidance = memory?.requester
+    const continuityGuidance = identity?.requester
       ? "This is a follow-up turn in an existing conversation. Treat it as a shared, potentially multi-participant conversation: provider user-role messages represent human turns, not one persistent person. " +
         "Preserve each turn's host_request_identity while interpreting the current request in relation to the preceding request and assistant response. " +
         "Never attribute an earlier request or first-person statement to the current requester unless their actor IDs match. " +
@@ -457,6 +473,13 @@ function auditErrorDetails(error) {
 
 export class PiEngine {
   constructor(config) {
+    if (
+      config.memoryUrl &&
+      (typeof config.memoryToken !== "string" ||
+        Buffer.byteLength(config.memoryToken) < 24)
+    ) {
+      throw new Error("Memory API credential is unavailable");
+    }
     this.config = config;
     this.activeRuns = new Map();
     this.locks = new KeyedLock();
@@ -468,9 +491,7 @@ export class PiEngine {
         sessionDir: config.sessionDir,
       });
     this.auditStore = config.auditStore ?? new RunAuditStore(config.auditDir);
-    this.authStorage = AuthStorage.inMemory();
-    this.authStorage.setRuntimeApiKey(PROVIDER, config.apiKey);
-    this.modelRegistry = ModelRegistry.inMemory(this.authStorage);
+    this.modelRuntimePromise = null;
     const thinkingLevel = normalizeThinkingLevel(config.reasoningEffort);
     const reasoning = thinkingLevel !== "off";
     this.thinkingLevel = thinkingLevel;
@@ -608,7 +629,17 @@ export class PiEngine {
   }
 
   async initialize() {
+    await this.#modelRuntime();
     await this.#ensureDirectories();
+    await Promise.all([
+      typeof this.auditStore.scrub === "function"
+        ? this.auditStore.scrub()
+        : Promise.resolve(),
+      scrubSessionDirectory(this.config.sessionDir, {
+        sensitiveValues: [this.config.apiKey],
+        identityAliasKey: this.config.identityAliasKey,
+      }),
+    ]);
     const loader = await this.#resourceLoader(
       "You are the Pi agent engine. Follow the current request.",
     );
@@ -634,16 +665,19 @@ export class PiEngine {
     );
   }
 
-  async *run(request, requestOwner = null) {
+  async *run(request, requestOwner) {
     if (this.activeRuns.has(request.runId)) {
       throw new Error("Agent run is already active");
+    }
+    if (typeof requestOwner !== "string" || requestOwner.length < 1) {
+      throw new Error("Agent request owner is required");
     }
     const startedAt = new Date().toISOString();
     const activeRun = {
       runId: request.runId,
       sessionId: request.sessionId,
-      scopeId: request.origin?.scopeId ?? null,
-      adapterInstanceId: request.origin?.adapterInstanceId ?? null,
+      scopeId: request.origin.scopeId,
+      adapterInstanceId: request.origin.adapterInstanceId,
       modelId: request.model ?? this.model.id,
       startedAt,
       updatedAt: startedAt,
@@ -693,7 +727,8 @@ export class PiEngine {
       systemPrompt: request.systemPrompt,
       toolPolicy: request.toolPolicy,
       model: request.model ?? null,
-      origin: request.origin ?? null,
+      origin: request.origin,
+      identity: request.identity,
       memory: request.memory ?? null,
       includeMemorySnapshot: Boolean(request.includeMemorySnapshot),
     });
@@ -717,12 +752,25 @@ export class PiEngine {
         yield await cancelledEvent();
         return;
       }
+      let persistenceState = {
+        privacyOptions: {
+          sensitiveValues: [this.config.apiKey],
+          identityAliasKey: this.config.identityAliasKey,
+          identityScope: request.origin.scopeId,
+        },
+      };
+      const sessionManager = hardenSessionPersistence(
+        await this.#sessionManager(request, activeRun.requestOwner),
+        () => persistenceState,
+      );
       this.#updateActiveRun(activeRun, { phase: "recalling" });
       const observeMemory = ({ type, data }) => record(type, data);
       const recalled = await retrieveMemoryContext({
         baseUrl: this.config.memoryUrl,
+        token: this.config.memoryToken,
         prompt: request.prompt,
         context: request.context,
+        identity: request.identity,
         memory: request.memory,
         timeoutMs: this.config.requestTimeoutMs,
         fetchImpl: this.config.memoryFetch,
@@ -743,7 +791,7 @@ export class PiEngine {
         access: recalled.access,
       });
       await record("memory.directory.policy", {
-        requester: request.memory?.requester ?? null,
+        requesterIsOwner: request.memory?.requesterIsOwner ?? null,
         primaryBankId: request.memory?.primaryBankId ?? null,
         grantedBankIds: request.memory?.grantedBankIds ?? [],
         participants: request.memory?.participants ?? [],
@@ -783,16 +831,50 @@ export class PiEngine {
             ],
           }
         : request;
-      let persistenceState = {
-        privacyOptions: {
-          sensitiveValues: [this.config.apiKey],
+      const accessWarning = continuationAccessWarning(
+        sessionManager.getEntries(),
+        request.memory,
+        {
           identityAliasKey: this.config.identityAliasKey,
+          scopeId: request.origin.scopeId,
         },
-      };
-      const sessionManager = hardenSessionPersistence(
-        await this.#sessionManager(request),
-        () => persistenceState,
       );
+      if (accessWarning) {
+        const failed = {
+          code: "SESSION_ACCESS_CHANGED",
+          message: "Start a new AI request because memory access changed",
+          sessionId: sessionManager.getSessionId(),
+        };
+        await record("memory.access.denied", {
+          ...accessWarning,
+          reason: "continuation_contains_less_accessible_bank_evidence",
+        });
+        terminalRecorded = true;
+        await record("run.failed", failed);
+        yield {
+          type: "run_failed",
+          code: failed.code,
+          message: failed.message,
+        };
+        return;
+      }
+      const evidenceBankIds = new Set(
+        (recalled.access?.sourceCapabilities ?? []).map(({ bankId }) => bankId),
+      );
+      if (recalled.memories.length > 0 && recalled.access?.primaryBankId) {
+        evidenceBankIds.add(recalled.access.primaryBankId);
+      }
+      if (evidenceBankIds.size > 0) {
+        sessionManager.appendCustomEntry("sidekick-access-manifest", {
+          bankDigests: [...evidenceBankIds].map((bankId) =>
+            pseudonymizeAccessBank(
+              bankId,
+              this.config.identityAliasKey,
+              request.origin.scopeId,
+            ),
+          ),
+        });
+      }
       const mcpEnabled =
         request.toolPolicy !== "none" && Boolean(this.config.mcpExtensionPath);
       const resourceLoader = await this.#resourceLoader(request.systemPrompt, {
@@ -819,6 +901,7 @@ export class PiEngine {
       );
       const memoryTools = createMemoryTools({
         baseUrl: this.config.memoryUrl,
+        token: this.config.memoryToken,
         access: recalled.access,
         timeoutMs: this.config.requestTimeoutMs,
         fetchImpl: this.config.memoryFetch,
@@ -829,11 +912,11 @@ export class PiEngine {
         memoryTools.length > 0,
         mcpEnabled,
       );
+      const modelRuntime = await this.#modelRuntime();
       const { session } = await createAgentSession({
         cwd: PUBLIC_AGENT_CWD,
         agentDir: this.config.agentDir,
-        authStorage: this.authStorage,
-        modelRegistry: this.modelRegistry,
+        modelRuntime,
         model,
         thinkingLevel: this.thinkingLevel,
         tools: toolNames,
@@ -876,6 +959,7 @@ export class PiEngine {
         ...allowedLiterals,
         sensitiveValues: [this.config.apiKey],
         identityAliasKey: this.config.identityAliasKey,
+        identityScope: request.origin.scopeId,
       };
       persistenceState = {
         privacyOptions,
@@ -886,32 +970,6 @@ export class PiEngine {
         }),
       };
       sanitizeConversationHistoryInPlace(session.messages, privacyOptions);
-      const accessWarning = continuationAccessWarning(
-        session.messages,
-        request.memory,
-      );
-      if (accessWarning) {
-        const failed = {
-          code: "SESSION_ACCESS_CHANGED",
-          message: "Start a new AI request because memory access changed",
-          sessionId: session.sessionId,
-        };
-        await record("memory.access.denied", {
-          historicalSourceCount: accessWarning.historicalBankIds.length,
-          unavailableSourceCount: accessWarning.unavailableBankIds.length,
-          reason: "continuation_contains_less_accessible_bank_evidence",
-        });
-        terminalRecorded = true;
-        await record("run.failed", failed);
-        activeRun.session = null;
-        await closeAgentSession(session);
-        yield {
-          type: "run_failed",
-          code: failed.code,
-          message: failed.message,
-        };
-        return;
-      }
 
       const queue = new AsyncQueue();
       const toolStartedAt = new Map();
@@ -1164,18 +1222,43 @@ export class PiEngine {
   }
 
   async #ensureDirectories() {
-    await Promise.all([
-      mkdir(this.config.workspaceDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.config.auditDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.config.agentDir, { recursive: true, mode: 0o700 }),
-    ]);
+    const directories = [
+      this.config.workspaceDir,
+      this.config.sessionDir,
+      this.config.auditDir,
+      this.config.agentDir,
+    ];
+    await Promise.all(
+      directories.map(async (directory) => {
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        await chmod(directory, 0o700);
+      }),
+    );
   }
 
-  async #sessionManager(request) {
+  async #sessionManager(request, requestOwner) {
+    const binding = {
+      principalId: requestOwner,
+      scopeId: request.origin.scopeId,
+      key: this.config.identityAliasKey,
+    };
     if (request.sessionId === null) {
-      return SessionManager.create(PUBLIC_AGENT_CWD, this.config.sessionDir);
+      const manager = SessionManager.create(
+        PUBLIC_AGENT_CWD,
+        this.config.sessionDir,
+      );
+      await bindSession(
+        this.config.sessionDir,
+        manager.getSessionId(),
+        binding,
+      );
+      return manager;
     }
+    await assertSessionBinding(
+      this.config.sessionDir,
+      request.sessionId,
+      binding,
+    );
     const sessions = await SessionManager.listAll(this.config.sessionDir);
     const existing = sessions.find(({ id }) => id === request.sessionId);
     if (!existing) throw new Error("Agent session not found");
@@ -1236,5 +1319,41 @@ export class PiEngine {
       );
     }
     return loader;
+  }
+
+  #modelRuntime() {
+    if (this.modelRuntimePromise) return this.modelRuntimePromise;
+    const model = this.model;
+    this.modelRuntimePromise = ModelRuntime.create({
+      credentials: new InMemoryCredentialStore(),
+      modelsPath: null,
+      modelsStore: new InMemoryModelsStore(),
+      allowModelNetwork: false,
+      refreshOnCreate: false,
+    }).then((runtime) => {
+      runtime.registerProvider(PROVIDER, {
+        name: PROVIDER,
+        baseUrl: model.baseUrl,
+        apiKey: this.config.apiKey,
+        api: model.api,
+        models: [
+          {
+            id: model.id,
+            name: model.name,
+            reasoning: model.reasoning,
+            ...(model.thinkingLevelMap
+              ? { thinkingLevelMap: model.thinkingLevelMap }
+              : {}),
+            input: model.input,
+            cost: model.cost,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+            compat: model.compat,
+          },
+        ],
+      });
+      return runtime;
+    });
+    return this.modelRuntimePromise;
   }
 }

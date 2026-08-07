@@ -53,7 +53,7 @@ async function main() {
 
   const server = createAgentServer({
     engine,
-    token: config.serviceToken,
+    clients: config.clients,
     logger: {
       info: (message, fields) => logger("info", message, fields),
       error: (message, fields) => logger("error", message, fields),
@@ -63,10 +63,7 @@ async function main() {
     server.once("error", reject);
     server.listen(config.port, config.host, resolve);
   });
-  logger("info", "Pi agent service started", {
-    host: config.host,
-    port: config.port,
-  });
+  logger("info", "Pi agent service started");
 
   let stopping = false;
   const stop = async () => {
@@ -81,7 +78,7 @@ async function main() {
 
 main().catch((error) => {
   logger("error", "Pi agent service failed to start", {
-    error: error instanceof Error ? error.message : String(error),
+    errorType: error instanceof Error ? error.name : "UnknownError",
   });
   process.exitCode = 1;
 });

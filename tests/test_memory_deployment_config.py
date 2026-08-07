@@ -31,6 +31,12 @@ def docker_compose_available() -> bool:
 def render_memory_service_environment(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    return render_memory_compose(overrides)["services"]["memory-api"]["environment"]
+
+
+def render_memory_compose(
+    overrides: dict[str, str] | None = None,
+) -> dict[str, object]:
     environment = {
         **os.environ,
         "MEMORY_LLM_API_KEY": "test-key",
@@ -38,6 +44,7 @@ def render_memory_service_environment(
         "MEMORY_LLM_MODEL": "global-model",
         "MEMORY_LLM_REASONING_EFFORT": "low",
         "MEMORY_EMBEDDING_API_KEY": "test-embedding-key",
+        "MEMORY_API_TOKEN": "memory-api-token-that-is-long-enough",
     }
     for key in (
         "MEMORY_RETAIN_LLM_MODEL",
@@ -69,8 +76,7 @@ def render_memory_service_environment(
         text=True,
     )
 
-    rendered = json.loads(completed.stdout)
-    return rendered["services"]["memory-api"]["environment"]
+    return json.loads(completed.stdout)
 
 
 @pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
@@ -128,3 +134,31 @@ def test_memory_operation_models_fall_back_to_the_global_model():
     assert (
         service_environment["HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT"] == "low"
     )
+
+
+@pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
+def test_raw_memory_service_is_reachable_only_through_the_authenticated_gateway():
+    rendered = render_memory_compose()
+    raw = rendered["services"]["memory-api"]
+    gateway = rendered["services"]["memory-gateway"]
+
+    assert "ports" not in raw
+    assert set(raw["networks"]) == {"memory-backend", "ollama-embedding"}
+    assert "VIRTUAL_HOST" not in raw["environment"]
+    assert set(gateway["networks"]) == {"default", "memory-backend"}
+    assert gateway["environment"]["MEMORY_GATEWAY_UPSTREAM_URL"] == (
+        "http://memory-api:8888"
+    )
+    assert gateway["environment"]["MEMORY_API_TOKEN"] == (
+        "memory-api-token-that-is-long-enough"
+    )
+    assert gateway["ports"] == [
+        {
+            "mode": "ingress",
+            "host_ip": "127.0.0.1",
+            "target": 8888,
+            "published": "18888",
+            "protocol": "tcp",
+        }
+    ]
+    assert rendered["networks"]["memory-backend"]["internal"] is True

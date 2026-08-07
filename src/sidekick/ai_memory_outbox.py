@@ -116,11 +116,8 @@ class MemoryOutboxScheduler:
                 except Exception as exc:
                     if self._logger is not None:
                         self._logger.warning(
-                            "Memory outbox scope failed "
-                            "(scope_id=%s, error=%s): %s",
-                            scope_id,
+                            "Memory outbox scope failed (error=%s)",
                             type(exc).__name__,
-                            exc,
                         )
                     return "failed", None
             return "succeeded", result
@@ -169,11 +166,9 @@ class MemoryOutboxScheduler:
                 result = await self.run_once()
             except Exception as exc:
                 if self._logger is not None:
-                    self._logger.exception(
-                        "Memory outbox orchestration failed "
-                        "(error=%s): %s",
+                    self._logger.error(
+                        "Memory outbox orchestration failed (error=%s)",
                         type(exc).__name__,
-                        exc,
                     )
                 result = None
             await self._sleep(

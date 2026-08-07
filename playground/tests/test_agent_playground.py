@@ -14,6 +14,10 @@ from agent_playground.app import (
     create_app,
 )
 
+PI_TOKEN = "private-pi-token-that-is-long-enough"
+MEMORY_TOKEN = "private-memory-token-that-is-long-enough"
+CHANNEL_TOKEN = "private-channel-token-that-is-long-enough"
+
 
 async def start(app: web.Application) -> tuple[web.AppRunner, str]:
     runner = web.AppRunner(app)
@@ -40,7 +44,8 @@ async def dependencies(
     async def memory_health(_):
         return web.json_response({"status": "healthy"})
 
-    async def banks(_):
+    async def banks(request):
+        assert request.headers["Authorization"] == f"Bearer {MEMORY_TOKEN}"
         return web.json_response(
             {
                 "banks": [
@@ -54,6 +59,7 @@ async def dependencies(
         )
 
     async def recall(request):
+        assert request.headers["Authorization"] == f"Bearer {MEMORY_TOKEN}"
         received["recalls"].append(await request.json())
         return web.json_response(
             {
@@ -83,7 +89,7 @@ async def dependencies(
         return web.json_response({"status": "ok"})
 
     async def run(request):
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         payload = await request.json()
         received["runs"].append(payload)
         response = web.StreamResponse(
@@ -134,12 +140,12 @@ async def dependencies(
         return response
 
     async def cancel(request):
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         received["cancelled"].append(request.match_info["run_id"])
         return web.json_response({"cancelled": True})
 
     async def sessions(request):
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         received["session_queries"].append(dict(request.query))
         return web.json_response(
             {
@@ -159,7 +165,7 @@ async def dependencies(
         )
 
     async def session_detail(request):
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         assert request.match_info["session_id"] == "session-1"
         return web.json_response(
             {
@@ -198,7 +204,7 @@ async def dependencies(
         )
 
     async def audits(request):
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         if request.query.get("status") == "active":
             return web.json_response({"items": [], "total": 0})
         received["audit_queries"].append(dict(request.query))
@@ -212,8 +218,9 @@ async def dependencies(
                         "status": "completed",
                         "startedAt": "2026-07-13T12:00:00.000Z",
                         "finishedAt": "2026-07-13T12:00:01.000Z",
-                        "prompt": "Who owns deployment?",
-                        "memoryScopeId": "chat:engineering",
+                        "prompt": "",
+                        "memoryEnabled": True,
+                        "memoryScopeId": None,
                         "eventCount": 11,
                     }
                 ],
@@ -223,7 +230,7 @@ async def dependencies(
         )
 
     async def audit_detail(request):
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         run_id = request.match_info["run_id"]
         return web.json_response(
             {
@@ -247,17 +254,19 @@ async def dependencies(
                         "thinkingLevel": "medium",
                     },
                     "memory": {
-                        "primaryBankId": "chat:engineering",
+                        "enabled": True,
+                        "primaryBankId": None,
                         "route": "cross_bank_queried",
                         "initialRecall": {
                             "status": "completed",
-                            "queries": ["Who owns deployment?"],
+                            "queries": [],
+                            "queryCount": 1,
                             "memoryCount": 1,
                             "eventSequence": 3,
                         },
                         "directory": {
                             "status": "available",
-                            "query": "Who owns deployment?",
+                            "query": None,
                             "sourceCount": 2,
                             "eventSequence": 4,
                         },
@@ -277,7 +286,7 @@ async def dependencies(
                             "name": "memory_find_sources",
                             "status": "completed",
                             "durationMs": 18,
-                            "query": "Deployment group",
+                            "query": None,
                             "source": None,
                             "eventSequence": 5,
                         },
@@ -286,11 +295,11 @@ async def dependencies(
                             "name": "memory_query_source",
                             "status": "completed",
                             "durationMs": 31,
-                            "query": "Who owns deployment?",
+                            "query": None,
                             "source": {
                                 "handle": "source_2",
-                                "displayName": "Release Engineering",
-                                "bankId": "chat:release-engineering",
+                                "displayName": None,
+                                "bankId": None,
                             },
                             "eventSequence": 7,
                         },
@@ -306,7 +315,7 @@ async def dependencies(
                 },
                 "events": [
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 1,
                         "timestamp": "2026-07-13T12:00:00.000Z",
                         "runId": run_id,
@@ -314,15 +323,13 @@ async def dependencies(
                         "data": {
                             "exchangeId": "exchange-1",
                             "operation": "recall",
-                            "request": {
-                                "method": "POST",
-                                "url": "http://memory/v1/default/banks/chat/memories/recall",
-                                "body": {"query": "Who owns deployment?"},
-                            },
+                            "variant": "initial",
+                            "toolCallId": None,
+                            "method": "POST",
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 2,
                         "timestamp": "2026-07-13T12:00:00.100Z",
                         "runId": run_id,
@@ -331,31 +338,34 @@ async def dependencies(
                             "toolCallId": "call-1",
                             "toolName": "memory_reflect",
                             "isError": False,
+                            "unavailable": False,
                             "durationMs": 42,
-                            "result": {"content": [{"type": "text", "text": "Alice"}]},
+                            "sourceHandle": None,
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 3,
                         "timestamp": "2026-07-13T12:00:00.200Z",
                         "runId": run_id,
                         "type": "memory.context",
                         "data": {
-                            "queries": ["Who owns deployment?"],
-                            "memories": [{"id": "memory-1"}],
+                            "memoryEnabled": True,
+                            "queryCount": 1,
+                            "memoryCount": 1,
+                            "recall": {"status": "completed"},
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 4,
                         "timestamp": "2026-07-13T12:00:00.250Z",
                         "runId": run_id,
                         "type": "memory.directory.result",
-                        "data": {"status": "available", "references": []},
+                        "data": {"status": "available", "referenceCount": 0},
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 5,
                         "timestamp": "2026-07-13T12:00:00.300Z",
                         "runId": run_id,
@@ -363,11 +373,10 @@ async def dependencies(
                         "data": {
                             "toolCallId": "call-find-1",
                             "toolName": "memory_find_sources",
-                            "args": {"query": "Deployment group"},
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 6,
                         "timestamp": "2026-07-13T12:00:00.400Z",
                         "runId": run_id,
@@ -376,11 +385,13 @@ async def dependencies(
                             "toolCallId": "call-find-1",
                             "toolName": "memory_find_sources",
                             "isError": False,
+                            "unavailable": False,
                             "durationMs": 18,
+                            "sourceHandle": None,
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 7,
                         "timestamp": "2026-07-13T12:00:00.500Z",
                         "runId": run_id,
@@ -388,14 +399,10 @@ async def dependencies(
                         "data": {
                             "toolCallId": "call-source-1",
                             "toolName": "memory_query_source",
-                            "args": {
-                                "reference": "source_2",
-                                "query": "Who owns deployment?",
-                            },
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 8,
                         "timestamp": "2026-07-13T12:00:00.650Z",
                         "runId": run_id,
@@ -403,11 +410,16 @@ async def dependencies(
                         "data": {
                             "toolCallId": "call-source-1",
                             "operation": "source.recall",
-                            "response": {"status": 200, "ok": True, "durationMs": 27},
+                            "status": 200,
+                            "ok": True,
+                            "usable": True,
+                            "failureReason": None,
+                            "durationMs": 27,
+                            "bodyBytes": 100,
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 9,
                         "timestamp": "2026-07-13T12:00:00.700Z",
                         "runId": run_id,
@@ -416,19 +428,21 @@ async def dependencies(
                             "toolCallId": "call-source-1",
                             "toolName": "memory_query_source",
                             "isError": False,
+                            "unavailable": False,
                             "durationMs": 31,
+                            "sourceHandle": "source_2",
                         },
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 10,
                         "timestamp": "2026-07-13T12:00:00.800Z",
                         "runId": run_id,
                         "type": "memory.access.warning",
-                        "data": {"unavailableBankIds": ["chat:old-source"]},
+                        "data": {"unavailableBankCount": 1},
                     },
                     {
-                        "version": 1,
+                        "version": 2,
                         "sequence": 11,
                         "timestamp": "2026-07-13T12:00:01.000Z",
                         "runId": run_id,
@@ -436,7 +450,7 @@ async def dependencies(
                         "data": {
                             "sessionId": "session-1",
                             "entryId": "entry-2",
-                            "answer": "Alice owns it.",
+                            "answerChars": 14,
                         },
                     },
                 ],
@@ -460,7 +474,9 @@ async def request_app(memory_url: str, pi_url: str) -> tuple[web.AppRunner, str]
             PlaygroundSettings(
                 memory_url=memory_url,
                 pi_url=pi_url,
-                pi_token="private-pi-token",
+                pi_token=PI_TOKEN,
+                memory_token=MEMORY_TOKEN,
+                channel_token=CHANNEL_TOKEN,
                 system_prompt="Use evidence carefully.",
             )
         )
@@ -468,7 +484,9 @@ async def request_app(memory_url: str, pi_url: str) -> tuple[web.AppRunner, str]
 
 
 def test_settings_use_generic_environment_names(monkeypatch):
-    monkeypatch.setenv("PI_AGENT_TOKEN", "configured-token")
+    monkeypatch.setenv("PI_AGENT_TOKEN", PI_TOKEN)
+    monkeypatch.setenv("MEMORY_API_TOKEN", MEMORY_TOKEN)
+    monkeypatch.setenv("PLAYGROUND_CHANNEL_TOKEN", CHANNEL_TOKEN)
     monkeypatch.setenv("MEMORY_API_URL", "http://memory.internal:8888/")
     monkeypatch.setenv("PI_AGENT_URL", "http://pi.internal:8790/")
 
@@ -476,7 +494,9 @@ def test_settings_use_generic_environment_names(monkeypatch):
 
     assert settings.memory_url == "http://memory.internal:8888"
     assert settings.pi_url == "http://pi.internal:8790"
-    assert settings.pi_token == "configured-token"
+    assert settings.pi_token == PI_TOKEN
+    assert settings.memory_token == MEMORY_TOKEN
+    assert settings.channel_token == CHANNEL_TOKEN
     assert settings.system_prompt.startswith("You are a helpful assistant")
 
 
@@ -597,14 +617,25 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
         assert pi_request["toolPolicy"] == "owner"
         assert pi_request["memory"] == {
             "primaryBankId": "chat:engineering",
+            "requesterIsOwner": True,
+            "grantedBankIds": [],
+            "participants": [],
+        }
+        assert pi_request["identity"] == {
             "requester": {
                 "id": "playground:user:owner",
                 "label": "Playground owner",
-                "owner": True,
             },
-            "grantedBankIds": [],
-            "participants": [],
-            "anchors": [],
+            "anchors": [
+                {
+                    "id": "playground:user:owner",
+                    "label": "Playground owner",
+                }
+            ],
+        }
+        assert pi_request["origin"] == {
+            "scopeId": "playground:owner",
+            "adapterInstanceId": "playground",
         }
         assert pi_request["includeMemorySnapshot"] is True
         assert [item["kind"] for item in pi_request["context"]] == [
@@ -612,7 +643,7 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
             "reference",
         ]
         assert "Earlier we discussed" in pi_request["context"][0]["text"]
-        assert "private-pi-token" not in json.dumps(events)
+        assert PI_TOKEN not in json.dumps(events)
     finally:
         await playground_runner.cleanup()
         for runner in dependency_runners:
@@ -685,16 +716,14 @@ async def test_session_history_and_run_audits_are_proxied_without_exposing_token
         assert detail["leafId"] == "entry-2"
         assert detail["entries"][1]["message"]["usage"]["input"] == 20
         assert audits["items"][0]["eventCount"] == 11
-        assert audit["events"][0]["data"]["request"]["body"]["query"] == (
-            "Who owns deployment?"
-        )
-        assert audit["events"][1]["data"]["result"]["content"][0]["text"] == ("Alice")
+        assert audit["events"][0]["data"]["method"] == "POST"
+        assert audit["events"][1]["data"]["durationMs"] == 42
         assert audit["summary"]["memory"]["route"] == "cross_bank_queried"
         assert audit["summary"]["memory"]["initialRecall"]["status"] == "completed"
         assert audit["summary"]["tools"][0]["name"] == "memory_reflect"
         assert received["session_queries"] == [{"limit": "20", "q": "deploy"}]
         assert received["audit_queries"] == [{"limit": "10", "sessionId": "session-1"}]
-        assert "private-pi-token" not in json.dumps(
+        assert PI_TOKEN not in json.dumps(
             {"sessions": sessions, "detail": detail, "audits": audits, "audit": audit}
         )
     finally:
@@ -795,10 +824,10 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 )
                 assert "elements.newChat.disabled = running" in script
                 assert 'event.type === "memory.access.warning"' in script
-                assert "non-disclosure safeguard is advisory" in script
+                assert "content omitted" in script
                 assert "function renderAuditDiagnosis" in script
                 assert "Decision trail" in script
-                assert "Inspect raw event" in script
+                assert "Inspect event metadata" in script
                 assert "current_bank_only" in script
 
             async with session.get(f"{playground_url}/styles.css") as response:

@@ -7,11 +7,12 @@ x-wechat-ai: &wechat-ai
     PYTHONPATH: /app/src
     HOME: /sidekick-data
     SIDEKICK_PI_URL: http://pi-agent:8790
-    SIDEKICK_PI_TOKEN: ${SIDEKICK_PI_TOKEN}
+    SIDEKICK_OPS_TOKEN: ${SIDEKICK_OPS_TOKEN}
     SIDEKICK_OPS_HOST: 0.0.0.0
     SIDEKICK_OPS_PORT: ${SIDEKICK_OPS_PORT:-8781}
     SIDEKICK_PI_RUN_TIMEOUT: ${SIDEKICK_PI_RUN_TIMEOUT:-300}
-    SIDEKICK_HINDSIGHT_URL: http://memory-api:8888
+    SIDEKICK_HINDSIGHT_URL: http://memory-gateway:8888
+    SIDEKICK_HINDSIGHT_TOKEN: ${MEMORY_API_TOKEN}
     SIDEKICK_HINDSIGHT_TIMEOUT: ${SIDEKICK_HINDSIGHT_TIMEOUT:-90}
     SIDEKICK_MEMORY_DREAM_LOOKBACK_HOURS: ${SIDEKICK_MEMORY_DREAM_LOOKBACK_HOURS:-24}
     SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS: ${SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS:-600}
@@ -114,12 +115,14 @@ services:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
       SIDEKICK_PI_URL: http://pi-agent:8790
-      SIDEKICK_PI_TOKEN: ${SIDEKICK_PI_TOKEN}
+      SIDEKICK_PI_TOKEN: ${SIDEKICK_TELEGRAM_PI_TOKEN}
+      SIDEKICK_OPS_TOKEN: ${SIDEKICK_OPS_TOKEN}
       SIDEKICK_OPS_HOST: 0.0.0.0
       SIDEKICK_OPS_PORT: ${SIDEKICK_OPS_PORT:-8781}
       SIDEKICK_ADAPTER_INSTANCE_ID: ${SIDEKICK_TELEGRAM_INSTANCE_ID:-telegram-default}
       SIDEKICK_PI_RUN_TIMEOUT: ${SIDEKICK_PI_RUN_TIMEOUT:-300}
-      SIDEKICK_HINDSIGHT_URL: http://memory-api:8888
+      SIDEKICK_HINDSIGHT_URL: http://memory-gateway:8888
+      SIDEKICK_HINDSIGHT_TOKEN: ${MEMORY_API_TOKEN}
       SIDEKICK_HINDSIGHT_TIMEOUT: ${SIDEKICK_HINDSIGHT_TIMEOUT:-90}
       SIDEKICK_MEMORY_DREAM_LOOKBACK_HOURS: ${SIDEKICK_MEMORY_DREAM_LOOKBACK_HOURS:-24}
       SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS: ${SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS:-600}
@@ -173,6 +176,11 @@ services:
     pids_limit: 256
     expose:
       - "${SIDEKICK_OPS_PORT:-8781}"
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
 
   onebot-ai:
@@ -190,12 +198,14 @@ services:
       SIDEKICK_ONEBOT_TOKEN: ${SIDEKICK_ONEBOT_TOKEN}
       SIDEKICK_ONEBOT_SELF_ID: ${SIDEKICK_ONEBOT_SELF_ID}
       SIDEKICK_PI_URL: http://pi-agent:8790
-      SIDEKICK_PI_TOKEN: ${SIDEKICK_PI_TOKEN}
+      SIDEKICK_PI_TOKEN: ${SIDEKICK_ONEBOT_PI_TOKEN}
+      SIDEKICK_OPS_TOKEN: ${SIDEKICK_OPS_TOKEN}
       SIDEKICK_OPS_HOST: 0.0.0.0
       SIDEKICK_OPS_PORT: ${SIDEKICK_OPS_PORT:-8781}
       SIDEKICK_ADAPTER_INSTANCE_ID: ${SIDEKICK_ONEBOT_INSTANCE_ID:-qq-default}
       SIDEKICK_PI_RUN_TIMEOUT: ${SIDEKICK_PI_RUN_TIMEOUT:-300}
-      SIDEKICK_HINDSIGHT_URL: http://memory-api:8888
+      SIDEKICK_HINDSIGHT_URL: http://memory-gateway:8888
+      SIDEKICK_HINDSIGHT_TOKEN: ${MEMORY_API_TOKEN}
       SIDEKICK_HINDSIGHT_TIMEOUT: ${SIDEKICK_HINDSIGHT_TIMEOUT:-90}
       SIDEKICK_MEMORY_DREAM_LOOKBACK_HOURS: ${SIDEKICK_MEMORY_DREAM_LOOKBACK_HOURS:-24}
       SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS: ${SIDEKICK_MEMORY_DREAM_OVERLAP_SECONDS:-600}
@@ -262,6 +272,11 @@ services:
       timeout: 5s
       retries: 4
       start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
 
   wechat-host-ai:
@@ -274,6 +289,7 @@ services:
       SIDEKICK_WECHAT_STATE_PATH: /sidekick-data/.sidekick/wechat-host.db
       SIDEKICK_AI_STATE_PATH: /sidekick-data/.sidekick/wechat-host-ai.db
       SIDEKICK_ADAPTER_INSTANCE_ID: ${SIDEKICK_WECHAT_HOST_INSTANCE_ID:-wechat-host}
+      SIDEKICK_PI_TOKEN: ${SIDEKICK_WECHAT_HOST_PI_TOKEN}
     volumes:
       - sidekick-wechat-host-runtime:/sidekick-data
     networks:
@@ -291,6 +307,7 @@ services:
       SIDEKICK_WECHAT_STATE_PATH: /sidekick-data/.sidekick/wechat-peer.db
       SIDEKICK_AI_STATE_PATH: /sidekick-data/.sidekick/wechat-peer-ai.db
       SIDEKICK_ADAPTER_INSTANCE_ID: ${SIDEKICK_WECHAT_PEER_INSTANCE_ID:-wechat-peer}
+      SIDEKICK_PI_TOKEN: ${SIDEKICK_WECHAT_PEER_PI_TOKEN}
     volumes:
       - sidekick-wechat-peer-runtime:/sidekick-data
     networks:

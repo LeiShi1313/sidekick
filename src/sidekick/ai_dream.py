@@ -145,11 +145,8 @@ class DreamScheduler:
                 except Exception as exc:
                     if self._logger is not None:
                         self._logger.warning(
-                            "Scheduled Dream Cycle failed "
-                            "(scope_id=%s, error=%s): %s",
-                            scope_id,
+                            "Scheduled Dream Cycle failed (error=%s)",
                             type(exc).__name__,
-                            exc,
                         )
                     return "failed"
             return "succeeded"
@@ -196,9 +193,7 @@ class DreamScheduler:
                 await self.run_once()
             except Exception as exc:
                 if self._logger is not None:
-                    self._logger.exception(
-                        "Scheduled Dream Cycle orchestration failed "
-                        "(error=%s): %s",
+                    self._logger.error(
+                        "Scheduled Dream Cycle orchestration failed (error=%s)",
                         type(exc).__name__,
-                        exc,
                     )

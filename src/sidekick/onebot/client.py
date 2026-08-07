@@ -252,10 +252,9 @@ class OneBotReverseWebSocket:
                     await self._event_handler(payload)
             except Exception as exc:
                 self._log(
-                    "exception",
-                    "OneBot event handling failed (%s): %s",
+                    "error",
+                    "OneBot event handling failed (%s)",
                     type(exc).__name__,
-                    exc,
                 )
             finally:
                 self._events.task_done()

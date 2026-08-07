@@ -78,9 +78,8 @@ class TelegramMessageIdentityResolver:
         except Exception as exc:
             if self._logger is not None:
                 self._logger.debug(
-                    "Telegram identity lookup failed (%s): %s",
+                    "Telegram identity lookup failed (%s)",
                     type(exc).__name__,
-                    exc,
                 )
             return None
 
@@ -117,9 +116,8 @@ class TelegramMessageMentionResolver:
             except Exception as exc:
                 if self._logger is not None:
                     self._logger.debug(
-                        "Telegram mention lookup failed (%s): %s",
+                        "Telegram mention lookup failed (%s)",
                         type(exc).__name__,
-                        exc,
                     )
                 continue
             user_id = getattr(actor, "id", None)
@@ -167,10 +165,8 @@ class TelegramMemoryScopeTargetResolver:
         except Exception as exc:
             if self._logger is not None:
                 self._logger.warning(
-                    "Telegram memory scope lookup failed (chat_id=%s, error=%s): %s",
-                    chat_id,
+                    "Telegram memory scope lookup failed (error=%s)",
                     type(exc).__name__,
-                    exc,
                 )
             raise ValueError("Telegram group or channel is inaccessible") from exc
         return MemoryScopeTarget(
@@ -318,10 +314,8 @@ class TelegramDirectorySourceResolver:
     def _log_failure(self, selector: str, exc: Exception) -> None:
         if self._logger is not None:
             self._logger.warning(
-                "Telegram directory lookup failed (selector=%s, error=%s): %s",
-                selector,
+                "Telegram directory lookup failed (error=%s)",
                 type(exc).__name__,
-                exc,
             )
 
 

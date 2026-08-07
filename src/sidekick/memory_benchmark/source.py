@@ -138,11 +138,17 @@ async def export_hindsight_bank(
     bank_id: str,
     bank_name: str,
     *,
+    token: str,
     concurrency: int = 8,
 ) -> SourceCorpus:
     timeout = aiohttp.ClientTimeout(total=120)
     encoded_bank = quote(bank_id, safe="")
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    if len(token) < 24:
+        raise ValueError("Memory API token must contain at least 24 characters")
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers={"Authorization": f"Bearer {token}"},
+    ) as session:
         summaries: list[dict[str, Any]] = []
         offset = 0
         while True:
@@ -240,13 +246,15 @@ async def _json_request(
     async with session.request(method, url, **kwargs) as response:
         text = await response.text()
         if response.status >= 400:
-            raise RuntimeError(f"{method} {url} failed with status {response.status}: {text[:500]}")
+            raise RuntimeError(
+                f"Memory source request failed with status {response.status}"
+            )
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"{method} {url} returned invalid JSON") from exc
+            raise ValueError("Memory source returned invalid JSON") from exc
         if not isinstance(payload, dict):
-            raise ValueError(f"{method} {url} returned a non-object response")
+            raise ValueError("Memory source returned a non-object response")
         return payload
 
 

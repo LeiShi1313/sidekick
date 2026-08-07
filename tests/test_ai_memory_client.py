@@ -101,6 +101,9 @@ async def test_hindsight_client_retains_episode_and_renders_bank_recall():
     received = {"bank_profiles": []}
 
     async def upsert_bank(request):
+        assert request.headers["Authorization"] == (
+            "Bearer memory-token-that-is-long-enough"
+        )
         payload = await request.json()
         received["bank_profiles"].append(
             (request.match_info["bank_id"], payload)
@@ -115,6 +118,9 @@ async def test_hindsight_client_retains_episode_and_renders_bank_recall():
         )
 
     async def retain(request):
+        assert request.headers["Authorization"] == (
+            "Bearer memory-token-that-is-long-enough"
+        )
         received["retain"] = await request.json()
         received["retain_bank"] = request.match_info["bank_id"]
         return web.json_response(
@@ -127,6 +133,9 @@ async def test_hindsight_client_retains_episode_and_renders_bank_recall():
         )
 
     async def recall(request):
+        assert request.headers["Authorization"] == (
+            "Bearer memory-token-that-is-long-enough"
+        )
         received["recall"] = await request.json()
         received["recall_bank"] = request.match_info["bank_id"]
         return web.json_response(
@@ -153,7 +162,7 @@ async def test_hindsight_client_retains_episode_and_renders_bank_recall():
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", recall)
 
     runner, url = await start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     item = episode()
     try:
         retained = await client.retain(item)
@@ -367,7 +376,7 @@ async def test_hindsight_revision_invalidates_only_cited_target_memory():
         )
 
     runner, url = await start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         result = await client.revise(
             scope_id="telegram:chat:-1001",
@@ -455,7 +464,7 @@ async def test_hindsight_revision_retries_uncited_selection_once():
         )
 
     runner, url = await start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         result = await client.revise(
             scope_id="telegram:chat:-1001",
@@ -499,7 +508,7 @@ async def test_hindsight_revision_rejects_uncited_memory_selection():
         app.router.add_post("/v1/default/banks/{bank_id}/reflect", reflect)
 
     runner, url = await start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         with pytest.raises(MemoryClientError, match="uncited"):
             await client.revise(
@@ -523,7 +532,7 @@ async def test_hindsight_client_rejects_malformed_recall():
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", malformed)
 
     runner, url = await start_server(configure)
-    client = HindsightMemoryClient(url)
+    client = HindsightMemoryClient(url, token="memory-token-that-is-long-enough")
     try:
         with pytest.raises(MemoryClientError, match="malformed"):
             await client.recall(
@@ -546,7 +555,11 @@ async def test_hindsight_client_enforces_timeout():
         app.router.add_post("/v1/default/banks/{bank_id}/memories/recall", slow)
 
     runner, url = await start_server(configure)
-    client = HindsightMemoryClient(url, timeout=0.01)
+    client = HindsightMemoryClient(
+        url,
+        token="memory-token-that-is-long-enough",
+        timeout=0.01,
+    )
     try:
         with pytest.raises(TimeoutError):
             await client.recall(

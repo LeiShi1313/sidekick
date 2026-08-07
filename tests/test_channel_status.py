@@ -32,7 +32,7 @@ class StateReader:
 def test_ops_settings_default_to_loopback() -> None:
     settings = ChannelOpsSettings.from_env(
         default_instance_id="telegram-default",
-        environ={},
+        environ={"SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough"},
     )
 
     assert settings.host == "127.0.0.1"
@@ -44,14 +44,20 @@ def test_adapter_instance_ids_follow_the_128_character_pi_contract() -> None:
 
     assert ChannelOpsSettings.from_env(
         default_instance_id="default",
-        environ={"SIDEKICK_ADAPTER_INSTANCE_ID": valid},
+        environ={
+            "SIDEKICK_ADAPTER_INSTANCE_ID": valid,
+            "SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough",
+        },
     ).instance_id == valid
     assert AgentRunOrigin("qq:group:700", valid).adapter_instance_id == valid
 
     with pytest.raises(ValueError, match="1 to 128"):
         ChannelOpsSettings.from_env(
             default_instance_id="default",
-            environ={"SIDEKICK_ADAPTER_INSTANCE_ID": "a" * 129},
+            environ={
+                "SIDEKICK_ADAPTER_INSTANCE_ID": "a" * 129,
+                "SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough",
+            },
         )
     with pytest.raises(ValueError, match="adapter instance"):
         AgentRunOrigin("qq:group:700", "a" * 129)
@@ -170,7 +176,7 @@ async def test_snapshot_merges_live_inventory_with_nested_operational_state() ->
 
 
 @pytest.mark.asyncio
-async def test_ops_routes_require_the_shared_pi_bearer_token() -> None:
+async def test_ops_routes_require_the_dedicated_channel_bearer_token() -> None:
     async def inventory() -> tuple[ChannelInventoryItem, ...]:
         return ()
 
@@ -187,8 +193,10 @@ async def test_ops_routes_require_the_shared_pi_bearer_token() -> None:
             adapter=adapter,
             memory_available=True,
         ),
-        token="shared-pi-token",
-        settings=ChannelOpsSettings(instance_id="qq-default"),
+        settings=ChannelOpsSettings(
+            instance_id="qq-default",
+            token="channel-ops-token-that-is-long-enough",
+        ),
     )
     server = TestServer(ops.application)
     await server.start_server()
@@ -202,7 +210,9 @@ async def test_ops_routes_require_the_shared_pi_bearer_token() -> None:
 
             authorized = await client.get(
                 server.make_url("/v1/channels"),
-                headers={"Authorization": "Bearer shared-pi-token"},
+                headers={
+                    "Authorization": "Bearer channel-ops-token-that-is-long-enough"
+                },
             )
             assert authorized.status == 200
             payload = await authorized.json()
@@ -219,7 +229,9 @@ async def test_ops_routes_require_the_shared_pi_bearer_token() -> None:
             }
             health = await client.get(
                 server.make_url("/health"),
-                headers={"Authorization": "Bearer shared-pi-token"},
+                headers={
+                    "Authorization": "Bearer channel-ops-token-that-is-long-enough"
+                },
             )
             assert health.status == 200
             assert (await health.json())["ok"] is True

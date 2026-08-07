@@ -64,8 +64,9 @@ separate download or message.
 Keep an unauthenticated connector bound to loopback; use its bearer token (and
 TLS outside a trusted local network) whenever it is reachable by another host.
 
-When `SIDEKICK_HINDSIGHT_URL` is set, the WeChat channel uses the same memory
-commands as the other chat adapters. `/ai` receives an account-scoped Hindsight
+When `SIDEKICK_HINDSIGHT_URL` is set, `SIDEKICK_HINDSIGHT_TOKEN` is also
+required. The WeChat channel then uses the same memory commands as the other
+chat adapters. `/ai` receives an account-scoped Hindsight
 memory target, replying with `/ai_memory` retains that stored reply chain,
 `/ai_memory_backfill days <1-30>` or `/ai_memory_backfill messages <1-5000>`
 performs the bounded best-effort local backfill, and `/ai_memory_enable` starts
@@ -105,7 +106,16 @@ gh repo clone vectorize-io/hindsight ../hindsight
 ```
 
 3. Create `.env`, `agent/.env`, and `memory/.env` from their example files,
-   then start each layer:
+   then start each layer. Copy the same `MEMORY_API_TOKEN` into all three files,
+   and copy the same `SIDEKICK_OPS_TOKEN` into `.env` and `agent/.env`. Keep the
+   five Pi client tokens distinct and map each root adapter token to its matching
+   agent token. Set each WeChat scope prefix to
+   `wechat:account:<percent-encoded-connector-account-id>:`.
+
+   Credential changes are an atomic migration: update all three environment
+   files before restarting the memory, agent, and adapter layers. Existing Pi
+   sessions without an authenticated owner binding deliberately cannot be
+   resumed; start a new AI thread after this migration.
 
 ```bash
 docker compose --env-file memory/.env -f memory/compose.yml up -d
@@ -118,7 +128,11 @@ Human-facing services are available through the dashboard proxy:
 
 - `http://sidekick.localhost:18865`: service index.
 - `http://playground.sidekick.localhost:18865`: agent playground.
-- `http://hindsight.sidekick.localhost:18865`: Hindsight memory dashboard.
+
+Raw Hindsight is isolated on an internal backend network. Trusted clients use
+the authenticated `memory-gateway`; its host port is loopback-only and its
+health response contains no backend details. The browser-facing raw Hindsight
+dashboard is intentionally not exposed.
 
 The adapter compose file expects the external `memory-platform` and
 `agent-platform` networks created by the memory and agent projects. Runtime

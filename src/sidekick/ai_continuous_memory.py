@@ -125,11 +125,8 @@ class ContinuousMemoryScheduler:
                 except Exception as exc:
                     if self._logger is not None:
                         self._logger.warning(
-                            "Continuous memory ingestion failed "
-                            "(scope_id=%s, error=%s): %s",
-                            scope_id,
+                            "Continuous memory ingestion failed (error=%s)",
                             type(exc).__name__,
-                            exc,
                         )
                     return "failed", None
             return "succeeded", result
@@ -188,11 +185,9 @@ class ContinuousMemoryScheduler:
                 result = await self.run_once()
             except Exception as exc:
                 if self._logger is not None:
-                    self._logger.exception(
-                        "Continuous memory orchestration failed "
-                        "(error=%s): %s",
+                    self._logger.error(
+                        "Continuous memory orchestration failed (error=%s)",
                         type(exc).__name__,
-                        exc,
                     )
                 result = None
             if result is not None and result.scopes_pending:

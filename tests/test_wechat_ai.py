@@ -13,6 +13,9 @@ from sidekick.ai import (
     AIResponder,
     AIStateRepository,
     AgentEvent,
+    AgentIdentityAnchor,
+    AgentRequestIdentity,
+    AgentRunOrigin,
     AgentRunRequest,
     PromptBuilder,
 )
@@ -285,6 +288,11 @@ async def test_wechat_responder_defers_placeholder_and_sends_one_bounded_final(
         context=(),
         system_prompt="system",
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("wechat:user:test", "Tester"),
+            anchors=(AgentIdentityAnchor("wechat:user:test", "Tester"),),
+        ),
+        origin=AgentRunOrigin("wechat:chat:test", "wechat-test"),
     )
     try:
         result = await responder.answer(trigger, request)
@@ -383,6 +391,11 @@ async def test_wechat_responder_does_not_resubmit_unknown_outcome(tmp_path) -> N
         context=(),
         system_prompt="system",
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("wechat:user:test", "Tester"),
+            anchors=(AgentIdentityAnchor("wechat:user:test", "Tester"),),
+        ),
+        origin=AgentRunOrigin("wechat:chat:test", "wechat-test"),
     )
     try:
         result = await responder.answer(trigger, request)
@@ -413,6 +426,11 @@ async def test_wechat_responder_does_not_change_payload_after_transport_error(
         context=(),
         system_prompt="system",
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("wechat:user:test", "Tester"),
+            anchors=(AgentIdentityAnchor("wechat:user:test", "Tester"),),
+        ),
+        origin=AgentRunOrigin("wechat:chat:test", "wechat-test"),
     )
     try:
         result = await responder.answer(trigger, request)
@@ -554,10 +572,8 @@ async def test_wechat_conversation_handler_uses_quoted_message_as_context(
         gateway.requests[0].context[0].text
     )
     assert marker is not None
-    assert "context=reply_path" in marker.reference_context
-    assert "The bridge uses a native hook and local projection." in (
-        marker.reference_context
-    )
+    assert marker.agent_session_id == "session-1"
+    assert marker.agent_entry_id == "entry-1"
 
 
 @pytest.mark.asyncio

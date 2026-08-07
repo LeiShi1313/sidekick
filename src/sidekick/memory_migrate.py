@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -178,6 +179,7 @@ async def migrate_legacy_store(
     *,
     source: Path,
     hindsight_url: str,
+    hindsight_token: str,
     state_path: Path,
     execute: bool,
     batch_size: int = 10,
@@ -194,8 +196,12 @@ async def migrate_legacy_store(
         report.labels = len(identities)
         return report
 
+    memory = HindsightMemoryClient(
+        hindsight_url,
+        token=hindsight_token,
+        timeout=300,
+    )
     store = await AIStateRepository(state_path).connect()
-    memory = HindsightMemoryClient(hindsight_url, timeout=300)
     try:
         grouped: dict[str, list[LegacyObservation]] = defaultdict(list)
         for observation in observations:
@@ -537,6 +543,7 @@ async def _run(args: argparse.Namespace) -> int:
     report = await migrate_legacy_store(
         source=args.source,
         hindsight_url=args.hindsight_url,
+        hindsight_token=args.hindsight_token,
         state_path=args.state_path,
         execute=args.execute,
         batch_size=args.batch_size,
@@ -555,6 +562,12 @@ def main() -> None:
     parser.add_argument(
         "--hindsight-url",
         default="http://127.0.0.1:18888",
+    )
+    parser.set_defaults(
+        hindsight_token=(
+            os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip()
+            or os.environ.get("MEMORY_API_TOKEN", "").strip()
+        )
     )
     parser.add_argument(
         "--state-path",

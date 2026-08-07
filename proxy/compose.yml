@@ -8,10 +8,14 @@ services:
       - /var/run/docker.sock:/tmp/docker.sock:ro
     networks:
       - agent-platform
-      - memory-platform
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "nginx", "-t"]
@@ -42,6 +46,11 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
     pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
     healthcheck:
       test:
@@ -58,6 +67,3 @@ networks:
   agent-platform:
     external: true
     name: agent-platform
-  memory-platform:
-    external: true
-    name: memory-platform

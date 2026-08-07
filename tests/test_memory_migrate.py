@@ -12,6 +12,8 @@ from sidekick.memory_migrate import inventory_legacy_store, migrate_legacy_store
 
 zvec = pytest.importorskip("zvec")
 
+MEMORY_TOKEN = "memory-api-token-that-is-long-enough"
+
 
 def memory_schema(dimension):
     return zvec.CollectionSchema(
@@ -327,12 +329,14 @@ async def test_migration_executes_idempotently_with_labels_and_no_vectors(tmp_pa
         first = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
         second = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
@@ -371,6 +375,7 @@ async def test_migration_resubmits_when_receipt_matches_but_destination_is_not_e
         first = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
@@ -382,6 +387,7 @@ async def test_migration_resubmits_when_receipt_matches_but_destination_is_not_e
         retry = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
@@ -410,12 +416,14 @@ async def test_migration_preserves_suppression_with_stable_idempotent_correction
         first = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
         second = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
@@ -464,12 +472,14 @@ async def test_suppression_without_active_candidate_converges_on_correction_evid
         first = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )
         second = await migrate_legacy_store(
             source=source,
             hindsight_url=url,
+            hindsight_token=MEMORY_TOKEN,
             state_path=state_path,
             execute=True,
         )

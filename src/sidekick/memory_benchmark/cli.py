@@ -5,6 +5,7 @@ import asyncio
 from collections import Counter
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -109,6 +110,7 @@ async def _dispatch(args: argparse.Namespace) -> None:
             args.bank,
             args.name,
             corpus,
+            token=_memory_token(),
             batch_size=args.batch_size,
             concurrency=args.concurrency,
             progress=lambda completed, total: print(
@@ -130,7 +132,10 @@ async def _dispatch(args: argparse.Namespace) -> None:
         started_at = datetime.fromisoformat(args.started_at.replace("Z", "+00:00"))
         if started_at.tzinfo is None:
             raise ValueError("--started-at must include a timezone")
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=7_300)) as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=7_300),
+            headers={"Authorization": f"Bearer {_memory_token()}"},
+        ) as session:
             stats = await wait_for_hindsight_idle(
                 session,
                 args.url,
@@ -218,6 +223,7 @@ async def _run_quality(
     hindsight_records = await list_hindsight_memories(
         args.hindsight_url,
         args.hindsight_bank,
+        token=_memory_token(),
         backend="hindsight",
     )
     tencent_records = read_tencent_memories(
@@ -323,6 +329,7 @@ async def _run_quality(
             args.hindsight_url,
             args.hindsight_bank,
             remaining_cases[0].question,
+            token=_memory_token(),
             backend="hindsight",
         )
         await recall_tencent(args.tencent_url, remaining_cases[0].question)
@@ -332,6 +339,7 @@ async def _run_quality(
             args.hindsight_url,
             args.hindsight_bank,
             case.question,
+            token=_memory_token(),
             backend="hindsight",
         )
         tencent = await recall_tencent(args.tencent_url, case.question)
@@ -370,6 +378,16 @@ def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--model", default="gpt-5.4-mini")
     parser.add_argument("--reasoning-effort", default="low")
+
+
+def _memory_token() -> str:
+    token = (
+        os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip()
+        or os.environ.get("MEMORY_API_TOKEN", "").strip()
+    )
+    if len(token) < 24:
+        raise ValueError("A memory API token is required")
+    return token
 
 
 def _llm_settings(

@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import {
+  appendFile,
+  chmod,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,7 +25,7 @@ async function fixture() {
   };
 }
 
-test("records ordered append-only events and redacts credential-shaped fields", async () => {
+test("records ordered append-only operational events", async () => {
   const app = await fixture();
   try {
     const audit = await app.store.start(RUN_ID);
@@ -68,28 +75,130 @@ test("records ordered append-only events and redacts credential-shaped fields", 
       "session.opened",
       "run.completed",
     ]);
-    assert.equal(result.events[0].data.authorization, "[REDACTED]");
-    assert.equal(result.events[0].data.provider.errorMessage, "[REDACTED]");
-    assert.equal(
-      result.events[0].data.callbackUrl,
-      "https://example.test/path?api_key=%5BREDACTED%5D&view=full",
-    );
-    assert.deepEqual(result.events[0].data.image, {
-      type: "image",
-      mimeType: "image/png",
-      sizeBytes: 13,
-      data: "[OMITTED]",
-    });
-    assert.equal(
-      result.events[1].data.request.body.apiKey,
-      "[REDACTED]",
-    );
+    assert.equal(result.events[0].data.promptChars, 17);
+    assert.equal(result.events[0].data.memoryEnabled, true);
+    assert.equal(result.events[1].data.method, "POST");
     assert.doesNotMatch(
       JSON.stringify(result),
       /Bearer secret|secret-key|provider credential detail|query-secret|user:pass|203\.0\.113\.42|example-service/,
     );
-    assert.match(JSON.stringify(result), /REDACTED_IP_ADDRESS/);
-    assert.match(JSON.stringify(result), /REDACTED_RUNTIME_PATH/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("persists only allowlisted operational audit metadata", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("run.request", {
+      prompt: "PRIVATE_USER_PROMPT",
+      context: [{ kind: "reference", text: "PRIVATE_QUOTED_CONTEXT" }],
+      systemPrompt: "PRIVATE_SYSTEM_PROMPT",
+      sessionId: null,
+      toolPolicy: "delegated",
+      origin: { scopeId: "PRIVATE_CHAT_ID" },
+      memory: { primaryBankId: "PRIVATE_MEMORY_BANK" },
+    });
+    await audit.record("model.input", {
+      model: { id: "test-model", provider: "test-provider" },
+      prompt: "PRIVATE_ENRICHED_PROMPT",
+      systemPrompt: "PRIVATE_MODEL_SYSTEM_PROMPT",
+      sessionMessagesBeforePrompt: ["PRIVATE_SESSION_HISTORY"],
+      tools: ["web_search"],
+    });
+    await audit.record("tool.completed", {
+      turn: 1,
+      toolCallId: "call-1",
+      toolName: "web_search",
+      args: { query: "PRIVATE_TOOL_ARGUMENT" },
+      result: { content: "PRIVATE_TOOL_RESULT" },
+      isError: false,
+      durationMs: 5,
+    });
+    await audit.record("run.completed", {
+      sessionId: "session-1",
+      entryId: "entry-1",
+      answer: "PRIVATE_FINAL_ANSWER",
+    });
+    await audit.flush();
+
+    const raw = await readFile(`${app.root}/${RUN_ID}.jsonl`, "utf8");
+    assert.doesNotMatch(
+      raw,
+      /PRIVATE_USER_PROMPT|PRIVATE_QUOTED_CONTEXT|PRIVATE_SYSTEM_PROMPT|PRIVATE_CHAT_ID|PRIVATE_MEMORY_BANK|PRIVATE_ENRICHED_PROMPT|PRIVATE_MODEL_SYSTEM_PROMPT|PRIVATE_SESSION_HISTORY|PRIVATE_TOOL_ARGUMENT|PRIVATE_TOOL_RESULT|PRIVATE_FINAL_ANSWER/,
+    );
+    const result = await app.store.get(RUN_ID);
+    assert.equal(result.events[0].version, 2);
+    assert.deepEqual(result.events[0].data, {
+      sessionId: null,
+      parentEntryId: null,
+      promptChars: 19,
+      contextCount: 1,
+      toolPolicy: "delegated",
+      model: null,
+      memoryEnabled: true,
+      includeMemorySnapshot: false,
+    });
+    assert.deepEqual(result.events[1].data, {
+      model: {
+        id: "test-model",
+        provider: "test-provider",
+        api: null,
+        reasoning: false,
+        thinkingLevel: null,
+      },
+      tools: ["web_search"],
+      promptChars: 23,
+      sessionMessageCount: 1,
+    });
+    assert.deepEqual(result.events[2].data, {
+      turn: 1,
+      toolCallId: "call-1",
+      toolName: "web_search",
+      isError: false,
+      unavailable: false,
+      durationMs: 5,
+      sourceHandle: null,
+    });
+    assert.deepEqual(result.events[3].data, {
+      sessionId: "session-1",
+      entryId: "entry-1",
+      answerChars: 20,
+    });
+  } finally {
+    await app.close();
+  }
+});
+
+test("rewrites legacy audit payloads through the current allowlist", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.flush();
+    await appendFile(
+      `${app.root}/${RUN_ID}.jsonl`,
+      `${JSON.stringify({
+        version: 1,
+        sequence: 1,
+        timestamp: new Date().toISOString(),
+        runId: RUN_ID,
+        type: "run.request",
+        data: {
+          prompt: "PRIVATE_LEGACY_PROMPT",
+          systemPrompt: "PRIVATE_LEGACY_SYSTEM_PROMPT",
+        },
+      })}\n`,
+    );
+    await chmod(`${app.root}/${RUN_ID}.jsonl`, 0o644);
+
+    const result = await app.store.scrub();
+    const raw = await readFile(`${app.root}/${RUN_ID}.jsonl`, "utf8");
+
+    assert.deepEqual(result, { scanned: 1, rewritten: 1 });
+    assert.doesNotMatch(raw, /PRIVATE_LEGACY/);
+    assert.match(raw, /"version":2/);
+    assert.equal((await stat(`${app.root}/${RUN_ID}.jsonl`)).mode & 0o777, 0o600);
   } finally {
     await app.close();
   }
@@ -118,9 +227,8 @@ test("redacts sensitive values while reading legacy audit events", async () => {
 
     const result = await app.store.get(RUN_ID);
     const serialized = JSON.stringify(result);
-    assert.match(serialized, /REDACTED_IP_ADDRESS/);
-    assert.match(serialized, /REDACTED_RUNTIME_PATH/);
     assert.doesNotMatch(serialized, /203\.0\.113\.42|example-service/);
+    assert.equal(result.events[1].data.answerChars, 62);
   } finally {
     await app.close();
   }
@@ -172,7 +280,8 @@ test("lists run summaries by session and reports terminal state", async () => {
     assert.equal(page.items[0].sessionId, "session-1");
     assert.equal(page.items[0].entryId, "entry-1");
     assert.equal(page.items[0].status, "completed");
-    assert.equal(page.items[0].memoryScopeId, "chat:engineering");
+    assert.equal(page.items[0].memoryEnabled, true);
+    assert.equal(page.items[0].memoryScopeId, null);
     assert.equal(page.items[0].eventCount, 3);
 
     const all = await app.store.list({ limit: 20 });
@@ -259,7 +368,7 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
     const { summary } = await app.store.get(RUN_ID);
 
     assert.equal(summary.status, "completed");
-    assert.equal(summary.prompt, "Did dog bro appear today?");
+    assert.equal(summary.prompt, "");
     assert(Number.isInteger(summary.durationMs));
     assert.deepEqual(summary.session, {
       kind: "root",
@@ -273,17 +382,19 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
       thinkingLevel: "high",
     });
     assert.deepEqual(summary.memory, {
-      primaryBankId: "telegram:chat:-1001",
+      enabled: true,
+      primaryBankId: null,
       route: "current_bank_only",
       initialRecall: {
         status: "unknown",
-        queries: ["2026-07-23 dog bro"],
+        queries: [],
+        queryCount: 1,
         memoryCount: 2,
         eventSequence: 2,
       },
       directory: {
         status: "available",
-        query: "Did dog bro appear today?",
+        query: null,
         sourceCount: 1,
         eventSequence: 4,
       },
@@ -294,7 +405,7 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
         name: "memory_query_current",
         status: "completed",
         durationMs: 12,
-        query: "2026-07-23 @dota2pp",
+        query: null,
         source: null,
         eventSequence: 8,
       },
@@ -417,7 +528,7 @@ test("distinguishes source discovery from successful cross-bank retrieval", asyn
         name: "memory_find_sources",
         status: "completed",
         durationMs: 14,
-        query: "Arch group",
+        query: null,
         source: null,
         eventSequence: 7,
       },
@@ -426,11 +537,11 @@ test("distinguishes source discovery from successful cross-bank retrieval", asyn
         name: "memory_query_source",
         status: "completed",
         durationMs: 23,
-        query: "release discussion",
+        query: null,
         source: {
           handle: "source_2",
-          displayName: "Arch Linux 中文群",
-          bankId: "telegram:chat:-3003",
+          displayName: null,
+          bankId: null,
         },
         eventSequence: 9,
       },
@@ -500,8 +611,8 @@ test("reports failed cross-bank attempts and incomplete runs conservatively", as
     assert.equal(summary.tools[0].status, "failed");
     assert.deepEqual(summary.tools[0].source, {
       handle: "source_1",
-      displayName: "Other group",
-      bankId: "telegram:chat:-2002",
+      displayName: null,
+      bankId: null,
     });
   } finally {
     await app.close();

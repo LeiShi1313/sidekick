@@ -69,12 +69,16 @@ function errorDetails(error) {
 
 export function createMemoryTools({
   baseUrl,
+  token,
   access,
   timeoutMs = 30_000,
   fetchImpl = fetch,
   observe = null,
 }) {
   if (!baseUrl || !access) return [];
+  if (typeof token !== "string" || Buffer.byteLength(token) < 24) {
+    throw new Error("Memory API credential is unavailable");
+  }
   const primaryBankPath = encodeURIComponent(access.primaryBankId);
   const allowed = new Map();
   const ambiguousMemoryIds = new Set();
@@ -145,7 +149,11 @@ export function createMemoryTools({
     try {
       response = await fetchImpl(url, {
         ...options,
-        headers: { "content-type": "application/json", ...options.headers },
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          ...options.headers,
+        },
         signal: AbortSignal.timeout(timeoutMs),
       });
       text = await response.text();
@@ -402,6 +410,7 @@ export function createMemoryTools({
   }) {
     const memories = await recallMemories({
       baseUrl,
+      token,
       scopeId: bankId,
       query,
       timeoutMs,
@@ -573,7 +582,7 @@ export function createMemoryTools({
       const allowedBankIds = policy.allowedBankIds;
       const memory = {
         primaryBankId: access.primaryBankId,
-        requester: { owner: policy.owner },
+        requesterIsOwner: policy.owner,
         grantedBankIds:
           allowedBankIds === null
             ? []
@@ -583,6 +592,7 @@ export function createMemoryTools({
       try {
         directory = await recallDirectory({
           baseUrl,
+          token,
           query,
           memory,
           timeoutMs,

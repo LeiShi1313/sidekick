@@ -52,7 +52,7 @@ class DashboardParser(HTMLParser):
         self._text = []
 
 
-def test_dashboard_links_every_human_facing_sidekick_surface() -> None:
+def test_dashboard_links_only_managed_human_facing_surfaces() -> None:
     parser = DashboardParser()
     parser.feed((ROOT / "proxy" / "dashboard" / "index.html").read_text())
 
@@ -60,21 +60,8 @@ def test_dashboard_links_every_human_facing_sidekick_surface() -> None:
     assert parser.heading == "Sidekick"
     assert parser.links == {
         "Agent Playground": "http://playground.sidekick.localhost:18865/",
-        "Hindsight Memory": "http://hindsight.sidekick.localhost:18865/",
-        "All Explainers": "http://100.99.247.60:18081/",
-        "Agent Design Atlas": (
-            "http://100.99.247.60:18081/agent-design-atlas.html"
-        ),
-        "Hindsight Memory Flow": (
-            "http://100.99.247.60:18081/hindsight-memory-system-flow-zh.html"
-        ),
-        "Multi-user Prompt Flow": (
-            "http://100.99.247.60:18081/multi-user-memory-prompt-flow.html"
-        ),
-        "Reply-thread Retrieval": (
-            "http://100.99.247.60:18081/reply-thread-memory-retrieval-zh.html"
-        ),
     }
+    assert "100.99." not in (ROOT / "proxy" / "dashboard" / "index.html").read_text()
     assert "benchmark" not in " ".join(parser.links.values()).lower()
 
 
@@ -95,6 +82,9 @@ def test_compose_routes_dashboard_and_playground_by_name() -> None:
         text=True,
     )
     proxy_config = json.loads(proxy.stdout)
+    assert set(proxy_config["services"]["dashboard-proxy"]["networks"]) == {
+        "agent-platform"
+    }
     dashboard = proxy_config["services"]["dashboard"]
     assert dashboard["environment"]["VIRTUAL_HOST"] == "sidekick.localhost"
     assert dashboard["environment"]["VIRTUAL_PORT"] == "8080"
@@ -118,7 +108,23 @@ def test_compose_routes_dashboard_and_playground_by_name() -> None:
         text=True,
     )
     agent_config = json.loads(agent.stdout)
+    pi_agent = agent_config["services"]["pi-agent"]
+    assert pi_agent["environment"]["MEMORY_API_URL"] == (
+        "http://memory-gateway:8888"
+    )
+    assert pi_agent["environment"]["MEMORY_API_TOKEN"]
+    assert pi_agent["environment"]["PI_AGENT_WECHAT_HOST_SCOPE_PREFIX"].startswith(
+        "wechat:account:"
+    )
+    assert pi_agent["environment"]["PI_AGENT_WECHAT_PEER_SCOPE_PREFIX"].startswith(
+        "wechat:account:"
+    )
     playground = agent_config["services"]["agent-playground"]
     assert playground["environment"]["VIRTUAL_HOST"] == (
         "playground.sidekick.localhost"
     )
+    assert playground["environment"]["MEMORY_API_URL"] == (
+        "http://memory-gateway:8888"
+    )
+    assert playground["environment"]["MEMORY_API_TOKEN"]
+    assert playground["environment"]["PLAYGROUND_CHANNEL_TOKEN"]

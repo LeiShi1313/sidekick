@@ -124,6 +124,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         self._memory = (
             HindsightMemoryClient(
                 settings.hindsight_url,
+                token=settings.hindsight_token or "",
                 timeout=settings.hindsight_timeout,
             )
             if settings.hindsight_url
@@ -152,7 +153,6 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 memory_available=self._memory is not None,
                 logger=self.logger,
             ),
-            token=settings.agent_token,
             settings=self._ops_settings,
             logger=self.logger,
         )
@@ -339,11 +339,10 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 if await self._handle_saved_memory(event.message):
                     return
                 await self._handler.handle(event.message)
-            except Exception:
-                self.logger.exception(
-                    "Telegram AI message handling failed (chat_id=%s, message_id=%s)",
-                    event.message.chat_id,
-                    event.message.id,
+            except Exception as exc:
+                self.logger.error(
+                    "Telegram AI message handling failed (%s)",
+                    type(exc).__name__,
                 )
 
     async def _handle_saved_memory(self, message) -> bool:
@@ -404,11 +403,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 )
             except Exception as exc:
                 self.logger.warning(
-                    "Saved Messages memory ingest failed "
-                    "(saved_message_id=%s, error=%s): %s",
-                    message.id,
+                    "Saved Messages memory ingest failed (error=%s)",
                     type(exc).__name__,
-                    exc,
                 )
                 await self._set_saved_memory_reaction(
                     message,
@@ -429,13 +425,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 )
                 return True
 
-            self.logger.info(
-                "Saved Messages memory ingested "
-                "(saved_message_id=%s, source_chat_id=%s, source_message_id=%s)",
-                message.id,
-                source_chat_id,
-                source_message_id,
-            )
+            self.logger.info("Saved Messages memory ingested")
             await self._set_saved_memory_reaction(
                 message,
                 self.MEMORY_STORED_REACTION,
@@ -462,7 +452,9 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 ids=link.message_id,
             )
         except Exception as exc:
-            raise _SavedMemoryLinkUnavailable(str(exc)) from exc
+            raise _SavedMemoryLinkUnavailable(
+                "linked Telegram message is unavailable"
+            ) from exc
 
         source_chat_id = getattr(source, "chat_id", None)
         source_message_id = getattr(source, "id", None)
@@ -483,12 +475,11 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         try:
             return await self.client.get_input_entity(peer)
         except ValueError as cache_error:
-            expected_chat_id = telegram_utils.get_peer_id(peer)
             self.logger.info(
                 "Private message-link peer missing from entity cache; "
-                "searching dialogs (chat_id=%s)",
-                expected_chat_id,
+                "searching dialogs",
             )
+            expected_chat_id = telegram_utils.get_peer_id(peer)
             async for dialog in self.client.iter_dialogs():
                 if dialog.id == expected_chat_id:
                     return dialog.input_entity
@@ -516,17 +507,12 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             return True
         except PremiumAccountRequiredError:
             self.logger.info(
-                "Saved Messages memory marker unavailable for non-Premium account "
-                "(saved_message_id=%s)",
-                message.id,
+                "Saved Messages memory marker unavailable for non-Premium account",
             )
         except Exception as exc:
             self.logger.warning(
-                "Saved Messages memory marker failed "
-                "(saved_message_id=%s, error=%s): %s",
-                message.id,
+                "Saved Messages memory marker failed (error=%s)",
                 type(exc).__name__,
-                exc,
             )
         return False
 
@@ -535,11 +521,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             return await message.reply(self.MEMORY_PROCESSING_REPLY, parse_mode=None)
         except Exception as exc:
             self.logger.warning(
-                "Saved Messages memory processing reply failed "
-                "(saved_message_id=%s, error=%s): %s",
-                message.id,
+                "Saved Messages memory processing reply failed (error=%s)",
                 type(exc).__name__,
-                exc,
             )
             return None
 
@@ -558,19 +541,13 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                     return
             except Exception as exc:
                 self.logger.warning(
-                    "Saved Messages memory status edit failed "
-                    "(saved_message_id=%s, error=%s): %s",
-                    message.id,
+                    "Saved Messages memory status edit failed (error=%s)",
                     type(exc).__name__,
-                    exc,
                 )
         try:
             await message.reply(reply, parse_mode=None)
         except Exception as exc:
             self.logger.warning(
-                "Saved Messages memory final reply failed "
-                "(saved_message_id=%s, error=%s): %s",
-                message.id,
+                "Saved Messages memory final reply failed (error=%s)",
                 type(exc).__name__,
-                exc,
             )

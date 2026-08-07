@@ -11,6 +11,9 @@ from sidekick.ai import (
     AIConversationHandler,
     AIResponder,
     AgentEvent,
+    AgentIdentityAnchor,
+    AgentRequestIdentity,
+    AgentRunOrigin,
     AgentRunRequest,
     PromptBuilder,
 )
@@ -212,6 +215,11 @@ async def test_tool_snapshot_is_replaced_by_the_streamed_final_answer():
         context=(),
         system_prompt=PromptBuilder().system_prompt,
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
     )
 
     result = await responder.answer(trigger, request)
@@ -270,6 +278,11 @@ async def test_repeated_tool_snapshot_does_not_fail_the_agent_run():
         context=(),
         system_prompt=PromptBuilder().system_prompt,
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
     )
 
     result = await responder.answer(trigger, request)
@@ -303,6 +316,11 @@ async def test_provider_rate_limit_gets_an_explicit_telegram_message():
         context=(),
         system_prompt=PromptBuilder().system_prompt,
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
     )
 
     result = await responder.answer(trigger, request)
