@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -13,6 +14,13 @@ import {
   continuationAccessWarning,
   toolNamesForPolicy,
 } from "../src/pi-engine.mjs";
+
+const MCP_TEST_EXTENSION_PATH = fileURLToPath(
+  new URL("../test-support/mcp-extension.mjs", import.meta.url),
+);
+const TAIBU_MCP_EXTENSION_PATH = fileURLToPath(
+  new URL("../src/taibu-mcp-extension.ts", import.meta.url),
+);
 
 function textOf(content) {
   if (typeof content === "string") return content;
@@ -147,6 +155,41 @@ function sendCodeToolCall(response) {
   ]);
 }
 
+function sendToolCall(response, { id, name, args }) {
+  writeSse(response, [
+    {
+      id: "chatcmpl-tool",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id,
+                type: "function",
+                function: { name, arguments: JSON.stringify(args) },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    },
+    {
+      id: "chatcmpl-tool",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+    },
+  ]);
+}
+
 async function collect(engine, request, requestOwner = null) {
   const events = [];
   for await (const event of engine.run(request, requestOwner)) events.push(event);
@@ -193,6 +236,7 @@ async function fixture(handler, overrides = {}) {
     auditDir: join(root, "audit"),
     agentDir: join(root, "agent"),
     webExtensionPath: null,
+    mcpExtensionPath: overrides.mcpExtensionPath ?? null,
     memoryUrl: overrides.memoryUrl ?? null,
     memoryFetch: overrides.memoryFetch,
     sessionHistory: overrides.sessionHistory,
@@ -546,7 +590,189 @@ test("owner and delegated runs receive the same restricted tools", () => {
   assert.deepEqual(toolNamesForPolicy("delegated", true), toolsWithMemory);
   assert.deepEqual(toolNamesForPolicy("none"), []);
   assert.deepEqual(toolNamesForPolicy("none", true), []);
+  assert.deepEqual(toolNamesForPolicy("owner", false, true), [
+    ...genericTools,
+    "mcp",
+  ]);
+  assert.deepEqual(toolNamesForPolicy("delegated", true, true), [
+    ...toolsWithMemory,
+    "mcp",
+  ]);
+  assert.deepEqual(toolNamesForPolicy("none", true, true), []);
 });
+
+test("exposes only the MCP gateway and adds Taibu routing guidance", async () => {
+  const app = await fixture(
+    (_body, response) => sendText(response, "MCP is available."),
+    { mcpExtensionPath: MCP_TEST_EXTENSION_PATH },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("45454545-4545-4545-8545-454545454545", {
+        prompt: "Read my BaZi chart",
+      }),
+    );
+
+    const toolNames = app.provider.requests[0].tools.map(
+      (tool) => tool.function.name,
+    );
+    assert(toolNames.includes("mcp"));
+    assert(!toolNames.includes("mcpScript"));
+    assert.match(
+      JSON.stringify(app.provider.requests[0].messages),
+      /TaiBu divination tools are available through the `mcp` tool/,
+    );
+    assert.equal(events.at(-1).answer, "MCP is available.");
+  } finally {
+    await app.close();
+  }
+});
+
+test("omits Taibu MCP and its guidance from no-tools runs", async () => {
+  const app = await fixture(
+    (_body, response) => sendText(response, "No tools are available."),
+    { mcpExtensionPath: MCP_TEST_EXTENSION_PATH },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("49494949-4949-4949-8949-494949494949", {
+        prompt: "Read my BaZi chart",
+        toolPolicy: "none",
+      }),
+    );
+
+    assert.deepEqual(app.provider.requests[0].tools ?? [], []);
+    assert.doesNotMatch(
+      JSON.stringify(app.provider.requests[0].messages),
+      /TaiBu divination tools are available/,
+    );
+    assert.equal(events.at(-1).answer, "No tools are available.");
+  } finally {
+    await app.close();
+  }
+});
+
+test("starts extension lifecycle before an MCP tool call", async () => {
+  let secondRequest;
+  const app = await fixture((body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendToolCall(response, {
+        id: "call-mcp",
+        name: "mcp",
+        args: { search: "almanac" },
+      });
+      return;
+    }
+    secondRequest = body;
+    sendText(response, "MCP lifecycle started.");
+  }, { mcpExtensionPath: MCP_TEST_EXTENSION_PATH });
+  try {
+    const events = await collect(
+      app.engine,
+      request("48484848-4848-4848-8848-484848484848", {
+        prompt: "Use MCP.",
+      }),
+    );
+
+    assert.match(JSON.stringify(secondRequest.messages), /MCP initialized/);
+    assert.doesNotMatch(
+      JSON.stringify(secondRequest.messages),
+      /MCP not initialized/,
+    );
+    assert.equal(events.at(-1).answer, "MCP lifecycle started.");
+  } finally {
+    await app.close();
+  }
+});
+
+test("loads the production Taibu MCP adapter lazily", async () => {
+  const app = await fixture(
+    (_body, response) => sendText(response, "Taibu adapter loaded."),
+    { mcpExtensionPath: TAIBU_MCP_EXTENSION_PATH },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("46464646-4646-4646-8646-464646464646", {
+        prompt: "Can you read a birth chart?",
+      }),
+    );
+
+    const toolNames = app.provider.requests[0].tools.map(
+      (tool) => tool.function.name,
+    );
+    assert(toolNames.includes("mcp"));
+    assert(!toolNames.includes("mcpScript"));
+    assert.equal(events.at(-1).answer, "Taibu adapter loaded.");
+  } finally {
+    await app.close();
+  }
+});
+
+test(
+  "live Taibu MCP proxy discovers and calls the hosted almanac tool",
+  { skip: process.env.TAIBU_MCP_LIVE !== "1", timeout: 30_000 },
+  async () => {
+    let searchResultRequest;
+    let almanacResultRequest;
+    const app = await fixture((body, response, requestNumber) => {
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-mcp-search",
+          name: "mcp",
+          args: { search: "almanac" },
+        });
+        return;
+      }
+      if (requestNumber === 2) {
+        searchResultRequest = body;
+        sendToolCall(response, {
+          id: "call-mcp-almanac",
+          name: "mcp",
+          args: {
+            tool: "taibu_almanac",
+            args: { date: "2026-08-07" },
+          },
+        });
+        return;
+      }
+      almanacResultRequest = body;
+      sendText(response, "The hosted TaiBu almanac tool returned a result.");
+    }, { mcpExtensionPath: TAIBU_MCP_EXTENSION_PATH });
+    try {
+      const events = await collect(
+        app.engine,
+        request("47474747-4747-4747-8747-474747474747", {
+          prompt: "Use TaiBu to check the almanac for 2026-08-07.",
+        }),
+      );
+
+      const searchToolResult = [...searchResultRequest.messages]
+        .reverse()
+        .find((message) => message.role === "tool");
+      const almanacToolResult = [...almanacResultRequest.messages]
+        .reverse()
+        .find((message) => message.role === "tool");
+      assert.match(JSON.stringify(searchToolResult), /taibu_almanac/);
+      assert.match(
+        JSON.stringify(almanacToolResult),
+        /择日宜忌|传统黄历基调|日干支/,
+      );
+      assert.equal(
+        events.at(-1).answer,
+        "The hosted TaiBu almanac tool returned a result.",
+      );
+      assert.equal(
+        events.filter((event) => event.type === "tool_snapshot").length,
+        4,
+      );
+    } finally {
+      await app.close();
+    }
+  },
+);
 
 test("detects persisted source evidence no longer allowed to a continuation requester", () => {
   const messages = [

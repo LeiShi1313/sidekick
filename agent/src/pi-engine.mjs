@@ -18,6 +18,7 @@ import { createMemoryTools, MEMORY_TOOL_NAMES } from "./memory-tools.mjs";
 import { isModelId } from "./model-id.mjs";
 import { RunAuditStore } from "./run-audit.mjs";
 import { SessionHistory } from "./session-history.mjs";
+import { TAIBU_MCP_GUIDANCE } from "./taibu-mcp-config.mjs";
 import { constrainWebTools } from "./web-tools.mjs";
 
 const PROVIDER = "openai-compatible";
@@ -186,11 +187,19 @@ export function buildRunPrompt({
   return sections.join("\n\n");
 }
 
-export function toolNamesForPolicy(policy, memoryEnabled = false) {
+export function toolNamesForPolicy(
+  policy,
+  memoryEnabled = false,
+  mcpEnabled = false,
+) {
   if (!TOOL_POLICIES.has(policy)) throw new Error("Unknown tool policy");
   if (policy === "none") return [];
   const memoryTools = memoryEnabled ? MEMORY_TOOL_NAMES : [];
-  return [...RESTRICTED_TOOLS, ...memoryTools];
+  return [
+    ...RESTRICTED_TOOLS,
+    ...memoryTools,
+    ...(mcpEnabled ? ["mcp"] : []),
+  ];
 }
 
 function createCodeTool() {
@@ -219,8 +228,9 @@ function createCodeTool() {
   });
 }
 
-function constrainExtensions(result) {
+function constrainExtensions(result, { requireWeb, requireMcp }) {
   let foundWebTools = false;
+  let foundMcp = false;
   const extensions = result.extensions.map((extension) => {
     const registered = [...extension.tools.values()];
     const names = new Set(registered.map(({ definition }) => definition.name));
@@ -240,6 +250,11 @@ function constrainExtensions(result) {
       );
       foundWebTools = true;
     }
+    const mcp = registered.find(({ definition }) => definition.name === "mcp");
+    if (mcp) {
+      tools.set("mcp", mcp);
+      foundMcp = true;
+    }
     return {
       ...extension,
       tools,
@@ -249,13 +264,32 @@ function constrainExtensions(result) {
       messageRenderers: new Map(),
     };
   });
-  if (!foundWebTools) {
+  if (requireWeb && !foundWebTools) {
     result.errors.push({
       path: "pi-web-access",
       error: "Required web tools were not registered",
     });
   }
+  if (requireMcp && !foundMcp) {
+    result.errors.push({
+      path: "pi-mcp-adapter",
+      error: "Required MCP gateway was not registered",
+    });
+  }
   return { ...result, extensions };
+}
+
+async function closeAgentSession(session) {
+  try {
+    if (session.hasExtensionHandlers("session_shutdown")) {
+      await session.extensionRunner.emit({
+        type: "session_shutdown",
+        reason: "quit",
+      });
+    }
+  } finally {
+    session.dispose();
+  }
 }
 
 function extractText(message) {
@@ -307,6 +341,7 @@ function toolStartSummary(name, args) {
     return `Fetching: ${boundedText(hosts.join(", "), 300) || "web page"}`;
   }
   if (name === "code_exec") return "Running calculation";
+  if (name === "mcp") return "Consulting TaiBu";
   if (name === "memory_reflect") return "Reasoning over memory";
   if (name === "memory_get_sources") return "Checking memory sources";
   if (name === "memory_query_current") return "Querying current memory";
@@ -535,6 +570,9 @@ export class PiEngine {
     ) {
       throw new Error("Agent web tools are unavailable");
     }
+    if (this.config.mcpExtensionPath && !names.has("mcp")) {
+      throw new Error("Agent MCP gateway is unavailable");
+    }
   }
 
   async shutdown() {
@@ -693,7 +731,11 @@ export class PiEngine {
           }
         : request;
       const sessionManager = await this.#sessionManager(request);
-      const resourceLoader = await this.#resourceLoader(request.systemPrompt);
+      const mcpEnabled =
+        request.toolPolicy !== "none" && Boolean(this.config.mcpExtensionPath);
+      const resourceLoader = await this.#resourceLoader(request.systemPrompt, {
+        enableMcp: mcpEnabled,
+      });
       const settingsManager = SettingsManager.inMemory(
         {
           compaction: { enabled: true },
@@ -723,6 +765,7 @@ export class PiEngine {
       const toolNames = toolNamesForPolicy(
         request.toolPolicy,
         memoryTools.length > 0,
+        mcpEnabled,
       );
       const { session } = await createAgentSession({
         cwd: this.config.workspaceDir,
@@ -737,6 +780,12 @@ export class PiEngine {
         sessionManager,
         settingsManager,
       });
+      try {
+        await session.bindExtensions({ mode: "print" });
+      } catch (error) {
+        await closeAgentSession(session);
+        throw error;
+      }
       activeRun.session = session;
       this.#updateActiveRun(activeRun, {
         sessionId: session.sessionId,
@@ -751,7 +800,7 @@ export class PiEngine {
       if (activeRun.cancelRequested) {
         const event = await cancelledEvent(session.sessionId);
         activeRun.session = null;
-        session.dispose();
+        await closeAgentSession(session);
         yield event;
         return;
       }
@@ -892,7 +941,7 @@ export class PiEngine {
         const event = await cancelledEvent(session.sessionId);
         unsubscribe();
         activeRun.session = null;
-        session.dispose();
+        await closeAgentSession(session);
         yield event;
         return;
       }
@@ -964,7 +1013,7 @@ export class PiEngine {
         } finally {
           this.#removeActiveRun(activeRun);
           unsubscribe();
-          session.dispose();
+          await closeAgentSession(session);
         }
       })();
 
@@ -1040,27 +1089,40 @@ export class PiEngine {
     return manager;
   }
 
-  async #resourceLoader(systemPrompt) {
+  async #resourceLoader(systemPrompt, { enableMcp = true } = {}) {
     const settingsManager = SettingsManager.inMemory(
       { packages: [], defaultProjectTrust: "never" },
       { projectTrusted: false },
     );
     const hasWeb = Boolean(this.config.webExtensionPath);
+    const hasMcp = enableMcp && Boolean(this.config.mcpExtensionPath);
     const loader = new DefaultResourceLoader({
       cwd: this.config.workspaceDir,
       agentDir: this.config.agentDir,
       settingsManager,
-      additionalExtensionPaths: hasWeb ? [this.config.webExtensionPath] : [],
+      additionalExtensionPaths: [
+        ...(hasWeb ? [this.config.webExtensionPath] : []),
+        ...(hasMcp ? [this.config.mcpExtensionPath] : []),
+      ],
       noExtensions: true,
       noSkills: true,
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
       systemPrompt,
+      appendSystemPrompt: hasMcp ? [TAIBU_MCP_GUIDANCE] : [],
       skillsOverride: () => ({ skills: [], diagnostics: [] }),
       promptsOverride: () => ({ prompts: [], diagnostics: [] }),
       agentsFilesOverride: () => ({ agentsFiles: [] }),
-      ...(hasWeb ? { extensionsOverride: constrainExtensions } : {}),
+      ...(hasWeb || hasMcp
+        ? {
+            extensionsOverride: (result) =>
+              constrainExtensions(result, {
+                requireWeb: hasWeb,
+                requireMcp: hasMcp,
+              }),
+          }
+        : {}),
     });
     await loader.reload();
     if (loader.getExtensions().errors.length > 0) {
