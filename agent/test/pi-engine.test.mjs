@@ -18,6 +18,9 @@ import {
 const MCP_TEST_EXTENSION_PATH = fileURLToPath(
   new URL("../test-support/mcp-extension.mjs", import.meta.url),
 );
+const WEB_TEST_EXTENSION_PATH = fileURLToPath(
+  new URL("../test-support/web-extension.mjs", import.meta.url),
+);
 const TAIBU_MCP_EXTENSION_PATH = fileURLToPath(
   new URL("../src/taibu-mcp-extension.ts", import.meta.url),
 );
@@ -239,7 +242,7 @@ async function fixture(handler, overrides = {}) {
     sessionDir: join(root, "sessions"),
     auditDir: join(root, "audit"),
     agentDir: join(root, "agent"),
-    webExtensionPath: null,
+    webExtensionPath: overrides.webExtensionPath ?? null,
     mcpExtensionPath: overrides.mcpExtensionPath ?? null,
     memoryUrl: overrides.memoryUrl ?? null,
     memoryFetch: overrides.memoryFetch,
@@ -1002,6 +1005,43 @@ test("redacts sensitive metadata across stream deltas, persistence, and audits",
     );
     assert.doesNotMatch(
       rawAudit,
+      /203\.0\.113\.42|example-service|test-key/,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("redacts sensitive values from live tool-start summaries", async () => {
+  const app = await fixture((body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendToolCall(response, {
+        id: "call-sensitive-search",
+        name: "web_search",
+        args: {
+          query:
+            "Find 203.0.113.42 at " +
+            "/home/example-service/private/workspace using test-key",
+        },
+      });
+      return;
+    }
+    sendText(response, "Search completed safely.");
+  }, { webExtensionPath: WEB_TEST_EXTENSION_PATH });
+  try {
+    const events = await collect(
+      app.engine,
+      request("69696969-6969-4969-8969-696969696969"),
+    );
+    const started = events.find(
+      (event) => event.type === "tool_snapshot" && event.phase === "started",
+    );
+
+    assert.match(started.summary, /REDACTED_IP_ADDRESS/);
+    assert.match(started.summary, /REDACTED_RUNTIME_PATH/);
+    assert.match(started.summary, /REDACTED_SECRET/);
+    assert.doesNotMatch(
+      JSON.stringify(events),
       /203\.0\.113\.42|example-service|test-key/,
     );
   } finally {

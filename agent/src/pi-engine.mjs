@@ -900,7 +900,10 @@ export class PiEngine {
             type: "tool_snapshot",
             phase: "started",
             tool: event.toolName,
-            summary: toolStartSummary(event.toolName, event.args),
+            summary: redactSensitiveText(
+              toolStartSummary(event.toolName, event.args),
+              privacyOptions,
+            ),
           });
         } else if (event.type === "tool_execution_end") {
           const started = toolStartedAt.get(event.toolCallId);
