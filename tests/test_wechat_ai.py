@@ -47,6 +47,7 @@ from sidekick.wechat.api import (
     WeChatDownloadedImage,
     WeChatEvent,
     WeChatMessageList,
+    WeChatSendFailed,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
     WeChatSession,
@@ -372,6 +373,159 @@ async def test_wechat_transport_quotes_eligible_trigger_when_reply_is_ready(
         await store.close()
 
     assert client.calls[0]["reply_to_message_id"] == trigger.id
+
+
+@pytest.mark.asyncio
+async def test_wechat_transport_falls_back_after_quote_send_failed(tmp_path) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    failed_operation = WeChatSendOperation(
+        request_id="placeholder",
+        status="failed",
+        message_id=None,
+        error_code="SEND_NOT_READY",
+        to=GROUP_ID,
+    )
+    client = RecordingConnectorClient(
+        (
+            WeChatSendFailed(failed_operation, "quote send failed"),
+            submitted(message_id="8158246912028861544"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        sent = await transport.reply(
+            trigger,
+            "Plain fallback answer.",
+            presentation="plain",
+        )
+    finally:
+        await store.close()
+
+    assert sent.id == "8158246912028861544"
+    assert [call["reply_to_message_id"] for call in client.calls] == [
+        trigger.id,
+        None,
+    ]
+    assert client.calls[1]["request_id"] == f"{client.calls[0]['request_id']}.plain"
+    assert client.calls[0]["content"] == client.calls[1]["content"]
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    (
+        (422, "REPLY_UNSUPPORTED"),
+        (503, "SEND_NOT_READY"),
+        (501, "SEND_UNAVAILABLE"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_wechat_transport_falls_back_after_safe_quote_rejection(
+    tmp_path,
+    status,
+    code,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient(
+        (
+            WeChatAPIError(status, code, "quote rejected before activation"),
+            submitted(message_id="8158246912028861544"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        await transport.reply(trigger, "Plain fallback answer.", presentation="plain")
+    finally:
+        await store.close()
+
+    assert [call["reply_to_message_id"] for call in client.calls] == [
+        trigger.id,
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_transport_does_not_fallback_after_quote_outcome_unknown(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    unknown_operation = WeChatSendOperation(
+        request_id="placeholder",
+        status="unknown",
+        message_id=None,
+        error_code="SEND_OUTCOME_UNKNOWN",
+        to=GROUP_ID,
+    )
+    client = RecordingConnectorClient(
+        (WeChatSendOutcomeUnknown(unknown_operation, "outcome unknown"),)
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        with pytest.raises(WeChatSendOutcomeUnknown):
+            await transport.reply(trigger, "Possibly sent.", presentation="plain")
+    finally:
+        await store.close()
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["reply_to_message_id"] == trigger.id
+
+
+@pytest.mark.asyncio
+async def test_wechat_transport_stops_after_plain_fallback_becomes_unknown(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    failed_operation = WeChatSendOperation(
+        request_id="placeholder",
+        status="failed",
+        message_id=None,
+        error_code="SEND_NOT_READY",
+        to=GROUP_ID,
+    )
+    unknown_operation = WeChatSendOperation(
+        request_id="placeholder.plain",
+        status="unknown",
+        message_id=None,
+        error_code="SEND_OUTCOME_UNKNOWN",
+        to=GROUP_ID,
+    )
+    client = RecordingConnectorClient(
+        (
+            WeChatSendFailed(failed_operation, "quote send failed"),
+            WeChatSendOutcomeUnknown(unknown_operation, "fallback outcome unknown"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        with pytest.raises(WeChatSendOutcomeUnknown):
+            await transport.reply(trigger, "Possibly sent plainly.", presentation="plain")
+    finally:
+        await store.close()
+
+    assert len(client.calls) == 2
+    assert [call["reply_to_message_id"] for call in client.calls] == [
+        trigger.id,
+        None,
+    ]
 
 
 @pytest.mark.asyncio

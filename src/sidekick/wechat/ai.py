@@ -18,6 +18,7 @@ from sidekick.chat.transport import ChatPresentation, SentMessage
 from sidekick.wechat.api import (
     MAX_MEDIA_BYTES,
     MAX_TEXT_BYTES,
+    WeChatAPIError,
     WeChatDownloadedImage,
     WeChatSendFailed,
     WeChatSendOperation,
@@ -25,6 +26,11 @@ from sidekick.wechat.api import (
 )
 from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import WeChatStateRepository
+
+
+_SAFE_PLAIN_FALLBACK_CODES = frozenset(
+    {"REPLY_UNSUPPORTED", "SEND_NOT_READY", "SEND_UNAVAILABLE"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,28 +336,51 @@ class WeChatChatTransport:
         return getattr(message, "chat_type", None) == "group"
 
     async def _send(self, message: WeChatSentMessage, text: str) -> None:
-        try:
-            operation = await self._client.send_text_and_wait(
-                request_id=message.request_id,
-                to=message.trigger.chat_id,
-                content=text,
-                reply_to_message_id=self._native_reply_target(message.trigger),
-            )
-        except WeChatSendOutcomeUnknown:
-            message.uncertain = True
-            message.text = text
-            raise
-        except WeChatSendFailed:
-            message.failed = True
-            message.text = text
-            raise
-        except Exception:
-            # A transport failure can happen after the connector accepted the
-            # request. Keep the original ID/payload reserved and never replace
-            # it with an error message under that ID.
-            message.uncertain = True
-            message.text = text
-            raise
+        reply_to_message_id = self._native_reply_target(message.trigger)
+        plain_fallback_available = reply_to_message_id is not None
+        while True:
+            try:
+                operation = await self._client.send_text_and_wait(
+                    request_id=message.request_id,
+                    to=message.trigger.chat_id,
+                    content=text,
+                    reply_to_message_id=reply_to_message_id,
+                )
+                break
+            except WeChatSendOutcomeUnknown:
+                message.uncertain = True
+                message.text = text
+                raise
+            except WeChatSendFailed:
+                # The connector reserves `unknown` for every path where Quote
+                # or Send may have taken effect. A terminal `failed` reply can
+                # therefore be replaced by one ordinary text operation.
+                if plain_fallback_available:
+                    plain_fallback_available = False
+                    reply_to_message_id = None
+                    message.request_id = f"{message.request_id}.plain"
+                    continue
+                message.failed = True
+                message.text = text
+                raise
+            except WeChatAPIError as exc:
+                # These synchronous reply errors are contractually rejected
+                # before operation creation or activation.
+                if plain_fallback_available and exc.code in _SAFE_PLAIN_FALLBACK_CODES:
+                    plain_fallback_available = False
+                    reply_to_message_id = None
+                    message.request_id = f"{message.request_id}.plain"
+                    continue
+                message.uncertain = True
+                message.text = text
+                raise
+            except Exception:
+                # A transport failure can happen after the connector accepted the
+                # request. Keep the original ID/payload reserved and never replace
+                # it with an error message under that ID.
+                message.uncertain = True
+                message.text = text
+                raise
         assert operation.message_id is not None
         await self._store.mark_processed_identity(
             self._connector_key,
