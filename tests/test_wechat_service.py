@@ -147,6 +147,7 @@ class FakeConnectorClient:
         )
         self.capabilities = WeChatCapabilities(
             receive_text=True,
+            receive_shared_chat_history=True,
             stable_inbound_message_ids=True,
             send_text=True,
             request_idempotency=True,
@@ -479,6 +480,7 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
         )
         client.capabilities = WeChatCapabilities(
             receive_text=True,
+            receive_shared_chat_history=True,
             stable_inbound_message_ids=True,
             send_text=True,
             request_idempotency=True,

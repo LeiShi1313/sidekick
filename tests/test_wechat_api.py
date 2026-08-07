@@ -91,6 +91,119 @@ def test_wechat_client_parses_image_media_identity() -> None:
     assert message.content_redacted is True
 
 
+def test_wechat_client_parses_shared_chat_history_as_bounded_text() -> None:
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "chat_history",
+        "content": "Team history",
+        "sharedChatHistory": {
+            "title": "Team history",
+            "itemCount": 3,
+            "items": [
+                {
+                    "kind": "text",
+                    "senderName": "Alice",
+                    "timestamp": 1_700_000_001,
+                    "content": "Hello",
+                },
+                {
+                    "kind": "video",
+                    "senderName": "Bob",
+                    "timestamp": 1_700_000_002,
+                    "content": "Demo clip",
+                    "reply": {
+                        "kind": "image",
+                        "senderName": "Carol",
+                        "content": "Earlier image",
+                    },
+                },
+            ],
+            "truncated": True,
+        },
+    }
+
+    message = WeChatConnectorMessage.parse(payload)
+
+    assert message.content == "Team history"
+    assert message.shared_chat_history is not None
+    assert message.shared_chat_history.item_count == 3
+    assert message.display_content == (
+        "[Forwarded chat history]\n"
+        "Team history\n"
+        "Alice: Hello\n"
+        "Bob: [Video] Demo clip\n"
+        "  ↳ Carol: [Image] Earlier image\n"
+        "… 1 more item not included"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda history: history["items"][0].update(kind="script"),
+        lambda history: history["items"][0].update(senderName="Alice\nAdmin"),
+        lambda history: history.update(itemCount=257),
+        lambda history: history.update(truncated=False),
+    ),
+)
+def test_wechat_client_rejects_invalid_shared_chat_history(mutation) -> None:
+    history = {
+        "title": "Team history",
+        "itemCount": 2,
+        "items": [
+            {"kind": "text", "senderName": "Alice", "content": "Hello"},
+        ],
+        "truncated": True,
+    }
+    mutation(history)
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "chat_history",
+        "content": "Team history",
+        "sharedChatHistory": history,
+    }
+
+    with pytest.raises(WeChatAPIContractError, match="shared chat history"):
+        WeChatConnectorMessage.parse(payload)
+
+
+def test_wechat_client_rejects_shared_history_on_other_message_types() -> None:
+    payload = connector_message_payload("4159667620982040828")
+    payload["sharedChatHistory"] = {
+        "title": "Team history",
+        "itemCount": 1,
+        "items": [{"kind": "text", "content": "Hello"}],
+    }
+
+    with pytest.raises(WeChatAPIContractError, match="shared chat history"):
+        WeChatConnectorMessage.parse(payload)
+
+
+def test_wechat_client_bounds_rendered_shared_chat_history() -> None:
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "chat_history",
+        "content": "Large history",
+        "sharedChatHistory": {
+            "title": "Large history",
+            "itemCount": 8,
+            "items": [
+                {
+                    "kind": "text",
+                    "senderName": f"User {index}",
+                    "content": "界" * 1_500,
+                }
+                for index in range(8)
+            ],
+        },
+    }
+
+    message = WeChatConnectorMessage.parse(payload)
+
+    assert len(message.display_content.encode("utf-8")) <= 16 * 1024
+    assert "more items not included" in message.display_content
+
+
 @pytest.mark.parametrize(
     "media_id",
     (
@@ -198,6 +311,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
                 "apiVersion": "v1alpha1",
                 "messages": {
                     "receiveText": True,
+                    "receiveSharedChatHistory": True,
                     "stableInboundMessageIds": True,
                     "sendText": True,
                     "requestIdempotency": True,
@@ -332,6 +446,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
     observed_capabilities.require_ai_channel()
     assert observed_capabilities.inbound_image_download is True
     assert observed_capabilities.request_original_image is True
+    assert observed_capabilities.receive_shared_chat_history is True
     assert observed_chats.snapshot.id == "snapshot-41"
     assert observed_chats.chats[0].id == "56825427596@chatroom"
     assert observed_messages.messages[0].id == "4159667620982040828"
