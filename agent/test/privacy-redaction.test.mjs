@@ -91,3 +91,30 @@ test("does not release a sensitive token split across stream deltas", () => {
     /203\.0\.|113\.42|example-service|demo-provider|secret-123/,
   );
 });
+
+test("redacts sensitive tokens at every possible stream split", () => {
+  for (const sensitive of [DOCUMENTATION_IPV4, DOCUMENTATION_IPV6, RUNTIME_PATH]) {
+    for (let split = 1; split < sensitive.length; split += 1) {
+      const stream = new SensitiveTextStream();
+      const output =
+        stream.push(`Value ${sensitive.slice(0, split)}`) +
+        stream.push(`${sensitive.slice(split)} done`) +
+        stream.flush();
+      assert.match(output, /\[REDACTED_/);
+      assert.doesNotMatch(output, new RegExp(sensitive.replaceAll(".", "\\.")));
+    }
+  }
+});
+
+test("preserves ordinary web content while redacting a standalone address", () => {
+  const result = sanitizeFetchedText(
+    `Version 1.2.3; docs https://example.com/api/v1; ` +
+      `relative path agent/src/main.mjs; DNS result ${DOCUMENTATION_IPV4}.`,
+  );
+
+  assert.match(result, /Version 1\.2\.3/);
+  assert.match(result, /https:\/\/example\.com\/api\/v1/);
+  assert.match(result, /agent\/src\/main\.mjs/);
+  assert.match(result, /DNS result \[REDACTED_IP_ADDRESS\]/);
+  assert.doesNotMatch(result, /203\.0\.113\.42/);
+});

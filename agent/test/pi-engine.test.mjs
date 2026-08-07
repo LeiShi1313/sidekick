@@ -965,6 +965,13 @@ test("redacts sensitive metadata across stream deltas, persistence, and audits",
       serializedEvents,
       /203\.0\.113\.42|example-service|test-key/,
     );
+    assert.equal(
+      events
+        .filter((event) => event.type === "text_delta")
+        .map((event) => event.delta)
+        .join(""),
+      events.at(-1).answer,
+    );
     const systemPrompt = app.provider.requests[0].messages.find(
       (message) => message.role === "system",
     ).content;
