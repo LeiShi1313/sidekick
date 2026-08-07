@@ -234,7 +234,7 @@ export function createPinnedRequester({
             const status = Number(response.statusCode ?? 0);
             const headers = normalizedHeaders(response.headers);
             if (REDIRECT_STATUSES.has(status) || !(status >= 200 && status < 300)) {
-              response.resume();
+              response.destroy();
               succeed({
                 status,
                 statusText: String(response.statusMessage ?? ""),

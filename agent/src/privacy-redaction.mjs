@@ -30,8 +30,8 @@ const PRIVATE_QUERY_NAMES =
   /^(?:api[_-]?key|key|sig|signature|token|access[_-]?token|auth|authorization)$/i;
 const PRIVATE_ENV_NAME =
   /(?:api[_-]?key|credential|password|private[_-]?key|secret|token)/i;
-const CANONICAL_ACTOR_ID_RE =
-  /(?<![A-Za-z0-9:_.%-])([A-Za-z0-9][A-Za-z0-9:_.%-]{0,191}:(?:user|channel):[A-Za-z0-9][A-Za-z0-9:_.%-]{0,191})(?![A-Za-z0-9:_.%-])/g;
+const HOST_ID_TOKEN_RE =
+  /(?<![A-Za-z0-9:_.%-])[A-Za-z0-9][A-Za-z0-9:_.%-]*(?![A-Za-z0-9:_.%-])/g;
 const NETWORK_IDENTITY_KEYS = new Set([
   "address",
   "clientip",
@@ -217,9 +217,15 @@ export function pseudonymizeAccessBank(bankId, key, scope) {
 export function pseudonymizeActorIdentities(value, key, scope) {
   const text = String(value ?? "");
   requirePseudonymContext(key, scope);
-  return text.replace(CANONICAL_ACTOR_ID_RE, (identity) =>
-    pseudonymizeIdentity(identity, key, scope),
-  );
+  return text.replace(HOST_ID_TOKEN_RE, (identity) => {
+    if (
+      identity.length > 256 ||
+      !/:(?:user|channel):/.test(identity)
+    ) {
+      return identity;
+    }
+    return pseudonymizeIdentity(identity, key, scope);
+  });
 }
 
 function redactNetworkLiterals(text, allowed) {

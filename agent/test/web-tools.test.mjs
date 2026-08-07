@@ -251,6 +251,50 @@ test("pins the actual HTTP socket lookup to the vetted address", async () => {
   assert.equal(response.body.toString(), "socket-pinned page");
 });
 
+test("destroys redirect and error bodies instead of draining unbounded data", async () => {
+  for (const status of [302, 404]) {
+    let producedBytes = 0;
+    let upstreamResponse;
+    const transport = (_options, onResponse) => {
+      const request = new EventEmitter();
+      request.end = () => {
+        upstreamResponse = Readable.from(
+          (function* body() {
+            for (let index = 0; index < 10; index += 1) {
+              producedBytes += 1024 * 1024;
+              yield Buffer.alloc(1024 * 1024);
+            }
+          })(),
+        );
+        upstreamResponse.statusCode = status;
+        upstreamResponse.statusMessage = status === 302 ? "Found" : "Not Found";
+        upstreamResponse.headers =
+          status === 302 ? { location: "https://example.org/final" } : {};
+        queueMicrotask(() => onResponse(upstreamResponse));
+      };
+      return request;
+    };
+    const request = createPinnedRequester({
+      httpRequest: transport,
+      httpsRequest: transport,
+    });
+
+    const response = await request(
+      {
+        url: new URL("https://example.com/start"),
+        address: PUBLIC_ADDRESS,
+        family: 4,
+      },
+      { maxBytes: 1 },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(response.status, status);
+    assert.equal(upstreamResponse.destroyed, true);
+    assert.equal(producedBytes, 0);
+  }
+});
+
 test("blocks redirects from a public URL to a private destination", async () => {
   const requested = [];
   const [, fetchContent] = tools({

@@ -475,13 +475,18 @@ test("keeps requester authorship distinct in shared continuations", () => {
 });
 
 test("pseudonymizes participant IDs outside the current identity anchors", () => {
+  const maximumLengthActorId = `${"a".repeat(249)}:user:x`;
+  const encodedWechatActorId =
+    `wechat:account:${"%41".repeat(70)}:user:self`;
   const prompt = buildRunPrompt({
     prompt: "Who wrote the earlier reply?",
     context: [
       {
         kind: "reference",
         text:
-          "message author actor_id=wechat:account:peer:user:self said hello",
+          "message author actor_id=wechat:account:peer:user:self said hello\n" +
+          `boundary author actor_id=${maximumLengthActorId}\n` +
+          `encoded author actor_id=${encodedWechatActorId}`,
       },
     ],
     identity: requestIdentity("wechat:account:peer:user:requester", "Requester"),
@@ -490,7 +495,12 @@ test("pseudonymizes participant IDs outside the current identity anchors", () =>
   });
 
   assert.doesNotMatch(prompt, /wechat:account:peer:(?:user|channel):/);
-  assert.match(prompt, /actor_id=actor_[a-f0-9]{16}/);
+  assert.equal(prompt.includes(maximumLengthActorId), false);
+  assert.equal(prompt.includes(encodedWechatActorId), false);
+  assert.equal(
+    new Set(prompt.match(/actor_id=actor_[a-f0-9]{16}/g)).size,
+    3,
+  );
 });
 
 test("serializes each requester identity in a shared session branch", async () => {
