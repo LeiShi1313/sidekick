@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from telethon.errors import FloodWaitError
+from telethon.tl import types as telegram_types
 
 from sidekick.ai import (
     AIAnswerMarker,
@@ -39,6 +40,8 @@ from sidekick.ai_memory_segments import (
 from sidekick.chat.commands import MemoryBackfillCommand
 from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
+    TelegramMatrixBridgeResolver,
+    TelegramMessageIdentityResolver,
     telegram_memory_event_metadata,
 )
 from sidekick.telegram.ai_history import (
@@ -151,6 +154,7 @@ class FakeMessage:
         post=False,
         grouped_id=None,
         post_author=None,
+        entities=(),
     ):
         self.id = message_id
         self.raw_text = text
@@ -162,7 +166,7 @@ class FakeMessage:
         self.post = post
         self.grouped_id = grouped_id
         self.post_author = post_author
-        self.entities = ()
+        self.entities = entities
         self.sender = type("Sender", (), {"bot": is_bot})()
 
     async def get_reply_message(self):
@@ -431,6 +435,7 @@ async def make_scanner(
     delivery_retry_max_delay=3_600,
     clock=lambda: NOW.timestamp(),
     identity_resolver=None,
+    attribution_resolver=None,
 ):
     store = await AIStateRepository(tmp_path / "ai.db").connect()
     await store.set_dream_memory_enabled("telegram:chat:-1001", True, "Dream Group")
@@ -443,6 +448,7 @@ async def make_scanner(
         memory=memory,
         prompt_builder=PromptBuilder(
             identity_resolver=identity_resolver or FakeIdentityResolver(),
+            attribution_resolver=attribution_resolver,
             attachment_describer=attachment_describer,
             identity_codec=TELEGRAM_IDENTITY_CODEC,
             metadata_resolver=telegram_memory_event_metadata,
@@ -1905,6 +1911,51 @@ async def test_dream_excludes_marked_messages_bots_and_keeps_attachment_text(tmp
         assert memory.retain_calls[0]["episode"].events[0].text == (
             "Attachment description: launch-plan whiteboard sketch."
         )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_dream_separates_matrix_bridge_display_name_aliases(tmp_path):
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    first = FakeMessage(
+        43,
+        "SteamedFish: first bridge memory",
+        sender_id=6332621450,
+        is_bot=True,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+    second = FakeMessage(
+        44,
+        "OtherFish: second bridge memory",
+        sender_id=6332621450,
+        is_bot=True,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=9),),
+    )
+    memory = FakeMemory()
+    store, scanner = await make_scanner(
+        tmp_path,
+        FakeSource([first, second]),
+        memory,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+        attribution_resolver=bridge_resolver,
+    )
+    try:
+        result = await scanner.run_scope(-1001)
+
+        assert result.messages_retained == 2
+        events = [call["episode"].events[0] for call in memory.retain_calls]
+        assert [event.actor_display_name for event in events] == [
+            "SteamedFish",
+            "OtherFish",
+        ]
+        assert events[0].actor_id != events[1].actor_id
+        assert [event.text for event in events] == [
+            "first bridge memory",
+            "second bridge memory",
+        ]
     finally:
         await store.close()
 

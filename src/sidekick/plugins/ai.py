@@ -54,6 +54,7 @@ from sidekick.telegram.ai_transport import (
 from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
     TelegramDirectorySourceResolver,
+    TelegramMatrixBridgeResolver,
     TelegramMemoryScopeTargetResolver,
     TelegramMessageIdentityResolver,
     TelegramMessageMentionResolver,
@@ -211,6 +212,9 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         self._responder = responder
         await self._store.connect()
         history_source = TelegramHistorySource(self.client)
+        matrix_bridge_resolver = TelegramMatrixBridgeResolver(
+            self.service.config.matrix_bridge_bot_ids
+        )
         prompt_builder = PromptBuilder(
             system_prompt=agent_system_prompt(self._settings.system_prompt),
             max_context_messages=self._settings.max_context_messages,
@@ -220,6 +224,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                 logger=self.logger,
             ),
             identity_resolver=TelegramMessageIdentityResolver(
+                bridge_resolver=matrix_bridge_resolver,
                 logger=self.logger,
             ),
             mention_resolver=TelegramMessageMentionResolver(
@@ -228,6 +233,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             ),
             history_source=history_source,
             transport=transport,
+            attribution_resolver=matrix_bridge_resolver,
             identity_codec=TELEGRAM_IDENTITY_CODEC,
             metadata_resolver=telegram_memory_event_metadata,
         )

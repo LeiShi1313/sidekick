@@ -38,6 +38,7 @@ from sidekick.ai_memory import (
 from sidekick.chat.commands import MemoryBackfillCommand
 from sidekick.telegram.ai_identity import (
     TELEGRAM_IDENTITY_CODEC,
+    TelegramMatrixBridgeResolver,
     TelegramMessageIdentityResolver,
     TelegramMessageMentionResolver,
     telegram_memory_event_metadata,
@@ -86,6 +87,7 @@ class FakeMessage:
         file=None,
         is_human=True,
         out=False,
+        entities=(),
     ):
         self.id = self.__class__.next_id
         self.__class__.next_id += 1
@@ -97,6 +99,7 @@ class FakeMessage:
         self.file = file
         self.is_human = is_human
         self.out = out
+        self.entities = entities
         self._reply_to = reply_to
         self.replies = []
         self.deleted = False
@@ -512,6 +515,7 @@ def make_handler(
     dream_runner=None,
     memory_scope_resolver=None,
     memory_command_delete_delay=0,
+    attribution_resolver=None,
 ):
     store = store or FakeStore(allowed=allowed)
     return AIConversationHandler(
@@ -523,6 +527,7 @@ def make_handler(
             identity_resolver=identity_resolver,
             mention_resolver=mention_resolver,
             history_source=history_source,
+            attribution_resolver=attribution_resolver,
             identity_codec=TELEGRAM_IDENTITY_CODEC,
             metadata_resolver=telegram_memory_event_metadata,
         ),
@@ -584,6 +589,210 @@ async def test_telegram_identity_resolver_rejects_bots_and_unresolved_senders():
     assert not (
         await TelegramMessageIdentityResolver().resolve(UnresolvedMessage())
     ).is_human
+
+
+def test_matrix_bridge_resolver_extracts_scoped_display_name_aliases():
+    resolver = TelegramMatrixBridgeResolver({6332621450})
+    message = FakeMessage(
+        "SteamedFish: /ai hello",
+        sender_id=6332621450,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+
+    attribution = resolver.resolve(message)
+
+    assert attribution is not None
+    assert attribution.actor_display_name == "SteamedFish"
+    assert attribution.text == "/ai hello"
+    assert attribution.actor_id.startswith("telegram:matrix-bridge:")
+    assert ":user:" not in attribution.actor_id
+    same_alias = resolver.resolve(
+        FakeMessage(
+            "SteamedFish: another message",
+            sender_id=6332621450,
+            entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+        )
+    )
+    other_alias = resolver.resolve(
+        FakeMessage(
+            "AnotherUser: another message",
+            sender_id=6332621450,
+            entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+        )
+    )
+    other_room_alias = resolver.resolve(
+        FakeMessage(
+            "SteamedFish: another room",
+            sender_id=6332621450,
+            chat_id=-2002,
+            entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+        )
+    )
+    assert same_alias is not None
+    assert other_alias is not None
+    assert other_room_alias is not None
+    assert same_alias.actor_id == attribution.actor_id
+    assert other_alias.actor_id != attribution.actor_id
+    assert other_room_alias.actor_id != attribution.actor_id
+
+
+def test_matrix_bridge_resolver_understands_matrix_emote_envelopes():
+    resolver = TelegramMatrixBridgeResolver({6332621450})
+    message = FakeMessage(
+        "* SteamedFish /ai hello",
+        sender_id=6332621450,
+        entities=(telegram_types.MessageEntityBold(offset=2, length=11),),
+    )
+
+    attribution = resolver.resolve(message)
+
+    assert attribution is not None
+    assert attribution.actor_display_name == "SteamedFish"
+    assert attribution.text == "/ai hello"
+
+
+def test_matrix_bridge_resolver_ignores_unconfigured_and_malformed_senders():
+    resolver = TelegramMatrixBridgeResolver({6332621450})
+
+    unconfigured = resolver.resolve(
+        FakeMessage(
+            "SteamedFish: /ai hello",
+            sender_id=7000000000,
+            entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+        )
+    )
+    malformed = resolver.resolve(
+        FakeMessage(
+            "SteamedFish: /ai hello",
+            sender_id=6332621450,
+            entities=(),
+        )
+    )
+    assert unconfigured is None
+    assert malformed is None
+
+
+@pytest.mark.asyncio
+async def test_matrix_bridge_identity_is_a_memory_source_with_an_alias_id():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    message = FakeMessage(
+        "SteamedFish: /ai hello",
+        sender_id=6332621450,
+        is_human=False,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+    attribution = bridge_resolver.resolve(message)
+    assert attribution is not None
+
+    identity = await TelegramMessageIdentityResolver(
+        bridge_resolver=bridge_resolver
+    ).resolve(message)
+
+    assert identity == MessageIdentity(
+        subject_id=attribution.actor_id,
+        subject_display_name="SteamedFish",
+        is_human=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_matrix_bridge_ai_command_uses_alias_for_prompt_and_memory():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    trigger = FakeMessage(
+        "SteamedFish: /ai can I use CaiBao?",
+        sender_id=6332621450,
+        is_human=False,
+        entities=(
+            telegram_types.MessageEntityBold(offset=0, length=11),
+            telegram_types.MessageEntityBotCommand(offset=13, length=3),
+        ),
+    )
+    attribution = bridge_resolver.resolve(trigger)
+    assert attribution is not None
+    store = FakeStore(allowed={attribution.actor_id})
+    store.bank_grants[attribution.actor_id] = {"telegram:chat:-9999"}
+    memory = FakeMemory()
+    gateway = FakeGateway(["yes"])
+    handler = make_handler(
+        gateway,
+        memory,
+        store=store,
+        attribution_resolver=bridge_resolver,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+    )
+
+    assert await handler.handle(trigger) is True
+
+    request = gateway.requests[0]
+    assert request.prompt == "can I use CaiBao?"
+    assert request.identity.requester.identity == attribution.actor_id
+    assert request.identity.requester.label == "SteamedFish"
+    assert request.memory is not None
+    assert request.memory.primary_bank_id == "telegram:chat:-1001"
+    assert request.memory.granted_bank_ids == ()
+    marker = next(iter(store.markers.values()))
+    assert marker.requester_id == attribution.actor_id
+    retained_event = memory.retain_calls[0]["episode"].events[0]
+    assert retained_event.actor_id == attribution.actor_id
+    assert retained_event.actor_display_name == "SteamedFish"
+    assert retained_event.text == "can I use CaiBao?"
+
+
+@pytest.mark.asyncio
+async def test_matrix_bridge_reply_continues_with_the_cleaned_message_text():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    store = FakeStore()
+    gateway = FakeGateway(["first answer", "second answer"])
+    handler = make_handler(
+        gateway,
+        None,
+        store=store,
+        attribution_resolver=bridge_resolver,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+    )
+    root = FakeMessage("/ai initial question", sender_id=10)
+    assert await handler.handle(root) is True
+    bridge_reply = FakeMessage(
+        "SteamedFish: follow up",
+        sender_id=6332621450,
+        reply_to=root.replies[0],
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+    attribution = bridge_resolver.resolve(bridge_reply)
+    assert attribution is not None
+    store.allowed.add(attribution.actor_id)
+
+    assert await handler.handle(bridge_reply) is True
+
+    assert gateway.requests[1].prompt == "follow up"
+    root_marker = store.markers[("telegram:chat:-1001", root.replies[0].id)]
+    assert gateway.requests[1].session_id == root_marker.agent_session_id
+    assert gateway.requests[1].identity.requester.identity == attribution.actor_id
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_bot_with_a_bridge_shaped_message_is_ignored():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    gateway = FakeGateway(["unused"])
+    handler = make_handler(
+        gateway,
+        None,
+        allowed={TELEGRAM_IDENTITY_CODEC.actor_id(7000000000)},
+        attribution_resolver=bridge_resolver,
+    )
+    trigger = FakeMessage(
+        "SteamedFish: /ai should not run",
+        sender_id=7000000000,
+        is_human=False,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+
+    assert await handler.handle(trigger) is False
+    assert gateway.requests == []
 
 
 @pytest.mark.asyncio
@@ -1065,6 +1274,47 @@ async def test_owner_revision_retains_chain_then_revises_direct_human():
         }
     ]
     assert command.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_owner_revision_targets_matrix_bridge_alias():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    target = FakeMessage(
+        "SteamedFish: I prefer tea",
+        sender_id=6332621450,
+        is_human=False,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+    attribution = bridge_resolver.resolve(target)
+    assert attribution is not None
+    command = FakeMessage(
+        "/ai_memory Correct the preference to coffee",
+        sender_id=10,
+        reply_to=target,
+    )
+    memory = FakeMemory()
+    handler = make_handler(
+        FakeGateway(["unused"]),
+        memory,
+        attribution_resolver=bridge_resolver,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+    )
+
+    assert await handler.handle(command) is True
+
+    revision = memory.retain_calls[1]["episode"]
+    assert revision.events[0].mentioned_actors == (
+        (attribution.actor_id, "SteamedFish"),
+    )
+    assert memory.revise_calls == [
+        {
+            "scope_id": "telegram:chat:-1001",
+            "subject_id": attribution.actor_id,
+            "instruction": "Correct the preference to coffee",
+        }
+    ]
 
 
 @pytest.mark.asyncio

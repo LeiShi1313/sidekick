@@ -13,6 +13,7 @@ class TelegramRuntimeConfig:
     api_hash: str
     session_name: str = DEFAULT_SESSION_NAME
     store_dir: Path = Path.home() / ".sidekick" / "telegram"
+    matrix_bridge_bot_ids: frozenset[int] = frozenset()
 
     @classmethod
     def from_account(
@@ -54,14 +55,43 @@ class TelegramRuntimeConfig:
             os.environ.get("TELEGRAM_STORE_DIR")
             or telegram.get("store_dir", Path.home() / ".sidekick" / "telegram")
         )
+        configured_bridge_ids = os.environ.get(
+            "SIDEKICK_TELEGRAM_MATRIX_BRIDGE_BOT_IDS"
+        )
+        if configured_bridge_ids is None:
+            configured_bridge_ids = telegram.get("matrix_bridge_bot_ids", ())
         return cls(
             account=selected_account,
             api_id=int(api_id),
             api_hash=api_hash,
             session_name=session_name,
             store_dir=store_dir,
+            matrix_bridge_bot_ids=_parse_matrix_bridge_bot_ids(configured_bridge_ids),
         )
 
     @classmethod
     def from_env(cls, session: str | None = None) -> "TelegramRuntimeConfig":
         return cls.from_account(session=session)
+
+
+def _parse_matrix_bridge_bot_ids(value: object) -> frozenset[int]:
+    candidates: object
+    if isinstance(value, str):
+        candidates = tuple(part.strip() for part in value.split(",") if part.strip())
+    else:
+        candidates = value
+    if not isinstance(candidates, (list, tuple, set, frozenset)):
+        raise ValueError("Matrix bridge bot IDs must be a list of positive integers")
+
+    parsed: set[int] = set()
+    for candidate in candidates:
+        if isinstance(candidate, bool):
+            raise ValueError("Matrix bridge bot IDs must be positive integers")
+        try:
+            bot_id = int(candidate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Matrix bridge bot IDs must be positive integers") from exc
+        if bot_id <= 0 or str(bot_id) != str(candidate).strip():
+            raise ValueError("Matrix bridge bot IDs must be positive integers")
+        parsed.add(bot_id)
+    return frozenset(parsed)

@@ -1355,7 +1355,7 @@ class ChatMemoryIngestor:
         identity_semaphore = asyncio.Semaphore(
             self._ingestion_settings.preprocess_concurrency
         )
-        identity_tasks: dict[ExternalId, asyncio.Task[Any]] = {}
+        identity_tasks: dict[str, asyncio.Task[Any]] = {}
         album_attachment_representatives: dict[int, ExternalId] = {}
         for message in messages:
             grouped_id = getattr(message, "grouped_id", None)
@@ -1371,11 +1371,12 @@ class ChatMemoryIngestor:
                 return await self._prompt_builder.resolve_identity(message)
 
         def identity_for(message: ReplyTarget) -> asyncio.Task[Any]:
-            assert message.sender_id is not None
-            task = identity_tasks.get(message.sender_id)
+            actor_id = self._prompt_builder.message_actor_id(message)
+            assert actor_id is not None
+            task = identity_tasks.get(actor_id)
             if task is None:
                 task = asyncio.create_task(resolve_identity(message))
-                identity_tasks[message.sender_id] = task
+                identity_tasks[actor_id] = task
             return task
 
         async def build(message: ReplyTarget) -> HumanObservation | None:
@@ -1386,7 +1387,9 @@ class ChatMemoryIngestor:
             ):
                 return None
             async with semaphore:
-                text = _memory_message_text(message.raw_text or "")
+                text = _memory_message_text(
+                    self._prompt_builder.message_text(message) or ""
+                )
                 grouped_id = getattr(message, "grouped_id", None)
                 representative_id = (
                     album_attachment_representatives.get(grouped_id)
