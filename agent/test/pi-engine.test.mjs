@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -99,6 +99,40 @@ function sendTextChunks(response, chunks) {
     })),
     {
       id: "chatcmpl-test",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ]);
+}
+
+function sendThinkingText(response, thinking, text) {
+  writeSse(response, [
+    {
+      id: "chatcmpl-thinking",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant", reasoning_content: thinking },
+          finish_reason: null,
+        },
+      ],
+    },
+    {
+      id: "chatcmpl-thinking",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [
+        { index: 0, delta: { content: text }, finish_reason: null },
+      ],
+    },
+    {
+      id: "chatcmpl-thinking",
       object: "chat.completion.chunk",
       created: 1,
       model: "test-model",
@@ -1180,8 +1214,85 @@ test("redacts sensitive tool results before the next model turn", async () => {
       join(app.engine.config.sessionDir, sessionFiles[0]),
       "utf8",
     );
-    assert.match(rawSession, /REDACTED_IP_ADDRESS/);
+    assert.match(rawSession, /Tool result omitted after use/);
     assert.doesNotMatch(rawSession, /203\.0\.113\.42/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("persists only conversation-safe session data", async () => {
+  const app = await fixture((body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendToolCall(response, {
+        id: "call-private-web-result",
+        name: "web_search",
+        args: { query: "ordinary search" },
+      });
+      return;
+    }
+    sendThinkingText(
+      response,
+      "PRIVATE_INTERNAL_REASONING",
+      "A safe final answer.",
+    );
+  }, {
+    webExtensionPath: WEB_TEST_EXTENSION_PATH,
+    memoryUrl: "http://memory.internal:8888",
+    memoryFetch: async () =>
+      new Response(
+        JSON.stringify({
+          results: [
+            {
+              id: "private-memory-1",
+              text: "PRIVATE_RECALLED_MEMORY",
+              entities: [],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+  });
+  try {
+    const events = await collect(
+      app.engine,
+      request("70707070-7070-4070-8070-707070707070", {
+        memory: memoryTarget(),
+      }),
+    );
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.match(
+      JSON.stringify(app.provider.requests[0]),
+      /PRIVATE_RECALLED_MEMORY/,
+    );
+    assert.match(JSON.stringify(app.provider.requests[1]), /Search complete/);
+
+    const sessionFiles = await readdir(app.engine.config.sessionDir);
+    assert.equal(sessionFiles.length, 1);
+    const sessionPath = join(app.engine.config.sessionDir, sessionFiles[0]);
+    const rawSession = await readFile(sessionPath, "utf8");
+    const entries = rawSession
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const webEntry = entries.find(
+      (entry) =>
+        entry.type === "custom" && entry.customType === "web-search-results",
+    );
+
+    assert.deepEqual(webEntry.data, {
+      type: "search",
+      timestamp: webEntry.data.timestamp,
+      omitted: true,
+    });
+    assert.doesNotMatch(
+      rawSession,
+      /PRIVATE_WEB_SNAPSHOT|RAW_FETCHED_PAGE_CONTENT|Search complete|ordinary search|PRIVATE_INTERNAL_REASONING|PRIVATE_RECALLED_MEMORY/,
+    );
+    assert.doesNotMatch(rawSession, /sidekick-pi-test-/);
+    assert.match(rawSession, /"cwd":"\/workspace"/);
+    assert.match(rawSession, /A safe final answer\./);
+    assert.equal((await stat(sessionPath)).mode & 0o777, 0o600);
   } finally {
     await app.close();
   }

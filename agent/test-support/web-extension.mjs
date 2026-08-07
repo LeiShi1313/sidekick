@@ -6,7 +6,24 @@ export default function fakeWebExtension(pi) {
     label: "Web search",
     description: "Test web search",
     parameters: Type.Object({ query: Type.String() }),
-    async execute() {
+    async execute(_toolCallId, { query }) {
+      pi.appendEntry("web-search-results", {
+        id: "raw-web-result-id",
+        type: "search",
+        timestamp: Date.now(),
+        queries: [
+          {
+            query,
+            results: [
+              {
+                title: "PRIVATE_WEB_SNAPSHOT",
+                url: "https://example.test/private",
+                content: "RAW_FETCHED_PAGE_CONTENT",
+              },
+            ],
+          },
+        ],
+      });
       return { content: [{ type: "text", text: "Search complete" }], details: {} };
     },
   });

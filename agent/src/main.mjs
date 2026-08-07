@@ -8,6 +8,8 @@ import { loadConfig } from "./config.mjs";
 import { createAgentServer } from "./http-service.mjs";
 import { PiEngine } from "./pi-engine.mjs";
 
+process.umask(0o077);
+
 const require = createRequire(import.meta.url);
 
 function logger(level, message, fields = {}) {

@@ -25,6 +25,7 @@ import {
   sanitizeMessageInPlace,
 } from "./privacy-redaction.mjs";
 import { RunAuditStore } from "./run-audit.mjs";
+import { hardenSessionPersistence } from "./session-persistence.mjs";
 import { SessionHistory } from "./session-history.mjs";
 import { TAIBU_MCP_GUIDANCE } from "./taibu-mcp-config.mjs";
 import { constrainWebTools } from "./web-tools.mjs";
@@ -782,7 +783,16 @@ export class PiEngine {
             ],
           }
         : request;
-      const sessionManager = await this.#sessionManager(request);
+      let persistenceState = {
+        privacyOptions: {
+          sensitiveValues: [this.config.apiKey],
+          identityAliasKey: this.config.identityAliasKey,
+        },
+      };
+      const sessionManager = hardenSessionPersistence(
+        await this.#sessionManager(request),
+        () => persistenceState,
+      );
       const mcpEnabled =
         request.toolPolicy !== "none" && Boolean(this.config.mcpExtensionPath);
       const resourceLoader = await this.#resourceLoader(request.systemPrompt, {
@@ -866,6 +876,14 @@ export class PiEngine {
         ...allowedLiterals,
         sensitiveValues: [this.config.apiKey],
         identityAliasKey: this.config.identityAliasKey,
+      };
+      persistenceState = {
+        privacyOptions,
+        userMessageContent: buildRunPrompt({
+          ...request,
+          continuation: request.sessionId !== null,
+          identityAliasKey: this.config.identityAliasKey,
+        }),
       };
       sanitizeConversationHistoryInPlace(session.messages, privacyOptions);
       const accessWarning = continuationAccessWarning(
@@ -1156,7 +1174,7 @@ export class PiEngine {
 
   async #sessionManager(request) {
     if (request.sessionId === null) {
-      return SessionManager.create(this.config.workspaceDir, this.config.sessionDir);
+      return SessionManager.create(PUBLIC_AGENT_CWD, this.config.sessionDir);
     }
     const sessions = await SessionManager.listAll(this.config.sessionDir);
     const existing = sessions.find(({ id }) => id === request.sessionId);
@@ -1164,7 +1182,7 @@ export class PiEngine {
     const manager = SessionManager.open(
       existing.path,
       this.config.sessionDir,
-      this.config.workspaceDir,
+      PUBLIC_AGENT_CWD,
     );
     if (!manager.getEntry(request.parentEntryId)) {
       throw new Error("Agent session entry not found");
