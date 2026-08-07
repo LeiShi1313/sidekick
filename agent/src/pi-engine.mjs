@@ -19,6 +19,7 @@ import { isModelId } from "./model-id.mjs";
 import {
   SensitiveTextStream,
   collectSensitiveLiterals,
+  pseudonymizeActorIdentities,
   redactSensitiveText,
   sanitizeConversationHistoryInPlace,
   sanitizeMessageInPlace,
@@ -117,6 +118,33 @@ function contextTag(kind) {
     : "untrusted_reference_context";
 }
 
+function modelIdentityAliases(memory, key) {
+  if (!memory) return new Map();
+  if (typeof key !== "string" || key.length < 8) {
+    throw new Error("Model identity alias key is unavailable");
+  }
+  const identities = [
+    memory.requester?.id,
+    ...(memory.anchors ?? []).map((anchor) => anchor?.id),
+    ...(memory.participants ?? []).map((participant) => participant?.id),
+  ];
+  return new Map(
+    identities
+      .filter((identity) => typeof identity === "string" && identity.length > 0)
+      .map((identity) => [identity, pseudonymizeActorIdentities(identity, key)]),
+  );
+}
+
+function replaceModelIdentityIds(value, aliases) {
+  let result = String(value ?? "");
+  for (const [identity, alias] of [...aliases].sort(
+    ([left], [right]) => right.length - left.length,
+  )) {
+    result = result.split(identity).join(alias);
+  }
+  return result;
+}
+
 export function continuationAccessWarning(messages, memory) {
   if (memory?.requester?.owner) return null;
   const historical = new Set();
@@ -164,10 +192,15 @@ export function buildRunPrompt({
   context,
   memory,
   continuation = false,
+  identityAliasKey,
 }) {
   const sections = [];
+  const identityAliases = modelIdentityAliases(memory, identityAliasKey);
   if (memory?.requester) {
-    const actorId = promptXmlText(memory.requester.id, 256);
+    const actorId = promptXmlText(
+      identityAliases.get(memory.requester.id),
+      256,
+    );
     const label = promptXmlText(memory.requester.label ?? "not provided", 256);
     sections.push(
       "<host_request_identity>\n" +
@@ -199,7 +232,7 @@ export function buildRunPrompt({
   sections.push(
     ...context.map(({ kind, text }) => {
       const tag = contextTag(kind);
-      return `<${tag}>\n${text}\n</${tag}>`;
+      return `<${tag}>\n${replaceModelIdentityIds(text, identityAliases)}\n</${tag}>`;
     }),
   );
   sections.push(`<current_request>\n${prompt}\n</current_request>`);
@@ -832,6 +865,7 @@ export class PiEngine {
       const privacyOptions = {
         ...allowedLiterals,
         sensitiveValues: [this.config.apiKey],
+        identityAliasKey: this.config.identityAliasKey,
       };
       sanitizeConversationHistoryInPlace(session.messages, privacyOptions);
       const accessWarning = continuationAccessWarning(
@@ -839,12 +873,26 @@ export class PiEngine {
         request.memory,
       );
       if (accessWarning) {
-        await record("memory.access.warning", {
-          ...accessWarning,
-          requester: request.memory?.requester ?? null,
-          advisoryOnly: true,
+        const failed = {
+          code: "SESSION_ACCESS_CHANGED",
+          message: "Start a new AI request because memory access changed",
+          sessionId: session.sessionId,
+        };
+        await record("memory.access.denied", {
+          historicalSourceCount: accessWarning.historicalBankIds.length,
+          unavailableSourceCount: accessWarning.unavailableBankIds.length,
           reason: "continuation_contains_less_accessible_bank_evidence",
         });
+        terminalRecorded = true;
+        await record("run.failed", failed);
+        activeRun.session = null;
+        await closeAgentSession(session);
+        yield {
+          type: "run_failed",
+          code: failed.code,
+          message: failed.message,
+        };
+        return;
       }
 
       const queue = new AsyncQueue();
@@ -952,22 +1000,10 @@ export class PiEngine {
         }
       });
 
-      const promptRequest = accessWarning
-        ? {
-            ...enrichedRequest,
-            context: [
-              {
-                kind: "access",
-                text:
-                  "This continuation contains earlier knowledge-source evidence that the current requester is no longer authorized to retrieve. Do not quote, summarize, confirm, or rely on that earlier source evidence. Ask the owner to restore access or start a new authorized request when it is needed. This is an advisory because prior session context cannot be removed in this version.",
-              },
-              ...enrichedRequest.context,
-            ],
-          }
-        : enrichedRequest;
       const preparedPrompt = buildRunPrompt({
-        ...promptRequest,
+        ...enrichedRequest,
         continuation: request.sessionId !== null,
+        identityAliasKey: this.config.identityAliasKey,
       });
       await record("model.input", {
         model: {

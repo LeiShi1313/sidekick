@@ -27,6 +27,7 @@ function integer(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}
 }
 
 export function loadConfig() {
+  const serviceToken = required("PI_AGENT_TOKEN");
   const reasoningEffort =
     process.env.AI_REASONING_EFFORT?.trim().toLowerCase() || "none";
   if (!REASONING_LEVELS.has(reasoningEffort)) {
@@ -37,10 +38,11 @@ export function loadConfig() {
   return {
     host: process.env.PI_HOST?.trim() || "0.0.0.0",
     port: integer("PI_PORT", 8790, { max: 65_535 }),
-    serviceToken: required("PI_AGENT_TOKEN"),
+    serviceToken,
     engine: {
       baseUrl: required("AI_BASE_URL"),
       apiKey: required("AI_API_KEY"),
+      identityAliasKey: serviceToken,
       model: required("AI_CHAT_MODEL"),
       reasoningEffort,
       maxOutputTokens: integer("AI_MAX_OUTPUT_TOKENS", 4_000, {

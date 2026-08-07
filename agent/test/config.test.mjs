@@ -17,6 +17,7 @@ test("loads the standalone agent configuration without Sidekick names", () => {
   const config = loadConfig();
 
   assert.equal(config.serviceToken, "test-agent-token");
+  assert.equal(config.engine.identityAliasKey, "test-agent-token");
   assert.equal(config.engine.baseUrl, "http://provider.internal/v1");
   assert.equal(config.engine.apiKey, "test-key");
   assert.equal(config.engine.model, "test-model");

@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { isIP } from "node:net";
 
 const REDACTED_IP = "[REDACTED_IP_ADDRESS]";
@@ -29,6 +30,8 @@ const PRIVATE_QUERY_NAMES =
   /^(?:api[_-]?key|key|sig|signature|token|access[_-]?token|auth|authorization)$/i;
 const PRIVATE_ENV_NAME =
   /(?:api[_-]?key|credential|password|private[_-]?key|secret|token)/i;
+const CANONICAL_ACTOR_ID_RE =
+  /(?<![A-Za-z0-9:_.%-])([A-Za-z0-9][A-Za-z0-9:_.%-]{0,191}:user:[A-Za-z0-9][A-Za-z0-9:_.%-]{0,191})(?![A-Za-z0-9:_.%-])/g;
 const NETWORK_IDENTITY_KEYS = new Set([
   "address",
   "clientip",
@@ -180,6 +183,18 @@ function replaceSensitiveValues(text, values) {
   return result;
 }
 
+export function pseudonymizeActorIdentities(value, key) {
+  const text = String(value ?? "");
+  if (typeof key !== "string" || key.length < 8) return text;
+  return text.replace(CANONICAL_ACTOR_ID_RE, (identity) => {
+    const digest = createHmac("sha256", key)
+      .update("sidekick:model-actor:v1\0")
+      .update(identity)
+      .digest("hex");
+    return `actor_${digest.slice(0, 16)}`;
+  });
+}
+
 function redactNetworkLiterals(text, allowed) {
   let result = text.replace(IPV4_RE, (value) => {
     if (!validIpv4(value)) return value;
@@ -211,6 +226,7 @@ export function redactSensitiveText(value, options = {}) {
     ...(options.sensitiveValues ?? []),
   ];
   let text = String(value ?? "");
+  text = pseudonymizeActorIdentities(text, options.identityAliasKey);
   text = replaceSensitiveValues(text, sensitiveValues);
   text = text.replace(
     /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi,
@@ -362,7 +378,7 @@ export function sanitizeSensitiveValue(
 
 export function sanitizeMessageInPlace(message, options = {}) {
   if (!message || typeof message !== "object") return message;
-  if (message.role === "assistant") {
+  if (message.role === "assistant" || message.role === "user") {
     if (typeof message.content === "string") {
       message.content = redactSensitiveText(message.content, options);
     } else if (Array.isArray(message.content)) {
@@ -389,7 +405,11 @@ export function sanitizeMessageInPlace(message, options = {}) {
 
 export function sanitizeConversationHistoryInPlace(messages, options = {}) {
   for (const message of messages ?? []) {
-    if (message?.role === "assistant" || message?.role === "toolResult") {
+    if (
+      message?.role === "assistant" ||
+      message?.role === "user" ||
+      message?.role === "toolResult"
+    ) {
       sanitizeMessageInPlace(message, options);
     }
   }
