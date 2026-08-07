@@ -18,6 +18,7 @@ EVENT_SCHEMA_VERSION = "wechat-bridge/v1alpha1"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 MAX_TEXT_BYTES = 4_095
+MAX_SHARED_CHAT_HISTORY_TEXT_BYTES = 16 * 1024
 MAX_NATIVE_MESSAGE_ID = "18446744073709551615"
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 CANONICAL_WECHAT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,159}")
@@ -33,6 +34,26 @@ IMAGE_MIME_TYPES = frozenset(
         "image/webp",
     }
 )
+SHARED_CHAT_HISTORY_KINDS = frozenset(
+    {
+        "text",
+        "image",
+        "voice",
+        "video",
+        "sticker",
+        "file",
+        "link",
+        "location",
+        "app",
+        "system",
+        "unknown",
+    }
+)
+MAX_SHARED_CHAT_HISTORY_ITEMS = 256
+MAX_PROJECTED_SHARED_CHAT_HISTORY_ITEMS = 100
+MAX_SHARED_CHAT_HISTORY_BYTES = 48 * 1024
+MAX_SHARED_CHAT_HISTORY_LABEL_CHARS = 240
+MAX_SHARED_CHAT_HISTORY_CONTENT_CHARS = 4_096
 
 
 class WeChatAPIError(RuntimeError):
@@ -88,6 +109,7 @@ class WeChatSession:
 @dataclass(frozen=True, slots=True)
 class WeChatCapabilities:
     receive_text: bool
+    receive_shared_chat_history: bool
     stable_inbound_message_ids: bool
     send_text: bool
     request_idempotency: bool
@@ -115,6 +137,10 @@ class WeChatCapabilities:
         sync = _required_object(payload, "sync")
         return cls(
             receive_text=_required_bool(messages, "receiveText"),
+            receive_shared_chat_history=_required_bool(
+                messages,
+                "receiveSharedChatHistory",
+            ),
             stable_inbound_message_ids=_required_bool(
                 messages,
                 "stableInboundMessageIds",
@@ -233,6 +259,102 @@ class WeChatChatList:
 
 
 @dataclass(frozen=True, slots=True)
+class WeChatSharedChatHistory:
+    title: str
+    item_count: int
+    text: str
+
+    @classmethod
+    def parse(cls, value: Any) -> WeChatSharedChatHistory:
+        payload = _shared_history_object(value, "object")
+        title = _shared_history_label(payload.get("title"), allow_empty=False)
+        item_count = _shared_history_nonnegative_int(
+            payload.get("itemCount"),
+            "item count",
+        )
+        rows = payload.get("items")
+        if not isinstance(rows, list):
+            raise _shared_history_error("items must be an array")
+        truncated = payload.get("truncated", False)
+        if not isinstance(truncated, bool):
+            raise _shared_history_error("truncated must be a boolean")
+        if (
+            item_count < 1
+            or item_count > MAX_SHARED_CHAT_HISTORY_ITEMS
+            or not rows
+            or len(rows) > MAX_PROJECTED_SHARED_CHAT_HISTORY_ITEMS
+            or len(rows) > item_count
+            or truncated != (len(rows) < item_count)
+        ):
+            raise _shared_history_error("item counts are inconsistent")
+
+        total_bytes = _shared_history_utf8_size(title)
+        formatted_items: list[tuple[str, ...]] = []
+        for row in rows:
+            item = _shared_history_object(row, "item")
+            kind = _shared_history_kind(item.get("kind"))
+            sender = _shared_history_label(
+                item.get("senderName", ""),
+                allow_empty=True,
+            )
+            content = _shared_history_text(item.get("content", ""))
+            _shared_history_nonnegative_int(
+                item.get("timestamp", 0),
+                "item timestamp",
+            )
+            item_lines = [_format_shared_history_part(kind, sender, content)]
+            total_bytes += sum(
+                _shared_history_utf8_size(value)
+                for value in (kind, sender, content)
+            ) + 32
+            if item.get("reply") is not None:
+                reply = _shared_history_object(item["reply"], "reply")
+                reply_kind = _shared_history_kind(reply.get("kind"))
+                reply_sender = _shared_history_label(
+                    reply.get("senderName", ""),
+                    allow_empty=True,
+                )
+                reply_content = _shared_history_text(reply.get("content", ""))
+                if not reply_sender and not reply_content:
+                    raise _shared_history_error(
+                        "reply must contain a sender or content"
+                    )
+                item_lines.append(
+                    "  ↳ "
+                    + _format_shared_history_part(
+                        reply_kind,
+                        reply_sender,
+                        reply_content,
+                    )
+                )
+                total_bytes += sum(
+                    _shared_history_utf8_size(value)
+                    for value in (reply_kind, reply_sender, reply_content)
+                ) + 16
+            if total_bytes > MAX_SHARED_CHAT_HISTORY_BYTES:
+                raise _shared_history_error("payload is oversized")
+            formatted_items.append(tuple(item_lines))
+
+        lines = ["[Forwarded chat history]", title]
+        rendered_items = 0
+        for item_lines in formatted_items:
+            remaining = item_count - (rendered_items + 1)
+            candidate = [*lines, *item_lines]
+            if remaining > 0:
+                candidate.append(_shared_history_footer(remaining))
+            if _shared_history_utf8_size("\n".join(candidate)) > (
+                MAX_SHARED_CHAT_HISTORY_TEXT_BYTES
+            ):
+                break
+            lines.extend(item_lines)
+            rendered_items += 1
+        remaining = item_count - rendered_items
+        if remaining > 0:
+            lines.append(_shared_history_footer(remaining))
+        return cls(title=title, item_count=item_count, text="\n".join(lines))
+
+
+@dataclass(frozen=True, slots=True)
 class WeChatConnectorMessage:
     id: str
     chat_id: str
@@ -246,11 +368,34 @@ class WeChatConnectorMessage:
     source: str | None
     sequence: str | None
     media_id: str | None = None
+    shared_chat_history: WeChatSharedChatHistory | None = None
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatConnectorMessage:
         message_id = _required_native_message_id(payload, "id")
         reply_id = _optional_native_message_id(payload, "replyToMessageId")
+        message_type = _required_text(payload, "messageType")
+        content_redacted = _optional_bool(payload, "contentRedacted", False)
+        has_shared_history = "sharedChatHistory" in payload
+        if message_type == "chat_history":
+            if content_redacted:
+                if has_shared_history:
+                    raise _shared_history_error(
+                        "redacted messages must omit the object"
+                    )
+                shared_chat_history = None
+            else:
+                if not has_shared_history:
+                    raise _shared_history_error("object is required")
+                shared_chat_history = WeChatSharedChatHistory.parse(
+                    payload.get("sharedChatHistory")
+                )
+        else:
+            if has_shared_history:
+                raise _shared_history_error(
+                    "object is only valid for chat_history messages"
+                )
+            shared_chat_history = None
         sequence = payload.get("seq")
         if sequence is not None:
             if (
@@ -266,16 +411,23 @@ class WeChatConnectorMessage:
             id=message_id,
             chat_id=_required_wechat_id(payload, "chatId"),
             direction=_required_enum(payload, "direction", {"in", "out"}),
-            message_type=_required_text(payload, "messageType"),
+            message_type=message_type,
             sender_id=_required_wechat_id(payload, "senderId"),
             reply_to_message_id=reply_id,
             content=_optional_raw_text(payload, "content") or "",
-            content_redacted=_optional_bool(payload, "contentRedacted", False),
+            content_redacted=content_redacted,
             timestamp=_required_nonnegative_int(payload, "timestamp"),
             source=_optional_text(payload, "source"),
             sequence=sequence_text,
             media_id=_optional_message_media_id(payload),
+            shared_chat_history=shared_chat_history,
         )
+
+    @property
+    def display_content(self) -> str:
+        if self.shared_chat_history is not None and not self.content_redacted:
+            return self.shared_chat_history.text
+        return self.content
 
 
 @dataclass(frozen=True, slots=True)
@@ -789,6 +941,94 @@ def _normalize_base_url(value: str) -> str:
     ):
         raise ValueError("WeChat connector URL must be an HTTP(S) origin")
     return normalized
+
+
+def _shared_history_error(detail: str) -> WeChatAPIContractError:
+    return WeChatAPIContractError(f"WeChat shared chat history {detail}")
+
+
+def _shared_history_object(value: Any, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise _shared_history_error(f"{field} must be an object")
+    return value
+
+
+def _shared_history_utf8_size(value: str) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise _shared_history_error("contains invalid Unicode") from exc
+
+
+def _shared_history_label(value: Any, *, allow_empty: bool) -> str:
+    if not isinstance(value, str):
+        raise _shared_history_error("label must be a string")
+    if not value:
+        if allow_empty:
+            return ""
+        raise _shared_history_error("label must not be empty")
+    if value.strip() != value or len(value) > MAX_SHARED_CHAT_HISTORY_LABEL_CHARS:
+        raise _shared_history_error("label is invalid or oversized")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise _shared_history_error("label contains control characters")
+    _shared_history_utf8_size(value)
+    return value
+
+
+def _shared_history_text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise _shared_history_error("content must be a string")
+    if not value:
+        return ""
+    if value.strip() != value or len(value) > MAX_SHARED_CHAT_HISTORY_CONTENT_CHARS:
+        raise _shared_history_error("content is invalid or oversized")
+    if any(
+        (ord(character) < 0x20 and character not in "\n\r\t")
+        or ord(character) == 0x7F
+        for character in value
+    ):
+        raise _shared_history_error("content contains control characters")
+    _shared_history_utf8_size(value)
+    return value
+
+
+def _shared_history_kind(value: Any) -> str:
+    if not isinstance(value, str) or value not in SHARED_CHAT_HISTORY_KINDS:
+        raise _shared_history_error("item kind is unsupported")
+    return value
+
+
+def _shared_history_nonnegative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _shared_history_error(f"{field} must be a non-negative integer")
+    return value
+
+
+def _format_shared_history_part(kind: str, sender_name: str, content: str) -> str:
+    prefixes = {
+        "image": "[Image]",
+        "voice": "[Voice]",
+        "video": "[Video]",
+        "sticker": "[Sticker]",
+        "file": "[File]",
+        "link": "[Link]",
+        "location": "[Location]",
+        "app": "[App]",
+        "system": "[System]",
+        "unknown": "[Unknown]",
+    }
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    prefix = prefixes.get(kind, "")
+    if prefix:
+        body = f"{prefix} {normalized}" if normalized else prefix
+    else:
+        body = normalized or "[Text]"
+    return f"{sender_name}: {body}" if sender_name else body
+
+
+def _shared_history_footer(remaining: int) -> str:
+    noun = "item" if remaining == 1 else "items"
+    return f"… {remaining} more {noun} not included"
 
 
 def _object(value: Any, field: str) -> Mapping[str, Any]:

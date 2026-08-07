@@ -293,7 +293,7 @@ def _dispatchable(message: WeChatMessage) -> bool:
         not message.content_redacted
         and bool(message.raw_text.strip())
         and (
-            message.message_type == "text"
+            message.message_type in {"text", "chat_history"}
             or (
                 message.message_type == "app"
                 and message.reply_to_msg_id is not None

@@ -147,6 +147,7 @@ class FakeConnectorClient:
         )
         self.capabilities = WeChatCapabilities(
             receive_text=True,
+            receive_shared_chat_history=True,
             stable_inbound_message_ids=True,
             send_text=True,
             request_idempotency=True,
@@ -220,6 +221,7 @@ def message_event(
     message_type: str = "text",
     content_redacted: bool = False,
     sender_id: str | None = ACCOUNT_ID,
+    shared_chat_history: dict[str, object] | None = None,
 ) -> WeChatEvent:
     payload = {
         "schemaVersion": "wechat-bridge/v1alpha1",
@@ -239,6 +241,8 @@ def message_event(
         payload["contentRedacted"] = True
     if reply_to is not None:
         payload["replyToMessageId"] = reply_to
+    if shared_chat_history is not None:
+        payload["sharedChatHistory"] = shared_chat_history
     return WeChatEvent.parse(payload)
 
 
@@ -326,6 +330,46 @@ async def test_wechat_event_pump_dispatches_textual_quoted_app_messages(
             "3159667620982040829",
         ]
         assert await store.get_cursor(CONNECTOR_KEY) == "13"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_dispatches_shared_chat_history(tmp_path) -> None:
+    client = FakeConnectorClient(
+        (
+            message_event(
+                cursor="11",
+                content="Team history",
+                message_type="chat_history",
+                shared_chat_history={
+                    "title": "Team history",
+                    "itemCount": 1,
+                    "items": [
+                        {"kind": "text", "senderName": "Alice", "content": "Hi"},
+                    ],
+                },
+            ),
+        )
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert result == "reconnect"
+        assert len(handler.messages) == 1
+        assert handler.messages[0].message_type == "chat_history"
+        assert handler.messages[0].raw_text == (
+            "[Forwarded chat history]\nTeam history\nAlice: Hi"
+        )
+        assert await store.get_cursor(CONNECTOR_KEY) == "11"
     finally:
         await store.close()
 
@@ -479,6 +523,7 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
         )
         client.capabilities = WeChatCapabilities(
             receive_text=True,
+            receive_shared_chat_history=True,
             stable_inbound_message_ids=True,
             send_text=True,
             request_idempotency=True,
