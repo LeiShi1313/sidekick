@@ -82,12 +82,24 @@ def test_compose_routes_dashboard_and_playground_by_name() -> None:
         text=True,
     )
     proxy_config = json.loads(proxy.stdout)
-    assert set(proxy_config["services"]["dashboard-proxy"]["networks"]) == {
+    dashboard_proxy = proxy_config["services"]["dashboard-proxy"]
+    assert set(dashboard_proxy["networks"]) == {
         "agent-platform"
     }
+    assert dashboard_proxy["image"] == "nginx:1.30.4-alpine"
+    assert dashboard_proxy["user"] == "101:101"
+    assert all(
+        volume.get("source") != "/var/run/docker.sock"
+        for volume in dashboard_proxy.get("volumes", [])
+    )
+    nginx_config = (ROOT / "proxy" / "nginx.conf").read_text()
+    assert "sidekick.localhost" in nginx_config
+    assert "playground.sidekick.localhost" in nginx_config
+    assert "dashboard:8080" in nginx_config
+    assert "agent-playground:8780" in nginx_config
+    assert "access_log off" in nginx_config
     dashboard = proxy_config["services"]["dashboard"]
-    assert dashboard["environment"]["VIRTUAL_HOST"] == "sidekick.localhost"
-    assert dashboard["environment"]["VIRTUAL_PORT"] == "8080"
+    assert "environment" not in dashboard
     assert dashboard["build"]["context"] == str(ROOT / "proxy" / "dashboard")
     assert "volumes" not in dashboard
 
@@ -120,9 +132,8 @@ def test_compose_routes_dashboard_and_playground_by_name() -> None:
         "wechat:account:"
     )
     playground = agent_config["services"]["agent-playground"]
-    assert playground["environment"]["VIRTUAL_HOST"] == (
-        "playground.sidekick.localhost"
-    )
+    assert "VIRTUAL_HOST" not in playground["environment"]
+    assert "VIRTUAL_PORT" not in playground["environment"]
     assert playground["environment"]["MEMORY_API_URL"] == (
         "http://memory-gateway:8888"
     )

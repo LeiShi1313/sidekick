@@ -132,7 +132,8 @@ Human-facing services are available through the dashboard proxy:
 Raw Hindsight is isolated on an internal backend network. Trusted clients use
 the authenticated `memory-gateway`; its host port is loopback-only and its
 health response contains no backend details. The browser-facing raw Hindsight
-dashboard is intentionally not exposed.
+dashboard is intentionally not exposed. Dashboard routing is static and no
+Sidekick container receives access to the Docker socket.
 
 The adapter compose file expects the external `memory-platform` and
 `agent-platform` networks created by the memory and agent projects. Runtime

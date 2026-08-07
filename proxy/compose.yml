@@ -1,15 +1,26 @@
 services:
   dashboard-proxy:
-    image: nginxproxy/nginx-proxy:1.11.0
+    image: nginx:1.30.4-alpine
     container_name: sidekick-dashboard-proxy
+    user: "101:101"
+    entrypoint: ["nginx"]
+    command: ["-g", "daemon off;"]
+    depends_on:
+      dashboard:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:${DASHBOARD_PROXY_EXPOSE_PORT:-18865}:80"
+      - "127.0.0.1:${DASHBOARD_PROXY_EXPOSE_PORT:-18865}:8080"
     volumes:
-      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - agent-platform
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=101,gid=101
     pids_limit: 128
     logging:
       driver: json-file
@@ -18,7 +29,13 @@ services:
         max-file: "2"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "nginx", "-t"]
+      test:
+        - CMD
+        - wget
+        - --spider
+        - --quiet
+        - "--header=Host: sidekick.localhost"
+        - http://127.0.0.1:8080/
       interval: 10s
       timeout: 3s
       retries: 10
@@ -31,9 +48,6 @@ services:
     container_name: sidekick-dashboard
     entrypoint: python
     command: ["-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/dashboard"]
-    environment:
-      VIRTUAL_HOST: sidekick.localhost
-      VIRTUAL_PORT: "8080"
     expose:
       - "8080"
     networks:
