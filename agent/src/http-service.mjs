@@ -15,6 +15,13 @@ const IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const BANK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$/;
 const MIME_RE = /^[a-z0-9][a-z0-9.+-]{0,63}\/[a-z0-9][a-z0-9.+-]{0,127}$/;
 const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const CLIENT_CAPABILITIES = new Set([
+  "models",
+  "runs",
+  "attachments",
+  "history",
+  "status",
+]);
 
 function json(response, status, payload) {
   const body = JSON.stringify(payload);
@@ -64,8 +71,8 @@ function boundedBankIds(value) {
   return [...value];
 }
 
-function isActorId(value) {
-  return isBankId(value) && value.includes(":user:");
+function isHostIdentity(value) {
+  return isBankId(value) && /:(?:user|channel):/.test(value);
 }
 
 function listOptions(url, kind) {
@@ -116,6 +123,7 @@ export function validateRunRequest(value) {
   const includeMemorySnapshot = value.includeMemorySnapshot;
   const model = value.model;
   const suppliedOrigin = value.origin;
+  const suppliedIdentity = value.identity;
   const isRoot = sessionId === null && parentEntryId === null;
   const isContinuation =
     typeof sessionId === "string" &&
@@ -141,26 +149,75 @@ export function validateRunRequest(value) {
   ) {
     return null;
   }
-  let origin;
-  if (suppliedOrigin !== undefined) {
+  if (
+    !suppliedOrigin ||
+    typeof suppliedOrigin !== "object" ||
+    Array.isArray(suppliedOrigin) ||
+    !hasOnlyKeys(
+      suppliedOrigin,
+      new Set(["scopeId", "adapterInstanceId"]),
+    ) ||
+    !isBoundedString(suppliedOrigin.scopeId, 1, 512) ||
+    !isBoundedString(suppliedOrigin.adapterInstanceId, 1, 128)
+  ) {
+    return null;
+  }
+  const origin = {
+    scopeId: suppliedOrigin.scopeId,
+    adapterInstanceId: suppliedOrigin.adapterInstanceId,
+  };
+  if (
+    !suppliedIdentity ||
+    typeof suppliedIdentity !== "object" ||
+    Array.isArray(suppliedIdentity) ||
+    !hasOnlyKeys(suppliedIdentity, new Set(["requester", "anchors"])) ||
+    !Array.isArray(suppliedIdentity.anchors) ||
+    suppliedIdentity.anchors.length < 1 ||
+    suppliedIdentity.anchors.length > MAX_MEMORY_ANCHORS
+  ) {
+    return null;
+  }
+  const requester = suppliedIdentity.requester;
+  if (
+    !requester ||
+    typeof requester !== "object" ||
+    Array.isArray(requester) ||
+    !hasOnlyKeys(requester, new Set(["id", "label"])) ||
+    !isHostIdentity(requester.id) ||
+    !(
+      requester.label === null ||
+      requester.label === undefined ||
+      isBoundedString(requester.label, 1, 256)
+    )
+  ) {
+    return null;
+  }
+  const anchors = [];
+  const seenIdentityIds = new Set();
+  for (const anchor of suppliedIdentity.anchors) {
     if (
-      !suppliedOrigin ||
-      typeof suppliedOrigin !== "object" ||
-      Array.isArray(suppliedOrigin) ||
-      !hasOnlyKeys(
-        suppliedOrigin,
-        new Set(["scopeId", "adapterInstanceId"]),
+      !anchor ||
+      typeof anchor !== "object" ||
+      Array.isArray(anchor) ||
+      !hasOnlyKeys(anchor, new Set(["id", "label"])) ||
+      !isHostIdentity(anchor.id) ||
+      !(
+        anchor.label === null ||
+        anchor.label === undefined ||
+        isBoundedString(anchor.label, 1, 256)
       ) ||
-      !isBoundedString(suppliedOrigin.scopeId, 1, 512) ||
-      !isBoundedString(suppliedOrigin.adapterInstanceId, 1, 128)
+      seenIdentityIds.has(anchor.id)
     ) {
       return null;
     }
-    origin = {
-      scopeId: suppliedOrigin.scopeId,
-      adapterInstanceId: suppliedOrigin.adapterInstanceId,
-    };
+    seenIdentityIds.add(anchor.id);
+    anchors.push({ id: anchor.id, label: anchor.label ?? null });
   }
+  if (anchors[0].id !== requester.id) return null;
+  const identity = {
+    requester: { id: requester.id, label: requester.label ?? null },
+    anchors,
+  };
   const context = [];
   for (const item of value.context) {
     if (
@@ -184,11 +241,10 @@ export function validateRunRequest(value) {
         supplied,
         new Set([
           "primaryBankId",
-          "requester",
+          "requesterIsOwner",
           "grantedBankIds",
           "participants",
           "query",
-          "anchors",
         ]),
       ) ||
       !isBankId(supplied.primaryBankId) ||
@@ -197,55 +253,18 @@ export function validateRunRequest(value) {
         supplied.query === null ||
         isBoundedString(supplied.query, 1, 8_000)
       ) ||
-      !Array.isArray(supplied.anchors) ||
-      supplied.anchors.length > MAX_MEMORY_ANCHORS ||
       !Array.isArray(supplied.participants) ||
       supplied.participants.length > MAX_PARTICIPANTS
     ) {
       return null;
     }
-    const requester = supplied.requester;
     const grantedBankIds = boundedBankIds(supplied.grantedBankIds);
     if (
-      !requester ||
-      typeof requester !== "object" ||
-      Array.isArray(requester) ||
-      !hasOnlyKeys(requester, new Set(["id", "label", "owner"])) ||
-      !isActorId(requester.id) ||
-      !(
-        requester.label === null ||
-        requester.label === undefined ||
-        isBoundedString(requester.label, 1, 256)
-      ) ||
-      typeof requester.owner !== "boolean" ||
+      typeof supplied.requesterIsOwner !== "boolean" ||
       grantedBankIds === null ||
-      (requester.owner && grantedBankIds.length > 0)
+      (supplied.requesterIsOwner && grantedBankIds.length > 0)
     ) {
       return null;
-    }
-    const anchors = [];
-    const seen = new Set();
-    for (const anchor of supplied.anchors) {
-      if (
-        !anchor ||
-        typeof anchor !== "object" ||
-        Array.isArray(anchor) ||
-        !hasOnlyKeys(anchor, new Set(["id", "label"])) ||
-        !isBoundedString(anchor.id, 1, 256) ||
-        !(
-          anchor.label === null ||
-          anchor.label === undefined ||
-          isBoundedString(anchor.label, 1, 256)
-        ) ||
-        seen.has(anchor.id)
-      ) {
-        return null;
-      }
-      seen.add(anchor.id);
-      anchors.push({
-        id: anchor.id,
-        label: anchor.label ?? null,
-      });
     }
     const participants = [];
     const participantIds = new Set();
@@ -259,8 +278,8 @@ export function validateRunRequest(value) {
           participant,
           new Set(["id", "label", "allowed", "bankIds"]),
         ) ||
-        !isActorId(participant.id) ||
-        participant.id === requester.id ||
+        !isHostIdentity(participant.id) ||
+        participant.id === identity.requester.id ||
         participantIds.has(participant.id) ||
         !(
           participant.label === null ||
@@ -283,15 +302,10 @@ export function validateRunRequest(value) {
     }
     memory = {
       primaryBankId: supplied.primaryBankId,
-      requester: {
-        id: requester.id,
-        label: requester.label ?? null,
-        owner: requester.owner,
-      },
+      requesterIsOwner: supplied.requesterIsOwner,
       grantedBankIds,
       participants,
       ...(supplied.query ? { query: supplied.query } : {}),
-      anchors,
     };
   }
   return {
@@ -302,8 +316,9 @@ export function validateRunRequest(value) {
     context,
     systemPrompt: value.systemPrompt,
     toolPolicy: value.toolPolicy,
+    identity,
+    origin,
     ...(model ? { model } : {}),
-    ...(origin ? { origin } : {}),
     ...(includeMemorySnapshot ? { includeMemorySnapshot: true } : {}),
     ...(memory ? { memory } : {}),
   };
@@ -331,6 +346,33 @@ function decodeBase64(value) {
   return decoded;
 }
 
+function detectedImageMimeType(data) {
+  if (
+    data.length >= 3 &&
+    data[0] === 0xff &&
+    data[1] === 0xd8 &&
+    data[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+  if (
+    data.length >= 8 &&
+    data.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    )
+  ) {
+    return "image/png";
+  }
+  if (
+    data.length >= 12 &&
+    data.subarray(0, 4).toString("ascii") === "RIFF" &&
+    data.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
 export function validateAttachmentRequest(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const mimeType = value.mimeType;
@@ -348,7 +390,13 @@ export function validateAttachmentRequest(value) {
   }
   if (value.kind === "image" && IMAGE_MIME_TYPES.has(mimeType)) {
     const data = decodeBase64(value.data);
-    if (!data || value.text !== undefined) return null;
+    if (
+      !data ||
+      detectedImageMimeType(data) !== mimeType ||
+      value.text !== undefined
+    ) {
+      return null;
+    }
     return { kind: "image", mimeType, filename: filename ?? null, data };
   }
   if (
@@ -370,17 +418,103 @@ function writeNdjson(response, event) {
   return response.write(`${JSON.stringify(event)}\n`);
 }
 
-function isAuthorized(request, tokenDigest) {
-  const actual = request.headers.authorization ?? "";
-  const actualDigest = createHash("sha256").update(actual).digest();
-  return timingSafeEqual(actualDigest, tokenDigest);
+function preparedClients(clients) {
+  if (!Array.isArray(clients) || clients.length < 1 || clients.length > 32) {
+    throw new Error("Agent service clients are invalid");
+  }
+  const ids = new Set();
+  const tokens = new Set();
+  return clients.map((client) => {
+    if (
+      !client ||
+      typeof client !== "object" ||
+      !IDENTIFIER_RE.test(client.id ?? "") ||
+      typeof client.token !== "string" ||
+      client.token.length < 24 ||
+      !Array.isArray(client.capabilities) ||
+      client.capabilities.length < 1 ||
+      new Set(client.capabilities).size !== client.capabilities.length ||
+      client.capabilities.some((item) => !CLIENT_CAPABILITIES.has(item)) ||
+      !(
+        client.adapterInstanceId === undefined ||
+        IDENTIFIER_RE.test(client.adapterInstanceId)
+      ) ||
+      !(
+        client.scopePrefix === undefined ||
+        isBoundedString(client.scopePrefix, 1, 512)
+      ) ||
+      !(
+        client.cancelAny === undefined ||
+        typeof client.cancelAny === "boolean"
+      )
+    ) {
+      throw new Error("Agent service client is invalid");
+    }
+    if (ids.has(client.id)) throw new Error("Agent client IDs must be unique");
+    if (tokens.has(client.token)) {
+      throw new Error("Agent client tokens must be unique");
+    }
+    ids.add(client.id);
+    tokens.add(client.token);
+    return {
+      id: client.id,
+      tokenDigest: createHash("sha256")
+        .update(`Bearer ${client.token}`)
+        .digest(),
+      capabilities: new Set(client.capabilities),
+      adapterInstanceId: client.adapterInstanceId ?? null,
+      scopePrefix: client.scopePrefix ?? null,
+      cancelAny: client.cancelAny === true,
+    };
+  });
 }
 
-export function createAgentServer({ engine, token, logger = console }) {
-  if (typeof token !== "string" || token.length < 24) {
-    throw new Error("Agent service token must contain at least 24 characters");
+function authenticate(request, clients) {
+  const actual = request.headers.authorization ?? "";
+  const actualDigest = createHash("sha256").update(actual).digest();
+  let authenticated = null;
+  for (const client of clients) {
+    if (timingSafeEqual(actualDigest, client.tokenDigest)) authenticated = client;
   }
-  const tokenDigest = createHash("sha256").update(`Bearer ${token}`).digest();
+  return authenticated;
+}
+
+function requireCapability(response, principal, capability) {
+  if (principal.capabilities.has(capability)) return true;
+  json(response, 403, {
+    error: { code: "FORBIDDEN", message: "Forbidden" },
+  });
+  return false;
+}
+
+function principalAllowsRun(principal, run) {
+  if (principal.adapterInstanceId === null) return true;
+  if (run.origin.adapterInstanceId !== principal.adapterInstanceId) return false;
+  if (
+    principal.scopePrefix !== null &&
+    !run.origin.scopeId.startsWith(principal.scopePrefix)
+  ) {
+    return false;
+  }
+  if (
+    principal.scopePrefix !== null &&
+    (run.identity.anchors.some(
+      ({ id }) => !id.startsWith(principal.scopePrefix),
+    ) || !run.identity.requester.id.startsWith(principal.scopePrefix))
+  ) {
+    return false;
+  }
+  if (
+    run.memory &&
+    run.memory.primaryBankId !== run.origin.scopeId
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function createAgentServer({ engine, clients, logger = console }) {
+  const serviceClients = preparedClients(clients);
   return createServer(async (request, response) => {
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("cache-control", "no-store");
@@ -391,7 +525,8 @@ export function createAgentServer({ engine, token, logger = console }) {
       return;
     }
 
-    if (!isAuthorized(request, tokenDigest)) {
+    const principal = authenticate(request, serviceClients);
+    if (!principal) {
       json(response, 401, {
         error: { code: "UNAUTHORIZED", message: "Unauthorized" },
       });
@@ -399,6 +534,7 @@ export function createAgentServer({ engine, token, logger = console }) {
     }
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
+      if (!requireCapability(response, principal, "models")) return;
       try {
         json(response, 200, await engine.listModels());
       } catch (error) {
@@ -416,6 +552,7 @@ export function createAgentServer({ engine, token, logger = console }) {
     }
 
     if (request.method === "GET" && url.pathname === "/v1/sessions") {
+      if (!requireCapability(response, principal, "history")) return;
       const options = listOptions(url, "sessions");
       if (!options) {
         json(response, 400, {
@@ -440,6 +577,7 @@ export function createAgentServer({ engine, token, logger = console }) {
       /^\/v1\/sessions\/([A-Za-z0-9_-]{1,128})$/,
     );
     if (request.method === "GET" && sessionMatch) {
+      if (!requireCapability(response, principal, "history")) return;
       try {
         const session = await engine.getSession(sessionMatch[1]);
         if (!session) {
@@ -462,6 +600,7 @@ export function createAgentServer({ engine, token, logger = console }) {
 
     if (request.method === "GET" && url.pathname === "/v1/runs") {
       if (url.searchParams.has("status")) {
+        if (!requireCapability(response, principal, "status")) return;
         if (!isActiveRunQuery(url)) {
           json(response, 400, {
             error: { code: "INVALID_REQUEST", message: "Invalid run query" },
@@ -480,6 +619,7 @@ export function createAgentServer({ engine, token, logger = console }) {
         }
         return;
       }
+      if (!requireCapability(response, principal, "history")) return;
       const options = listOptions(url, "runs");
       if (!options) {
         json(response, 400, {
@@ -504,6 +644,7 @@ export function createAgentServer({ engine, token, logger = console }) {
       /^\/v1\/runs\/([0-9a-f-]+)\/audit$/i,
     );
     if (request.method === "GET" && auditMatch) {
+      if (!requireCapability(response, principal, "history")) return;
       if (!UUID_RE.test(auditMatch[1])) {
         json(response, 400, {
           error: { code: "INVALID_REQUEST", message: "Invalid history request" },
@@ -531,6 +672,7 @@ export function createAgentServer({ engine, token, logger = console }) {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/attachments/describe") {
+      if (!requireCapability(response, principal, "attachments")) return;
       let attachment;
       try {
         attachment = validateAttachmentRequest(
@@ -566,6 +708,7 @@ export function createAgentServer({ engine, token, logger = console }) {
       /^\/v1\/runs\/([0-9a-f-]+)\/cancel$/i,
     );
     if (request.method === "POST" && cancelMatch) {
+      if (!requireCapability(response, principal, "runs")) return;
       const runId = cancelMatch[1];
       if (!UUID_RE.test(runId)) {
         json(response, 400, {
@@ -573,7 +716,12 @@ export function createAgentServer({ engine, token, logger = console }) {
         });
         return;
       }
-      json(response, 200, { cancelled: await engine.cancel(runId) });
+      json(response, 200, {
+        cancelled: await engine.cancel(
+          runId,
+          principal.cancelAny ? null : principal.id,
+        ),
+      });
       return;
     }
 
@@ -583,6 +731,7 @@ export function createAgentServer({ engine, token, logger = console }) {
       });
       return;
     }
+    if (!requireCapability(response, principal, "runs")) return;
 
     let run;
     try {
@@ -596,12 +745,18 @@ export function createAgentServer({ engine, token, logger = console }) {
       });
       return;
     }
+    if (!principalAllowsRun(principal, run)) {
+      json(response, 403, {
+        error: { code: "FORBIDDEN", message: "Forbidden" },
+      });
+      return;
+    }
 
     response.writeHead(200, {
       "content-type": "application/x-ndjson; charset=utf-8",
       "transfer-encoding": "chunked",
     });
-    const requestOwner = Symbol(run.runId);
+    const requestOwner = principal.id;
     let completed = false;
     response.on("close", () => {
       if (!completed) void engine.cancel(run.runId, requestOwner);

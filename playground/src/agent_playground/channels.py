@@ -84,7 +84,9 @@ class ChannelDashboardConfig:
     adapter_urls: tuple[tuple[str, str], ...]
     pi_url: str
     memory_url: str
-    token: str
+    pi_token: str
+    channel_token: str
+    memory_token: str
     poll_interval: float = 2.0
     source_timeout: float = 5.0
     bank_cache_ttl: float = 15.0
@@ -149,7 +151,7 @@ class ChannelDashboard:
                         "adapter",
                         url,
                         _parse_adapter_snapshot,
-                        authenticated=True,
+                        token=self._config.channel_token,
                     )
                 )
             model_cache_valid = (
@@ -163,7 +165,7 @@ class ChannelDashboard:
                         "pi",
                         f"{self._config.pi_url}/v1/models",
                         _parse_models,
-                        authenticated=True,
+                        token=self._config.pi_token,
                     )
                 )
             source_tasks["pi-runs"] = asyncio.create_task(
@@ -172,7 +174,7 @@ class ChannelDashboard:
                     "pi",
                     f"{self._config.pi_url}/v1/runs?status=active",
                     _parse_active_runs,
-                    authenticated=True,
+                    token=self._config.pi_token,
                 )
             )
             bank_cache_valid = (
@@ -186,7 +188,7 @@ class ChannelDashboard:
                         "memory",
                         f"{self._config.memory_url}/v1/default/banks",
                         _parse_banks,
-                        authenticated=False,
+                        token=self._config.memory_token,
                     )
                 )
 
@@ -334,10 +336,10 @@ class ChannelDashboard:
         url: str,
         parser: Any,
         *,
-        authenticated: bool,
+        token: str,
     ) -> tuple[Any, dict[str, Any]]:
         try:
-            payload = await self._json(url, authenticated=authenticated)
+            payload = await self._json(url, token=token)
             value = parser(payload, source_id)
             succeeded_at = _now()
             self._cache[source_id] = _CachedSource(value, succeeded_at)
@@ -407,7 +409,7 @@ class ChannelDashboard:
                     payload = await self._json(
                         f"{self._config.memory_url}/v1/default/banks/"
                         f"{quote(bank_id, safe='')}/stats",
-                        authenticated=False,
+                        token=self._config.memory_token,
                     )
                     value = _parse_bank_stats(payload, bank_id)
                     succeeded_at = _now()
@@ -460,10 +462,8 @@ class ChannelDashboard:
             error,
         )
 
-    async def _json(self, url: str, *, authenticated: bool) -> dict[str, Any]:
-        headers = (
-            {"Authorization": f"Bearer {self._config.token}"} if authenticated else None
-        )
+    async def _json(self, url: str, *, token: str) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {token}"}
         try:
             async with self._get_session().get(url, headers=headers) as response:
                 if response.status < 200 or response.status >= 300:
@@ -1053,8 +1053,7 @@ def _parse_timestamp(value: str) -> datetime:
 
 
 def _safe_error(exc: Exception) -> str:
-    message = str(exc).strip() or exc.__class__.__name__
-    return message[:240]
+    return f"Upstream request failed ({exc.__class__.__name__})"
 
 
 def _now() -> str:

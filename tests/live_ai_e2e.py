@@ -135,6 +135,7 @@ async def assert_no_reply(client, chat, trigger, sender_id: int, timeout: float 
 
 async def wait_for_document(
     hindsight_url: str,
+    hindsight_token: str,
     scope_id: str,
     document_id: str,
     expected: tuple[str, ...],
@@ -147,7 +148,8 @@ async def wait_for_document(
     async with aiohttp.ClientSession() as session:
         while asyncio.get_running_loop().time() < deadline:
             async with session.get(
-                f"{hindsight_url}/v1/default/banks/{bank}/documents/{document}"
+                f"{hindsight_url}/v1/default/banks/{bank}/documents/{document}",
+                headers={"Authorization": f"Bearer {hindsight_token}"},
             ) as response:
                 if response.status == 200:
                     payload = await response.json()
@@ -183,7 +185,14 @@ async def run() -> None:
         "http://127.0.0.1:" + os.environ.get("SIDEKICK_HINDSIGHT_EXPOSE_PORT", "18888")
     )
     hindsight_url = hindsight_url.rstrip("/")
+    hindsight_token = (
+        os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip()
+        or os.environ.get("MEMORY_API_TOKEN", "").strip()
+    )
+    if len(hindsight_token) < 24:
+        raise RuntimeError("A memory API token is required for the live E2E test")
     os.environ.setdefault("SIDEKICK_HINDSIGHT_URL", hindsight_url)
+    os.environ.setdefault("SIDEKICK_HINDSIGHT_TOKEN", hindsight_token)
     os.environ.setdefault(
         "SIDEKICK_PI_URL",
         "http://127.0.0.1:" + os.environ.get("SIDEKICK_PI_EXPOSE_PORT", "18790"),
@@ -193,7 +202,9 @@ async def run() -> None:
     owner_userbot = await start_owner_userbot(owner_account)
     owner = owner_userbot.client
     peer = await connect_account(peer_account)
-    memory = HindsightMemoryClient(hindsight_url, timeout=90)
+    memory = HindsightMemoryClient(
+        hindsight_url, token=hindsight_token, timeout=90
+    )
     baseline_id = 0
     saved_baseline_id = 0
     chat = None
@@ -288,6 +299,7 @@ async def run() -> None:
         started_at = standalone.date.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
         await wait_for_document(
             hindsight_url,
+            hindsight_token,
             scope_id,
             f"telegram:memory-session:{chat_id}:{started_at}:{standalone.id}",
             (standalone_token, thread_root_token, thread_reply_token),
@@ -427,6 +439,7 @@ async def run() -> None:
         )
         await wait_for_document(
             hindsight_url,
+            hindsight_token,
             scope_id,
             f"telegram:thread:{chat_id}:{link_root.id}",
             (link_root_token, link_reply_token),

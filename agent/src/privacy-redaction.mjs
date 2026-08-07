@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { isIP } from "node:net";
 
 const REDACTED_IP = "[REDACTED_IP_ADDRESS]";
@@ -29,6 +30,8 @@ const PRIVATE_QUERY_NAMES =
   /^(?:api[_-]?key|key|sig|signature|token|access[_-]?token|auth|authorization)$/i;
 const PRIVATE_ENV_NAME =
   /(?:api[_-]?key|credential|password|private[_-]?key|secret|token)/i;
+const HOST_ID_TOKEN_RE =
+  /(?<![A-Za-z0-9:_.%-])[A-Za-z0-9][A-Za-z0-9:_.%-]*(?![A-Za-z0-9:_.%-])/g;
 const NETWORK_IDENTITY_KEYS = new Set([
   "address",
   "clientip",
@@ -180,6 +183,48 @@ function replaceSensitiveValues(text, values) {
   return result;
 }
 
+function requirePseudonymContext(key, scope) {
+  if (typeof key !== "string" || Buffer.byteLength(key) < 32) {
+    throw new Error("Identity alias key must contain at least 32 bytes");
+  }
+  if (typeof scope !== "string" || scope.length < 1 || scope.length > 512) {
+    throw new Error("Identity alias scope is invalid");
+  }
+}
+
+export function pseudonymizeIdentity(identity, key, scope) {
+  requirePseudonymContext(key, scope);
+  const digest = createHmac("sha256", key)
+    .update("sidekick:model-actor:v2\0")
+    .update(scope)
+    .update("\0")
+    .update(String(identity ?? ""))
+    .digest("hex");
+  return `actor_${digest.slice(0, 16)}`;
+}
+
+export function pseudonymizeAccessBank(bankId, key, scope) {
+  requirePseudonymContext(key, scope);
+  const digest = createHmac("sha256", key)
+    .update("sidekick:session-bank-access:v1\0")
+    .update(scope)
+    .update("\0")
+    .update(String(bankId ?? ""))
+    .digest("hex");
+  return `bank_${digest.slice(0, 32)}`;
+}
+
+export function pseudonymizeActorIdentities(value, key, scope) {
+  const text = String(value ?? "");
+  requirePseudonymContext(key, scope);
+  return text.replace(HOST_ID_TOKEN_RE, (identity) => {
+    if (!/:(?:user|channel):/.test(identity)) {
+      return identity;
+    }
+    return pseudonymizeIdentity(identity, key, scope);
+  });
+}
+
 function redactNetworkLiterals(text, allowed) {
   let result = text.replace(IPV4_RE, (value) => {
     if (!validIpv4(value)) return value;
@@ -211,6 +256,13 @@ export function redactSensitiveText(value, options = {}) {
     ...(options.sensitiveValues ?? []),
   ];
   let text = String(value ?? "");
+  if (options.identityAliasKey !== undefined) {
+    text = pseudonymizeActorIdentities(
+      text,
+      options.identityAliasKey,
+      options.identityScope,
+    );
+  }
   text = replaceSensitiveValues(text, sensitiveValues);
   text = text.replace(
     /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi,
@@ -362,7 +414,7 @@ export function sanitizeSensitiveValue(
 
 export function sanitizeMessageInPlace(message, options = {}) {
   if (!message || typeof message !== "object") return message;
-  if (message.role === "assistant") {
+  if (message.role === "assistant" || message.role === "user") {
     if (typeof message.content === "string") {
       message.content = redactSensitiveText(message.content, options);
     } else if (Array.isArray(message.content)) {
@@ -389,7 +441,11 @@ export function sanitizeMessageInPlace(message, options = {}) {
 
 export function sanitizeConversationHistoryInPlace(messages, options = {}) {
   for (const message of messages ?? []) {
-    if (message?.role === "assistant" || message?.role === "toolResult") {
+    if (
+      message?.role === "assistant" ||
+      message?.role === "user" ||
+      message?.role === "toolResult"
+    ) {
       sanitizeMessageInPlace(message, options);
     }
   }

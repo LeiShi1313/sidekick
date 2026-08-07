@@ -15,6 +15,9 @@ from sidekick.ai import (
     AIResponder,
     AIStateRepository,
     AgentEvent,
+    AgentIdentityAnchor,
+    AgentRequestIdentity,
+    AgentRunOrigin,
     AgentRunRequest,
     MemoryScopeState,
     PromptBuilder,
@@ -263,6 +266,11 @@ async def test_responder_streams_through_transport_not_message_sdk_methods():
         context=(),
         system_prompt="system",
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("test:user:1", "Tester"),
+            anchors=(AgentIdentityAnchor("test:user:1", "Tester"),),
+        ),
+        origin=AgentRunOrigin("test:chat:1", "test-adapter"),
     )
 
     result = await responder.answer(trigger, request)
@@ -521,9 +529,39 @@ async def test_memory_coordinates_follow_the_injected_chat_identity_codec():
     memory = gateway.requests[0].memory
     assert memory is not None
     assert memory.primary_bank_id == "qq:group:7"
-    assert [anchor.identity for anchor in memory.anchors] == ["qq:user:42"]
+    assert [
+        anchor.identity for anchor in gateway.requests[0].identity.anchors
+    ] == ["qq:user:42"]
     assert store.saved[0].scope_id == "qq:group:7"
     assert store.saved[0].requester_id == "qq:user:42"
+
+
+@pytest.mark.asyncio
+async def test_request_identity_is_present_when_memory_is_disabled():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(transport=transport, identity_codec=codec),
+        transport=transport,
+        identity_codec=codec,
+    )
+
+    assert await handler.handle(MinimalMessage("/ai who am I?")) is True
+
+    request = gateway.requests[0]
+    assert request.memory is None
+    assert request.identity.requester.identity == "qq:user:42"
+    assert [anchor.identity for anchor in request.identity.anchors] == [
+        "qq:user:42"
+    ]
 
 
 @pytest.mark.asyncio
@@ -603,10 +641,7 @@ async def test_state_repository_preserves_opaque_decimal_string_message_ids(tmp_
                 answer_message_id=answer_id,
                 trigger_message_id=trigger_id,
                 requester_id="wechat:user:wxid_example",
-                prompt="question",
-                answer_text="answer",
                 parent_answer_message_id=None,
-                reference_context="",
                 agent_session_id="session-1",
                 agent_entry_id="entry-1",
             )

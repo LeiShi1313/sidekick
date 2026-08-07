@@ -25,11 +25,15 @@ class FailingHandler:
 class RecordingLogger:
     def __init__(self):
         self.exceptions = []
+        self.errors = []
         self.infos = []
         self.warnings = []
 
     def exception(self, message, *args):
         self.exceptions.append((message, args))
+
+    def error(self, message, *args):
+        self.errors.append((message, args))
 
     def info(self, message, *args):
         self.infos.append((message, args))
@@ -444,10 +448,10 @@ async def test_ai_plugin_logs_message_handler_failures():
 
     await plugin._on_message(event)
 
-    assert plugin.logger.exceptions == [
+    assert plugin.logger.errors == [
         (
-            "Telegram AI message handling failed (chat_id=%s, message_id=%s)",
-            (-1001, 42),
+            "Telegram AI message handling failed (%s)",
+            ("RuntimeError",),
         )
     ]
 

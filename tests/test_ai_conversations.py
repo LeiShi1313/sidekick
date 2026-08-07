@@ -217,8 +217,8 @@ async def test_trigger_in_reply_chain_labels_ancestors_as_untrusted_context():
     assert "We are comparing SQLite" in reply_context
     assert "/ai in quoted text" in reply_context
     marker = next(iter(store.markers.values()))
-    assert marker.prompt == "which database fits?"
-    assert marker.reference_context == reply_context
+    assert marker.agent_session_id == "session-1"
+    assert marker.agent_entry_id == "entry-1"
 
 
 @pytest.mark.asyncio
@@ -561,10 +561,7 @@ async def test_answer_marker_survives_repository_restart(tmp_path):
         answer_message_id=50,
         trigger_message_id=40,
         requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(10),
-        prompt="persisted question",
-        answer_text="persisted answer",
         parent_answer_message_id=None,
-        reference_context="",
         agent_session_id="persisted-session",
         agent_entry_id="persisted-entry",
     )
@@ -637,6 +634,21 @@ async def test_state_repository_migrates_pre_pi_answer_rows(tmp_path):
     assert marker.agent_entry_id is None
     assert turn_from_answer == marker
     assert turn_from_trigger == marker
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ai_answers)")
+        }
+        serialized = "\n".join(
+            value
+            for row in connection.execute("SELECT * FROM ai_answers")
+            for value in row
+            if isinstance(value, str)
+        )
+
+    assert {"prompt", "answer_text", "reference_context"}.isdisjoint(columns)
+    assert "old prompt" not in serialized
+    assert "old answer" not in serialized
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,10 @@
+import { Readability } from "@mozilla/readability";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { BlockList, isIP } from "node:net";
+import { parseHTML } from "linkedom";
+import TurndownService from "turndown";
 
 import { sanitizeSensitiveValue } from "./privacy-redaction.mjs";
 
@@ -15,6 +20,9 @@ const FORBIDDEN_HOSTS = new Set([
 const RECENCY_FILTERS = new Set(["day", "week", "month", "year"]);
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 5;
+const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_INLINE_CONTENT = 30_000;
+const FETCH_TIMEOUT_MS = 30_000;
 const BLOCKED_HOST_SUFFIXES = [".internal", ".local", ".localhost", ".home.arpa"];
 const BLOCKED_IPV4 = blockList("ipv4", [
   ["0.0.0.0", 8],
@@ -43,6 +51,12 @@ const BLOCKED_IPV6 = blockList("ipv6", [
   ["2002::", 16],
   ["3fff::", 20],
 ]);
+const USER_AGENT =
+  "Mozilla/5.0 (compatible; Sidekick/1.0; public-web-fetch)";
+const turndown = new TurndownService({
+  headingStyle: "atx",
+  codeBlockStyle: "fenced",
+});
 
 function blockList(family, ranges) {
   const list = new BlockList();
@@ -83,7 +97,7 @@ function assertPublicAddress(address) {
   }
 }
 
-async function assertAllowedUrl(raw, lookup) {
+async function resolveAllowedTarget(raw, lookup) {
   if (typeof raw !== "string" || raw.length > 2_048) {
     throw new Error("URL is not allowed");
   }
@@ -110,9 +124,10 @@ async function assertAllowedUrl(raw, lookup) {
     throw new Error("URL host is not allowed");
   }
 
-  if (isIP(hostname)) {
+  const literalFamily = isIP(hostname);
+  if (literalFamily) {
     assertPublicAddress(hostname);
-    return url.toString();
+    return { url, address: hostname, family: literalFamily };
   }
 
   let addresses;
@@ -124,31 +139,153 @@ async function assertAllowedUrl(raw, lookup) {
   if (!Array.isArray(addresses) || addresses.length === 0) {
     throw new Error("URL host is not allowed");
   }
-  for (const result of addresses) assertPublicAddress(result?.address);
-  return url.toString();
+  const vetted = addresses.map((result) => {
+    const address = normalizedHostname(result?.address ?? "");
+    const family = isIP(address);
+    assertPublicAddress(address);
+    if (family !== 4 && family !== 6) {
+      throw new Error("URL host is not allowed");
+    }
+    return { address, family };
+  });
+  const selected = vetted.find(({ family }) => family === 4) ?? vetted[0];
+  return { url, ...selected };
 }
 
-async function assertAllowedRedirectChain(raw, { lookup, fetch: fetchImpl, signal }) {
-  let current = await assertAllowedUrl(raw, lookup);
-  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    const response = await fetchImpl(current, {
-      method: "HEAD",
-      redirect: "manual",
-      signal,
-    });
-    try {
-      if (!REDIRECT_STATUSES.has(response.status)) return current;
-      const location = response.headers.get("location");
-      if (!location || redirects === MAX_REDIRECTS) {
-        throw new Error("URL redirect is not allowed");
-      }
-      current = await assertAllowedUrl(new URL(location, current).toString(), lookup);
-    } finally {
-      await response.body?.cancel().catch(() => {});
-    }
-  }
-  throw new Error("URL redirect is not allowed");
+function headerValue(headers, name) {
+  if (typeof headers?.get === "function") return headers.get(name);
+  const value = headers?.[name.toLowerCase()] ?? headers?.[name];
+  return Array.isArray(value) ? value[0] : value ?? null;
 }
+
+function normalizedHeaders(headers) {
+  const result = new Headers();
+  for (const [name, raw] of Object.entries(headers ?? {})) {
+    if (raw === undefined) continue;
+    result.set(name, Array.isArray(raw) ? raw.join(", ") : String(raw));
+  }
+  return result;
+}
+
+function responseTooLarge() {
+  const error = new Error("Response too large");
+  error.code = "RESPONSE_TOO_LARGE";
+  return error;
+}
+
+export function createPinnedRequester({
+  httpRequest: requestHttp = httpRequest,
+  httpsRequest: requestHttps = httpsRequest,
+} = {}) {
+  return async function requestPinned(
+    target,
+    { signal, maxBytes = MAX_RESPONSE_BYTES } = {},
+  ) {
+    const { url, address, family } = target;
+    const hostname = normalizedHostname(url.hostname);
+    const transport = url.protocol === "https:" ? requestHttps : requestHttp;
+    const lookup = (_requestedHostname, options, callback) => {
+      const done = typeof options === "function" ? options : callback;
+      const wantsAll = typeof options === "object" && options?.all === true;
+      if (wantsAll) {
+        done(null, [{ address, family }]);
+      } else {
+        done(null, address, family);
+      }
+    };
+
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const succeed = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      let request;
+      try {
+        request = transport(
+          {
+            protocol: url.protocol,
+            hostname,
+            port: url.port || undefined,
+            method: "GET",
+            path: `${url.pathname}${url.search}`,
+            headers: {
+              Accept:
+                "text/html,application/xhtml+xml,text/plain,application/json,application/xml;q=0.9,*/*;q=0.1",
+              "Cache-Control": "no-cache",
+              "User-Agent": USER_AGENT,
+            },
+            family,
+            lookup,
+            autoSelectFamily: false,
+            agent: false,
+            signal,
+            ...(url.protocol === "https:" && isIP(hostname) === 0
+              ? { servername: hostname }
+              : {}),
+          },
+          (response) => {
+            const status = Number(response.statusCode ?? 0);
+            const headers = normalizedHeaders(response.headers);
+            if (REDIRECT_STATUSES.has(status) || !(status >= 200 && status < 300)) {
+              response.destroy();
+              succeed({
+                status,
+                statusText: String(response.statusMessage ?? ""),
+                headers,
+                body: Buffer.alloc(0),
+              });
+              return;
+            }
+            const rawLength = headerValue(headers, "content-length");
+            if (rawLength !== null) {
+              const length = Number(rawLength);
+              if (!Number.isSafeInteger(length) || length < 0 || length > maxBytes) {
+                response.destroy();
+                fail(responseTooLarge());
+                return;
+              }
+            }
+            const chunks = [];
+            let size = 0;
+            response.on("data", (chunk) => {
+              const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              size += buffer.length;
+              if (size > maxBytes) {
+                response.destroy();
+                fail(responseTooLarge());
+                return;
+              }
+              chunks.push(buffer);
+            });
+            response.once("end", () => {
+              succeed({
+                status,
+                statusText: String(response.statusMessage ?? ""),
+                headers,
+                body: Buffer.concat(chunks, size),
+              });
+            });
+            response.once("error", fail);
+          },
+        );
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      request.once("error", fail);
+      request.end();
+    });
+  };
+}
+
+const defaultPinnedRequest = createPinnedRequester();
 
 function normalizeQueries(params) {
   const source = Array.isArray(params.queries)
@@ -198,12 +335,144 @@ function constrainSearch(definition) {
   };
 }
 
+function readableText(body, contentType, url) {
+  const text = new TextDecoder().decode(body);
+  if (text.includes("\0")) {
+    return { title: "", content: "", error: "Unsupported page content" };
+  }
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  const isHtml =
+    mediaType === "text/html" || mediaType === "application/xhtml+xml";
+  const isText =
+    !mediaType ||
+    mediaType.startsWith("text/") ||
+    mediaType === "application/json" ||
+    mediaType === "application/xml" ||
+    mediaType === "application/rss+xml" ||
+    mediaType === "application/atom+xml";
+  if (!isHtml && !isText) {
+    return { title: "", content: "", error: "Unsupported page content" };
+  }
+  if (!isHtml) {
+    const content = text.trim();
+    return content
+      ? { title: url.hostname, content, error: null }
+      : { title: "", content: "", error: "Page contained no readable text" };
+  }
+
+  const { document } = parseHTML(text);
+  const fallbackTitle = document.title?.trim() ?? "";
+  const fallbackText = document.body?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+  const article = new Readability(document).parse();
+  const content = article?.content
+    ? turndown.turndown(article.content).trim()
+    : fallbackText;
+  if (!content) {
+    return { title: "", content: "", error: "Page contained no readable text" };
+  }
+  return {
+    title: article?.title?.trim() || fallbackTitle || url.hostname,
+    content,
+    error: null,
+  };
+}
+
+async function fetchPage(raw, { lookup, request, signal }) {
+  let current = raw;
+  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
+    const target = await resolveAllowedTarget(current, lookup);
+    let response;
+    try {
+      response = await request(target, {
+        signal,
+        maxBytes: MAX_RESPONSE_BYTES,
+      });
+    } catch (error) {
+      return {
+        url: target.url.toString(),
+        title: "",
+        content: "",
+        error:
+          error?.code === "RESPONSE_TOO_LARGE"
+            ? "Response too large"
+            : signal?.aborted
+              ? "Page fetch cancelled"
+              : "Page could not be fetched",
+      };
+    }
+
+    if (REDIRECT_STATUSES.has(response.status)) {
+      const location = headerValue(response.headers, "location");
+      if (!location || redirects === MAX_REDIRECTS) {
+        throw new Error("URL redirect is not allowed");
+      }
+      try {
+        current = new URL(location, target.url).toString();
+      } catch {
+        throw new Error("URL redirect is not allowed");
+      }
+      continue;
+    }
+    if (!(response.status >= 200 && response.status < 300)) {
+      return {
+        url: target.url.toString(),
+        title: "",
+        content: "",
+        error: `HTTP ${response.status}`,
+      };
+    }
+    return {
+      url: target.url.toString(),
+      ...readableText(
+        response.body,
+        headerValue(response.headers, "content-type") ?? "",
+        target.url,
+      ),
+    };
+  }
+  throw new Error("URL redirect is not allowed");
+}
+
+function formatFetchResults(results) {
+  const successful = results.filter(({ error }) => !error);
+  const sections = results.map((result) => {
+    if (result.error) {
+      return `## ${result.url}\n\nError: ${result.error}`;
+    }
+    return (
+      `## ${result.title || result.url}\n\n` +
+      `Source: ${result.url}\n\n${result.content}`
+    );
+  });
+  const fullOutput = sections.join("\n\n---\n\n");
+  const truncated = fullOutput.length > MAX_INLINE_CONTENT;
+  const output = truncated
+    ? `${fullOutput.slice(0, MAX_INLINE_CONTENT)}\n\n[Content truncated]`
+    : fullOutput;
+  return {
+    content: [{ type: "text", text: output }],
+    details: {
+      urls: results.map(({ url }) => url),
+      urlCount: results.length,
+      successful: successful.length,
+      totalChars: successful.reduce(
+        (total, result) => total + result.content.length,
+        0,
+      ),
+      truncated,
+      ...(results.length === 1 && successful.length === 1
+        ? { title: successful[0].title }
+        : {}),
+    },
+  };
+}
+
 function constrainFetch(definition, options) {
   return {
     ...definition,
     description:
       "Fetch and extract readable content from up to three public HTTP or HTTPS pages.",
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate) {
       const supplied = Array.isArray(params?.urls)
         ? params.urls
         : params?.url === undefined
@@ -212,34 +481,39 @@ function constrainFetch(definition, options) {
       if (supplied.length === 0 || supplied.length > 3) {
         throw new Error("URL count is not allowed");
       }
-      const urls = await Promise.all(
-        supplied.map((url) =>
-          assertAllowedRedirectChain(url, { ...options, signal }),
+      onUpdate?.(
+        sanitizeSensitiveValue(
+          {
+            content: [
+              {
+                type: "text",
+                text: `Fetching ${supplied.length} public page(s)...`,
+              },
+            ],
+            details: { phase: "fetch" },
+          },
+          { externalText: true },
         ),
       );
-      const safe = Array.isArray(params?.urls) ? { urls } : { url: urls[0] };
-      const safeOnUpdate =
-        typeof onUpdate === "function"
-          ? (update) =>
-              onUpdate(
-                sanitizeSensitiveValue(update, { externalText: true }),
-              )
-          : onUpdate;
-      const result = await definition.execute(
-        toolCallId,
-        safe,
-        signal,
-        safeOnUpdate,
-        ctx,
+      const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+      const requestSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
+      const results = await Promise.all(
+        supplied.map((url) =>
+          fetchPage(url, { ...options, signal: requestSignal }),
+        ),
       );
-      return sanitizeSensitiveValue(result, { externalText: true });
+      return sanitizeSensitiveValue(formatFetchResults(results), {
+        externalText: true,
+      });
     },
   };
 }
 
 export function constrainWebTools(
   definitions,
-  { lookup = defaultLookup, fetch: fetchImpl = fetch } = {},
+  { lookup = defaultLookup, request = defaultPinnedRequest } = {},
 ) {
   const byName = new Map(definitions.map((definition) => [definition.name, definition]));
   const search = byName.get("web_search");
@@ -249,6 +523,6 @@ export function constrainWebTools(
   }
   return [
     constrainSearch(search),
-    constrainFetch(fetchContent, { lookup, fetch: fetchImpl }),
+    constrainFetch(fetchContent, { lookup, request }),
   ];
 }

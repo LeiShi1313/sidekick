@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
 import test from "node:test";
 
-import { constrainWebTools } from "../src/web-tools.mjs";
+import {
+  constrainWebTools,
+  createPinnedRequester,
+} from "../src/web-tools.mjs";
 
 const PUBLIC_ADDRESS = "93.184.216.34";
 
@@ -9,8 +14,22 @@ async function publicLookup() {
   return [{ address: PUBLIC_ADDRESS, family: 4 }];
 }
 
-async function noRedirectFetch() {
-  return new Response(null, { status: 204 });
+function pageResponse({
+  status = 200,
+  statusText = "OK",
+  headers = { "content-type": "text/plain; charset=utf-8" },
+  body = "page content",
+} = {}) {
+  return {
+    status,
+    statusText,
+    headers: new Headers(headers),
+    body: Buffer.from(body),
+  };
+}
+
+async function textRequest() {
+  return pageResponse();
 }
 
 function tool(name, execute) {
@@ -21,6 +40,18 @@ function tool(name, execute) {
     parameters: {},
     execute,
   };
+}
+
+function tools(options) {
+  return constrainWebTools(
+    [
+      tool("web_search", async () => ({ content: [], details: {} })),
+      tool("fetch_content", async () => {
+        throw new Error("the unpinned upstream fetcher must never run");
+      }),
+    ],
+    options,
+  );
 }
 
 test("forces raw Exa search and bounds query count", async () => {
@@ -51,16 +82,20 @@ test("forces raw Exa search and bounds query count", async () => {
 });
 
 test("allows bounded public HTTP and HTTPS page retrieval", async () => {
-  let received;
-  const [, fetchContent] = constrainWebTools([
-    tool("web_search", async () => ({ content: [], details: {} })),
-    tool("fetch_content", async (_id, params) => {
-      received = params;
-      return { content: [{ type: "text", text: "page" }], details: {} };
-    }),
-  ], { lookup: publicLookup, fetch: noRedirectFetch });
+  const requested = [];
+  const [, fetchContent] = tools({
+    lookup: publicLookup,
+    request: async (target) => {
+      requested.push({
+        url: target.url.toString(),
+        address: target.address,
+        family: target.family,
+      });
+      return pageResponse({ body: `content for ${target.url.pathname}` });
+    },
+  });
 
-  await fetchContent.execute(
+  const result = await fetchContent.execute(
     "call-2",
     { urls: ["https://example.com/a", "http://example.org/b"] },
     undefined,
@@ -68,16 +103,32 @@ test("allows bounded public HTTP and HTTPS page retrieval", async () => {
     {},
   );
 
-  assert.deepEqual(received, {
-    urls: ["https://example.com/a", "http://example.org/b"],
-  });
+  assert.deepEqual(requested, [
+    {
+      url: "https://example.com/a",
+      address: PUBLIC_ADDRESS,
+      family: 4,
+    },
+    {
+      url: "http://example.org/b",
+      address: PUBLIC_ADDRESS,
+      family: 4,
+    },
+  ]);
+  assert.match(result.content[0].text, /content for \/a/);
+  assert.match(result.content[0].text, /content for \/b/);
+  assert.equal(result.details.successful, 2);
 });
 
 test("blocks internal hostnames, loopback, GitHub, and video retrieval", async () => {
-  const [, fetchContent] = constrainWebTools([
-    tool("web_search", async () => ({ content: [], details: {} })),
-    tool("fetch_content", async () => ({ content: [], details: {} })),
-  ], { lookup: publicLookup, fetch: noRedirectFetch });
+  let requested = 0;
+  const [, fetchContent] = tools({
+    lookup: publicLookup,
+    request: async () => {
+      requested += 1;
+      return pageResponse();
+    },
+  });
 
   for (const url of [
     "file:///etc/passwd",
@@ -102,22 +153,20 @@ test("blocks internal hostnames, loopback, GitHub, and video retrieval", async (
       /not allowed/i,
     );
   }
+  assert.equal(requested, 0);
 });
 
 test("blocks a hostname when any DNS answer is private", async () => {
-  let delegated = false;
-  const [, fetchContent] = constrainWebTools([
-    tool("web_search", async () => ({ content: [], details: {} })),
-    tool("fetch_content", async () => {
-      delegated = true;
-      return { content: [], details: {} };
-    }),
-  ], {
+  let requested = false;
+  const [, fetchContent] = tools({
     lookup: async () => [
       { address: PUBLIC_ADDRESS, family: 4 },
       { address: "10.0.0.8", family: 4 },
     ],
-    fetch: noRedirectFetch,
+    request: async () => {
+      requested = true;
+      return pageResponse();
+    },
   });
 
   await assert.rejects(
@@ -130,25 +179,133 @@ test("blocks a hostname when any DNS answer is private", async () => {
     ),
     /not allowed/i,
   );
-  assert.equal(delegated, false);
+  assert.equal(requested, false);
+});
+
+test("uses the vetted DNS address without resolving the hostname again", async () => {
+  let lookupCalls = 0;
+  const targets = [];
+  const [, fetchContent] = tools({
+    lookup: async () => {
+      lookupCalls += 1;
+      return lookupCalls === 1
+        ? [{ address: PUBLIC_ADDRESS, family: 4 }]
+        : [{ address: "127.0.0.1", family: 4 }];
+    },
+    request: async (target) => {
+      targets.push(target);
+      return pageResponse();
+    },
+  });
+
+  await fetchContent.execute(
+    "call-rebinding",
+    { url: "https://rebinding.example/page" },
+    undefined,
+    undefined,
+    {},
+  );
+
+  assert.equal(lookupCalls, 1);
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].address, PUBLIC_ADDRESS);
+});
+
+test("pins the actual HTTP socket lookup to the vetted address", async () => {
+  let requestOptions;
+  const transport = (options, onResponse) => {
+    requestOptions = options;
+    const request = new EventEmitter();
+    request.end = () => {
+      const response = Readable.from([Buffer.from("socket-pinned page")]);
+      response.statusCode = 200;
+      response.statusMessage = "OK";
+      response.headers = { "content-type": "text/plain" };
+      queueMicrotask(() => onResponse(response));
+    };
+    return request;
+  };
+  const request = createPinnedRequester({
+    httpRequest: transport,
+    httpsRequest: transport,
+  });
+
+  const response = await request({
+    url: new URL("https://rebinding.example/path?q=1"),
+    address: PUBLIC_ADDRESS,
+    family: 4,
+  });
+  const pinned = await new Promise((resolve, reject) => {
+    requestOptions.lookup(
+      "rebinding.example",
+      {},
+      (error, address, family) =>
+        error ? reject(error) : resolve({ address, family }),
+    );
+  });
+
+  assert.deepEqual(pinned, { address: PUBLIC_ADDRESS, family: 4 });
+  assert.equal(requestOptions.hostname, "rebinding.example");
+  assert.equal(requestOptions.servername, "rebinding.example");
+  assert.equal(requestOptions.path, "/path?q=1");
+  assert.equal(response.body.toString(), "socket-pinned page");
+});
+
+test("destroys redirect and error bodies instead of draining unbounded data", async () => {
+  for (const status of [302, 404]) {
+    let producedBytes = 0;
+    let upstreamResponse;
+    const transport = (_options, onResponse) => {
+      const request = new EventEmitter();
+      request.end = () => {
+        upstreamResponse = Readable.from(
+          (function* body() {
+            for (let index = 0; index < 10; index += 1) {
+              producedBytes += 1024 * 1024;
+              yield Buffer.alloc(1024 * 1024);
+            }
+          })(),
+        );
+        upstreamResponse.statusCode = status;
+        upstreamResponse.statusMessage = status === 302 ? "Found" : "Not Found";
+        upstreamResponse.headers =
+          status === 302 ? { location: "https://example.org/final" } : {};
+        queueMicrotask(() => onResponse(upstreamResponse));
+      };
+      return request;
+    };
+    const request = createPinnedRequester({
+      httpRequest: transport,
+      httpsRequest: transport,
+    });
+
+    const response = await request(
+      {
+        url: new URL("https://example.com/start"),
+        address: PUBLIC_ADDRESS,
+        family: 4,
+      },
+      { maxBytes: 1 },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(response.status, status);
+    assert.equal(upstreamResponse.destroyed, true);
+    assert.equal(producedBytes, 0);
+  }
 });
 
 test("blocks redirects from a public URL to a private destination", async () => {
   const requested = [];
-  let delegated = false;
-  const [, fetchContent] = constrainWebTools([
-    tool("web_search", async () => ({ content: [], details: {} })),
-    tool("fetch_content", async () => {
-      delegated = true;
-      return { content: [], details: {} };
-    }),
-  ], {
+  const [, fetchContent] = tools({
     lookup: publicLookup,
-    fetch: async (url) => {
-      requested.push(url.toString());
-      return new Response(null, {
+    request: async (target) => {
+      requested.push(target.url.toString());
+      return pageResponse({
         status: 302,
+        statusText: "Found",
         headers: { location: "http://127.0.0.1/admin" },
+        body: "",
       });
     },
   });
@@ -164,33 +321,27 @@ test("blocks redirects from a public URL to a private destination", async () => 
     /not allowed/i,
   );
   assert.deepEqual(requested, ["https://example.com/start"]);
-  assert.equal(delegated, false);
 });
 
-test("allows redirects between public destinations", async () => {
+test("allows redirects between public destinations and pins each hop", async () => {
   const requested = [];
-  let received;
-  const [, fetchContent] = constrainWebTools([
-    tool("web_search", async () => ({ content: [], details: {} })),
-    tool("fetch_content", async (_id, params) => {
-      received = params;
-      return { content: [{ type: "text", text: "page" }], details: {} };
-    }),
-  ], {
+  const [, fetchContent] = tools({
     lookup: publicLookup,
-    fetch: async (url) => {
-      requested.push(url.toString());
+    request: async (target) => {
+      requested.push({ url: target.url.toString(), address: target.address });
       if (requested.length === 1) {
-        return new Response(null, {
+        return pageResponse({
           status: 302,
+          statusText: "Found",
           headers: { location: "https://www.example.org/final" },
+          body: "",
         });
       }
-      return new Response(null, { status: 204 });
+      return pageResponse({ body: "final page" });
     },
   });
 
-  await fetchContent.execute(
+  const result = await fetchContent.execute(
     "call-6",
     { url: "https://example.com/start" },
     undefined,
@@ -199,37 +350,28 @@ test("allows redirects between public destinations", async () => {
   );
 
   assert.deepEqual(requested, [
-    "https://example.com/start",
-    "https://www.example.org/final",
+    { url: "https://example.com/start", address: PUBLIC_ADDRESS },
+    { url: "https://www.example.org/final", address: PUBLIC_ADDRESS },
   ]);
-  assert.deepEqual(received, { url: "https://www.example.org/final" });
+  assert.match(result.content[0].text, /final page/);
+  assert.deepEqual(result.details.urls, ["https://www.example.org/final"]);
 });
 
 test("withholds reflected requester metadata from fetched page results", async () => {
   const reflectedAddress = "203.0.113.42";
-  const [, fetchContent] = constrainWebTools([
-    tool("web_search", async () => ({ content: [], details: {} })),
-    tool("fetch_content", async () => ({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            ip: reflectedAddress,
-            hostname: "runtime-node",
-            city: "Example City",
-            org: "Example Network",
-          }),
-        },
-      ],
-      details: {
-        endpoint: "http://memory-api:8888/private",
-        address: reflectedAddress,
-        hostname: "runtime-node",
-        city: "Example City",
-        org: "Example Network",
-      },
-    })),
-  ], { lookup: publicLookup, fetch: noRedirectFetch });
+  const [, fetchContent] = tools({
+    lookup: publicLookup,
+    request: async () =>
+      pageResponse({
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ip: reflectedAddress,
+          hostname: "runtime-node",
+          city: "Example City",
+          org: "Example Network",
+        }),
+      }),
+  });
 
   const result = await fetchContent.execute(
     "call-7",
@@ -245,6 +387,6 @@ test("withholds reflected requester metadata from fetched page results", async (
   );
   assert.doesNotMatch(
     JSON.stringify(result),
-    /203\.0\.113\.42|runtime-node|Example City|Example Network|memory-api/,
+    /203\.0\.113\.42|runtime-node|Example City|Example Network/,
   );
 });

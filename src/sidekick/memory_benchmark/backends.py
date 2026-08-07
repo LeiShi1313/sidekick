@@ -57,6 +57,7 @@ async def ingest_hindsight(
     bank_name: str,
     corpus: SourceCorpus,
     *,
+    token: str,
     batch_size: int = 1,
     concurrency: int = 4,
     progress: Callable[[int, int], None] | None = None,
@@ -67,7 +68,10 @@ async def ingest_hindsight(
     encoded_bank = quote(bank_id, safe="")
     started = perf_counter()
     operations = []
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=_memory_headers(token),
+    ) as session:
         await _json_request(
             session,
             "PUT",
@@ -175,13 +179,17 @@ async def list_hindsight_memories(
     base_url: str,
     bank_id: str,
     *,
+    token: str,
     backend: str,
 ) -> tuple[MemoryRecord, ...]:
     timeout = aiohttp.ClientTimeout(total=120)
     encoded_bank = quote(bank_id, safe="")
     offset = 0
     all_items: list[dict[str, Any]] = []
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=_memory_headers(token),
+    ) as session:
         while True:
             payload = await _json_request(
                 session,
@@ -257,12 +265,16 @@ async def recall_hindsight(
     bank_id: str,
     query: str,
     *,
+    token: str,
     backend: str,
     max_tokens: int = 2_000,
 ) -> RecallMeasurement:
     timeout = aiohttp.ClientTimeout(total=120)
     encoded_bank = quote(bank_id, safe="")
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=_memory_headers(token),
+    ) as session:
         started = perf_counter()
         payload = await _json_request(
             session,
@@ -482,14 +494,22 @@ async def _json_request(
     async with session.request(method, url, **kwargs) as response:
         text = await response.text()
         if response.status >= 400:
-            raise RuntimeError(f"{method} {url} failed with status {response.status}: {text[:500]}")
+            raise RuntimeError(
+                f"Memory backend request failed with status {response.status}"
+            )
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"{method} {url} returned invalid JSON") from exc
+            raise ValueError("Memory backend returned invalid JSON") from exc
         if not isinstance(payload, dict):
-            raise ValueError(f"{method} {url} returned a non-object response")
+            raise ValueError("Memory backend returned a non-object response")
         return payload
+
+
+def _memory_headers(token: str) -> dict[str, str]:
+    if len(token) < 24:
+        raise ValueError("Memory API token must contain at least 24 characters")
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _hindsight_record(

@@ -760,9 +760,9 @@ async def test_ai_request_delegates_scope_and_identity_anchors_to_agent():
     assert "Untrusted chat context" in request.context[0].text
     assert request.memory is not None
     assert request.memory.primary_bank_id == "telegram:chat:-1001"
-    assert request.memory.requester_id == "telegram:user:10"
+    assert request.identity.requester.identity == "telegram:user:10"
     assert request.memory.requester_is_owner is True
-    assert [(item.identity, item.label) for item in request.memory.anchors] == [
+    assert [(item.identity, item.label) for item in request.identity.anchors] == [
         ("telegram:user:10", "User 10"),
         ("telegram:user:20", "User 20"),
     ]
@@ -790,9 +790,9 @@ async def test_recent_chat_participants_become_memory_identity_anchors():
 
     assert await handler.handle(trigger) is True
 
-    target = gateway.requests[0].memory
-    assert target is not None
-    assert [(item.identity, item.label) for item in target.anchors] == [
+    request = gateway.requests[0]
+    assert request.memory is not None
+    assert [(item.identity, item.label) for item in request.identity.anchors] == [
         ("telegram:user:10", "User 10"),
         ("telegram:user:20", "User 20"),
     ]
@@ -821,9 +821,10 @@ async def test_agent_memory_target_has_fresh_requester_and_participant_grants():
 
     assert await handler.handle(trigger) is True
 
-    target = gateway.requests[0].memory
+    request = gateway.requests[0]
+    target = request.memory
     assert target is not None
-    assert target.requester_id == "telegram:user:20"
+    assert request.identity.requester.identity == "telegram:user:20"
     assert target.requester_is_owner is False
     assert target.granted_bank_ids == ("qq:group:686743769",)
     assert target.participants == (
@@ -873,11 +874,11 @@ async def test_ai_request_bounds_identity_anchors_for_agent_contract():
 
     assert await handler.handle(trigger) is True
 
-    target = gateway.requests[0].memory
-    assert target is not None
-    assert len(target.anchors) == 64
-    assert target.anchors[0].identity == "telegram:user:10"
-    assert target.anchors[-1].identity == "telegram:user:102"
+    request = gateway.requests[0]
+    assert request.memory is not None
+    assert len(request.identity.anchors) == 64
+    assert request.identity.anchors[0].identity == "telegram:user:10"
+    assert request.identity.anchors[-1].identity == "telegram:user:102"
 
 
 @pytest.mark.asyncio
@@ -897,10 +898,11 @@ async def test_out_of_chain_exact_mention_enters_agent_anchors_and_episode_entit
     )
 
     assert await handler.handle(trigger) is True
-    target = gateway.requests[0].memory
+    request = gateway.requests[0]
+    target = request.memory
     assert target is not None
     assert ("telegram:user:40", "User 40") in [
-        (item.identity, item.label) for item in target.anchors
+        (item.identity, item.label) for item in request.identity.anchors
     ]
     assert target.participants == ()
     event = memory.retain_calls[0]["episode"].events[0]
@@ -919,10 +921,7 @@ async def test_ai_generated_chain_message_is_context_but_not_retained_evidence()
         answer_message_id=ai_output.id,
         trigger_message_id=999,
         requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
-        prompt="old prompt",
-        answer_text=ai_output.raw_text,
         parent_answer_message_id=None,
-        reference_context="",
         agent_session_id="session-old",
         agent_entry_id="entry-old",
     )
@@ -1103,10 +1102,7 @@ async def test_revision_requires_direct_human_target_and_owner():
         answer_message_id=ai_output.id,
         trigger_message_id=999,
         requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
-        prompt="question",
-        answer_text=ai_output.raw_text,
         parent_answer_message_id=None,
-        reference_context="",
         agent_session_id="session-old",
         agent_entry_id="entry-old",
     )
@@ -1249,7 +1245,10 @@ async def test_telegram_handler_retains_through_hindsight_and_delegates_recall()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    client = HindsightMemoryClient(f"http://127.0.0.1:{port}")
+    client = HindsightMemoryClient(
+        f"http://127.0.0.1:{port}",
+        token="memory-token-that-is-long-enough",
+    )
     gateway = FakeGateway(["Use PostgreSQL"])
     store = FakeStore()
     handler = make_handler(
@@ -1623,7 +1622,7 @@ async def test_enabled_continuation_retains_human_chain_across_ai_answer():
     ]
     assert any(
         item.identity == "telegram:user:20"
-        for item in gateway.requests[1].memory.anchors
+        for item in gateway.requests[1].identity.anchors
     )
     assert not any(item.kind == "reference" for item in gateway.requests[1].context)
 

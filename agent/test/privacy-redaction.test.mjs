@@ -8,6 +8,39 @@ import {
   sanitizeSensitiveValue,
 } from "../src/privacy-redaction.mjs";
 
+test("pseudonymizes platform actor identifiers with a stable keyed alias", () => {
+  const options = {
+    identityAliasKey: "test-identity-alias-key-that-is-strong",
+    identityScope: "telegram:chat:-1001",
+  };
+  const first = redactSensitiveText(
+    "Requester telegram:user:419540347 replied to qq:user:12345678",
+    options,
+  );
+  const repeated = redactSensitiveText(
+    "Again telegram:user:419540347",
+    options,
+  );
+
+  assert.match(first, /actor_[a-f0-9]{16}/);
+  assert.doesNotMatch(first, /telegram:user:419540347|qq:user:12345678/);
+  assert.equal(
+    first.match(/actor_[a-f0-9]{16}/)?.[0],
+    repeated.match(/actor_[a-f0-9]{16}/)?.[0],
+  );
+  assert.notEqual(
+    first.match(/actor_[a-f0-9]{16}/)?.[0],
+    redactSensitiveText("Again telegram:user:419540347", {
+      ...options,
+      identityScope: "telegram:chat:-1002",
+    }).match(/actor_[a-f0-9]{16}/)?.[0],
+  );
+  assert.doesNotMatch(
+    redactSensitiveText("Post by telegram:channel:998877", options),
+    /telegram:channel:998877/,
+  );
+});
+
 const DOCUMENTATION_IPV4 = "203.0.113.42";
 const DOCUMENTATION_IPV6 = "2001:db8::42";
 const RUNTIME_PATH = "/home/example-service/private/workspace";

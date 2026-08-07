@@ -92,7 +92,8 @@ The exporter accepts Hindsight documents using Sidekick's
 `sidekick.memory.episode.v1` schema and writes a backend-neutral v1 corpus.
 
 ```bash
-export HINDSIGHT_URL=http://127.0.0.1:8888
+export HINDSIGHT_URL=http://127.0.0.1:18888
+export MEMORY_API_TOKEN=replace-with-the-memory-gateway-token
 export SOURCE_BANK='telegram:chat:example'
 export SOURCE_BANK_NAME='Example chat'
 
@@ -108,6 +109,7 @@ corpus = asyncio.run(
         os.environ["HINDSIGHT_URL"],
         os.environ["SOURCE_BANK"],
         os.environ["SOURCE_BANK_NAME"],
+        token=os.environ["MEMORY_API_TOKEN"],
     )
 )
 write_corpus(corpus, Path(".benchmark-data/source.json"))

@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -45,6 +46,39 @@ from sidekick.telegram.ai_history import (
     telegram_channel_album_document_id,
     telegram_source_retry_delay,
 )
+
+
+@pytest.mark.asyncio
+async def test_repository_scrubs_private_legacy_error_details(tmp_path):
+    path = tmp_path / "ai.db"
+    scope_id = "telegram:chat:-1001"
+    store = await AIStateRepository(path).connect()
+    await store.set_continuous_memory_enabled(scope_id, True)
+    await store.set_dream_memory_enabled(scope_id, True)
+    await store.close()
+
+    private_detail = "https://internal.example/path?token=private-value"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE ai_memory_scopes SET continuous_last_error = ?",
+            (f"ConnectionError: {private_detail}",),
+        )
+        connection.execute(
+            "INSERT INTO ai_memory_dream_state "
+            "(scope_id, last_attempt_at, last_error) VALUES (?, ?, ?)",
+            (scope_id, 1.0, f"TimeoutError: {private_detail}"),
+        )
+
+    reopened = await AIStateRepository(path).connect()
+    try:
+        scope = await reopened.get_memory_scope_state(scope_id)
+        dream = await reopened.get_memory_dream_state(scope_id)
+        assert scope.continuous_last_error == "ConnectionError"
+        assert dream.last_error == "TimeoutError"
+    finally:
+        await reopened.close()
+
+    assert b"private-value" not in path.read_bytes()
 
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
@@ -451,10 +485,7 @@ async def test_manual_dream_retains_standalone_and_complete_reply_tree(tmp_path)
             answer_message_id=ai_answer.id,
             trigger_message_id=999,
             requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
-            prompt="old",
-            answer_text=ai_answer.raw_text,
             parent_answer_message_id=None,
-            reference_context="",
             agent_session_id="session-old",
             agent_entry_id="entry-old",
         )

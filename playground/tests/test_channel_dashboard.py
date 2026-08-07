@@ -21,6 +21,10 @@ from agent_playground.channels import (
     parse_adapter_urls,
 )
 
+PI_TOKEN = "private-pi-token-that-is-long-enough"
+MEMORY_TOKEN = "private-memory-token-that-is-long-enough"
+CHANNEL_TOKEN = "private-channel-token-that-is-long-enough"
+
 
 async def _start(app: web.Application) -> tuple[web.AppRunner, str]:
     runner = web.AppRunner(app)
@@ -43,7 +47,7 @@ async def _channel_dependencies():
     adapter = web.Application()
 
     async def channels(request: web.Request) -> web.Response:
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {CHANNEL_TOKEN}"
         return web.json_response(
             {
                 "adapter": {
@@ -102,14 +106,14 @@ async def _channel_dependencies():
     pi = web.Application()
 
     async def models(request: web.Request) -> web.Response:
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         state["model_requests"] += 1
         return web.json_response(
             {"defaultModel": "gpt-5.6-sol", "models": ["gpt-5.6-sol"]}
         )
 
     async def runs(request: web.Request) -> web.Response:
-        assert request.headers["Authorization"] == "Bearer private-pi-token"
+        assert request.headers["Authorization"] == f"Bearer {PI_TOKEN}"
         assert dict(request.query) == {"status": "active"}
         return web.json_response(
             {
@@ -147,7 +151,8 @@ async def _channel_dependencies():
 
     memory = web.Application()
 
-    async def banks(_request: web.Request) -> web.Response:
+    async def banks(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == f"Bearer {MEMORY_TOKEN}"
         if not state["memory_available"]:
             return web.json_response({"error": "offline"}, status=503)
         return web.json_response(
@@ -165,6 +170,7 @@ async def _channel_dependencies():
         )
 
     async def stats(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == f"Bearer {MEMORY_TOKEN}"
         assert request.match_info["bank_id"] == "qq:group:42"
         state["stats_requests"] += 1
         return web.json_response(
@@ -194,7 +200,9 @@ def _settings(adapter_url: str, pi_url: str, memory_url: str) -> PlaygroundSetti
     return PlaygroundSettings(
         memory_url=memory_url,
         pi_url=pi_url,
-        pi_token="private-pi-token",
+        pi_token=PI_TOKEN,
+        memory_token=MEMORY_TOKEN,
+        channel_token=CHANNEL_TOKEN,
         channel_adapter_urls=(
             ("onebot", f"{adapter_url}/v1/channels"),
             ("offline", f"{adapter_url}/broken"),
@@ -237,7 +245,9 @@ def test_adapter_url_configuration_rejects_internal_source_ids(source_id: str):
         parse_adapter_urls(f"{source_id}=http://adapter:8781/v1/channels")
     with pytest.raises(ValueError, match="reserved"):
         PlaygroundSettings(
-            pi_token="token",
+            pi_token=PI_TOKEN,
+            memory_token=MEMORY_TOKEN,
+            channel_token=CHANNEL_TOKEN,
             channel_adapter_urls=((source_id, "http://adapter:8781/v1/channels"),),
         )
 
@@ -320,7 +330,9 @@ async def test_source_response_stops_reading_at_size_limit(monkeypatch):
             adapter_urls=(("adapter", "http://adapter/v1/channels"),),
             pi_url="http://pi",
             memory_url="http://memory",
-            token="token",
+            pi_token=PI_TOKEN,
+            memory_token=MEMORY_TOKEN,
+            channel_token=CHANNEL_TOKEN,
         )
     )
     monkeypatch.setattr("agent_playground.channels._MAX_SOURCE_BYTES", 5)
@@ -331,7 +343,9 @@ async def test_source_response_stops_reading_at_size_limit(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="too large"):
-        await dashboard._json("http://adapter/v1/channels", authenticated=True)
+        await dashboard._json(
+            "http://adapter/v1/channels", token=CHANNEL_TOKEN
+        )
 
     assert content.consumed == 2
 
@@ -345,14 +359,16 @@ async def test_hindsight_bank_stats_keep_last_good_value_after_refresh_failure(
             adapter_urls=(("adapter", "http://adapter/v1/channels"),),
             pi_url="http://pi",
             memory_url="http://memory",
-            token="token",
+            pi_token=PI_TOKEN,
+            memory_token=MEMORY_TOKEN,
+            channel_token=CHANNEL_TOKEN,
             bank_cache_ttl=15,
         )
     )
     calls = []
 
-    async def load(url, *, authenticated):
-        calls.append((url, authenticated))
+    async def load(url, *, token):
+        calls.append((url, token))
         if len(calls) > 1:
             raise RuntimeError("stats unavailable")
         return {
@@ -374,7 +390,7 @@ async def test_hindsight_bank_stats_keep_last_good_value_after_refresh_failure(
     assert calls[0] == (
         "http://memory/v1/default/banks/"
         "wechat%3Aaccount%3Awx%2Fid%3Achat%3Agroup/stats",
-        False,
+        MEMORY_TOKEN,
     )
     assert second == first
     assert first_status["status"] == "ok"

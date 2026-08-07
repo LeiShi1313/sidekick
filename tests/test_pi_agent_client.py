@@ -9,11 +9,17 @@ from sidekick.ai import (
     AgentMemoryTarget,
     AgentModelCatalog,
     AgentParticipantAccess,
+    AgentRequestIdentity,
     AgentRunOrigin,
     AgentRunRequest,
     PiAgentGateway,
 )
 from sidekick.ai_attachments import AttachmentAnalysisRequest
+
+
+def test_pi_gateway_rejects_weak_credentials() -> None:
+    with pytest.raises(ValueError, match="at least 24"):
+        PiAgentGateway("http://agent.test:8790", token="short")
 
 
 async def serve(app: web.Application) -> tuple[web.AppRunner, str]:
@@ -35,6 +41,18 @@ def run_request(*, model: str | None = None) -> AgentRunRequest:
         context=(AgentContext(kind="reference", text="Prior conversation"),),
         system_prompt="Answer directly.",
         tool_policy="delegated",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor(
+                identity="telegram:user:40",
+                label="Alice",
+            ),
+            anchors=(
+                AgentIdentityAnchor(
+                    identity="telegram:user:40",
+                    label="Alice",
+                ),
+            ),
+        ),
         model=model,
         origin=AgentRunOrigin(
             scope_id="telegram:chat:-1001",
@@ -42,8 +60,6 @@ def run_request(*, model: str | None = None) -> AgentRunRequest:
         ),
         memory=AgentMemoryTarget(
             primary_bank_id="telegram:chat:-1001",
-            requester_id="telegram:user:40",
-            requester_label="Alice",
             requester_is_owner=False,
             granted_bank_ids=("qq:group:686743769",),
             participants=(
@@ -52,12 +68,6 @@ def run_request(*, model: str | None = None) -> AgentRunRequest:
                     label="Bob",
                     allowed=True,
                     bank_ids=("telegram:chat:-1002",),
-                ),
-            ),
-            anchors=(
-                AgentIdentityAnchor(
-                    identity="telegram:user:40",
-                    label="Alice",
                 ),
             ),
         ),
@@ -70,7 +80,9 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
 
     async def runs(request: web.Request) -> web.StreamResponse:
         nonlocal received
-        assert request.headers["Authorization"] == "Bearer test-agent-token"
+        assert request.headers["Authorization"] == (
+            "Bearer test-agent-token-that-is-long-enough"
+        )
         received = await request.json()
         response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
         await response.prepare(request)
@@ -93,7 +105,9 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
     app = web.Application()
     app.router.add_post("/v1/runs", runs)
     runner, base_url = await serve(app)
-    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
     try:
         events = [
             event
@@ -111,6 +125,10 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
         "context": [{"kind": "reference", "text": "Prior conversation"}],
         "systemPrompt": "Answer directly.",
         "toolPolicy": "delegated",
+        "identity": {
+            "requester": {"id": "telegram:user:40", "label": "Alice"},
+            "anchors": [{"id": "telegram:user:40", "label": "Alice"}],
+        },
         "model": "gpt-5.4-mini",
         "origin": {
             "scopeId": "telegram:chat:-1001",
@@ -118,11 +136,7 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
         },
         "memory": {
             "primaryBankId": "telegram:chat:-1001",
-            "requester": {
-                "id": "telegram:user:40",
-                "label": "Alice",
-                "owner": False,
-            },
+            "requesterIsOwner": False,
             "grantedBankIds": ["qq:group:686743769"],
             "participants": [
                 {
@@ -132,7 +146,6 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
                     "bankIds": ["telegram:chat:-1002"],
                 }
             ],
-            "anchors": [{"id": "telegram:user:40", "label": "Alice"}],
         },
     }
     assert [event.type for event in events] == [
@@ -149,7 +162,9 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
 @pytest.mark.asyncio
 async def test_pi_gateway_lists_a_validated_model_catalog() -> None:
     async def models(request: web.Request) -> web.Response:
-        assert request.headers["Authorization"] == "Bearer test-agent-token"
+        assert request.headers["Authorization"] == (
+            "Bearer test-agent-token-that-is-long-enough"
+        )
         return web.json_response(
             {
                 "defaultModel": "gpt-5.6-sol",
@@ -160,7 +175,9 @@ async def test_pi_gateway_lists_a_validated_model_catalog() -> None:
     app = web.Application()
     app.router.add_get("/v1/models", models)
     runner, base_url = await serve(app)
-    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
     try:
         catalog = await gateway.list_models()
     finally:
@@ -186,7 +203,9 @@ async def test_pi_gateway_rejects_a_malformed_model_catalog() -> None:
     app = web.Application()
     app.router.add_get("/v1/models", models)
     runner, base_url = await serve(app)
-    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
     try:
         with pytest.raises(RuntimeError, match="catalog is malformed"):
             await gateway.list_models()
@@ -206,7 +225,9 @@ async def test_pi_gateway_rejects_a_malformed_or_incomplete_stream() -> None:
     app = web.Application()
     app.router.add_post("/v1/runs", runs)
     runner, base_url = await serve(app)
-    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
     try:
         with pytest.raises(RuntimeError, match="invalid event"):
             async for _ in gateway.run(run_request()):
@@ -222,14 +243,18 @@ async def test_pi_gateway_cancels_by_run_id() -> None:
 
     async def cancel(request: web.Request) -> web.Response:
         nonlocal cancelled
-        assert request.headers["Authorization"] == "Bearer test-agent-token"
+        assert request.headers["Authorization"] == (
+            "Bearer test-agent-token-that-is-long-enough"
+        )
         cancelled = request.match_info["run_id"]
         return web.json_response({"cancelled": True})
 
     app = web.Application()
     app.router.add_post("/v1/runs/{run_id}/cancel", cancel)
     runner, base_url = await serve(app)
-    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
     try:
         assert await gateway.cancel(run_request().run_id) is True
     finally:
@@ -245,7 +270,9 @@ async def test_pi_gateway_sends_bounded_attachment_for_description() -> None:
 
     async def describe(request: web.Request) -> web.Response:
         nonlocal received
-        assert request.headers["Authorization"] == "Bearer test-agent-token"
+        assert request.headers["Authorization"] == (
+            "Bearer test-agent-token-that-is-long-enough"
+        )
         received = await request.json()
         return web.json_response(
             {"description": "Description: a diagram.\nVisible text: API"}
@@ -254,7 +281,9 @@ async def test_pi_gateway_sends_bounded_attachment_for_description() -> None:
     app = web.Application()
     app.router.add_post("/v1/attachments/describe", describe)
     runner, base_url = await serve(app)
-    gateway = PiAgentGateway(base_url, token="test-agent-token", timeout=5)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
     try:
         result = await gateway.describe_attachment(
             AttachmentAnalysisRequest(

@@ -136,7 +136,10 @@ async def test_onebot_memory_admin_rejects_private_chat_ids(bridge):
             )
 
             assert response.status == 400
-            assert "positive" in (await response.json())["error"]
+            assert (await response.json()) == {
+                "error": "Invalid memory administration request.",
+                "code": "INVALID_REQUEST",
+            }
 
 
 @pytest.mark.asyncio
@@ -205,7 +208,7 @@ def test_onebot_memory_cli_uses_configured_publish_address(monkeypatch):
 
     monkeypatch.setenv("SIDEKICK_ONEBOT_TOKEN", "secret")
     monkeypatch.setenv("SIDEKICK_ONEBOT_SELF_ID", "329787230")
-    monkeypatch.setenv("SIDEKICK_ONEBOT_PUBLISH_HOST", "100.99.247.60")
+    monkeypatch.setenv("SIDEKICK_ONEBOT_PUBLISH_HOST", "198.51.100.60")
     monkeypatch.setenv("SIDEKICK_ONEBOT_PUBLISH_PORT", "18867")
     monkeypatch.delenv("SIDEKICK_ONEBOT_ADMIN_URL", raising=False)
     monkeypatch.setattr(onebot_plugin, "OneBotMemoryAdminClient", Client)
@@ -213,7 +216,7 @@ def test_onebot_memory_cli_uses_configured_publish_address(monkeypatch):
     onebot_plugin._onebot_memory_admin_client()
 
     assert captured == {
-        "base_url": "http://100.99.247.60:18867",
+        "base_url": "http://198.51.100.60:18867",
         "token": "secret",
         "self_id": 329787230,
         "timeout": 900,

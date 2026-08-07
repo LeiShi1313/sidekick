@@ -1,9 +1,12 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
+  chmod,
   mkdir,
   open,
+  rename,
   readdir,
+  unlink,
 } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -17,6 +20,238 @@ const MAX_STRING_CHARS = 1024 * 1024;
 const MAX_ARRAY_ITEMS = 5_000;
 const MAX_OBJECT_KEYS = 1_000;
 const MAX_DEPTH = 16;
+const CURRENT_AUDIT_VERSION = 2;
+
+function safeString(value, max = 1_000) {
+  return typeof value === "string" ? bounded(value, max) : null;
+}
+
+function safeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function suppliedCount(data, countKey, collectionKey) {
+  return safeInteger(data[countKey]) ??
+    (Array.isArray(data[collectionKey]) ? data[collectionKey].length : 0);
+}
+
+function suppliedChars(data, countKey, textKey) {
+  return safeInteger(data[countKey]) ??
+    (typeof data[textKey] === "string" ? data[textKey].length : 0);
+}
+
+function safeSourceHandle(value) {
+  return typeof value === "string" && /^source_[0-9]+$/.test(value)
+    ? value
+    : null;
+}
+
+function modelMetadata(value) {
+  const model = objectValue(value);
+  return {
+    id: safeString(model.id, 256),
+    provider: safeString(model.provider, 128),
+    api: safeString(model.api, 128),
+    reasoning: model.reasoning === true,
+    thinkingLevel: safeString(model.thinkingLevel, 64),
+  };
+}
+
+function memoryHttpMetadata(type, data) {
+  const result = {
+    exchangeId: safeString(data.exchangeId, 128),
+    operation: safeString(data.operation, 128),
+    variant: safeString(data.variant, 128),
+    toolCallId: safeString(data.toolCallId, 256),
+  };
+  if (type === "memory.http.request") {
+    return {
+      ...result,
+      method: safeString(data.method ?? objectValue(data.request).method, 16),
+    };
+  }
+  if (type === "memory.http.response") {
+    const response = Object.keys(objectValue(data.response)).length > 0
+      ? objectValue(data.response)
+      : data;
+    return {
+      ...result,
+      status: safeInteger(response.status),
+      ok: response.ok === true,
+      usable: response.usable === true,
+      failureReason: safeString(response.failureReason, 128),
+      durationMs: safeInteger(response.durationMs),
+      bodyBytes: safeInteger(response.bodyBytes),
+    };
+  }
+  return {
+    ...result,
+    durationMs: safeInteger(data.durationMs),
+    errorName: safeString(objectValue(data.error).name, 128),
+  };
+}
+
+export function minimizeAuditData(type, value = {}) {
+  const data = objectValue(value);
+  switch (type) {
+    case "run.request":
+      return {
+        sessionId: safeString(data.sessionId, 128),
+        parentEntryId: safeString(data.parentEntryId, 128),
+        promptChars: suppliedChars(data, "promptChars", "prompt"),
+        contextCount: suppliedCount(data, "contextCount", "context"),
+        toolPolicy: safeString(data.toolPolicy, 32),
+        model: safeString(data.model, 256),
+        memoryEnabled:
+          data.memoryEnabled === true ||
+          objectValue(data.memory).primaryBankId != null ||
+          objectValue(data.memory).scopeId != null,
+        includeMemorySnapshot: data.includeMemorySnapshot === true,
+      };
+    case "memory.context":
+      return {
+        memoryEnabled:
+          data.memoryEnabled === true || data.primaryBankId != null,
+        queryCount: suppliedCount(data, "queryCount", "queries"),
+        memoryCount: suppliedCount(data, "memoryCount", "memories"),
+        recall: {
+          status: safeString(objectValue(data.recall).status, 64),
+        },
+      };
+    case "memory.directory.policy":
+      return {
+        requesterOwner:
+          data.requesterOwner === true || objectValue(data.requester).owner === true,
+        grantedBankCount: suppliedCount(
+          data,
+          "grantedBankCount",
+          "grantedBankIds",
+        ),
+        participantCount: suppliedCount(
+          data,
+          "participantCount",
+          "participants",
+        ),
+        allowedBankCount:
+          data.allowedBankCount === null || data.allowedBankIds === null
+            ? null
+            : suppliedCount(data, "allowedBankCount", "allowedBankIds"),
+      };
+    case "memory.directory.result":
+      return {
+        status: safeString(data.status, 64),
+        referenceCount: suppliedCount(data, "referenceCount", "references"),
+      };
+    case "memory.capabilities.issued":
+      return {
+        sourceCount: suppliedCount(data, "sourceCount", "sources"),
+        stopReason: safeString(data.stopReason, 128),
+      };
+    case "memory.http.request":
+    case "memory.http.response":
+    case "memory.http.error":
+      return memoryHttpMetadata(type, data);
+    case "session.opened":
+      return {
+        sessionId: safeString(data.sessionId, 128),
+        requestedSessionId: safeString(data.requestedSessionId, 128),
+        parentEntryId: safeString(data.parentEntryId, 128),
+        requestedParentEntryId: safeString(data.requestedParentEntryId, 128),
+      };
+    case "model.input":
+      return {
+        model: modelMetadata(data.model),
+        tools: (Array.isArray(data.tools) ? data.tools : [])
+          .map((tool) => safeString(tool, 128))
+          .filter(Boolean)
+          .slice(0, 64),
+        promptChars: suppliedChars(data, "promptChars", "prompt"),
+        sessionMessageCount: suppliedCount(
+          data,
+          "sessionMessageCount",
+          "sessionMessagesBeforePrompt",
+        ),
+      };
+    case "model.turn.started":
+      return { turn: safeInteger(data.turn) };
+    case "model.turn.completed":
+      return {
+        turn: safeInteger(data.turn),
+        durationMs: safeInteger(data.durationMs),
+        assistantTextChars:
+          safeInteger(data.assistantTextChars) ??
+          messageTextLength(data.message),
+        toolResultCount: suppliedCount(
+          data,
+          "toolResultCount",
+          "toolResults",
+        ),
+      };
+    case "tool.started":
+      return {
+        turn: safeInteger(data.turn),
+        toolCallId: safeString(data.toolCallId, 256),
+        toolName: safeString(data.toolName, 128),
+      };
+    case "tool.completed": {
+      const details = resultDetails(data);
+      return {
+        turn: safeInteger(data.turn),
+        toolCallId: safeString(data.toolCallId, 256),
+        toolName: safeString(data.toolName, 128),
+        isError: data.isError === true,
+        unavailable: data.unavailable === true || details.unavailable === true,
+        durationMs: safeInteger(data.durationMs),
+        sourceHandle: safeSourceHandle(
+          data.sourceHandle ?? details.sourceHandle ?? objectValue(data.args).reference,
+        ),
+      };
+    }
+    case "memory.access.warning":
+      return {
+        unavailableBankCount:
+          safeInteger(data.unavailableBankCount) ??
+          (Array.isArray(data.unavailableBankIds)
+            ? data.unavailableBankIds.length
+            : 0),
+      };
+    case "memory.access.denied":
+      return {
+        historicalSourceCount: safeInteger(data.historicalSourceCount) ?? 0,
+        unavailableSourceCount: safeInteger(data.unavailableSourceCount) ?? 0,
+        reason: safeString(data.reason, 128),
+      };
+    case "run.completed":
+      return {
+        sessionId: safeString(data.sessionId, 128),
+        entryId: safeString(data.entryId, 128),
+        answerChars: suppliedChars(data, "answerChars", "answer"),
+      };
+    case "run.failed":
+      return {
+        code: safeString(data.code, 128) ?? "FAILED",
+        sessionId: safeString(data.sessionId, 128),
+      };
+    case "audit.scrubbed":
+      return { reason: safeString(data.reason, 128) ?? "legacy_unreadable" };
+    default:
+      return { omitted: true };
+  }
+}
+
+function messageTextLength(message) {
+  const content = objectValue(message).content;
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  return content.reduce(
+    (total, part) =>
+      total +
+      (part?.type === "text" && typeof part.text === "string"
+        ? part.text.length
+        : 0),
+    0,
+  );
+}
 
 function isPrivateKey(key) {
   const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
@@ -147,13 +382,14 @@ class RunAuditRecorder {
   }
 
   record(type, data = {}) {
+    const safeType = bounded(type, 128);
     const event = {
-      version: 1,
+      version: CURRENT_AUDIT_VERSION,
       sequence: (this.sequence += 1),
       timestamp: new Date().toISOString(),
       runId: this.runId,
-      type: bounded(type, 128),
-      data: sanitizeAuditValue(data),
+      type: safeType,
+      data: sanitizeAuditValue(minimizeAuditData(safeType, data)),
     };
     const line = encodeEvent(event);
     this.tail = this.tail.then(() =>
@@ -181,7 +417,7 @@ function parseAudit(content, expectedRunId) {
     }
     if (
       !event ||
-      event.version !== 1 ||
+      (event.version !== 1 && event.version !== CURRENT_AUDIT_VERSION) ||
       event.runId !== expectedRunId ||
       !Number.isInteger(event.sequence) ||
       typeof event.timestamp !== "string" ||
@@ -189,7 +425,11 @@ function parseAudit(content, expectedRunId) {
     ) {
       throw new Error("Malformed run audit");
     }
-    events.push({ ...event, data: sanitizeAuditValue(event.data) });
+    events.push({
+      ...event,
+      version: CURRENT_AUDIT_VERSION,
+      data: sanitizeAuditValue(minimizeAuditData(event.type, event.data)),
+    });
   }
   events.sort((left, right) => left.sequence - right.sequence);
   return events;
@@ -225,51 +465,6 @@ function resultDetails(data) {
   return objectValue(objectValue(data.result).details);
 }
 
-function registerCapability(capabilities, value) {
-  const capability = objectValue(value);
-  const handle = stringValue(capability.handle, 32);
-  if (!handle) return;
-  capabilities.set(handle, {
-    handle,
-    displayName: stringValue(capability.displayName, 512),
-    bankId: stringValue(capability.bankId, 512),
-  });
-}
-
-function sourceCapabilities(events) {
-  const capabilities = new Map();
-  for (const event of events) {
-    const data = objectValue(event.data);
-    if (event.type === "memory.capabilities.issued") {
-      for (const source of Array.isArray(data.sources) ? data.sources : []) {
-        registerCapability(capabilities, source);
-      }
-    }
-    if (
-      event.type === "tool.completed" &&
-      data.toolName === "memory_find_sources"
-    ) {
-      const references = resultDetails(data).references;
-      for (const source of Array.isArray(references) ? references : []) {
-        registerCapability(capabilities, source);
-      }
-    }
-  }
-  return capabilities;
-}
-
-function sourceForTool(name, args, details, capabilities) {
-  if (name !== "memory_query_source") return null;
-  const handle = stringValue(details.sourceHandle ?? args.reference, 32);
-  const capability = handle ? capabilities.get(handle) : null;
-  return {
-    handle,
-    displayName:
-      stringValue(details.displayName, 512) ?? capability?.displayName ?? null,
-    bankId: stringValue(details.bankId, 512) ?? capability?.bankId ?? null,
-  };
-}
-
 function summarizeTools(events) {
   const calls = new Map();
   for (const event of events) {
@@ -285,7 +480,6 @@ function summarizeTools(events) {
     calls.set(key, call);
   }
 
-  const capabilities = sourceCapabilities(events);
   return [...calls.values()]
     .map((call) => {
       const startedData = objectValue(call.started?.data);
@@ -294,13 +488,9 @@ function summarizeTools(events) {
         stringValue(startedData.toolName, 128) ??
         stringValue(completedData.toolName, 128) ??
         "unknown";
-      const args = {
-        ...objectValue(startedData.args),
-        ...objectValue(completedData.args),
-      };
-      const details = resultDetails(completedData);
       const failed =
-        completedData.isError === true || details.unavailable === true;
+        completedData.isError === true || completedData.unavailable === true;
+      const sourceHandle = safeSourceHandle(completedData.sourceHandle);
       return {
         callId: call.callId,
         name,
@@ -310,8 +500,11 @@ function summarizeTools(events) {
             : "completed"
           : "in_progress",
         durationMs: durationValue(completedData.durationMs),
-        query: stringValue(args.query ?? args.question, 2_000),
-        source: sourceForTool(name, args, details, capabilities),
+        query: null,
+        source:
+          name === "memory_query_source"
+            ? { handle: sourceHandle, displayName: null, bankId: null }
+            : null,
         eventSequence: call.started?.sequence ?? call.completed?.sequence ?? null,
       };
     })
@@ -339,7 +532,9 @@ function initialRecallStatus(context, events) {
     if (event.type === "memory.http.request" && !exchanges.has(key)) {
       exchanges.set(key, "in_progress");
     } else if (event.type === "memory.http.response") {
-      const response = objectValue(data.response);
+      const response = Object.keys(objectValue(data.response)).length > 0
+        ? objectValue(data.response)
+        : data;
       exchanges.set(
         key,
         response.usable === true
@@ -400,14 +595,6 @@ function summarize(events) {
   const capabilityEvent = events.find(
     (event) => event.type === "memory.capabilities.issued",
   ) ?? null;
-  const directoryRequestEvent = events.find((event) => {
-    const data = objectValue(event.data);
-    return (
-      event.type === "memory.http.request" &&
-      data.operation === "directory.recall" &&
-      !data.toolCallId
-    );
-  }) ?? null;
   const terminalEvent = [...events].reverse().find(
     (event) => event.type === "run.completed" || event.type === "run.failed",
   ) ?? null;
@@ -417,39 +604,26 @@ function summarize(events) {
   const opened = objectValue(openedEvent?.data);
   const completed = objectValue(completedEvent?.data);
   const failed = objectValue(failedEvent?.data);
-  const requestMemory = objectValue(request.memory);
   const context = objectValue(contextEvent?.data);
   const directory = objectValue(directoryEvent?.data);
   const capabilityData = objectValue(capabilityEvent?.data);
   const model = objectValue(objectValue(modelEvent?.data).model);
   const startedAt = stringValue(events[0]?.timestamp, 64);
   const finishedAt = stringValue(terminalEvent?.timestamp, 64);
-  const primaryBankId = stringValue(
-    requestMemory.primaryBankId ?? requestMemory.scopeId ?? context.primaryBankId,
-    512,
-  );
+  const memoryEnabled = request.memoryEnabled === true || context.memoryEnabled === true;
   const tools = summarizeTools(events);
   const directoryStatus = ["available", "unavailable", "disabled"].includes(
     directory.status,
   )
     ? directory.status
     : "unknown";
-  const directoryRequest = objectValue(
-    objectValue(directoryRequestEvent?.data).request,
-  );
-  const directoryBody = objectValue(directoryRequest.body);
-  const initialSources = Array.isArray(capabilityData.sources)
-    ? capabilityData.sources
-    : [];
   const warnings = events
     .filter((event) => event.type === "memory.access.warning")
     .map((event) => {
       const data = objectValue(event.data);
       return {
         kind: "memory_access",
-        unavailableBankCount: Array.isArray(data.unavailableBankIds)
-          ? data.unavailableBankIds.length
-          : 0,
+        unavailableBankCount: safeInteger(data.unavailableBankCount) ?? 0,
         eventSequence: event.sequence,
       };
     });
@@ -471,7 +645,7 @@ function summarize(events) {
     startedAt,
     finishedAt,
     durationMs: elapsedMs(startedAt, finishedAt),
-    prompt: stringValue(request.prompt, 300) ?? "",
+    prompt: "",
     eventCount: events.length,
     session: {
       kind:
@@ -492,26 +666,26 @@ function summarize(events) {
         }
       : null,
     memory: {
-      primaryBankId,
-      route: memoryRoute(primaryBankId, tools),
+      enabled: memoryEnabled,
+      primaryBankId: null,
+      route: memoryRoute(memoryEnabled ? "enabled" : null, tools),
       initialRecall: contextEvent
         ? {
             status: initialRecallStatus(context, events),
-            queries: (Array.isArray(context.queries) ? context.queries : [])
-              .map((query) => stringValue(query, 2_000))
-              .filter(Boolean)
-              .slice(0, 32),
-            memoryCount: Array.isArray(context.memories)
-              ? context.memories.length
-              : 0,
+            queries: [],
+            queryCount: safeInteger(context.queryCount) ?? 0,
+            memoryCount: safeInteger(context.memoryCount) ?? 0,
             eventSequence: contextEvent.sequence,
           }
         : null,
       directory: directoryEvent
         ? {
             status: directoryStatus,
-            query: stringValue(directoryBody.query, 2_000),
-            sourceCount: initialSources.length,
+            query: null,
+            sourceCount:
+              safeInteger(capabilityData.sourceCount) ??
+              safeInteger(directory.referenceCount) ??
+              0,
             eventSequence: directoryEvent.sequence,
           }
         : null,
@@ -521,10 +695,7 @@ function summarize(events) {
     failure: failedEvent
       ? {
           code: stringValue(failed.code, 128) ?? "FAILED",
-          message:
-            stringValue(failed.message, 1_000) ??
-            stringValue(objectValue(failed.error).message, 1_000) ??
-            "Run failed",
+          message: "Run failed",
           eventSequence: failedEvent.sequence,
         }
       : null,
@@ -540,9 +711,37 @@ function listSummary(runId, summary) {
     startedAt: summary.startedAt,
     finishedAt: summary.finishedAt,
     prompt: summary.prompt,
-    memoryScopeId: summary.memory.primaryBankId,
+    memoryEnabled: summary.memory.enabled,
+    memoryScopeId: null,
     eventCount: summary.eventCount,
   };
+}
+
+function unreadableAuditEvent(runId) {
+  return {
+    version: CURRENT_AUDIT_VERSION,
+    sequence: 1,
+    timestamp: new Date().toISOString(),
+    runId,
+    type: "audit.scrubbed",
+    data: { reason: "legacy_unreadable" },
+  };
+}
+
+async function replaceFile(path, content) {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporary, "wx", 0o600);
+    await handle.writeFile(content, "utf8");
+    await handle.close();
+    handle = null;
+    await rename(temporary, path);
+    await chmod(path, 0o600);
+  } finally {
+    await handle?.close();
+    await unlink(temporary).catch(() => {});
+  }
 }
 
 export class RunAuditStore {
@@ -557,9 +756,54 @@ export class RunAuditStore {
   async start(runId) {
     if (!RUN_ID_RE.test(runId ?? "")) throw new Error("Invalid run id");
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await chmod(this.directory, 0o700);
     const handle = await open(this.#path(runId), "wx", 0o600);
     await handle.close();
     return new RunAuditRecorder(this.#path(runId), runId);
+  }
+
+  async scrub() {
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await chmod(this.directory, 0o700);
+    const names = await readdir(this.directory);
+    let scanned = 0;
+    let rewritten = 0;
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const runId = name.slice(0, -6);
+      if (!RUN_ID_RE.test(runId)) continue;
+      scanned += 1;
+      const path = this.#path(runId);
+      const handle = await open(path, "r");
+      let raw;
+      let mode;
+      let tooLarge;
+      try {
+        const info = await handle.stat();
+        mode = info.mode & 0o777;
+        tooLarge = !info.isFile() || info.size > MAX_FILE_BYTES;
+        raw = tooLarge ? "" : await handle.readFile("utf8");
+      } finally {
+        await handle.close();
+      }
+      let events;
+      try {
+        events = tooLarge
+          ? [unreadableAuditEvent(runId)]
+          : parseAudit(raw, runId);
+      } catch {
+        events = [unreadableAuditEvent(runId)];
+      }
+      const safe = events.map((event) => encodeEvent(event)).join("");
+      if (tooLarge || raw !== safe) {
+        await replaceFile(path, safe);
+        rewritten += 1;
+      } else if (mode !== 0o600) {
+        await chmod(path, 0o600);
+        rewritten += 1;
+      }
+    }
+    return { scanned, rewritten };
   }
 
   async get(runId) {
@@ -588,7 +832,7 @@ export class RunAuditStore {
       names = [];
     }
     const summaries = [];
-    for (const name of names.slice(0, 20_000)) {
+    for (const name of names) {
       if (!name.endsWith(".jsonl")) continue;
       const runId = name.slice(0, -6);
       if (!RUN_ID_RE.test(runId)) continue;

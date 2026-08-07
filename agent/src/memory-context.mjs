@@ -45,7 +45,7 @@ function errorDetails(error) {
   };
 }
 
-export function buildMemoryQueries({ prompt, context, memory }) {
+export function buildMemoryQueries({ prompt, context, memory, identity }) {
   const explicit = memory?.query?.trim();
   const sections = [explicit || `Current request: ${prompt.trim()}`];
   if (!explicit) {
@@ -58,7 +58,7 @@ export function buildMemoryQueries({ prompt, context, memory }) {
     }
   }
   const unanchored = bounded(sections.join("\n"), MAX_QUERY_CHARS);
-  const anchors = memory?.anchors ?? [];
+  const anchors = identity?.anchors ?? [];
   if (anchors.length === 0) return [unanchored];
   const labels = anchors.map(({ id, label }) =>
     label ? `${oneLine(label, 256)} (${oneLine(id, 256)})` : oneLine(id, 256),
@@ -117,6 +117,7 @@ function parseMemories(payload) {
 
 export async function recallMemories({
   baseUrl,
+  token,
   scopeId,
   query,
   timeoutMs,
@@ -152,7 +153,10 @@ export async function recallMemories({
   try {
     response = await fetchImpl(url, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -224,6 +228,7 @@ export async function recallMemories({
 
 export async function recallDirectory({
   baseUrl,
+  token,
   query,
   memory,
   timeoutMs,
@@ -234,7 +239,7 @@ export async function recallDirectory({
 }) {
   const bank = encodeURIComponent(KNOWLEDGE_DIRECTORY_BANK_ID);
   const url = `${baseUrl.replace(/\/$/, "")}/v1/default/banks/${bank}/memories/recall`;
-  const allowedBankIds = memory.requester.owner
+  const allowedBankIds = memory.requesterIsOwner
     ? null
     : [
         ...new Set([
@@ -279,7 +284,10 @@ export async function recallDirectory({
   try {
     response = await fetchImpl(url, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -445,8 +453,10 @@ function renderDirectoryContext(capabilities, participants) {
 
 export async function retrieveMemoryContext({
   baseUrl,
+  token,
   prompt,
   context,
+  identity,
   memory,
   timeoutMs = 30_000,
   fetchImpl = fetch,
@@ -468,12 +478,16 @@ export async function retrieveMemoryContext({
       access: null,
     };
   }
-  const queries = buildMemoryQueries({ prompt, context, memory });
+  if (typeof token !== "string" || Buffer.byteLength(token) < 24) {
+    throw new Error("Memory API credential is unavailable");
+  }
+  const queries = buildMemoryQueries({ prompt, context, memory, identity });
   const [settled, directorySettled] = await Promise.all([
     Promise.allSettled(
       queries.map((query, index) =>
         recallMemories({
           baseUrl,
+          token,
           scopeId: memory.primaryBankId,
           query,
           timeoutMs,
@@ -486,6 +500,7 @@ export async function retrieveMemoryContext({
     Promise.allSettled([
       recallDirectory({
         baseUrl,
+        token,
         query: queries[0],
         memory,
         timeoutMs,
@@ -520,7 +535,7 @@ export async function retrieveMemoryContext({
       directory: {
         status: "unavailable",
         references: [],
-        allowedBankIds: memory.requester.owner
+        allowedBankIds: memory.requesterIsOwner
           ? null
           : [memory.primaryBankId, ...memory.grantedBankIds],
       },
@@ -537,7 +552,7 @@ export async function retrieveMemoryContext({
       ? directorySettled.value
       : {
           references: [],
-          allowedBankIds: memory.requester.owner
+          allowedBankIds: memory.requesterIsOwner
             ? null
             : [memory.primaryBankId, ...memory.grantedBankIds],
         };
@@ -570,7 +585,7 @@ export async function retrieveMemoryContext({
       })),
       sourceCapabilities: capabilities,
       directoryPolicy: {
-        owner: memory.requester.owner,
+        owner: memory.requesterIsOwner,
         allowedBankIds: directory.allowedBankIds,
       },
       participants: memory.participants,

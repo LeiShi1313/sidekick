@@ -13,10 +13,14 @@ from sidekick.memory_directory import DirectoryPublication, DirectorySource
 
 
 HINDSIGHT_URL = os.environ.get("SIDEKICK_HINDSIGHT_URL", "").rstrip("/")
+HINDSIGHT_TOKEN = (
+    os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip()
+    or os.environ.get("MEMORY_API_TOKEN", "").strip()
+)
 
 pytestmark = pytest.mark.skipif(
-    not HINDSIGHT_URL,
-    reason="SIDEKICK_HINDSIGHT_URL is required for the real Hindsight contract",
+    not HINDSIGHT_URL or not HINDSIGHT_TOKEN,
+    reason="Hindsight URL and memory token are required for the real contract",
 )
 
 
@@ -31,6 +35,7 @@ async def _request(
         method,
         f"{HINDSIGHT_URL}{path}",
         json=json,
+        headers={"Authorization": f"Bearer {HINDSIGHT_TOKEN}"},
     ) as response:
         payload = await response.json()
         assert response.status < 300, payload
@@ -39,7 +44,10 @@ async def _request(
 
 
 async def _delete_bank(session: aiohttp.ClientSession, bank_id: str) -> None:
-    async with session.delete(f"{HINDSIGHT_URL}/v1/default/banks/{bank_id}"):
+    async with session.delete(
+        f"{HINDSIGHT_URL}/v1/default/banks/{bank_id}",
+        headers={"Authorization": f"Bearer {HINDSIGHT_TOKEN}"},
+    ):
         pass
 
 
@@ -68,7 +76,9 @@ async def test_hindsight_directory_publication_and_filtered_recall_contract(
         ),
         description=f"Discusses Project Directory-{suffix} release planning.",
     )
-    client = HindsightMemoryClient(HINDSIGHT_URL, timeout=300)
+    client = HindsightMemoryClient(
+        HINDSIGHT_URL, token=HINDSIGHT_TOKEN, timeout=300
+    )
     async with aiohttp.ClientSession() as session:
         try:
             retained = await client.publish_directory(publication)
@@ -116,7 +126,9 @@ async def test_hindsight_accepts_the_production_episode_serializer():
             ),
         ),
     )
-    client = HindsightMemoryClient(HINDSIGHT_URL, timeout=300)
+    client = HindsightMemoryClient(
+        HINDSIGHT_URL, token=HINDSIGHT_TOKEN, timeout=300
+    )
     async with aiohttp.ClientSession() as session:
         try:
             retained = await client.retain(episode)

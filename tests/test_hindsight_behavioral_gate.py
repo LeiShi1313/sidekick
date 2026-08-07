@@ -10,10 +10,14 @@ import pytest
 
 
 HINDSIGHT_URL = os.environ.get("SIDEKICK_HINDSIGHT_URL", "").rstrip("/")
+HINDSIGHT_TOKEN = (
+    os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip()
+    or os.environ.get("MEMORY_API_TOKEN", "").strip()
+)
 
 pytestmark = pytest.mark.skipif(
-    not HINDSIGHT_URL,
-    reason="SIDEKICK_HINDSIGHT_URL is required for the behavioral gate",
+    not HINDSIGHT_URL or not HINDSIGHT_TOKEN,
+    reason="Hindsight URL and memory token are required for the behavioral gate",
 )
 
 
@@ -38,6 +42,7 @@ async def request(
         method,
         f"{HINDSIGHT_URL}{path}",
         json=json,
+        headers={"Authorization": f"Bearer {HINDSIGHT_TOKEN}"},
     ) as response:
         payload = await response.json()
         assert response.status < 300, payload
@@ -328,6 +333,7 @@ async def test_contextual_memory_behavioral_gate_three_paraphrases_per_scenario(
         finally:
             for bank_id in [*banks, other_alias_bank]:
                 async with session.delete(
-                    f"{HINDSIGHT_URL}/v1/default/banks/{bank_id}"
+                    f"{HINDSIGHT_URL}/v1/default/banks/{bank_id}",
+                    headers={"Authorization": f"Bearer {HINDSIGHT_TOKEN}"},
                 ):
                     pass

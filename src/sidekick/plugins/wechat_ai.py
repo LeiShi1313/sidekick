@@ -141,6 +141,7 @@ class WeChatAI(metaclass=PluginMount):
         self._memory = (
             HindsightMemoryClient(
                 self._settings.hindsight_url,
+                token=self._settings.hindsight_token or "",
                 timeout=self._settings.hindsight_timeout,
             )
             if self._settings.hindsight_url
@@ -159,7 +160,6 @@ class WeChatAI(metaclass=PluginMount):
                 memory_available=self._memory is not None,
                 logger=self.logger,
             ),
-            token=self._settings.agent_token,
             settings=self._ops_settings,
             logger=self.logger,
         )
@@ -207,8 +207,7 @@ class WeChatAI(metaclass=PluginMount):
                         connected=True,
                     )
                     self.logger.info(
-                        "WeChat AI connected (self_id=%s, generation=%s)",
-                        bootstrap.session.self_id,
+                        "WeChat AI connected (generation=%s)",
                         bootstrap.session.connection_generation,
                     )
                     result = await WeChatEventPump(
@@ -221,15 +220,13 @@ class WeChatAI(metaclass=PluginMount):
                         break
                     self._adapter_status.update(connected=False)
                     self.logger.warning(
-                        "WeChat event stream ended (%s); reconnecting",
-                        result,
+                        "WeChat event stream ended; reconnecting",
                     )
                 except Exception as exc:
                     self._adapter_status.update(connected=False)
-                    self.logger.exception(
-                        "WeChat adapter cycle failed (%s): %s",
+                    self.logger.error(
+                        "WeChat adapter cycle failed (%s)",
                         type(exc).__name__,
-                        exc,
                     )
                 await _wait_or_stop(stop, self._runtime.reconnect_delay)
         finally:

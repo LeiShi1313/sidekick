@@ -53,10 +53,13 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
     plugin = object.__new__(WeChatAI)
     plugin._settings = AISettings(
         agent_url="http://agent.invalid",
-        agent_token="test-token",
+        agent_token="test-agent-token-that-is-long-enough",
         state_path=tmp_path / "ai.db",
     )
-    plugin._ops_settings = ChannelOpsSettings(instance_id="wechat-test")
+    plugin._ops_settings = ChannelOpsSettings(
+        instance_id="wechat-test",
+        token="channel-ops-token-that-is-long-enough",
+    )
     plugin._client = SimpleNamespace(base_url=CONNECTOR_KEY)
     plugin._wechat_store = WeChatStateRepository(tmp_path / "wechat.db")
     plugin._ai_store = AIStateRepository(tmp_path / "ai.db")

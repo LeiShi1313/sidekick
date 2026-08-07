@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -84,6 +85,12 @@ AgentEventType = Literal[
 MAX_AGENT_MEMORY_ANCHORS = 64
 MAX_AGENT_BANK_GRANTS = 64
 MAX_AGENT_PARTICIPANTS = 16
+_PERSISTED_ERROR_KIND_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{0,127})(?::|$)")
+
+
+def _persisted_error_kind(value: object) -> str:
+    match = _PERSISTED_ERROR_KIND_RE.match(str(value))
+    return match.group(1) if match is not None else "PreviousError"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,12 +114,15 @@ class AgentParticipantAccess:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentRequestIdentity:
+    requester: AgentIdentityAnchor
+    anchors: tuple[AgentIdentityAnchor, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AgentMemoryTarget:
     primary_bank_id: str
-    requester_id: str
-    requester_label: str | None
     requester_is_owner: bool
-    anchors: tuple[AgentIdentityAnchor, ...] = ()
     granted_bank_ids: tuple[str, ...] = ()
     participants: tuple[AgentParticipantAccess, ...] = ()
     query: str | None = None
@@ -143,9 +153,10 @@ class AgentRunRequest:
     context: tuple[AgentContext, ...]
     system_prompt: str
     tool_policy: ToolPolicy
+    identity: AgentRequestIdentity
+    origin: AgentRunOrigin
     memory: AgentMemoryTarget | None = None
     model: str | None = None
-    origin: AgentRunOrigin | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +192,12 @@ class PiAgentGateway:
         timeout: float = 90.0,
     ):
         self._base_url = base_url.rstrip("/")
+        if not self._base_url.startswith(("http://", "https://")):
+            raise ValueError("Pi agent URL must use http or https")
+        if len(token) < 24:
+            raise ValueError("Pi agent token must contain at least 24 characters")
+        if timeout <= 0:
+            raise ValueError("Pi agent timeout must be positive")
         self._headers = {"Authorization": f"Bearer {token}"}
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: aiohttp.ClientSession | None = None
@@ -231,22 +248,27 @@ class PiAgentGateway:
             ],
             "systemPrompt": request.system_prompt,
             "toolPolicy": request.tool_policy,
+            "identity": {
+                "requester": {
+                    "id": request.identity.requester.identity,
+                    "label": request.identity.requester.label,
+                },
+                "anchors": [
+                    {"id": anchor.identity, "label": anchor.label}
+                    for anchor in request.identity.anchors
+                ],
+            },
+            "origin": {
+                "scopeId": request.origin.scope_id,
+                "adapterInstanceId": request.origin.adapter_instance_id,
+            },
         }
         if request.model is not None:
             payload["model"] = request.model
-        if request.origin is not None:
-            payload["origin"] = {
-                "scopeId": request.origin.scope_id,
-                "adapterInstanceId": request.origin.adapter_instance_id,
-            }
         if request.memory is not None:
             payload["memory"] = {
                 "primaryBankId": request.memory.primary_bank_id,
-                "requester": {
-                    "id": request.memory.requester_id,
-                    "label": request.memory.requester_label,
-                    "owner": request.memory.requester_is_owner,
-                },
+                "requesterIsOwner": request.memory.requester_is_owner,
                 "grantedBankIds": list(request.memory.granted_bank_ids),
                 "participants": [
                     {
@@ -256,10 +278,6 @@ class PiAgentGateway:
                         "bankIds": list(participant.bank_ids),
                     }
                     for participant in request.memory.participants
-                ],
-                "anchors": [
-                    {"id": anchor.identity, "label": anchor.label}
-                    for anchor in request.memory.anchors
                 ],
             }
             if request.memory.query:
@@ -616,14 +634,27 @@ class AISettings:
     max_context_chars: int = 12_000
     delegated_cooldown: float = 30.0
     memory_command_delete_delay: float = 3.0
-    hindsight_url: str | None = "http://127.0.0.1:18888"
+    hindsight_url: str | None = None
+    hindsight_token: str | None = None
     hindsight_timeout: float = 90.0
+
+    def __post_init__(self) -> None:
+        if len(self.agent_token) < 24:
+            raise ValueError("Pi agent token must contain at least 24 characters")
+        if self.hindsight_url is not None and (
+            self.hindsight_token is None or len(self.hindsight_token) < 24
+        ):
+            raise ValueError(
+                "Memory API token must contain at least 24 characters when memory is enabled"
+            )
 
     @classmethod
     def from_env(cls) -> AISettings:
         agent_token = os.environ.get("SIDEKICK_PI_TOKEN", "").strip()
-        if not agent_token:
-            raise ValueError("Missing AI configuration: SIDEKICK_PI_TOKEN")
+        if len(agent_token) < 24:
+            raise ValueError(
+                "SIDEKICK_PI_TOKEN must contain at least 24 characters"
+            )
         return cls(
             agent_url=os.environ.get("SIDEKICK_PI_URL", "http://127.0.0.1:8790")
             .strip()
@@ -663,6 +694,9 @@ class AISettings:
                 ).strip()
                 or None
             ),
+            hindsight_token=(
+                os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip() or None
+            ),
             hindsight_timeout=float(os.environ.get("SIDEKICK_HINDSIGHT_TIMEOUT", "90")),
         )
 
@@ -673,10 +707,7 @@ class AIAnswerMarker:
     answer_message_id: ExternalId
     trigger_message_id: ExternalId
     requester_id: str
-    prompt: str
-    answer_text: str
     parent_answer_message_id: ExternalId | None
-    reference_context: str
     agent_session_id: str | None
     agent_entry_id: str | None
 
@@ -911,9 +942,8 @@ class AIResponder:
     def _log_failure(self, exc: Exception) -> None:
         if self._logger is not None:
             self._logger.error(
-                "AI agent request failed (%s): %s",
+                "AI agent request failed (%s)",
                 type(exc).__name__,
-                exc,
             )
 
 
@@ -1388,6 +1418,7 @@ class AIStateRepository:
         await self._ensure_memory_outbox_schema()
         await self._ensure_memory_scope_schema()
         await self._ensure_memory_dream_schema()
+        await self._scrub_persisted_errors()
         await self._connection.commit()
         self.path.chmod(0o600)
         return self
@@ -1489,7 +1520,16 @@ class AIStateRepository:
         if not columns:
             await self._create_ai_answers_table()
             return
-        if "scope_id" in columns:
+        expected_columns = {
+            "scope_id",
+            "answer_message_id",
+            "trigger_message_id",
+            "requester_id",
+            "parent_answer_message_id",
+            "agent_session_id",
+            "agent_entry_id",
+        }
+        if columns == expected_columns:
             external_id_columns = (
                 "answer_message_id",
                 "trigger_message_id",
@@ -1498,19 +1538,16 @@ class AIStateRepository:
             if all(
                 column_types.get(column) == "BLOB" for column in external_id_columns
             ):
-                if "agent_session_id" not in columns:
-                    await connection.execute(
-                        "ALTER TABLE ai_answers ADD COLUMN agent_session_id TEXT"
-                    )
-                if "agent_entry_id" not in columns:
-                    await connection.execute(
-                        "ALTER TABLE ai_answers ADD COLUMN agent_entry_id TEXT"
-                    )
                 await self._create_ai_answers_index()
                 return
 
         session_value = "agent_session_id" if "agent_session_id" in columns else "NULL"
         entry_value = "agent_entry_id" if "agent_entry_id" in columns else "NULL"
+        parent_value = (
+            "parent_answer_message_id"
+            if "parent_answer_message_id" in columns
+            else "NULL"
+        )
         await connection.execute("DROP INDEX IF EXISTS ai_answers_by_trigger")
         await connection.execute("ALTER TABLE ai_answers RENAME TO ai_answers_legacy")
         await self._create_ai_answers_table()
@@ -1526,18 +1563,14 @@ class AIStateRepository:
             f"""
             INSERT INTO ai_answers (
                 scope_id, answer_message_id, trigger_message_id, requester_id,
-                prompt, answer_text, parent_answer_message_id, reference_context,
-                agent_session_id, agent_entry_id
+                parent_answer_message_id, agent_session_id, agent_entry_id
             )
             SELECT
                 {scope_value},
                 answer_message_id,
                 trigger_message_id,
                 {requester_value},
-                prompt,
-                answer_text,
-                parent_answer_message_id,
-                reference_context,
+                {parent_value},
                 {session_value},
                 {entry_value}
             FROM ai_answers_legacy
@@ -1554,10 +1587,7 @@ class AIStateRepository:
                 answer_message_id BLOB NOT NULL,
                 trigger_message_id BLOB NOT NULL,
                 requester_id TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                answer_text TEXT NOT NULL,
                 parent_answer_message_id BLOB,
-                reference_context TEXT NOT NULL,
                 agent_session_id TEXT,
                 agent_entry_id TEXT,
                 PRIMARY KEY (scope_id, answer_message_id)
@@ -1733,6 +1763,31 @@ class AIStateRepository:
             )
             await connection.execute("DROP TABLE ai_memory_pending_documents")
 
+    async def _scrub_persisted_errors(self) -> None:
+        connection = self._require_connection()
+        for table, column in (
+            ("ai_memory_scopes", "continuous_last_error"),
+            ("ai_memory_dream_state", "last_error"),
+            ("ai_memory_outbox", "last_error"),
+        ):
+            rows = await (
+                await connection.execute(
+                    f"SELECT rowid AS error_rowid, {column} FROM {table} "  # nosec B608
+                    f"WHERE {column} IS NOT NULL"  # nosec B608
+                )
+            ).fetchall()
+            updates = []
+            for row in rows:
+                supplied = str(row[column])
+                safe = _persisted_error_kind(supplied)
+                if safe != supplied:
+                    updates.append((safe, row["error_rowid"]))
+            if updates:
+                await connection.executemany(
+                    f"UPDATE {table} SET {column} = ? WHERE rowid = ?",  # nosec B608
+                    updates,
+                )
+
     async def _ensure_memory_scope_schema(self) -> None:
         connection = self._require_connection()
         column_types = await self._table_column_types("ai_memory_scopes")
@@ -1903,16 +1958,12 @@ class AIStateRepository:
             """
             INSERT INTO ai_answers (
                 scope_id, answer_message_id, trigger_message_id, requester_id,
-                prompt, answer_text, parent_answer_message_id, reference_context,
-                agent_session_id, agent_entry_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                parent_answer_message_id, agent_session_id, agent_entry_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(scope_id, answer_message_id) DO UPDATE SET
                 trigger_message_id = excluded.trigger_message_id,
                 requester_id = excluded.requester_id,
-                prompt = excluded.prompt,
-                answer_text = excluded.answer_text,
                 parent_answer_message_id = excluded.parent_answer_message_id,
-                reference_context = excluded.reference_context,
                 agent_session_id = excluded.agent_session_id,
                 agent_entry_id = excluded.agent_entry_id
             """,
@@ -1921,10 +1972,7 @@ class AIStateRepository:
                 marker.answer_message_id,
                 marker.trigger_message_id,
                 marker.requester_id,
-                marker.prompt,
-                marker.answer_text,
                 marker.parent_answer_message_id,
-                marker.reference_context,
                 marker.agent_session_id,
                 marker.agent_entry_id,
             ),
@@ -2925,7 +2973,7 @@ class AIStateRepository:
                 attempt_count,
                 next_attempt_at,
                 attempted_at,
-                error[:1_000],
+                _persisted_error_kind(error),
                 dead_lettered_at,
                 attempted_at,
                 scope_id,
@@ -3228,7 +3276,7 @@ class AIStateRepository:
                 updated_at = ?
             WHERE scope_id = ?
             """,
-            (failed_at, error[:1_000], failed_at, scope_id),
+            (failed_at, _persisted_error_kind(error), failed_at, scope_id),
         )
         await connection.commit()
 
@@ -3400,7 +3448,7 @@ class AIStateRepository:
                 last_attempt_at = excluded.last_attempt_at,
                 last_error = excluded.last_error
             """,
-            (scope_id, failed_at, error[:1_000]),
+            (scope_id, failed_at, _persisted_error_kind(error)),
         )
         await connection.commit()
 
@@ -3572,7 +3620,9 @@ class AIConversationHandler:
         self._identity_codec = identity_codec or prompt_builder.identity_codec
         self._owner_actor_id = self._identity_codec.actor_id(owner_id)
         self._run_store = run_store
-        self._adapter_instance_id = adapter_instance_id
+        self._adapter_instance_id = (
+            adapter_instance_id or f"{self._identity_codec.source}-local"
+        )
         self._active_runs: dict[str, str] = {}
 
     async def handle(self, message: ReplyTarget) -> bool:
@@ -3823,11 +3873,15 @@ class AIConversationHandler:
                     )
                 anchor_observations.extend(human_context)
                 retained_observations.extend(human_reply_path)
-            memory_target = await self._build_agent_memory_target(
+            request_identity = self._build_agent_request_identity(
                 requester_id=message.sender_id,
-                chat_id=message.chat_id,
                 requester_identity=current_identity,
                 current_mentions=current_mentions,
+                observations=anchor_observations,
+            )
+            memory_target = await self._build_agent_memory_target(
+                chat_id=message.chat_id,
+                request_identity=request_identity,
                 observations=anchor_observations,
             )
             request = AgentRunRequest(
@@ -3845,16 +3899,13 @@ class AIConversationHandler:
                 ),
                 system_prompt=self._prompt_builder.system_prompt,
                 tool_policy="owner" if is_owner else "delegated",
+                identity=request_identity,
+                origin=AgentRunOrigin(
+                    scope_id=scope_id,
+                    adapter_instance_id=self._adapter_instance_id,
+                ),
                 memory=memory_target,
                 model=await self._store.get_model_override(scope_id),
-                origin=(
-                    AgentRunOrigin(
-                        scope_id=scope_id,
-                        adapter_instance_id=self._adapter_instance_id,
-                    )
-                    if self._adapter_instance_id is not None
-                    else None
-                ),
             )
             await self._record_ai_run_running(run_id)
             self._active_runs[actor_id] = run_id
@@ -3891,10 +3942,7 @@ class AIConversationHandler:
                         answer_message_id=result.message.id,
                         trigger_message_id=message.id,
                         requester_id=actor_id,
-                        prompt=prompt,
-                        answer_text=result.text,
                         parent_answer_message_id=parent_answer_id,
-                        reference_context=reference_context,
                         agent_session_id=result.session_id,
                         agent_entry_id=result.entry_id,
                     )
@@ -4716,23 +4764,21 @@ class AIConversationHandler:
             human_reply_path,
         )
 
-    async def _build_agent_memory_target(
+    def _build_agent_request_identity(
         self,
         *,
         requester_id: ExternalId,
-        chat_id: ExternalId,
         requester_identity: MessageIdentity,
         current_mentions: tuple[MentionedUser, ...],
         observations: list[HumanObservation],
-    ) -> AgentMemoryTarget | None:
-        if self._memory is None:
-            return None
+    ) -> AgentRequestIdentity:
+        requester_actor_id = (
+            requester_identity.subject_id
+            or self._identity_codec.actor_id(requester_id)
+        )
         anchor_identities: dict[str, str | None] = {
-            self._identity_codec.actor_id(
-                requester_id
-            ): requester_identity.subject_display_name
+            requester_actor_id: requester_identity.subject_display_name
         }
-        participant_authors: dict[str, str | None] = {}
         for observation in observations:
             subject_id = (
                 observation.identity.subject_id
@@ -4741,8 +4787,6 @@ class AIConversationHandler:
             display_name = observation.identity.subject_display_name
             if subject_id not in anchor_identities or display_name:
                 anchor_identities[subject_id] = display_name
-            if subject_id not in participant_authors or display_name:
-                participant_authors[subject_id] = display_name
             for mention in observation.mentioned_users:
                 subject_id = self._identity_codec.actor_id(mention.user_id)
                 if subject_id not in anchor_identities or mention.display_name:
@@ -4760,7 +4804,24 @@ class AIConversationHandler:
                 :MAX_AGENT_MEMORY_ANCHORS
             ]
         )
-        requester_actor_id = self._identity_codec.actor_id(requester_id)
+        return AgentRequestIdentity(
+            requester=AgentIdentityAnchor(
+                identity=requester_actor_id,
+                label=requester_identity.subject_display_name,
+            ),
+            anchors=anchors,
+        )
+
+    async def _build_agent_memory_target(
+        self,
+        *,
+        chat_id: ExternalId,
+        request_identity: AgentRequestIdentity,
+        observations: list[HumanObservation],
+    ) -> AgentMemoryTarget | None:
+        if self._memory is None:
+            return None
+        requester_actor_id = request_identity.requester.identity
         requester_is_owner = requester_actor_id == self._owner_actor_id
         requester_grants = (
             ()
@@ -4768,6 +4829,15 @@ class AIConversationHandler:
             else await self._load_bank_grants(requester_actor_id)
         )
         participant_access: list[AgentParticipantAccess] = []
+        participant_authors: dict[str, str | None] = {}
+        for observation in observations:
+            subject_id = (
+                observation.identity.subject_id
+                or self._identity_codec.actor_id(observation.sender_id)
+            )
+            display_name = observation.identity.subject_display_name
+            if subject_id not in participant_authors or display_name:
+                participant_authors[subject_id] = display_name
         for subject_id, display_name in participant_authors.items():
             if (
                 subject_id in {requester_actor_id, self._owner_actor_id}
@@ -4792,10 +4862,7 @@ class AIConversationHandler:
             )
         return AgentMemoryTarget(
             primary_bank_id=self._identity_codec.scope_id(chat_id),
-            requester_id=requester_actor_id,
-            requester_label=requester_identity.subject_display_name,
             requester_is_owner=requester_is_owner,
-            anchors=anchors,
             granted_bank_ids=requester_grants,
             participants=tuple(participant_access),
         )
@@ -5029,10 +5096,9 @@ class AIConversationHandler:
         except Exception as exc:
             if self._logger is not None:
                 self._logger.warning(
-                    "Command %s deletion failed (%s): %s",
+                    "Command %s deletion failed (%s)",
                     command,
                     type(exc).__name__,
-                    exc,
                 )
 
     async def _schedule_memory_command_delete(
@@ -5060,27 +5126,24 @@ class AIConversationHandler:
     def _log_memory_failure(self, operation: str, exc: Exception) -> None:
         if self._logger is not None:
             self._logger.warning(
-                "Memory %s failed (%s): %s",
+                "Memory %s failed (%s)",
                 operation,
                 type(exc).__name__,
-                exc,
             )
 
     def _log_model_failure(self, exc: Exception) -> None:
         if self._logger is not None:
             self._logger.warning(
-                "AI model catalog failed (%s): %s",
+                "AI model catalog failed (%s)",
                 type(exc).__name__,
-                exc,
             )
 
     def _log_ai_run_state_failure(self, operation: str, exc: Exception) -> None:
         if self._logger is not None:
             self._logger.warning(
-                "AI run state %s failed (%s): %s",
+                "AI run state %s failed (%s)",
                 operation,
                 type(exc).__name__,
-                exc,
             )
 
 
@@ -5090,10 +5153,7 @@ def _marker_from_row(row: aiosqlite.Row) -> AIAnswerMarker:
         answer_message_id=row["answer_message_id"],
         trigger_message_id=row["trigger_message_id"],
         requester_id=str(row["requester_id"]),
-        prompt=row["prompt"],
-        answer_text=row["answer_text"],
         parent_answer_message_id=row["parent_answer_message_id"],
-        reference_context=row["reference_context"],
         agent_session_id=row["agent_session_id"],
         agent_entry_id=row["agent_entry_id"],
     )

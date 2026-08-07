@@ -4,6 +4,8 @@ import test from "node:test";
 
 import { createMemoryTools } from "../src/memory-tools.mjs";
 
+const MEMORY_TOKEN = "memory-api-token-that-is-long-enough";
+
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -15,6 +17,7 @@ function fixture(handler, observe, accessOverrides = {}) {
   const calls = [];
   const tools = createMemoryTools({
     baseUrl: "http://memory.internal:8888",
+    token: MEMORY_TOKEN,
     access: {
       primaryBankId: "telegram:chat:-1001",
       references: [
@@ -66,6 +69,7 @@ test("reflect uses fixed bank and budget and can run only once", async () => {
     question: "Who is Rocket and what changed?",
   });
   assert.match(app.calls[0].url, /banks\/telegram%3Achat%3A-1001\/reflect$/);
+  assert.equal(app.calls[0].options.headers.authorization, `Bearer ${MEMORY_TOKEN}`);
   assert.match(result.content[0].text, /memory-2/);
   await assert.rejects(
     reflect.execute("call-2", { question: "Try again" }),

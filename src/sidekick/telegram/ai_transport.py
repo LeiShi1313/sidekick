@@ -409,7 +409,7 @@ class TelegramChatTransport:
         state.error = exc
         self._notify_state_changed(state)
         if self._logger is not None:
-            self._logger.exception(
+            self._logger.error(
                 "Telegram %s failed (%s)",
                 operation,
                 type(exc).__name__,

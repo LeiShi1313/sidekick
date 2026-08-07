@@ -1139,7 +1139,7 @@ function inspectAuditEvent(sequence) {
 
 function traceStep({ label, detail, status, eventSequence }) {
   const item = button(null, `trace-step ${status}`, () => inspectAuditEvent(eventSequence));
-  item.setAttribute("aria-label", `Inspect raw event #${eventSequence}: ${label}`);
+  item.setAttribute("aria-label", `Inspect event metadata #${eventSequence}: ${label}`);
   const header = node("span", null, "trace-step-header");
   header.append(node("span", label, "trace-step-label"));
   header.append(node("span", status.replaceAll("_", " "), "trace-step-status"));
@@ -1187,7 +1187,7 @@ function renderAuditDiagnosis(summary, audit) {
   if (!summary) {
     const loading = state.auditError ? "Run diagnosis unavailable." : "Loading run diagnosis...";
     elements.auditSummary.replaceChildren(
-      node("p", `${audit.status} · ${audit.eventCount} events · ${audit.memoryScopeId || "memory off"}`, "trace-loading"),
+      node("p", `${audit.status} · ${audit.eventCount} events · ${audit.memoryEnabled ? "memory enabled" : "memory off"}`, "trace-loading"),
       node("p", loading, "trace-loading-detail"),
     );
     return;
@@ -1224,7 +1224,12 @@ function renderAuditDiagnosis(summary, audit) {
   const facts = node("dl", null, "trace-facts");
   facts.append(traceFact("Session", sessionText));
   facts.append(traceFact("Model", modelText));
-  facts.append(traceFact("Primary memory", summary.memory.primaryBankId || "Off"));
+  facts.append(traceFact(
+    "Primary memory",
+    summary.memory.enabled
+      ? summary.memory.primaryBankId || "Enabled · identifier omitted"
+      : "Off",
+  ));
   facts.append(traceFact("Memory path", routeText, `trace-route ${summary.memory.route}`));
   diagnosis.append(facts);
 
@@ -1236,7 +1241,7 @@ function renderAuditDiagnosis(summary, audit) {
       : "";
     steps.push({
       label: "Automatic primary recall",
-      detail: `${initial.memoryCount} memories from ${initial.queries.length} queries${queryDetail}`,
+      detail: `${initial.memoryCount} memories from ${initial.queryCount} queries${queryDetail}`,
       status: initial.status,
       eventSequence: initial.eventSequence,
     });
@@ -1288,7 +1293,7 @@ function renderAuditDiagnosis(summary, audit) {
     warningSection.append(node("h3", "Warnings"));
     for (const notice of notices) {
       const warning = button(notice.label, "trace-warning", () => inspectAuditEvent(notice.eventSequence));
-      warning.setAttribute("aria-label", `Inspect raw event #${notice.eventSequence}: ${notice.label}`);
+      warning.setAttribute("aria-label", `Inspect event metadata #${notice.eventSequence}: ${notice.label}`);
       warningSection.append(warning);
     }
     diagnosis.append(warningSection);
@@ -1345,38 +1350,36 @@ async function selectAudit(runId) {
 function auditDescription(event) {
   const data = event.data || {};
   if (event.type === "memory.http.request") {
-    const request = data.request || {};
-    return `${data.operation || "memory"}${data.variant ? ` · ${data.variant}` : ""}\n${request.method || "GET"} ${request.url || ""}`;
+    return `${data.operation || "memory"}${data.variant ? ` · ${data.variant}` : ""}\n${data.method || "GET"} · payload omitted`;
   }
   if (event.type === "memory.http.response") {
-    const response = data.response || {};
-    const outcome = response.usable === false
-      ? ` · unusable (${(response.failureReason || "invalid response").replaceAll("_", " ")})`
+    const outcome = data.usable === false
+      ? ` · unusable (${(data.failureReason || "invalid response").replaceAll("_", " ")})`
       : "";
-    return `${data.operation || "memory"} · HTTP ${response.status ?? "?"}${outcome} · ${response.durationMs ?? "?"} ms · ${response.bodyBytes ?? "?"} bytes`;
+    return `${data.operation || "memory"} · HTTP ${data.status ?? "?"}${outcome} · ${data.durationMs ?? "?"} ms · ${data.bodyBytes ?? "?"} bytes`;
   }
-  if (event.type === "memory.http.error") return `${data.operation || "memory"} · ${data.error?.message || "request failed"}`;
+  if (event.type === "memory.http.error") return `${data.operation || "memory"} · ${data.errorName || "request failed"}`;
   if (event.type === "memory.directory.policy") {
-    return `${data.requester?.owner ? "Owner" : "Delegated"} directory policy · ${(data.allowedBankIds || []).length || "unrestricted"} allowed banks · ${(data.participants || []).length} participants`;
+    return `${data.requesterOwner ? "Owner" : "Delegated"} directory policy · ${data.allowedBankCount ?? "unrestricted"} allowed banks · ${data.participantCount ?? 0} participants`;
   }
   if (event.type === "memory.directory.result") {
-    return `${data.status || "unknown"} · ${(data.references || []).length} validated directory references`;
+    return `${data.status || "unknown"} · ${data.referenceCount ?? 0} validated directory references`;
   }
   if (event.type === "memory.capabilities.issued") {
-    return `${(data.sources || []).length} opaque source handles issued · ${data.stopReason || "complete"}`;
+    return `${data.sourceCount ?? 0} opaque source handles issued · ${data.stopReason || "complete"}`;
   }
   if (event.type === "memory.access.warning") {
-    return `Access warning · ${data.unavailableBankIds?.length || 0} prior source banks are no longer available to this requester. Earlier branch evidence remains in the shared session; the non-disclosure safeguard is advisory in this version.`;
+    return `Access warning · ${data.unavailableBankCount ?? 0} prior source banks are no longer available to this requester.`;
   }
-  if (event.type === "tool.started") return `${data.toolName || "tool"} started\n${short(pretty(data.args), 300)}`;
+  if (event.type === "tool.started") return `${data.toolName || "tool"} started · arguments omitted`;
   if (event.type === "tool.completed") return `${data.toolName || "tool"} ${data.isError ? "failed" : "completed"} · ${data.durationMs ?? "?"} ms`;
-  if (event.type === "model.input") return `${data.model?.id || "model"} · ${(data.tools || []).length} tools\n${short(currentRequest(data.prompt), 300)}`;
+  if (event.type === "model.input") return `${data.model?.id || "model"} · ${(data.tools || []).length} tools · ${data.promptChars ?? 0} prompt chars`;
   if (event.type === "model.turn.started") return `Model turn ${data.turn ?? "?"} started`;
   if (event.type === "model.turn.completed") return `Model turn ${data.turn ?? "?"} completed · ${data.durationMs ?? "?"} ms`;
-  if (event.type === "memory.context") return `${(data.memories || []).length} memories merged from ${(data.queries || []).length} recall queries`;
-  if (event.type === "run.request") return short(data.prompt, 300);
-  if (event.type === "run.completed") return short(data.answer, 300);
-  if (event.type === "run.failed") return `${data.code || "FAILED"} · ${data.message || data.error?.message || "Run failed"}`;
+  if (event.type === "memory.context") return `${data.memoryCount ?? 0} memories merged from ${data.queryCount ?? 0} recall queries`;
+  if (event.type === "run.request") return `${data.promptChars ?? 0} prompt chars · content omitted`;
+  if (event.type === "run.completed") return `${data.answerChars ?? 0} answer chars · content omitted`;
+  if (event.type === "run.failed") return `${data.code || "FAILED"} · Run failed`;
   if (event.type === "session.opened") return `${data.sessionId || "session"} from ${data.parentEntryId || "root"}`;
   return short(pretty(data), 300);
 }
@@ -1397,7 +1400,7 @@ function renderAuditEvents() {
     return;
   }
   const heading = node("div", null, "raw-events-header");
-  heading.append(node("h3", "Raw events"), node("span", `${events.length} recorded`, "panel-count"));
+  heading.append(node("h3", "Minimized events"), node("span", `${events.length} recorded`, "panel-count"));
   elements.auditEvents.replaceChildren(heading, ...events.map((event) => {
     const category = event.type.split(".")[0];
     const warning = event.type === "memory.access.warning" ? " warning" : "";

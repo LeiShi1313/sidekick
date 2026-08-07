@@ -12,7 +12,10 @@ from sidekick.ai import (
     AIResponder,
     AISettings,
     AgentEvent,
+    AgentIdentityAnchor,
     AgentModelCatalog,
+    AgentRequestIdentity,
+    AgentRunOrigin,
     AgentRunRequest,
     PromptBuilder,
 )
@@ -251,6 +254,11 @@ def make_request(prompt: str) -> AgentRunRequest:
         context=(),
         system_prompt=PromptBuilder().system_prompt,
         tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Alice"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Alice"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
     )
 
 
@@ -369,11 +377,12 @@ def test_parse_memory_backfill_has_bounded_exact_syntax(text, expected):
 def test_ai_settings_are_loaded_without_provider_specific_assumptions(monkeypatch):
     values = {
         "SIDEKICK_PI_URL": "http://agent.test:8790/",
-        "SIDEKICK_PI_TOKEN": "test-agent-token",
+        "SIDEKICK_PI_TOKEN": "test-agent-token-that-is-long-enough",
         "SIDEKICK_AI_MAX_OUTPUT_CHARS": "1234",
         "SIDEKICK_AI_EDIT_CADENCE": "0.25",
         "SIDEKICK_MEMORY_COMMAND_DELETE_DELAY": "2.5",
         "SIDEKICK_PI_RUN_TIMEOUT": "12",
+        "SIDEKICK_HINDSIGHT_TOKEN": "memory-api-token-that-is-long-enough",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -381,12 +390,22 @@ def test_ai_settings_are_loaded_without_provider_specific_assumptions(monkeypatc
     settings = AISettings.from_env()
 
     assert settings.agent_url == "http://agent.test:8790"
-    assert settings.agent_token == "test-agent-token"
+    assert settings.agent_token == "test-agent-token-that-is-long-enough"
     assert settings.max_output_chars == 1234
     assert settings.edit_cadence == 0.25
     assert settings.memory_command_delete_delay == 2.5
     assert settings.request_timeout == 12
     assert settings.hindsight_timeout == 90
+    assert settings.hindsight_token == "memory-api-token-that-is-long-enough"
+
+
+def test_ai_settings_fail_closed_when_memory_has_no_credential() -> None:
+    with pytest.raises(ValueError, match="Memory API token"):
+        AISettings(
+            agent_url="http://agent.test:8790",
+            agent_token="test-agent-token-that-is-long-enough",
+            hindsight_url="http://memory.test:8888",
+        )
 
 
 def test_ai_command_is_registered_under_telegram():
@@ -1281,7 +1300,7 @@ async def test_provider_failure_replaces_loading_message():
 async def test_provider_failure_uses_standard_logging_format(caplog):
     import logging
 
-    gateway = FakeGateway(error=RuntimeError("provider detail"))
+    gateway = FakeGateway(error=RuntimeError("provider secret detail"))
     responder = make_telegram_responder(
         gateway,
         logger=logging.getLogger("sidekick-ai-test"),
@@ -1291,6 +1310,7 @@ async def test_provider_failure_uses_standard_logging_format(caplog):
     await responder.answer(trigger, make_request("hello"))
 
     assert "AI agent request failed (RuntimeError)" in caplog.text
+    assert "provider secret detail" not in caplog.text
 
 
 @pytest.mark.asyncio

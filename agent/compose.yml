@@ -19,8 +19,20 @@ services:
       PI_HOST: "0.0.0.0"
       PI_PORT: "8790"
       PI_DATA_DIR: /agent-data/.pi-agent
-      PI_AGENT_TOKEN: ${PI_AGENT_TOKEN}
-      MEMORY_API_URL: http://memory-api:8888
+      PI_IDENTITY_ALIAS_KEY: ${PI_IDENTITY_ALIAS_KEY}
+      PI_AGENT_TELEGRAM_TOKEN: ${PI_AGENT_TELEGRAM_TOKEN}
+      PI_AGENT_ONEBOT_TOKEN: ${PI_AGENT_ONEBOT_TOKEN}
+      PI_AGENT_WECHAT_HOST_TOKEN: ${PI_AGENT_WECHAT_HOST_TOKEN}
+      PI_AGENT_WECHAT_PEER_TOKEN: ${PI_AGENT_WECHAT_PEER_TOKEN}
+      PI_AGENT_PLAYGROUND_TOKEN: ${PI_AGENT_PLAYGROUND_TOKEN}
+      PI_AGENT_TELEGRAM_INSTANCE_ID: ${PI_AGENT_TELEGRAM_INSTANCE_ID:-telegram-default}
+      PI_AGENT_ONEBOT_INSTANCE_ID: ${PI_AGENT_ONEBOT_INSTANCE_ID:-qq-default}
+      PI_AGENT_WECHAT_HOST_INSTANCE_ID: ${PI_AGENT_WECHAT_HOST_INSTANCE_ID:-wechat-host}
+      PI_AGENT_WECHAT_PEER_INSTANCE_ID: ${PI_AGENT_WECHAT_PEER_INSTANCE_ID:-wechat-peer}
+      PI_AGENT_WECHAT_HOST_SCOPE_PREFIX: ${PI_AGENT_WECHAT_HOST_SCOPE_PREFIX}
+      PI_AGENT_WECHAT_PEER_SCOPE_PREFIX: ${PI_AGENT_WECHAT_PEER_SCOPE_PREFIX}
+      MEMORY_API_URL: http://memory-gateway:8888
+      MEMORY_API_TOKEN: ${MEMORY_API_TOKEN}
     init: true
     networks:
       - default
@@ -37,6 +49,11 @@ services:
       - "127.0.0.1:${PI_AGENT_EXPOSE_PORT:-18790}:8790"
     volumes:
       - agent-data:/agent-data
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
     healthcheck:
       test:
@@ -60,16 +77,16 @@ services:
         condition: service_healthy
     environment:
       PI_AGENT_URL: http://pi-agent:8790
-      PI_AGENT_TOKEN: ${PI_AGENT_TOKEN}
-      MEMORY_API_URL: http://memory-api:8888
+      PI_AGENT_TOKEN: ${PI_AGENT_PLAYGROUND_TOKEN}
+      MEMORY_API_URL: http://memory-gateway:8888
+      MEMORY_API_TOKEN: ${MEMORY_API_TOKEN}
+      PLAYGROUND_CHANNEL_TOKEN: ${SIDEKICK_OPS_TOKEN}
       PLAYGROUND_REQUEST_TIMEOUT: ${PLAYGROUND_REQUEST_TIMEOUT:-300}
       PLAYGROUND_SYSTEM_PROMPT: ${PLAYGROUND_SYSTEM_PROMPT:-}
       PLAYGROUND_CHANNEL_ADAPTER_URLS: ${PLAYGROUND_CHANNEL_ADAPTER_URLS:-}
       PLAYGROUND_CHANNEL_POLL_INTERVAL: ${PLAYGROUND_CHANNEL_POLL_INTERVAL:-2}
       PLAYGROUND_CHANNEL_SOURCE_TIMEOUT: ${PLAYGROUND_CHANNEL_SOURCE_TIMEOUT:-5}
       PLAYGROUND_CHANNEL_BANK_CACHE_TTL: ${PLAYGROUND_CHANNEL_BANK_CACHE_TTL:-15}
-      VIRTUAL_HOST: playground.sidekick.localhost
-      VIRTUAL_PORT: "8780"
     networks:
       - default
       - memory-platform
@@ -83,6 +100,11 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
     restart: unless-stopped
     healthcheck:
       test:
