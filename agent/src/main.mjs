@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "./config.mjs";
 import { createAgentServer } from "./http-service.mjs";
@@ -42,6 +43,9 @@ async function main() {
   const engine = new PiEngine({
     ...config.engine,
     webExtensionPath: join(dirname(packagePath), "index.ts"),
+    mcpExtensionPath: fileURLToPath(
+      new URL("./taibu-mcp-extension.ts", import.meta.url),
+    ),
   });
   await engine.initialize();
 
