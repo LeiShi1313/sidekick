@@ -88,6 +88,7 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
         runtime.handler._prompt_builder.quoted_attachment_describer,
         WeChatQuotedImageDescriber,
     )
+    assert runtime.handler._transport._native_reply_ready is True
 
 
 @pytest.mark.asyncio

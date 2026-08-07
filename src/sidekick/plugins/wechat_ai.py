@@ -251,6 +251,7 @@ class WeChatAI(metaclass=PluginMount):
             self._client,
             self._wechat_store,
             self._client.base_url,
+            native_reply_ready=bootstrap.capabilities.native_reply_ready,
             logger=self.logger,
         )
         history = WeChatHistorySource(

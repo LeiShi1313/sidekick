@@ -233,11 +233,13 @@ class WeChatChatTransport:
         store: WeChatStateRepository,
         connector_key: str,
         *,
+        native_reply_ready: bool,
         logger: Any | None = None,
     ):
         self._client = client
         self._store = store
         self._connector_key = connector_key
+        self._native_reply_ready = native_reply_ready
         self._logger = logger
 
     async def draft_reply(self, message: Any) -> WeChatSentMessage:
@@ -333,7 +335,7 @@ class WeChatChatTransport:
                 request_id=message.request_id,
                 to=message.trigger.chat_id,
                 content=text,
-                reply_to_message_id=None,
+                reply_to_message_id=self._native_reply_target(message.trigger),
             )
         except WeChatSendOutcomeUnknown:
             message.uncertain = True
@@ -360,6 +362,19 @@ class WeChatChatTransport:
         message.id = operation.message_id
         message.text = text
         message.sent = True
+
+    def _native_reply_target(self, trigger: WeChatMessage) -> str | None:
+        if not self._native_reply_ready:
+            return None
+        if trigger.message_type != "text" or trigger.content_redacted:
+            return None
+        if (
+            not trigger.raw_text.strip()
+            or "\n" in trigger.raw_text
+            or "\r" in trigger.raw_text
+        ):
+            return None
+        return trigger.id
 
     @staticmethod
     def _trigger(message: Any) -> WeChatMessage:
