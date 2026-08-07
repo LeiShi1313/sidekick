@@ -17,6 +17,9 @@ const usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const DOCUMENTATION_ADDRESS = "203.0.113.42";
+const RUNTIME_PATH = "/home/example-service/private/workspace";
+
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "sidekick-session-history-"));
   const workspaceDir = join(root, "workspace");
@@ -56,14 +59,24 @@ async function fixture() {
     role: "toolResult",
     toolCallId: "call-1",
     toolName: "memory_reflect",
-    content: [{ type: "text", text: "Alice owns deployment." }],
+    content: [
+      {
+        type: "text",
+        text: `Alice owns deployment from ${DOCUMENTATION_ADDRESS}.`,
+      },
+    ],
     details: { memoryIds: ["memory-1"] },
     isError: false,
     timestamp: 3,
   });
   manager.appendMessage({
     role: "assistant",
-    content: [{ type: "text", text: "Alice owns deployment." }],
+    content: [
+      {
+        type: "text",
+        text: `Alice owns deployment; runtime path ${RUNTIME_PATH}.`,
+      },
+    ],
     api: "openai-completions",
     provider: "openai-compatible",
     model: "test-model",
@@ -165,6 +178,12 @@ test("returns the complete branchable session tree with bounded redaction", asyn
     assert.equal(toolCall.arguments.authorization, "[REDACTED]");
     assert.match(JSON.stringify(detail), /Alice owns deployment/);
     assert.doesNotMatch(JSON.stringify(detail), /must-not-leak/);
+    assert.match(JSON.stringify(detail), /REDACTED_IP_ADDRESS/);
+    assert.match(JSON.stringify(detail), /REDACTED_RUNTIME_PATH/);
+    assert.doesNotMatch(
+      JSON.stringify(detail),
+      /203\.0\.113\.42|example-service/,
+    );
   } finally {
     await app.close();
   }
