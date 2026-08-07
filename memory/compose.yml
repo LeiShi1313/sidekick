@@ -9,11 +9,14 @@ services:
     container_name: sidekick-memory-api
     # pg0 uses 512 MB maintenance_work_mem while creating vector indexes.
     shm_size: 1gb
+    depends_on:
+      memory-egress-gateway:
+        condition: service_healthy
     environment:
       HINDSIGHT_API_LLM_PROVIDER: openai
-      HINDSIGHT_API_LLM_API_KEY: ${MEMORY_LLM_API_KEY}
+      HINDSIGHT_API_LLM_API_KEY: ${MEMORY_EGRESS_TOKEN}
       HINDSIGHT_API_LLM_MODEL: ${MEMORY_LLM_MODEL}
-      HINDSIGHT_API_LLM_BASE_URL: ${MEMORY_LLM_BASE_URL}
+      HINDSIGHT_API_LLM_BASE_URL: http://memory-egress-gateway:8080/llm/v1
       HINDSIGHT_API_LLM_REASONING_EFFORT: ${MEMORY_LLM_REASONING_EFFORT:-low}
       HINDSIGHT_API_RETAIN_LLM_MODEL: ${MEMORY_RETAIN_LLM_MODEL:-${MEMORY_LLM_MODEL}}
       HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT: ${MEMORY_RETAIN_LLM_REASONING_EFFORT:-${MEMORY_LLM_REASONING_EFFORT:-low}}
@@ -23,18 +26,15 @@ services:
       HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT: ${MEMORY_REFLECT_LLM_REASONING_EFFORT:-${MEMORY_LLM_REASONING_EFFORT:-low}}
       HINDSIGHT_API_LLM_TEMPERATURE: none
       HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
-      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${MEMORY_EMBEDDING_API_KEY:-ollama}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${MEMORY_EGRESS_TOKEN}
       HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: ${MEMORY_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
-      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: ${MEMORY_EMBEDDING_BASE_URL:-http://ollama-embedding-ollama-1:11434/v1}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: http://memory-egress-gateway:8080/embeddings/v1
       HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS: ${MEMORY_EMBEDDING_DIMENSIONS:-1024}
       HINDSIGHT_API_RERANKER_PROVIDER: rrf
       HINDSIGHT_API_RETAIN_ENTITY_LOOKUP: full
       HINDSIGHT_API_WORKER_ID: memory-api
     networks:
       - memory-backend
-      - ollama-embedding
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     expose:
       - "8888"
     volumes:
@@ -64,6 +64,53 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+
+  memory-egress-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sidekick-memory-egress-gateway:local
+    container_name: sidekick-memory-egress-gateway
+    command: ["python", "-m", "sidekick.memory_egress_gateway"]
+    environment:
+      MEMORY_EGRESS_HOST: 0.0.0.0
+      MEMORY_EGRESS_PORT: "8080"
+      MEMORY_EGRESS_TIMEOUT: ${MEMORY_EGRESS_TIMEOUT:-300}
+      MEMORY_EGRESS_TOKEN: ${MEMORY_EGRESS_TOKEN}
+      MEMORY_LLM_UPSTREAM_URL: ${MEMORY_LLM_BASE_URL}
+      MEMORY_LLM_UPSTREAM_API_KEY: ${MEMORY_LLM_API_KEY}
+      MEMORY_EMBEDDING_UPSTREAM_URL: ${MEMORY_EMBEDDING_BASE_URL:-http://ollama-embedding-ollama-1:11434/v1}
+      MEMORY_EMBEDDING_UPSTREAM_API_KEY: ${MEMORY_EMBEDDING_API_KEY:-ollama}
+    networks:
+      - memory-backend
+      - memory-egress
+      - ollama-embedding
+    expose:
+      - "8080"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "2"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   memory-gateway:
     build:
@@ -121,6 +168,8 @@ networks:
   memory-backend:
     name: sidekick-memory-backend
     internal: true
+  memory-egress:
+    name: sidekick-memory-egress
   ollama-embedding:
     external: true
     name: ollama-embedding

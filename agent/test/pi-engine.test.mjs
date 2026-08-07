@@ -474,6 +474,25 @@ test("keeps requester authorship distinct in shared continuations", () => {
   );
 });
 
+test("pseudonymizes participant IDs outside the current identity anchors", () => {
+  const prompt = buildRunPrompt({
+    prompt: "Who wrote the earlier reply?",
+    context: [
+      {
+        kind: "reference",
+        text:
+          "message author actor_id=wechat:account:peer:user:self said hello",
+      },
+    ],
+    identity: requestIdentity("wechat:account:peer:user:requester", "Requester"),
+    origin: runOrigin("wechat:account:peer:channel:group"),
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+
+  assert.doesNotMatch(prompt, /wechat:account:peer:(?:user|channel):/);
+  assert.match(prompt, /actor_id=actor_[a-f0-9]{16}/);
+});
+
 test("serializes each requester identity in a shared session branch", async () => {
   const app = await fixture((_body, response) => sendText(response, "ack"));
   try {

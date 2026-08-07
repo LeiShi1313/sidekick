@@ -109,7 +109,9 @@ gh repo clone vectorize-io/hindsight ../hindsight
    then start each layer. Copy the same `MEMORY_API_TOKEN` into all three files,
    and copy the same `SIDEKICK_OPS_TOKEN` into `.env` and `agent/.env`. Keep the
    five Pi client tokens distinct and map each root adapter token to its matching
-   agent token. Set each WeChat scope prefix to
+   agent token. Generate a separate `MEMORY_EGRESS_TOKEN` in `memory/.env`; it
+   is used only between raw Hindsight and its fixed provider egress. Set each
+   WeChat scope prefix to
    `wechat:account:<percent-encoded-connector-account-id>:`.
 
    Credential changes are an atomic migration: update all three environment
@@ -131,7 +133,9 @@ Human-facing services are available through the dashboard proxy:
 
 Raw Hindsight is isolated on an internal backend network. Trusted clients use
 the authenticated `memory-gateway`; its host port is loopback-only and its
-health response contains no backend details. The browser-facing raw Hindsight
+health response contains no backend details. Hindsight reaches only the fixed
+LLM and embedding endpoints through a separately authenticated egress gateway;
+it never joins the shared embedding network. The browser-facing raw Hindsight
 dashboard is intentionally not exposed. Dashboard routing is static and no
 Sidekick container receives access to the Docker socket.
 

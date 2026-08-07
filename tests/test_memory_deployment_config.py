@@ -45,6 +45,7 @@ def render_memory_compose(
         "MEMORY_LLM_REASONING_EFFORT": "low",
         "MEMORY_EMBEDDING_API_KEY": "test-embedding-key",
         "MEMORY_API_TOKEN": "memory-api-token-that-is-long-enough",
+        "MEMORY_EGRESS_TOKEN": "memory-egress-token-that-is-long-enough",
     }
     for key in (
         "MEMORY_RETAIN_LLM_MODEL",
@@ -141,9 +142,22 @@ def test_raw_memory_service_is_reachable_only_through_the_authenticated_gateway(
     rendered = render_memory_compose()
     raw = rendered["services"]["memory-api"]
     gateway = rendered["services"]["memory-gateway"]
+    egress = rendered["services"]["memory-egress-gateway"]
 
     assert "ports" not in raw
-    assert set(raw["networks"]) == {"memory-backend", "ollama-embedding"}
+    assert set(raw["networks"]) == {"memory-backend"}
+    assert raw["environment"]["HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"] == (
+        "http://memory-egress-gateway:8080/embeddings/v1"
+    )
+    assert raw["environment"]["HINDSIGHT_API_LLM_BASE_URL"] == (
+        "http://memory-egress-gateway:8080/llm/v1"
+    )
+    assert raw["environment"]["HINDSIGHT_API_LLM_API_KEY"] == (
+        "memory-egress-token-that-is-long-enough"
+    )
+    assert raw["environment"]["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"] == (
+        "memory-egress-token-that-is-long-enough"
+    )
     assert "VIRTUAL_HOST" not in raw["environment"]
     assert set(gateway["networks"]) == {"default", "memory-backend"}
     assert gateway["environment"]["MEMORY_GATEWAY_UPSTREAM_URL"] == (
@@ -162,3 +176,27 @@ def test_raw_memory_service_is_reachable_only_through_the_authenticated_gateway(
         }
     ]
     assert rendered["networks"]["memory-backend"]["internal"] is True
+
+    assert "ports" not in egress
+    assert set(egress["networks"]) == {
+        "memory-backend",
+        "memory-egress",
+        "ollama-embedding",
+    }
+    assert egress["environment"]["MEMORY_EGRESS_TOKEN"] == (
+        "memory-egress-token-that-is-long-enough"
+    )
+    assert egress["environment"]["MEMORY_LLM_UPSTREAM_URL"] == (
+        "https://provider.example/v1"
+    )
+    assert egress["environment"]["MEMORY_LLM_UPSTREAM_API_KEY"] == "test-key"
+    assert egress["environment"]["MEMORY_EMBEDDING_UPSTREAM_URL"] == (
+        "http://ollama-embedding-ollama-1:11434/v1"
+    )
+    assert egress["environment"]["MEMORY_EMBEDDING_UPSTREAM_API_KEY"] == (
+        "test-embedding-key"
+    )
+    assert egress["read_only"] is True
+    assert egress["cap_drop"] == ["ALL"]
+    assert egress["security_opt"] == ["no-new-privileges:true"]
+    assert rendered["networks"]["memory-egress"].get("external", False) is False

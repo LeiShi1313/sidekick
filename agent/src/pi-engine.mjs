@@ -22,6 +22,7 @@ import { isModelId } from "./model-id.mjs";
 import {
   SensitiveTextStream,
   collectSensitiveLiterals,
+  pseudonymizeActorIdentities,
   pseudonymizeAccessBank,
   pseudonymizeIdentity,
   redactSensitiveText,
@@ -253,7 +254,11 @@ export function buildRunPrompt({
     }),
   );
   sections.push(`<current_request>\n${prompt}\n</current_request>`);
-  return sections.join("\n\n");
+  return pseudonymizeActorIdentities(
+    sections.join("\n\n"),
+    identityAliasKey,
+    origin.scopeId,
+  );
 }
 
 export function toolNamesForPolicy(
