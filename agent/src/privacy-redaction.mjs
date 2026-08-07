@@ -218,10 +218,7 @@ export function pseudonymizeActorIdentities(value, key, scope) {
   const text = String(value ?? "");
   requirePseudonymContext(key, scope);
   return text.replace(HOST_ID_TOKEN_RE, (identity) => {
-    if (
-      identity.length > 256 ||
-      !/:(?:user|channel):/.test(identity)
-    ) {
+    if (!/:(?:user|channel):/.test(identity)) {
       return identity;
     }
     return pseudonymizeIdentity(identity, key, scope);
