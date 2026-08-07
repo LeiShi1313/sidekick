@@ -29,6 +29,47 @@ const PRIVATE_QUERY_NAMES =
   /^(?:api[_-]?key|key|sig|signature|token|access[_-]?token|auth|authorization)$/i;
 const PRIVATE_ENV_NAME =
   /(?:api[_-]?key|credential|password|private[_-]?key|secret|token)/i;
+const NETWORK_IDENTITY_KEYS = new Set([
+  "address",
+  "clientip",
+  "ip",
+  "ipaddress",
+  "ipv4",
+  "ipv6",
+  "origin",
+  "remoteaddr",
+  "remoteaddress",
+]);
+const REQUEST_HEADER_KEYS = new Set([
+  "headers",
+  "requestheaders",
+  "useragent",
+  "xforwardedfor",
+  "xrealip",
+]);
+const REQUEST_METADATA_KEYS = new Set([
+  "asn",
+  "autonomoussystem",
+  "city",
+  "country",
+  "countrycode",
+  "countryname",
+  "host",
+  "hostname",
+  "isp",
+  "latitude",
+  "loc",
+  "longitude",
+  "networkprovider",
+  "org",
+  "organization",
+  "postal",
+  "postalcode",
+  "region",
+  "server",
+  "state",
+  "timezone",
+]);
 
 function normalizedNetworkLiteral(value) {
   const unwrapped = String(value).replace(/^\[|\]$/g, "");
@@ -73,7 +114,7 @@ function iterableSet(values, normalize = String) {
   );
 }
 
-export function runtimeSensitiveValues(environment = process.env) {
+function runtimeSensitiveValues(environment = process.env) {
   return Object.entries(environment)
     .filter(
       ([name, value]) =>
@@ -228,7 +269,7 @@ export function sanitizeFetchedText(value, options = {}) {
 }
 
 function isPrivateKey(key) {
-  const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  const normalized = normalizedKey(key);
   return (
     normalized === "authorization" ||
     normalized === "cookie" ||
@@ -244,56 +285,27 @@ function normalizedKey(key) {
   return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
+function containsAny(keys, candidates) {
+  for (const key of keys) {
+    if (candidates.has(key)) return true;
+  }
+  return false;
+}
+
 function reflectsStructuredRequestMetadata(value) {
   const keys = new Set(Object.keys(value).map(normalizedKey));
-  const hasNetworkKey = [
-    "address",
-    "clientip",
-    "ip",
-    "ipaddress",
-    "ipv4",
-    "ipv6",
-    "origin",
-    "remoteaddr",
-    "remoteaddress",
-  ].some((key) => keys.has(key));
-  const hasRequestHeaderKey = [
-    "headers",
-    "requestheaders",
-    "useragent",
-    "xforwardedfor",
-    "xrealip",
-  ].some((key) => keys.has(key));
-  const metadataKeys = [
-    "asn",
-    "autonomoussystem",
-    "city",
-    "country",
-    "countrycode",
-    "countryname",
-    "host",
-    "hostname",
-    "isp",
-    "latitude",
-    "loc",
-    "longitude",
-    "networkprovider",
-    "org",
-    "organization",
-    "postal",
-    "postalcode",
-    "region",
-    "server",
-    "state",
-    "timezone",
-  ].filter((key) => keys.has(key));
+  let metadataCount = 0;
+  for (const key of keys) {
+    if (REQUEST_METADATA_KEYS.has(key)) metadataCount += 1;
+  }
   const hasNetworkLiteral = stringValues(value).some(
     (text) => networkLiterals(text).size > 0,
   );
   return (
-    hasRequestHeaderKey ||
-    metadataKeys.length >= 3 ||
-    ((hasNetworkKey || hasNetworkLiteral) && metadataKeys.length >= 1)
+    containsAny(keys, REQUEST_HEADER_KEYS) ||
+    metadataCount >= 3 ||
+    ((containsAny(keys, NETWORK_IDENTITY_KEYS) || hasNetworkLiteral) &&
+      metadataCount >= 1)
   );
 }
 
