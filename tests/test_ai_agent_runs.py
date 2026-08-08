@@ -338,6 +338,42 @@ async def test_provider_rate_limit_gets_an_explicit_telegram_message():
 
 
 @pytest.mark.asyncio
+async def test_unavailable_session_gets_a_short_explicit_telegram_message():
+    class UnavailableSessionGateway(FakeAgentGateway):
+        async def run(self, request):
+            self.requests.append(request)
+            yield AgentEvent(
+                type="run_failed",
+                code="SESSION_UNAVAILABLE",
+                message="Agent session is unavailable",
+            )
+
+    gateway = UnavailableSessionGateway()
+    responder = make_telegram_responder(gateway)
+    trigger = FakeMessage("/ai continue")
+    request = AgentRunRequest(
+        run_id="11111111-1111-4111-8111-111111111111",
+        session_id="legacy-session",
+        parent_entry_id="legacy-entry",
+        prompt="continue",
+        context=(),
+        system_prompt=PromptBuilder().system_prompt,
+        tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
+    )
+
+    result = await responder.answer(trigger, request)
+
+    assert result.succeeded is False
+    assert result.failure_code == "SESSION_UNAVAILABLE"
+    assert trigger.replies[0].text == "AI thread unavailable. Start a new /ai."
+
+
+@pytest.mark.asyncio
 async def test_provider_timeout_gets_an_explicit_telegram_message():
     class TimeoutGateway(FakeAgentGateway):
         async def run(self, request):

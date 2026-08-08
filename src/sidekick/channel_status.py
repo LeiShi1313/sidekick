@@ -743,6 +743,7 @@ def _run_error_message(code: str | None) -> str | None:
         "ADAPTER_RESTARTED": "The adapter restarted before the AI run completed.",
         "CANCELLED": "The AI run was cancelled.",
         "RATE_LIMITED": "The AI provider rate limited the run.",
+        "SESSION_UNAVAILABLE": "The referenced AI thread is unavailable.",
         "DELIVERY_FAILED": "The AI response could not be delivered.",
         "EMPTY_RESPONSE": "The AI run returned no usable response.",
         "AGENT_ERROR": "The AI agent run failed.",

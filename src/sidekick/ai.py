@@ -888,6 +888,19 @@ class AIResponder:
                             succeeded=False,
                             failure_code="RATE_LIMITED",
                         )
+                    if event.code == "SESSION_UNAVAILABLE":
+                        unavailable = "AI thread unavailable. Start a new /ai."
+                        await self._edit_message(
+                            answer,
+                            unavailable,
+                            wait=True,
+                        )
+                        return AnswerResult(
+                            message=answer,
+                            text=unavailable,
+                            succeeded=False,
+                            failure_code="SESSION_UNAVAILABLE",
+                        )
                     raise RuntimeError(event.message or "Agent run failed")
                 if event.type == "run_completed":
                     assert event.answer is not None
@@ -5735,6 +5748,7 @@ _SAFE_AI_RUN_ERROR_CODES = frozenset(
         "CANCELLED",
         "RATE_LIMITED",
         "TIMEOUT",
+        "SESSION_UNAVAILABLE",
         "DELIVERY_FAILED",
         "EMPTY_RESPONSE",
         "AGENT_ERROR",
