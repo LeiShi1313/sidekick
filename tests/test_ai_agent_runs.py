@@ -429,3 +429,41 @@ async def test_ai_cancel_aborts_only_the_requesters_active_run():
     assert gateway.cancelled == [run_id]
     assert cancel.replies[0].text == "AI request cancellation requested."
     assert trigger.replies[0].text == "AI request cancelled."
+
+
+@pytest.mark.asyncio
+async def test_reply_to_active_request_reports_that_ai_is_still_working():
+    gateway = BlockingAgentGateway()
+    handler = AIConversationHandler(
+        owner_id=10,
+        responder=make_telegram_responder(gateway),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(identity_codec=TELEGRAM_IDENTITY_CODEC),
+        identity_codec=TELEGRAM_IDENTITY_CODEC,
+    )
+    trigger = FakeMessage("/ai wait")
+    running = asyncio.create_task(handler.handle(trigger))
+    await gateway.started.wait()
+
+    try:
+        follow_up = FakeMessage("Are you still working?", reply_to=trigger)
+        assert await handler.handle(follow_up) is True
+        assert follow_up.replies[0].text == (
+            "AI is still working. Please wait for the answer."
+        )
+        assert len(gateway.requests) == 1
+
+        other_chat = FakeMessage(
+            "Are you still working?",
+            chat_id=-1002,
+            reply_to=trigger,
+        )
+        assert await handler.handle(other_chat) is False
+        assert other_chat.replies == []
+    finally:
+        gateway.cancelled_event.set()
+        await running
+
+    late_follow_up = FakeMessage("Still working?", reply_to=trigger)
+    assert await handler.handle(late_follow_up) is False
+    assert late_follow_up.replies == []
