@@ -919,6 +919,20 @@ class AIResponder:
                 entry_id=entry_id,
                 failure_code=None if succeeded else "EMPTY_RESPONSE",
             )
+        except TimeoutError as exc:
+            self._log_failure(exc)
+            failure = "AI request timed out. Try again later."
+            await self._edit_message(
+                answer,
+                failure,
+                wait=True,
+            )
+            return AnswerResult(
+                message=answer,
+                text=failure,
+                succeeded=False,
+                failure_code="TIMEOUT",
+            )
         except Exception as exc:
             self._log_failure(exc)
             failure = "AI request failed. Try again later."
@@ -5706,6 +5720,7 @@ _SAFE_AI_RUN_ERROR_CODES = frozenset(
         "ADAPTER_RESTARTED",
         "CANCELLED",
         "RATE_LIMITED",
+        "TIMEOUT",
         "DELIVERY_FAILED",
         "EMPTY_RESPONSE",
         "AGENT_ERROR",

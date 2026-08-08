@@ -170,6 +170,31 @@ async def test_repository_persists_only_allowlisted_run_error_codes(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_repository_persists_timeout_run_error_code(tmp_path) -> None:
+    store = await AIStateRepository(tmp_path / "ai.db").connect()
+    try:
+        await store.start_ai_run(
+            run_id="run-timeout",
+            scope_id="qq:private:42",
+            actor_id="qq:user:42",
+            adapter_instance_id="qq-default",
+            started_at=1_800_000_000,
+        )
+        await store.finish_ai_run(
+            "run-timeout",
+            status="FAILED",
+            updated_at=1_800_000_001,
+            error_code="TIMEOUT",
+        )
+
+        state = (await store.list_channel_operational_states())[0]
+
+        assert state.last_run_error == "TIMEOUT"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_later_success_clears_the_channel_run_error(tmp_path) -> None:
     store = await AIStateRepository(tmp_path / "ai.db").connect()
     try:

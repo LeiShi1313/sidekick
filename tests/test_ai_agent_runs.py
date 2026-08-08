@@ -338,6 +338,43 @@ async def test_provider_rate_limit_gets_an_explicit_telegram_message():
 
 
 @pytest.mark.asyncio
+async def test_provider_timeout_gets_an_explicit_telegram_message():
+    class TimeoutGateway(FakeAgentGateway):
+        async def run(self, request):
+            self.requests.append(request)
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-timeout",
+            )
+            raise TimeoutError
+
+    gateway = TimeoutGateway()
+    responder = make_telegram_responder(gateway)
+    trigger = FakeMessage("/ai hello")
+    request = AgentRunRequest(
+        run_id="11111111-1111-4111-8111-111111111111",
+        session_id=None,
+        parent_entry_id=None,
+        prompt="hello",
+        context=(),
+        system_prompt=PromptBuilder().system_prompt,
+        tool_policy="owner",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
+    )
+
+    result = await responder.answer(trigger, request)
+
+    assert result.succeeded is False
+    assert result.failure_code == "TIMEOUT"
+    assert trigger.replies[0].text == "AI request timed out. Try again later."
+
+
+@pytest.mark.asyncio
 async def test_handler_maps_answers_to_pi_sessions_and_forks_by_entry():
     gateway = FakeAgentGateway(["root answer", "child answer", "fork answer"])
     store = FakeStore(allowed={TELEGRAM_IDENTITY_CODEC.actor_id(20)})
