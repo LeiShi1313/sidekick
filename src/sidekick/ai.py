@@ -919,6 +919,20 @@ class AIResponder:
                 entry_id=entry_id,
                 failure_code=None if succeeded else "EMPTY_RESPONSE",
             )
+        except TimeoutError as exc:
+            self._log_failure(exc)
+            failure = "AI request timed out. Try again later."
+            await self._edit_message(
+                answer,
+                failure,
+                wait=True,
+            )
+            return AnswerResult(
+                message=answer,
+                text=failure,
+                succeeded=False,
+                failure_code="TIMEOUT",
+            )
         except Exception as exc:
             self._log_failure(exc)
             failure = "AI request failed. Try again later."
@@ -3810,6 +3824,7 @@ class AIConversationHandler:
             adapter_instance_id or f"{self._identity_codec.source}-local"
         )
         self._active_runs: dict[str, str] = {}
+        self._active_request_runs: dict[tuple[str, ExternalId], str] = {}
 
     async def handle(self, message: ReplyTarget) -> bool:
         if message.sender_id is None or message.chat_id is None:
@@ -3986,6 +4001,13 @@ class AIConversationHandler:
             parent_answer_id = message.reply_to_msg_id
             if parent_answer_id is None:
                 return False
+            if (scope_id, parent_answer_id) in self._active_request_runs:
+                await self._reply_memory_excluded(
+                    message,
+                    "AI is still working. Please wait for the answer.",
+                    kind="ai-control",
+                )
+                return True
             parent = await self._store.get_answer(scope_id, parent_answer_id)
             if parent is None:
                 return False
@@ -4027,6 +4049,8 @@ class AIConversationHandler:
             scope_id=scope_id,
             actor_id=actor_id,
         )
+        active_request_key = (scope_id, message.id)
+        self._active_request_runs[active_request_key] = run_id
         try:
             if ai_trigger is not None:
                 parent = await self._find_explicit_parent(message)
@@ -4133,6 +4157,8 @@ class AIConversationHandler:
             )
             if self._active_runs.get(actor_id) == run_id:
                 self._active_runs.pop(actor_id, None)
+            if self._active_request_runs.get(active_request_key) == run_id:
+                self._active_request_runs.pop(active_request_key, None)
             if result.succeeded:
                 assert result.session_id is not None
                 assert result.entry_id is not None
@@ -4215,6 +4241,8 @@ class AIConversationHandler:
                 )
             if self._active_runs.get(actor_id) == run_id:
                 self._active_runs.pop(actor_id, None)
+            if self._active_request_runs.get(active_request_key) == run_id:
+                self._active_request_runs.pop(active_request_key, None)
             if not rate_released:
                 await self._rate_limiter.release(
                     scope_id=scope_id,
@@ -5706,6 +5734,7 @@ _SAFE_AI_RUN_ERROR_CODES = frozenset(
         "ADAPTER_RESTARTED",
         "CANCELLED",
         "RATE_LIMITED",
+        "TIMEOUT",
         "DELIVERY_FAILED",
         "EMPTY_RESPONSE",
         "AGENT_ERROR",
