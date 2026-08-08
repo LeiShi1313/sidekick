@@ -135,13 +135,28 @@ class FakeStore:
     async def set_model_override(self, scope_id: str, model: str | None):
         return None
 
+    async def get_ai_cooldown_override(self, scope_id: str):
+        return None
+
+    async def set_ai_cooldown_override(
+        self,
+        scope_id: str,
+        cooldown_seconds: int | None,
+    ):
+        return None
+
     async def is_allowed(self, actor_id: str):
         return False
 
-    async def get_last_request_at(self, actor_id: str):
+    async def get_last_request_at(self, scope_id: str, actor_id: str):
         return None
 
-    async def set_last_request_at(self, actor_id: str, timestamp: float):
+    async def set_last_request_at(
+        self,
+        scope_id: str,
+        actor_id: str,
+        timestamp: float,
+    ):
         return None
 
     async def allow_user(self, actor_id: str):

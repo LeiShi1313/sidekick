@@ -269,6 +269,80 @@ async def test_owner_can_open_and_restrict_ai_access_for_one_group(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_owner_can_set_inspect_and_reset_ai_limit_for_one_group(tmp_path):
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        FakeGateway([]),
+        cooldown=30,
+    )
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    try:
+        show_default = FakeMessage("/ai_limit", sender_id=10)
+        assert await handler.handle(show_default) is True
+        assert show_default.replies[0].text == (
+            "AI limit for this group: 30 seconds per person (server default)."
+        )
+
+        set_limit = FakeMessage("/ai_limit 60", sender_id=10)
+        assert await handler.handle(set_limit) is True
+        assert set_limit.replies[0].text == (
+            "AI limit for this group set to 60 seconds per person."
+        )
+        assert await store.get_ai_cooldown_override(first_scope) == 60
+        assert await store.get_ai_cooldown_override(second_scope) is None
+
+        show_override = FakeMessage("/ai_limit", sender_id=10)
+        assert await handler.handle(show_override) is True
+        assert show_override.replies[0].text == (
+            "AI limit for this group: 60 seconds per person (group override)."
+        )
+
+        reset = FakeMessage("/ai_limit default", sender_id=10)
+        assert await handler.handle(reset) is True
+        assert reset.replies[0].text == (
+            "AI limit for this group reset to the server default "
+            "(30 seconds per person)."
+        )
+        assert await store.get_ai_cooldown_override(first_scope) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_ai_limit_rejects_private_chat_member_and_invalid_changes(tmp_path):
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        FakeGateway([]),
+    )
+    scope_id = "telegram:chat:-1001"
+    try:
+        private_command = FakeMessage(
+            "/ai_limit 60",
+            sender_id=10,
+            chat_id=10,
+            is_group=False,
+        )
+        assert await handler.handle(private_command) is True
+        assert private_command.replies[0].text == (
+            "Group AI limits can only be changed in a group chat."
+        )
+
+        member_command = FakeMessage("/ai_limit 60", sender_id=20)
+        assert await handler.handle(member_command) is False
+        assert member_command.replies == []
+
+        invalid_command = FakeMessage("/ai_limit 86401", sender_id=10)
+        assert await handler.handle(invalid_command) is True
+        assert invalid_command.replies[0].text == (
+            "Usage: /ai_limit [seconds|default] (seconds: 0-86400)"
+        )
+        assert await store.get_ai_cooldown_override(scope_id) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_access_cannot_open_private_chats_or_be_changed_by_members(tmp_path):
     handler, store = await make_handler(
         tmp_path / "state.db",
@@ -520,17 +594,18 @@ async def test_bank_grants_require_whitelist_and_survive_restart(tmp_path):
 async def test_deny_atomically_clears_usage_and_all_bank_grants(tmp_path):
     path = tmp_path / "state.db"
     actor = actor_id(20)
+    scope_id = "telegram:chat:-1001"
     store = await AIStateRepository(path).connect()
     try:
         await store.allow_user(actor)
-        await store.set_last_request_at(actor, 123.0)
+        await store.set_last_request_at(scope_id, actor, 123.0)
         assert await store.grant_bank(actor, "telegram:chat:-100123") is True
         assert await store.grant_bank(actor, "qq:group:686743769") is True
 
         await store.deny_user(actor)
 
         assert await store.is_allowed(actor) is False
-        assert await store.get_last_request_at(actor) is None
+        assert await store.get_last_request_at(scope_id, actor) is None
         assert await store.list_bank_grants(actor) == ()
 
         await store.allow_user(actor)
@@ -572,16 +647,29 @@ async def test_nonowner_has_one_inflight_request_and_persistent_cooldown(tmp_pat
     restarted = await AIStateRepository(tmp_path / "state.db").connect()
     try:
         restarted_now = [110.0]
+        scope_id = "telegram:chat:-1001"
         limiter = AIRateLimiter(
             restarted,
             cooldown_seconds=30,
             clock=lambda: restarted_now[0],
         )
         assert await restarted.is_allowed(actor_id(20)) is True
-        assert await limiter.acquire(actor_id=actor_id(20), is_owner=False) is False
+        assert await limiter.acquire(
+            scope_id=scope_id,
+            actor_id=actor_id(20),
+            is_owner=False,
+        ) is False
         restarted_now[0] = 131.0
-        assert await limiter.acquire(actor_id=actor_id(20), is_owner=False) is True
-        await limiter.release(actor_id=actor_id(20), is_owner=False)
+        assert await limiter.acquire(
+            scope_id=scope_id,
+            actor_id=actor_id(20),
+            is_owner=False,
+        ) is True
+        await limiter.release(
+            scope_id=scope_id,
+            actor_id=actor_id(20),
+            is_owner=False,
+        )
         await restarted.deny_user(actor_id(20))
     finally:
         await restarted.close()
@@ -591,6 +679,106 @@ async def test_nonowner_has_one_inflight_request_and_persistent_cooldown(tmp_pat
         assert await final_store.is_allowed(actor_id(20)) is False
     finally:
         await final_store.close()
+
+
+@pytest.mark.asyncio
+async def test_nonowner_cooldown_uses_group_override_without_cross_group_leakage(
+    tmp_path,
+):
+    now = [100.0]
+    store = await AIStateRepository(tmp_path / "state.db").connect()
+    limiter = AIRateLimiter(
+        store,
+        cooldown_seconds=30,
+        clock=lambda: now[0],
+    )
+    actor = actor_id(20)
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    try:
+        await store.set_ai_cooldown_override(first_scope, 60)
+
+        assert await limiter.acquire(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is True
+        await limiter.release(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        )
+
+        now[0] = 131.0
+        assert await limiter.acquire(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is False
+        assert await limiter.acquire(
+            scope_id=second_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is True
+        await limiter.release(
+            scope_id=second_scope,
+            actor_id=actor,
+            is_owner=False,
+        )
+
+        now[0] = 161.0
+        assert await limiter.acquire(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is True
+        await limiter.release(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_group_cooldown_still_blocks_one_global_inflight_request(tmp_path):
+    store = await AIStateRepository(tmp_path / "state.db").connect()
+    limiter = AIRateLimiter(store, cooldown_seconds=30, clock=lambda: 100.0)
+    actor = actor_id(20)
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    try:
+        await store.set_ai_cooldown_override(first_scope, 0)
+
+        assert await limiter.acquire(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is True
+        assert await limiter.acquire(
+            scope_id=second_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is False
+        await limiter.release(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        )
+
+        assert await limiter.acquire(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        ) is True
+        await limiter.release(
+            scope_id=first_scope,
+            actor_id=actor,
+            is_owner=False,
+        )
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

@@ -211,6 +211,12 @@ class FakeStore:
         else:
             self.model_overrides[scope_id] = model
 
+    async def get_ai_cooldown_override(self, scope_id):
+        return None
+
+    async def set_ai_cooldown_override(self, scope_id, cooldown_seconds):
+        return None
+
     async def mark_memory_excluded_message(self, scope_id, message_id, kind):
         self.memory_excluded.add((scope_id, message_id, kind))
 
@@ -222,10 +228,10 @@ class FakeStore:
     async def is_allowed(self, actor_id):
         return False
 
-    async def get_last_request_at(self, actor_id):
+    async def get_last_request_at(self, scope_id, actor_id):
         return None
 
-    async def set_last_request_at(self, actor_id, timestamp):
+    async def set_last_request_at(self, scope_id, actor_id, timestamp):
         return None
 
     async def allow_user(self, actor_id):

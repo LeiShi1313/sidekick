@@ -26,6 +26,7 @@ from sidekick.chat.attachments import AttachmentDescription, AttachmentReference
 from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
+    AILimitCommand,
     AIModelCommand,
     AccessCommand,
     ChatAccessCommand,
@@ -50,6 +51,21 @@ from sidekick.chat.transport import ChatPresentation
             AIAskCommand(prompt="summarize", recent_messages=10),
         ),
         ("/ai_cancel", AICancelCommand()),
+        ("/ai_limit", AILimitCommand(action="show")),
+        (
+            "/ai_limit 60",
+            AILimitCommand(action="set", cooldown_seconds=60),
+        ),
+        ("/ai_limit 0", AILimitCommand(action="set", cooldown_seconds=0)),
+        (
+            "/ai_limit 86400",
+            AILimitCommand(action="set", cooldown_seconds=86_400),
+        ),
+        ("/ai_limit default", AILimitCommand(action="reset")),
+        ("/ai_limit -1", InvalidCommand(name="/ai_limit")),
+        ("/ai_limit 86401", InvalidCommand(name="/ai_limit")),
+        ("/ai_limit 1.5", InvalidCommand(name="/ai_limit")),
+        ("/ai_limit 10 seconds", InvalidCommand(name="/ai_limit")),
         ("/ai_model", AIModelCommand(action="show")),
         (
             "/ai_model gpt-5.4-mini",
@@ -169,6 +185,64 @@ async def test_chat_model_override_can_be_replaced_reset_and_reloaded(tmp_path):
         assert await restarted.get_model_override(scope_id) is None
     finally:
         await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_ai_limit_override_is_scoped_persistent_and_resettable(tmp_path):
+    path = tmp_path / "ai.db"
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    store = await AIStateRepository(path).connect()
+    try:
+        assert await store.get_ai_cooldown_override(first_scope) is None
+
+        await store.set_ai_cooldown_override(first_scope, 60)
+
+        assert await store.get_ai_cooldown_override(first_scope) == 60
+        assert await store.get_ai_cooldown_override(second_scope) is None
+    finally:
+        await store.close()
+
+    restarted = await AIStateRepository(path).connect()
+    try:
+        assert await restarted.get_ai_cooldown_override(first_scope) == 60
+
+        await restarted.set_ai_cooldown_override(first_scope, None)
+
+        assert await restarted.get_ai_cooldown_override(first_scope) is None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_ai_usage_migration_discards_unscoped_cooldown(tmp_path):
+    path = tmp_path / "ai.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE ai_usage (
+            actor_id TEXT PRIMARY KEY,
+            last_request_at REAL NOT NULL
+        );
+        INSERT INTO ai_usage VALUES ('telegram:user:20', 123);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    actor = "telegram:user:20"
+    store = await AIStateRepository(path).connect()
+    try:
+        assert await store.get_last_request_at(first_scope, actor) is None
+
+        await store.set_last_request_at(first_scope, actor, 456)
+
+        assert await store.get_last_request_at(first_scope, actor) == 456
+        assert await store.get_last_request_at(second_scope, actor) is None
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -317,13 +391,19 @@ class FakeStore:
     async def set_model_override(self, scope_id, model):
         return None
 
+    async def get_ai_cooldown_override(self, scope_id):
+        return None
+
+    async def set_ai_cooldown_override(self, scope_id, cooldown_seconds):
+        return None
+
     async def is_allowed(self, actor_id):
         return False
 
-    async def get_last_request_at(self, actor_id):
+    async def get_last_request_at(self, scope_id, actor_id):
         return None
 
-    async def set_last_request_at(self, actor_id, timestamp):
+    async def set_last_request_at(self, scope_id, actor_id, timestamp):
         return None
 
     async def allow_user(self, actor_id):
@@ -618,7 +698,13 @@ async def test_state_repository_migrates_legacy_telegram_identity_columns(tmp_pa
         assert marker.requester_id == "telegram:user:20"
         assert await store.is_allowed("telegram:user:20") is True
         assert await store.is_allowed("qq:user:20") is False
-        assert await store.get_last_request_at("telegram:user:20") == 2
+        assert (
+            await store.get_last_request_at(
+                "telegram:chat:-1001",
+                "telegram:user:20",
+            )
+            is None
+        )
         assert await store.is_memory_excluded_message(
             "telegram:chat:-1001",
             101,
