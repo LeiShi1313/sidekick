@@ -195,6 +195,31 @@ async def test_repository_persists_timeout_run_error_code(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_repository_persists_session_unavailable_run_error_code(tmp_path) -> None:
+    store = await AIStateRepository(tmp_path / "ai.db").connect()
+    try:
+        await store.start_ai_run(
+            run_id="run-session-unavailable",
+            scope_id="qq:private:42",
+            actor_id="qq:user:42",
+            adapter_instance_id="qq-default",
+            started_at=1_800_000_000,
+        )
+        await store.finish_ai_run(
+            "run-session-unavailable",
+            status="FAILED",
+            updated_at=1_800_000_001,
+            error_code="SESSION_UNAVAILABLE",
+        )
+
+        state = (await store.list_channel_operational_states())[0]
+
+        assert state.last_run_error == "SESSION_UNAVAILABLE"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_later_success_clears_the_channel_run_error(tmp_path) -> None:
     store = await AIStateRepository(tmp_path / "ai.db").connect()
     try:

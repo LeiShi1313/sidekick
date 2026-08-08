@@ -1056,17 +1056,22 @@ test("binds continuations to the authenticated client and conversation scope", a
         ...overrides,
       });
 
-    await assert.rejects(
-      collect(app.engine, continuation(), "other-client"),
-      /session is unavailable/i,
+    const unavailable = {
+      type: "run_failed",
+      code: "SESSION_UNAVAILABLE",
+      message: "Agent session is unavailable",
+    };
+    assert.deepEqual(
+      await collect(app.engine, continuation(), "other-client"),
+      [unavailable],
     );
-    await assert.rejects(
-      collect(
+    assert.deepEqual(
+      await collect(
         app.engine,
         continuation({ origin: runOrigin("workspace:other") }),
         "telegram-client",
       ),
-      /session is unavailable/i,
+      [unavailable],
     );
     assert.equal(app.provider.requests.length, 1);
   } finally {
@@ -1074,7 +1079,7 @@ test("binds continuations to the authenticated client and conversation scope", a
   }
 });
 
-test("fails closed for an unbound legacy session", async () => {
+test("reports an unavailable unbound legacy session without resuming it", async () => {
   const app = await fixture((_body, response) => sendText(response, "continued"));
   try {
     const legacy = SessionManager.create(
@@ -1113,17 +1118,22 @@ test("fails closed for an unbound legacy session", async () => {
       timestamp: 2,
     });
 
-    await assert.rejects(
-      collect(
-        app.engine,
-        request("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", {
-          sessionId: legacy.getSessionId(),
-          parentEntryId,
-          prompt: "continue this session",
-        }),
-      ),
-      /session is unavailable/i,
+    const events = await collect(
+      app.engine,
+      request("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", {
+        sessionId: legacy.getSessionId(),
+        parentEntryId,
+        prompt: "continue this session",
+      }),
     );
+
+    assert.deepEqual(events, [
+      {
+        type: "run_failed",
+        code: "SESSION_UNAVAILABLE",
+        message: "Agent session is unavailable",
+      },
+    ]);
     assert.equal(app.provider.requests.length, 0);
   } finally {
     await app.close();
