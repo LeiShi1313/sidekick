@@ -7,6 +7,7 @@ from typing import Literal, TypeAlias
 
 MAX_MEMORY_BACKFILL_DAYS = 30
 MAX_MEMORY_BACKFILL_MESSAGES = 5_000
+MAX_AI_COOLDOWN_SECONDS = 86_400
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 
 
@@ -19,6 +20,20 @@ class AIAskCommand:
 @dataclass(frozen=True, slots=True)
 class AICancelCommand:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AILimitCommand:
+    action: Literal["show", "set", "reset"]
+    cooldown_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.action == "set") != (self.cooldown_seconds is not None):
+            raise ValueError("Only a limit-setting command accepts a cooldown")
+        if self.cooldown_seconds is not None and not (
+            0 <= self.cooldown_seconds <= MAX_AI_COOLDOWN_SECONDS
+        ):
+            raise ValueError("AI cooldown is outside supported bounds")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +131,7 @@ class InvalidCommand:
 ChatCommand: TypeAlias = (
     AIAskCommand
     | AICancelCommand
+    | AILimitCommand
     | AIModelCommand
     | AccessCommand
     | ChatAccessCommand
@@ -138,6 +154,10 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     directory = _parse_directory_control(text)
     if directory is not None:
         return directory
+
+    ai_limit = _parse_ai_limit_control(text.strip())
+    if ai_limit is not None:
+        return ai_limit
 
     model = _parse_model_control(text.strip())
     if model is not None:
@@ -178,6 +198,25 @@ def _parse_chat_access_control(
     if len(parts) != 2 or parts[1] not in {"open", "restricted", "status"}:
         return InvalidCommand(name="/ai_access")
     return ChatAccessCommand(action=parts[1])
+
+
+def _parse_ai_limit_control(text: str) -> AILimitCommand | InvalidCommand | None:
+    parts = text.split()
+    if not parts or parts[0] != "/ai_limit":
+        return None
+    if len(parts) == 1:
+        return AILimitCommand(action="show")
+    if len(parts) != 2:
+        return InvalidCommand(name="/ai_limit")
+    value = parts[1]
+    if value.casefold() == "default":
+        return AILimitCommand(action="reset")
+    if not value.isascii() or not value.isdigit():
+        return InvalidCommand(name="/ai_limit")
+    cooldown_seconds = int(value)
+    if not 0 <= cooldown_seconds <= MAX_AI_COOLDOWN_SECONDS:
+        return InvalidCommand(name="/ai_limit")
+    return AILimitCommand(action="set", cooldown_seconds=cooldown_seconds)
 
 
 def _parse_model_control(text: str) -> AIModelCommand | InvalidCommand | None:

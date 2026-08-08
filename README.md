@@ -80,8 +80,11 @@ chat adapters. `/ai` receives an account-scoped Hindsight
 memory target, replying with `/ai_memory` retains that stored reply chain,
 `/ai_memory_backfill days <1-30>` or `/ai_memory_backfill messages <1-5000>`
 performs the bounded best-effort local backfill, and `/ai_memory_enable` starts
-continuous ingestion for new messages in that chat. Continuous and Dream
-ingestion are off per chat until explicitly enabled. Setting
+continuous ingestion for new messages in that chat. The configured Sidekick
+owner can inspect or change a group's per-person AI cooldown with `/ai_limit`,
+`/ai_limit <0-86400>`, or `/ai_limit default`; zero disables the cooldown but
+keeps the one-active-run safeguard. Continuous and Dream ingestion are off per
+chat until explicitly enabled. Setting
 `SIDEKICK_HINDSIGHT_URL` to an empty value disables memory; memory commands then
 report that Hindsight is disabled instead of silently changing ingestion state.
 A recalled or redacted WeChat message is excluded from later local reads and

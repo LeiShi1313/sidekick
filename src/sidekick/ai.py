@@ -37,6 +37,7 @@ from sidekick.chat.attachments import AttachmentDescriber, AttachmentDescription
 from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
+    AILimitCommand,
     AIModelCommand,
     AccessCommand,
     BankGrantCommand,
@@ -49,6 +50,7 @@ from sidekick.chat.commands import (
     MemoryModeCommand,
     MemoryRememberCommand,
     MemoryStatusCommand,
+    MAX_AI_COOLDOWN_SECONDS,
     MODEL_ID_RE,
     parse_chat_command,
 )
@@ -503,6 +505,14 @@ class ConversationStore(Protocol):
         model: str | None,
     ) -> None: ...
 
+    async def get_ai_cooldown_override(self, scope_id: str) -> int | None: ...
+
+    async def set_ai_cooldown_override(
+        self,
+        scope_id: str,
+        cooldown_seconds: int | None,
+    ) -> None: ...
+
     async def is_allowed(self, actor_id: str) -> bool: ...
 
     async def allow_user(self, actor_id: str) -> None: ...
@@ -519,10 +529,15 @@ class ConversationStore(Protocol):
 
     async def list_bank_grants(self, actor_id: str) -> tuple[str, ...]: ...
 
-    async def get_last_request_at(self, actor_id: str) -> float | None: ...
+    async def get_last_request_at(
+        self,
+        scope_id: str,
+        actor_id: str,
+    ) -> float | None: ...
 
     async def set_last_request_at(
         self,
+        scope_id: str,
         actor_id: str,
         timestamp: float,
     ) -> None: ...
@@ -1484,10 +1499,7 @@ class AIStateRepository:
             "ai_whitelist",
             value_definition="allowed_at REAL NOT NULL",
         )
-        await self._ensure_actor_state_table(
-            "ai_usage",
-            value_definition="last_request_at REAL NOT NULL",
-        )
+        await self._ensure_ai_usage_schema()
         await self._require_connection().execute(
             """
             CREATE TABLE IF NOT EXISTS ai_bank_grants (
@@ -1506,6 +1518,18 @@ class AIStateRepository:
                 updated_at REAL NOT NULL
             )
             """
+        )
+        await self._require_connection().execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS ai_chat_rate_limits (
+                scope_id TEXT PRIMARY KEY,
+                cooldown_seconds INTEGER NOT NULL
+                    CHECK (
+                        cooldown_seconds BETWEEN 0 AND {MAX_AI_COOLDOWN_SECONDS}
+                    ),
+                updated_at REAL NOT NULL
+            )
+            """  # nosec B608 -- the interpolated bound is a module constant
         )
         await self._require_connection().execute(
             """
@@ -1696,6 +1720,33 @@ class AIStateRepository:
             """  # nosec B608
         )
         await connection.execute(f"DROP TABLE {legacy}")  # nosec B608
+
+    async def _ensure_ai_usage_schema(self) -> None:
+        connection = self._require_connection()
+        columns = await self._table_columns("ai_usage")
+        if not columns:
+            await self._create_ai_usage_table()
+            return
+        if {"scope_id", "actor_id", "last_request_at"}.issubset(columns):
+            return
+
+        # Actor-only timestamps cannot be assigned to a chat without restoring
+        # the cross-group cooldown leakage this schema replaces.
+        await connection.execute("ALTER TABLE ai_usage RENAME TO ai_usage_legacy")
+        await self._create_ai_usage_table()
+        await connection.execute("DROP TABLE ai_usage_legacy")
+
+    async def _create_ai_usage_table(self) -> None:
+        await self._require_connection().execute(
+            """
+            CREATE TABLE ai_usage (
+                scope_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                last_request_at REAL NOT NULL,
+                PRIMARY KEY (scope_id, actor_id)
+            )
+            """
+        )
 
     async def _ensure_excluded_messages_schema(self) -> None:
         connection = self._require_connection()
@@ -2413,6 +2464,50 @@ class AIStateRepository:
             )
         await connection.commit()
 
+    async def get_ai_cooldown_override(self, scope_id: str) -> int | None:
+        if not is_canonical_bank_id(scope_id):
+            raise ValueError("AI cooldown overrides require a canonical chat identity")
+        cursor = await self._require_connection().execute(
+            "SELECT cooldown_seconds FROM ai_chat_rate_limits WHERE scope_id = ?",
+            (scope_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row["cooldown_seconds"]) if row is not None else None
+
+    async def set_ai_cooldown_override(
+        self,
+        scope_id: str,
+        cooldown_seconds: int | None,
+    ) -> None:
+        if not is_canonical_bank_id(scope_id):
+            raise ValueError("AI cooldown overrides require a canonical chat identity")
+        if cooldown_seconds is not None and (
+            type(cooldown_seconds) is not int
+            or not 0 <= cooldown_seconds <= MAX_AI_COOLDOWN_SECONDS
+        ):
+            raise ValueError("AI cooldown is outside supported bounds")
+        connection = self._require_connection()
+        if cooldown_seconds is None:
+            await connection.execute(
+                "DELETE FROM ai_chat_rate_limits WHERE scope_id = ?",
+                (scope_id,),
+            )
+        else:
+            await connection.execute(
+                """
+                INSERT INTO ai_chat_rate_limits (
+                    scope_id,
+                    cooldown_seconds,
+                    updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(scope_id) DO UPDATE SET
+                    cooldown_seconds = excluded.cooldown_seconds,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_id, cooldown_seconds, time.time()),
+            )
+        await connection.commit()
+
     async def is_allowed(self, actor_id: str) -> bool:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -2514,22 +2609,37 @@ class AIStateRepository:
         )
         return tuple([str(row["bank_id"]) async for row in cursor])
 
-    async def get_last_request_at(self, actor_id: str) -> float | None:
+    async def get_last_request_at(
+        self,
+        scope_id: str,
+        actor_id: str,
+    ) -> float | None:
+        if not is_canonical_bank_id(scope_id) or not is_canonical_actor_id(actor_id):
+            raise ValueError("AI usage requires canonical chat and actor identities")
         connection = self._require_connection()
         cursor = await connection.execute(
-            "SELECT last_request_at FROM ai_usage WHERE actor_id = ?",
-            (actor_id,),
+            "SELECT last_request_at FROM ai_usage "
+            "WHERE scope_id = ? AND actor_id = ?",
+            (scope_id, actor_id),
         )
         row = await cursor.fetchone()
         return float(row["last_request_at"]) if row else None
 
-    async def set_last_request_at(self, actor_id: str, timestamp: float) -> None:
+    async def set_last_request_at(
+        self,
+        scope_id: str,
+        actor_id: str,
+        timestamp: float,
+    ) -> None:
+        if not is_canonical_bank_id(scope_id) or not is_canonical_actor_id(actor_id):
+            raise ValueError("AI usage requires canonical chat and actor identities")
         connection = self._require_connection()
         await connection.execute(
-            "INSERT INTO ai_usage (actor_id, last_request_at) VALUES (?, ?) "
-            "ON CONFLICT(actor_id) DO UPDATE SET "
+            "INSERT INTO ai_usage (scope_id, actor_id, last_request_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(scope_id, actor_id) DO UPDATE SET "
             "last_request_at = excluded.last_request_at",
-            (actor_id, timestamp),
+            (scope_id, actor_id, timestamp),
         )
         await connection.commit()
 
@@ -3592,27 +3702,55 @@ class AIRateLimiter:
         self._in_flight: set[str] = set()
         self._lock = asyncio.Lock()
 
-    async def acquire(self, *, actor_id: str, is_owner: bool) -> bool:
+    @property
+    def default_cooldown_seconds(self) -> float:
+        return self._cooldown_seconds
+
+    async def cooldown_seconds_for(self, scope_id: str) -> float:
+        override = await self._store.get_ai_cooldown_override(scope_id)
+        return self._cooldown_seconds if override is None else float(override)
+
+    async def acquire(
+        self,
+        *,
+        scope_id: str,
+        actor_id: str,
+        is_owner: bool,
+    ) -> bool:
         if is_owner:
             return True
         async with self._lock:
             if actor_id in self._in_flight:
                 return False
-            last_request_at = await self._store.get_last_request_at(actor_id)
+            last_request_at = await self._store.get_last_request_at(
+                scope_id,
+                actor_id,
+            )
+            cooldown_seconds = await self.cooldown_seconds_for(scope_id)
             if (
                 last_request_at is not None
-                and self._clock() - last_request_at < self._cooldown_seconds
+                and self._clock() - last_request_at < cooldown_seconds
             ):
                 return False
             self._in_flight.add(actor_id)
             return True
 
-    async def release(self, *, actor_id: str, is_owner: bool) -> None:
+    async def release(
+        self,
+        *,
+        scope_id: str,
+        actor_id: str,
+        is_owner: bool,
+    ) -> None:
         if is_owner:
             return
         async with self._lock:
             try:
-                await self._store.set_last_request_at(actor_id, self._clock())
+                await self._store.set_last_request_at(
+                    scope_id,
+                    actor_id,
+                    self._clock(),
+                )
             finally:
                 self._in_flight.discard(actor_id)
 
@@ -3707,6 +3845,12 @@ class AIConversationHandler:
                     "Usage: /ai_model [model-id|default]",
                     kind="ai-control",
                 )
+            elif command.name == "/ai_limit":
+                await self._reply_memory_excluded(
+                    message,
+                    "Usage: /ai_limit [seconds|default] (seconds: 0-86400)",
+                    kind="ai-control",
+                )
             elif command.name == "/ai_access":
                 await self._reply_memory_excluded(
                     message,
@@ -3731,6 +3875,10 @@ class AIConversationHandler:
             if not is_owner_control:
                 return False
             return await self._handle_model_command(message, scope_id, command)
+        if isinstance(command, AILimitCommand):
+            if not is_owner_control:
+                return False
+            return await self._handle_ai_limit_command(message, scope_id, command)
         if isinstance(command, MemoryBackfillCommand):
             if not is_owner_control:
                 return False
@@ -3856,6 +4004,7 @@ class AIConversationHandler:
             prompt = authored_prompt or "Describe the attached content."
 
         acquired = await self._rate_limiter.acquire(
+            scope_id=scope_id,
             actor_id=actor_id,
             is_owner=is_owner,
         )
@@ -3999,6 +4148,7 @@ class AIConversationHandler:
                     )
                 )
                 await self._rate_limiter.release(
+                    scope_id=scope_id,
                     actor_id=actor_id,
                     is_owner=is_owner,
                 )
@@ -4067,6 +4217,7 @@ class AIConversationHandler:
                 self._active_runs.pop(actor_id, None)
             if not rate_released:
                 await self._rate_limiter.release(
+                    scope_id=scope_id,
                     actor_id=actor_id,
                     is_owner=is_owner,
                 )
@@ -4224,6 +4375,60 @@ class AIConversationHandler:
             kind="ai-control",
         )
         return True
+
+    async def _handle_ai_limit_command(
+        self,
+        message: ReplyTarget,
+        scope_id: str,
+        command: AILimitCommand,
+    ) -> bool:
+        if not self._transport.is_group(message):
+            await self._reply_memory_excluded(
+                message,
+                "Group AI limits can only be changed in a group chat.",
+                kind="ai-control",
+            )
+            return True
+
+        default = self._rate_limiter.default_cooldown_seconds
+        if command.action == "reset":
+            await self._store.set_ai_cooldown_override(scope_id, None)
+            await self._reply_memory_excluded(
+                message,
+                "AI limit for this group reset to the server default "
+                f"({self._format_cooldown(default)} seconds per person).",
+                kind="ai-control",
+            )
+            return True
+
+        if command.action == "set":
+            assert command.cooldown_seconds is not None
+            await self._store.set_ai_cooldown_override(
+                scope_id,
+                command.cooldown_seconds,
+            )
+            await self._reply_memory_excluded(
+                message,
+                "AI limit for this group set to "
+                f"{command.cooldown_seconds} seconds per person.",
+                kind="ai-control",
+            )
+            return True
+
+        override = await self._store.get_ai_cooldown_override(scope_id)
+        cooldown = default if override is None else override
+        source = "server default" if override is None else "group override"
+        await self._reply_memory_excluded(
+            message,
+            "AI limit for this group: "
+            f"{self._format_cooldown(cooldown)} seconds per person ({source}).",
+            kind="ai-control",
+        )
+        return True
+
+    @staticmethod
+    def _format_cooldown(cooldown_seconds: float) -> str:
+        return f"{cooldown_seconds:g}"
 
     @staticmethod
     def _format_model_catalog(

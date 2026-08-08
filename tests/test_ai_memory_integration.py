@@ -188,6 +188,12 @@ class FakeStore:
         else:
             self.model_overrides[scope_id] = model
 
+    async def get_ai_cooldown_override(self, scope_id):
+        return None
+
+    async def set_ai_cooldown_override(self, scope_id, cooldown_seconds):
+        return None
+
     async def is_allowed(self, actor_id):
         return actor_id in self.allowed
 
@@ -210,11 +216,11 @@ class FakeStore:
     async def list_bank_grants(self, actor_id):
         return tuple(sorted(self.bank_grants.get(actor_id, ())))
 
-    async def get_last_request_at(self, actor_id):
-        return self.last_request.get(actor_id)
+    async def get_last_request_at(self, scope_id, actor_id):
+        return self.last_request.get((scope_id, actor_id))
 
-    async def set_last_request_at(self, actor_id, timestamp):
-        self.last_request[actor_id] = timestamp
+    async def set_last_request_at(self, scope_id, actor_id, timestamp):
+        self.last_request[(scope_id, actor_id)] = timestamp
 
     async def get_memory_document_receipt(self, scope_id, document_id):
         return self.memory_documents.get((scope_id, document_id))
