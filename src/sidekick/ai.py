@@ -39,6 +39,7 @@ from sidekick.chat.commands import (
     AICancelCommand,
     AILimitCommand,
     AIModelCommand,
+    AIPrefixCommand,
     AccessCommand,
     BankGrantCommand,
     ChatAccessCommand,
@@ -50,8 +51,10 @@ from sidekick.chat.commands import (
     MemoryModeCommand,
     MemoryRememberCommand,
     MemoryStatusCommand,
+    DEFAULT_AI_COMMAND_PREFIX,
     MAX_AI_COOLDOWN_SECONDS,
     MODEL_ID_RE,
+    normalize_ai_command_prefix,
     parse_chat_command,
 )
 from sidekick.chat.identity import (
@@ -505,6 +508,14 @@ class ConversationStore(Protocol):
         model: str | None,
     ) -> None: ...
 
+    async def get_ai_command_prefix(self, scope_id: str) -> str | None: ...
+
+    async def set_ai_command_prefix(
+        self,
+        scope_id: str,
+        prefix: str | None,
+    ) -> None: ...
+
     async def get_ai_cooldown_override(self, scope_id: str) -> int | None: ...
 
     async def set_ai_cooldown_override(
@@ -799,9 +810,13 @@ class MemoryChainRetain:
     created: bool
 
 
-def _memory_message_text(text: str) -> str:
+def _memory_message_text(
+    text: str,
+    *,
+    ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
+) -> str:
     text = text.strip()
-    command = parse_chat_command(text)
+    command = parse_chat_command(text, ai_prefix=ai_prefix)
     if isinstance(command, AIAskCommand):
         return command.prompt
     return text if command is None else ""
@@ -889,7 +904,7 @@ class AIResponder:
                             failure_code="RATE_LIMITED",
                         )
                     if event.code == "SESSION_UNAVAILABLE":
-                        unavailable = "AI thread unavailable. Start a new /ai."
+                        unavailable = "AI thread unavailable. Start over."
                         await self._edit_message(
                             answer,
                             unavailable,
@@ -1152,6 +1167,7 @@ class PromptBuilder:
         trigger: ReplyTarget,
         *,
         recent_messages: int | None = None,
+        ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
     ) -> ChatContext:
         reply_target = await self._transport.get_reply(trigger)
         reply_path = await self._load_reply_path(reply_target)
@@ -1196,16 +1212,20 @@ class PromptBuilder:
             reply_path,
             recent,
             current_reply_to_message_id=trigger.reply_to_msg_id,
+            ai_prefix=ai_prefix,
         )
 
     async def load_reply_chain(
         self,
         current: ReplyTarget | None,
+        *,
+        ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
     ) -> ChatContext:
         return await self._build_chat_context(
             await self._load_reply_path(current),
             (),
             current_reply_to_message_id=None,
+            ai_prefix=ai_prefix,
         )
 
     async def _load_reply_path(
@@ -1229,6 +1249,7 @@ class PromptBuilder:
         recent: tuple[ReplyTarget, ...],
         *,
         current_reply_to_message_id: ExternalId | None,
+        ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
     ) -> ChatContext:
         candidates: dict[
             tuple[ExternalId | None, ExternalId],
@@ -1290,7 +1311,11 @@ class PromptBuilder:
                     break
                 if len(rendered_content) > remaining:
                     rendered_content = rendered_content[:remaining]
-                observation_text = self.build_observation_text(text, attachment)
+                observation_text = self.build_observation_text(
+                    text,
+                    attachment,
+                    ai_prefix=ai_prefix,
+                )
                 message_identity = await self.resolve_identity(message)
                 observation = None
                 if (
@@ -1428,8 +1453,10 @@ class PromptBuilder:
     def build_observation_text(
         text: str,
         attachment: AttachmentDescription | None,
+        *,
+        ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
     ) -> str:
-        normalized_text = _memory_message_text(text)
+        normalized_text = _memory_message_text(text, ai_prefix=ai_prefix)
         parts = [normalized_text] if normalized_text else []
         if attachment is not None:
             parts.append(attachment.memory_text)
@@ -1542,6 +1569,15 @@ class AIStateRepository:
             CREATE TABLE IF NOT EXISTS ai_model_overrides (
                 scope_id TEXT PRIMARY KEY,
                 model_id TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        await self._require_connection().execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_command_prefixes (
+                scope_id TEXT PRIMARY KEY,
+                command_prefix TEXT NOT NULL,
                 updated_at REAL NOT NULL
             )
             """
@@ -2488,6 +2524,49 @@ class AIStateRepository:
                     updated_at = excluded.updated_at
                 """,
                 (scope_id, model, time.time()),
+            )
+        await connection.commit()
+
+    async def get_ai_command_prefix(self, scope_id: str) -> str | None:
+        if not is_canonical_bank_id(scope_id):
+            raise ValueError("AI command prefixes require a canonical chat identity")
+        cursor = await self._require_connection().execute(
+            "SELECT command_prefix FROM ai_command_prefixes WHERE scope_id = ?",
+            (scope_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row["command_prefix"]) if row is not None else None
+
+    async def set_ai_command_prefix(
+        self,
+        scope_id: str,
+        prefix: str | None,
+    ) -> None:
+        if not is_canonical_bank_id(scope_id):
+            raise ValueError("AI command prefixes require a canonical chat identity")
+        if prefix is not None:
+            prefix = normalize_ai_command_prefix(prefix)
+            if prefix == DEFAULT_AI_COMMAND_PREFIX:
+                prefix = None
+        connection = self._require_connection()
+        if prefix is None:
+            await connection.execute(
+                "DELETE FROM ai_command_prefixes WHERE scope_id = ?",
+                (scope_id,),
+            )
+        else:
+            await connection.execute(
+                """
+                INSERT INTO ai_command_prefixes (
+                    scope_id,
+                    command_prefix,
+                    updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(scope_id) DO UPDATE SET
+                    command_prefix = excluded.command_prefix,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_id, prefix, time.time()),
             )
         await connection.commit()
 
@@ -3847,7 +3926,10 @@ class AIConversationHandler:
             return False
         message_text = self._prompt_builder.message_text(message)
         scope_id = self._identity_codec.scope_id(message.chat_id)
-        command = parse_chat_command(message_text)
+        ai_prefix = DEFAULT_AI_COMMAND_PREFIX
+        if message_text is not None and message_text.startswith("/"):
+            ai_prefix = await self._ai_command_prefix_for(scope_id)
+        command = parse_chat_command(message_text, ai_prefix=ai_prefix)
         is_owner = actor_id == self._owner_actor_id
         is_owner_control = is_owner or self._transport.is_outgoing(message)
         if command is not None and not isinstance(command, AIAskCommand):
@@ -3879,6 +3961,12 @@ class AIConversationHandler:
                     "Usage: /ai_limit [seconds|default] (seconds: 0-86400)",
                     kind="ai-control",
                 )
+            elif command.name == "/ai_prefix":
+                await self._reply_memory_excluded(
+                    message,
+                    "Usage: /ai_prefix [/command|default]",
+                    kind="ai-control",
+                )
             elif command.name == "/ai_access":
                 await self._reply_memory_excluded(
                     message,
@@ -3903,6 +3991,10 @@ class AIConversationHandler:
             if not is_owner_control:
                 return False
             return await self._handle_model_command(message, scope_id, command)
+        if isinstance(command, AIPrefixCommand):
+            if not is_owner_control:
+                return False
+            return await self._handle_ai_prefix_command(message, scope_id, command)
         if isinstance(command, AILimitCommand):
             if not is_owner_control:
                 return False
@@ -3982,7 +4074,7 @@ class AIConversationHandler:
                 message,
                 "Recent context count must be between 1 and "
                 f"{self._prompt_builder.max_context_messages}. Usage: "
-                "/ai10 <question>",
+                f"{ai_prefix}10 <question>",
                 kind="ai-control",
             )
             return True
@@ -3998,9 +4090,9 @@ class AIConversationHandler:
         if ai_trigger is not None:
             if not ai_trigger.prompt and not has_current_attachment:
                 command_usage = (
-                    f"/ai{ai_trigger.recent_messages} <question>"
+                    f"{ai_prefix}{ai_trigger.recent_messages} <question>"
                     if ai_trigger.recent_messages is not None
-                    else "/ai <question>"
+                    else f"{ai_prefix} <question>"
                 )
                 await self._reply_memory_excluded(
                     message,
@@ -4024,10 +4116,12 @@ class AIConversationHandler:
             parent = await self._store.get_answer(scope_id, parent_answer_id)
             if parent is None:
                 return False
+            ai_prefix = await self._ai_command_prefix_for(scope_id)
             if not parent.agent_session_id or not parent.agent_entry_id:
                 await self._reply_memory_excluded(
                     message,
-                    "This conversation predates agent sessions. Start a new /ai request.",
+                    "This conversation predates agent sessions. "
+                    f"Start a new {ai_prefix} request.",
                     kind="ai-control",
                 )
                 return True
@@ -4087,6 +4181,7 @@ class AIConversationHandler:
                             if ai_trigger is not None
                             else None
                         ),
+                        ai_prefix=ai_prefix,
                     )
                 except ChatContextUnavailable:
                     await self._reply_memory_excluded(
@@ -4362,6 +4457,57 @@ class AIConversationHandler:
             else "No active AI request."
         )
         await self._reply_memory_excluded(message, response, kind="memory-control")
+        return True
+
+    async def _ai_command_prefix_for(self, scope_id: str) -> str:
+        override = await self._store.get_ai_command_prefix(scope_id)
+        return (
+            DEFAULT_AI_COMMAND_PREFIX
+            if override is None
+            else normalize_ai_command_prefix(override)
+        )
+
+    async def _handle_ai_prefix_command(
+        self,
+        message: ReplyTarget,
+        scope_id: str,
+        command: AIPrefixCommand,
+    ) -> bool:
+        if not self._transport.is_group(message):
+            await self._reply_memory_excluded(
+                message,
+                "Group AI command can only be changed in a group chat.",
+                kind="ai-control",
+            )
+            return True
+
+        if command.action == "reset":
+            await self._store.set_ai_command_prefix(scope_id, None)
+            await self._reply_memory_excluded(
+                message,
+                f"AI command for this group reset to {DEFAULT_AI_COMMAND_PREFIX}.",
+                kind="ai-control",
+            )
+            return True
+
+        if command.action == "set":
+            assert command.prefix is not None
+            await self._store.set_ai_command_prefix(scope_id, command.prefix)
+            await self._reply_memory_excluded(
+                message,
+                f"AI command for this group set to {command.prefix}.",
+                kind="ai-control",
+            )
+            return True
+
+        override = await self._store.get_ai_command_prefix(scope_id)
+        prefix = override or DEFAULT_AI_COMMAND_PREFIX
+        source = "server default" if override is None else "group override"
+        await self._reply_memory_excluded(
+            message,
+            f"AI command for this group: {prefix} ({source}).",
+            kind="ai-control",
+        )
         return True
 
     async def _handle_model_command(
@@ -5328,9 +5474,13 @@ class AIConversationHandler:
     ) -> MemoryChainRetain | None:
         if self._memory is None or target.chat_id is None:
             return None
-        loaded_context = await self._prompt_builder.load_reply_chain(target)
+        scope_id = self._identity_codec.scope_id(target.chat_id)
+        loaded_context = await self._prompt_builder.load_reply_chain(
+            target,
+            ai_prefix=await self._ai_command_prefix_for(scope_id),
+        )
         _, _, observations = await self._classify_chat_context(
-            self._identity_codec.scope_id(target.chat_id),
+            scope_id,
             loaded_context,
         )
         if not observations:

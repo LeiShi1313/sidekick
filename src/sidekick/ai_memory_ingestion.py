@@ -17,13 +17,13 @@ from sidekick.ai import (
     PromptBuilder,
     ReplyTarget,
     _chat_memory_episode,
-    _memory_message_text,
     _memory_cursor,
     _message_datetime,
     _record_episode_labels,
 )
 from sidekick.ai_attachments import attachment_metadata_only, message_has_attachment
 from sidekick.chat.commands import (
+    DEFAULT_AI_COMMAND_PREFIX,
     MAX_MEMORY_BACKFILL_MESSAGES,
     MemoryBackfillCommand,
 )
@@ -1347,10 +1347,12 @@ class ChatMemoryIngestor:
     ) -> dict[ExternalId, HumanObservation]:
         message_ids = tuple(message.id for message in messages)
         scope_id = self._identity_codec.scope_id(chat_id)
-        excluded_ids, answer_ids = await asyncio.gather(
+        excluded_ids, answer_ids, ai_prefix_override = await asyncio.gather(
             self._store.get_memory_excluded_message_ids(scope_id, message_ids),
             self._store.get_ai_answer_message_ids(scope_id, message_ids),
+            self._store.get_ai_command_prefix(scope_id),
         )
+        ai_prefix = ai_prefix_override or DEFAULT_AI_COMMAND_PREFIX
         semaphore = asyncio.Semaphore(self._ingestion_settings.preprocess_concurrency)
         identity_semaphore = asyncio.Semaphore(
             self._ingestion_settings.preprocess_concurrency
@@ -1387,9 +1389,7 @@ class ChatMemoryIngestor:
             ):
                 return None
             async with semaphore:
-                text = _memory_message_text(
-                    self._prompt_builder.message_text(message) or ""
-                )
+                text = self._prompt_builder.message_text(message) or ""
                 grouped_id = getattr(message, "grouped_id", None)
                 representative_id = (
                     album_attachment_representatives.get(grouped_id)
@@ -1406,6 +1406,7 @@ class ChatMemoryIngestor:
                 observation_text = self._prompt_builder.build_observation_text(
                     text,
                     attachment,
+                    ai_prefix=ai_prefix,
                 )
                 if not observation_text:
                     return None

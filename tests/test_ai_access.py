@@ -343,6 +343,104 @@ async def test_ai_limit_rejects_private_chat_member_and_invalid_changes(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_owner_can_set_inspect_and_reset_ai_command_for_one_group(tmp_path):
+    gateway = FakeGateway(["custom answer", "other answer", "default answer"])
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        gateway,
+        cooldown=0,
+    )
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    try:
+        show_default = FakeMessage("/ai_prefix", sender_id=10)
+        assert await handler.handle(show_default) is True
+        assert show_default.replies[0].text == (
+            "AI command for this group: /ai (server default)."
+        )
+
+        set_prefix = FakeMessage("/ai_prefix /Ask", sender_id=10)
+        assert await handler.handle(set_prefix) is True
+        assert set_prefix.replies[0].text == (
+            "AI command for this group set to /ask."
+        )
+        assert await store.get_ai_command_prefix(first_scope) == "/ask"
+        assert await store.get_ai_command_prefix(second_scope) is None
+
+        old_command = FakeMessage("/ai no longer a trigger", sender_id=10)
+        assert await handler.handle(old_command) is False
+        assert old_command.replies == []
+
+        custom_command = FakeMessage("/Ask group question", sender_id=10)
+        assert await handler.handle(custom_command) is True
+        assert gateway.requests[0].prompt == "group question"
+
+        other_group = FakeMessage(
+            "/ai other group question",
+            sender_id=10,
+            chat_id=-1002,
+        )
+        assert await handler.handle(other_group) is True
+        assert gateway.requests[1].prompt == "other group question"
+
+        show_override = FakeMessage("/ai_prefix", sender_id=10)
+        assert await handler.handle(show_override) is True
+        assert show_override.replies[0].text == (
+            "AI command for this group: /ask (group override)."
+        )
+
+        empty_custom_command = FakeMessage("/ask", sender_id=10)
+        assert await handler.handle(empty_custom_command) is True
+        assert empty_custom_command.replies[0].text == "Usage: /ask <question>"
+
+        reset = FakeMessage("/ai_prefix default", sender_id=10)
+        assert await handler.handle(reset) is True
+        assert reset.replies[0].text == (
+            "AI command for this group reset to /ai."
+        )
+        assert await store.get_ai_command_prefix(first_scope) is None
+
+        restored_default = FakeMessage("/ai restored", sender_id=10)
+        assert await handler.handle(restored_default) is True
+        assert gateway.requests[2].prompt == "restored"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_ai_command_prefix_rejects_private_member_and_invalid_changes(tmp_path):
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        FakeGateway([]),
+    )
+    scope_id = "telegram:chat:-1001"
+    try:
+        private_command = FakeMessage(
+            "/ai_prefix /ask",
+            sender_id=10,
+            chat_id=10,
+            is_group=False,
+        )
+        assert await handler.handle(private_command) is True
+        assert private_command.replies[0].text == (
+            "Group AI command can only be changed in a group chat."
+        )
+
+        member_command = FakeMessage("/ai_prefix /ask", sender_id=20)
+        assert await handler.handle(member_command) is False
+        assert member_command.replies == []
+
+        invalid_command = FakeMessage("/ai_prefix /ai_model", sender_id=10)
+        assert await handler.handle(invalid_command) is True
+        assert invalid_command.replies[0].text == (
+            "Usage: /ai_prefix [/command|default]"
+        )
+        assert await store.get_ai_command_prefix(scope_id) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_access_cannot_open_private_chats_or_be_changed_by_members(tmp_path):
     handler, store = await make_handler(
         tmp_path / "state.db",

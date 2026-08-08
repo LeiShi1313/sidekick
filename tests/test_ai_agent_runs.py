@@ -134,6 +134,7 @@ class FakeStore:
     def __init__(self, allowed: set[str] | None = None):
         self.allowed = allowed or set()
         self.markers: dict[tuple[str, int], AIAnswerMarker] = {}
+        self.ai_command_prefixes: dict[str, str] = {}
 
     async def get_answer(self, scope_id, answer_message_id):
         return self.markers.get((scope_id, answer_message_id))
@@ -158,6 +159,15 @@ class FakeStore:
 
     async def set_model_override(self, scope_id, model):
         return None
+
+    async def get_ai_command_prefix(self, scope_id):
+        return self.ai_command_prefixes.get(scope_id)
+
+    async def set_ai_command_prefix(self, scope_id, prefix):
+        if prefix is None:
+            self.ai_command_prefixes.pop(scope_id, None)
+        else:
+            self.ai_command_prefixes[scope_id] = prefix
 
     async def get_ai_cooldown_override(self, scope_id):
         return None
@@ -370,7 +380,7 @@ async def test_unavailable_session_gets_a_short_explicit_telegram_message():
 
     assert result.succeeded is False
     assert result.failure_code == "SESSION_UNAVAILABLE"
-    assert trigger.replies[0].text == "AI thread unavailable. Start a new /ai."
+    assert trigger.replies[0].text == "AI thread unavailable. Start over."
 
 
 @pytest.mark.asyncio

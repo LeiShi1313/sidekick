@@ -161,6 +161,7 @@ class FakeStore:
         self.memory_labels = {}
         self.memory_scope_display_names = {}
         self.model_overrides = {}
+        self.ai_command_prefixes = {}
 
     async def get_answer(self, scope_id, answer_message_id):
         return self.markers.get((scope_id, answer_message_id))
@@ -187,6 +188,15 @@ class FakeStore:
             self.model_overrides.pop(scope_id, None)
         else:
             self.model_overrides[scope_id] = model
+
+    async def get_ai_command_prefix(self, scope_id):
+        return self.ai_command_prefixes.get(scope_id)
+
+    async def set_ai_command_prefix(self, scope_id, prefix):
+        if prefix is None:
+            self.ai_command_prefixes.pop(scope_id, None)
+        else:
+            self.ai_command_prefixes[scope_id] = prefix
 
     async def get_ai_cooldown_override(self, scope_id):
         return None
@@ -747,6 +757,45 @@ async def test_matrix_bridge_ai_command_uses_alias_for_prompt_and_memory():
 
 
 @pytest.mark.asyncio
+async def test_matrix_bridge_uses_the_group_ai_command_for_prompt_and_memory():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    trigger = FakeMessage(
+        "SteamedFish: /Ask can I use CaiBao?",
+        sender_id=6332621450,
+        is_human=False,
+        entities=(
+            telegram_types.MessageEntityBold(offset=0, length=11),
+            telegram_types.MessageEntityBotCommand(offset=13, length=4),
+        ),
+    )
+    attribution = bridge_resolver.resolve(trigger)
+    assert attribution is not None
+    store = FakeStore(allowed={attribution.actor_id})
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
+    memory = FakeMemory()
+    gateway = FakeGateway(["yes"])
+    handler = make_handler(
+        gateway,
+        memory,
+        store=store,
+        attribution_resolver=bridge_resolver,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+    )
+
+    assert await handler.handle(trigger) is True
+
+    request = gateway.requests[0]
+    assert request.prompt == "can I use CaiBao?"
+    assert request.identity.requester.identity == attribution.actor_id
+    retained_event = memory.retain_calls[0]["episode"].events[0]
+    assert retained_event.actor_id == attribution.actor_id
+    assert retained_event.actor_display_name == "SteamedFish"
+    assert retained_event.text == "can I use CaiBao?"
+
+
+@pytest.mark.asyncio
 async def test_matrix_bridge_reply_continues_with_the_cleaned_message_text():
     bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
     store = FakeStore()
@@ -876,6 +925,26 @@ async def test_bare_memory_command_retains_one_ordered_multi_actor_episode():
     receipt = store.memory_documents[(item.scope_id, item.document_id)]
     assert receipt.content_hash == item.content_hash
     assert receipt.event_versions == item.event_versions
+
+
+@pytest.mark.asyncio
+async def test_manual_memory_strips_the_group_ai_command_prefix():
+    store = FakeStore()
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
+    memory = FakeMemory()
+    handler = make_handler(
+        FakeGateway(["unused"]),
+        memory,
+        store=store,
+        identity_resolver=FakeIdentityResolver(),
+    )
+    target = FakeMessage("/Ask remember the launch decision", sender_id=20)
+    command = FakeMessage("/ai_memory", sender_id=10, reply_to=target)
+
+    assert await handler.handle(command) is True
+
+    retained_event = memory.retain_calls[0]["episode"].events[0]
+    assert retained_event.text == "remember the launch decision"
 
 
 @pytest.mark.asyncio

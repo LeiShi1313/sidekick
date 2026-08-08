@@ -535,6 +535,23 @@ async def test_manual_dream_retains_standalone_and_complete_reply_tree(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_dream_memory_strips_the_group_ai_command_prefix(tmp_path):
+    source = FakeSource([FakeMessage(1, "/Ask record the launch decision")])
+    memory = FakeMemory()
+    store, scanner = await make_scanner(tmp_path, source, memory)
+    try:
+        await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
+
+        result = await scanner.run_scope(-1001)
+
+        assert result.messages_retained == 1
+        retained_event = memory.retain_calls[0]["episode"].events[0]
+        assert retained_event.text == "record the launch decision"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_dream_segments_root_groups_by_message_time(tmp_path):
     first = FakeMessage(
         1_000,
