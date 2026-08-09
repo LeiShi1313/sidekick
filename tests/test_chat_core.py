@@ -348,7 +348,8 @@ async def test_object_transport_replies_with_a_named_file() -> None:
 
     result = await ObjectChatTransport().reply_attachment(message, attachment)
 
-    assert result is None
+    assert isinstance(result, FakeSentMessage)
+    assert result.id == 100
     assert message.observed == ("report.txt", b"report", True)
 
 

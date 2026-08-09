@@ -8,6 +8,8 @@ test("loads the standalone agent configuration without Sidekick names", () => {
     AI_BASE_URL: "http://provider.internal/v1",
     AI_API_KEY: "test-key",
     AI_CHAT_MODEL: "test-model",
+    AI_IMAGE_MODEL: "gpt-image-2",
+    AI_IMAGE_REQUEST_TIMEOUT: "180",
     AI_REASONING_EFFORT: "low",
     PI_IDENTITY_ALIAS_KEY: "test-identity-alias-key-that-is-strong",
     PI_AGENT_TELEGRAM_TOKEN: "telegram-agent-token-that-is-long-enough",
@@ -71,6 +73,8 @@ test("loads the standalone agent configuration without Sidekick names", () => {
   assert.equal(config.engine.baseUrl, "http://provider.internal/v1");
   assert.equal(config.engine.apiKey, "test-key");
   assert.equal(config.engine.model, "test-model");
+  assert.equal(config.engine.imageModel, "gpt-image-2");
+  assert.equal(config.engine.imageRequestTimeoutMs, 180_000);
   assert.equal(config.engine.reasoningEffort, "low");
   assert.equal(config.engine.memoryUrl, "http://memory.internal:8888");
   assert.equal(config.engine.memoryToken, "memory-api-token-that-is-long-enough");
@@ -80,4 +84,7 @@ test("loads the standalone agent configuration without Sidekick names", () => {
   delete process.env.MEMORY_API_TOKEN;
   assert.throws(() => loadConfig(), /MEMORY_API_TOKEN/);
   process.env.MEMORY_API_TOKEN = "memory-api-token-that-is-long-enough";
+
+  delete process.env.AI_IMAGE_MODEL;
+  assert.equal(loadConfig().engine.imageModel, null);
 });

@@ -420,7 +420,9 @@ async def test_onebot_transport_replies_with_an_inline_image(make_png) -> None:
         attachment,
     )
 
-    assert result is None
+    assert result is not None
+    assert result.id == 503
+    assert result.text is None
     action, params, timeout = action_client.calls[0]
     assert action == "send_group_msg"
     assert timeout == 120

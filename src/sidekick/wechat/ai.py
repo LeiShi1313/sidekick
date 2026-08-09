@@ -316,7 +316,7 @@ class WeChatChatTransport:
         self,
         message: Any,
         attachment: OutboundAttachment,
-    ) -> None:
+    ) -> SentMessage | None:
         trigger = self._trigger(message)
         payload_fingerprint = sha256(
             b"\0".join(
@@ -361,6 +361,13 @@ class WeChatChatTransport:
             trigger.account_id,
             trigger.chat_id,
             operation.message_id,
+        )
+        return WeChatSentMessage(
+            id=operation.message_id,
+            text=None,
+            trigger=trigger,
+            request_id=request_id,
+            sent=True,
         )
 
     async def update(

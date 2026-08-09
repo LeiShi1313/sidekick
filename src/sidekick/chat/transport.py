@@ -30,7 +30,7 @@ class ChatTransport(Protocol):
         self,
         message: Any,
         attachment: OutboundAttachment,
-    ) -> None: ...
+    ) -> SentMessage | None: ...
 
     async def update(
         self,
@@ -71,14 +71,14 @@ class ObjectChatTransport:
         self,
         message: Any,
         attachment: OutboundAttachment,
-    ) -> None:
+    ) -> SentMessage | None:
         operation = getattr(message, "reply", None)
         if not callable(operation):
             raise RuntimeError("Chat transport cannot reply to this message")
         upload = BytesIO(attachment.data)
         upload.name = attachment.filename
         try:
-            await operation(
+            return await operation(
                 file=upload,
                 force_document=attachment.display_as == "file",
             )

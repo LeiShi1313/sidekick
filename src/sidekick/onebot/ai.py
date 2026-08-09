@@ -214,12 +214,12 @@ class OneBotChatTransport:
         self,
         message: Any,
         attachment: OutboundAttachment,
-    ) -> None:
+    ) -> SentMessage | None:
         if not isinstance(message, OneBotMessage):
             raise RuntimeError("OneBot transport requires a OneBot message")
         encoded = "base64://" + base64.b64encode(attachment.data).decode("ascii")
         if attachment.display_as == "image":
-            await self._send_segments(
+            message_id = await self._send_segments(
                 message,
                 [
                     {"type": "reply", "data": {"id": str(message.id)}},
@@ -227,7 +227,7 @@ class OneBotChatTransport:
                 ],
                 timeout=120,
             )
-            return
+            return OneBotSentMessage(id=message_id, text=None, trigger=message)
 
         if message.chat_id > 0:
             action = "upload_group_file"

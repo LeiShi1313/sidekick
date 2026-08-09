@@ -171,14 +171,14 @@ class TelegramChatTransport:
         self,
         message: Any,
         attachment: OutboundAttachment,
-    ) -> None:
+    ) -> SentMessage | None:
         operation = getattr(message, "reply", None)
         if not callable(operation):
             raise RuntimeError("Telegram message cannot be replied to")
         upload = BytesIO(attachment.data)
         upload.name = attachment.filename
         try:
-            await operation(
+            return await operation(
                 file=upload,
                 force_document=attachment.display_as == "file",
             )

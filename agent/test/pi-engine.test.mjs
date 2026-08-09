@@ -55,6 +55,7 @@ async function fakeProvider(handler) {
           data: [
             { id: "test-model" },
             { id: "alternate-model" },
+            { id: "gpt-image-2" },
             { id: "invalid model" },
             { id: 123 },
             { id: "alternate-model" },
@@ -288,6 +289,9 @@ async function fixture(handler, overrides = {}) {
     maxOutputTokens: 1_000,
     contextWindow: 32_000,
     requestTimeoutMs: 5_000,
+    imageModel: overrides.imageModel ?? null,
+    imageRequestTimeoutMs: 5_000,
+    imageClient: overrides.imageClient,
     workspaceDir: join(root, "workspace"),
     sessionDir: join(root, "sessions"),
     auditDir: join(root, "audit"),
@@ -311,8 +315,16 @@ async function fixture(handler, overrides = {}) {
 }
 
 test("lists bounded provider models and selects one for a single run", async () => {
-  const app = await fixture((body, response) => sendText(response, body.model));
+  const app = await fixture(
+    (body, response) => sendText(response, body.model),
+    {
+      imageModel: "gpt-image-2",
+    },
+  );
   try {
+    assert.equal(app.engine.imageClient.maxRetries, 0);
+    assert.equal(app.engine.imageClient.logLevel, "off");
+    assert.notEqual(app.engine.imageClient.logger, console);
     assert.deepEqual(await app.engine.listModels(), {
       defaultModel: "test-model",
       models: ["alternate-model", "test-model"],
@@ -373,6 +385,18 @@ test("passes one image to the model without persisting or auditing its bytes", a
       1,
     );
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
+test("keeps the known image-only model out of chat selection when disabled", async () => {
+  const app = await fixture((body, response) => sendText(response, body.model));
+  try {
+    assert.deepEqual(await app.engine.listModels(), {
+      defaultModel: "test-model",
+      models: ["alternate-model", "test-model"],
+    });
   } finally {
     await app.close();
   }
@@ -735,6 +759,75 @@ test("owner and delegated runs receive the same restricted tools", () => {
     "mcp",
   ]);
   assert.deepEqual(toolNamesForPolicy("none", true, true), []);
+  assert.deepEqual(toolNamesForPolicy("delegated", false, false, true), [
+    ...genericTools,
+    "image_generate",
+  ]);
+  assert.deepEqual(toolNamesForPolicy("none", false, false, true), []);
+});
+
+test("streams generated image bytes without persisting them", async () => {
+  const imageBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]);
+  const encoded = imageBytes.toString("base64");
+  const imageCalls = [];
+  const imageClient = {
+    images: {
+      async generate(request) {
+        imageCalls.push(request);
+        return { data: [{ b64_json: encoded }] };
+      },
+    },
+  };
+  const app = await fixture(
+    (body, response, requestNumber) => {
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-image-1",
+          name: "image_generate",
+          args: { prompt: "A fox and cat visiting Xiamen" },
+        });
+        return;
+      }
+      assert.equal(body.messages.at(-1)?.role, "tool");
+      assert.doesNotMatch(JSON.stringify(body.messages), new RegExp(encoded));
+      sendText(response, "Here is the generated image.");
+    },
+    { imageModel: "gpt-image-2", imageClient },
+  );
+  try {
+    const runId = "48484848-4848-4848-8848-484848484848";
+    const events = await collect(
+      app.engine,
+      request(runId, { prompt: "Generate a fox and cat in Xiamen" }),
+    );
+
+    assert.equal(imageCalls.length, 1);
+    const attachment = events.find((event) => event.type === "attachment");
+    assert.deepEqual(attachment, {
+      type: "attachment",
+      filename: "generated-image.jpg",
+      mimeType: "image/jpeg",
+      displayAs: "image",
+      data: encoded,
+    });
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "Here is the generated image.");
+
+    const sessionFiles = (await readdir(app.engine.config.sessionDir)).filter(
+      (name) => name.endsWith(".jsonl"),
+    );
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    const audit = await app.engine.getRunAudit(runId);
+    assert.doesNotMatch(rawSession, new RegExp(encoded));
+    assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
 });
 
 test("exposes only the MCP gateway and adds Taibu routing guidance", async () => {

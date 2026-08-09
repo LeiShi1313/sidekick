@@ -15,3 +15,16 @@ def make_png():
         return output.getvalue()
 
     return create
+
+
+@pytest.fixture
+def make_jpeg():
+    def create(width: int = 2, height: int = 2) -> bytes:
+        output = BytesIO()
+        Image.new("RGB", (width, height), (20, 80, 160)).save(
+            output,
+            format="JPEG",
+        )
+        return output.getvalue()
+
+    return create

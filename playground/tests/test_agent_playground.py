@@ -17,6 +17,10 @@ from agent_playground.app import (
 PI_TOKEN = "private-pi-token-that-is-long-enough"
 MEMORY_TOKEN = "private-memory-token-that-is-long-enough"
 CHANNEL_TOKEN = "private-channel-token-that-is-long-enough"
+PNG_DATA = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42Y"
+    "AAAAASUVORK5CYII="
+)
 
 
 async def start(app: web.Application) -> tuple[web.AppRunner, str]:
@@ -29,7 +33,9 @@ async def start(app: web.Application) -> tuple[web.AppRunner, str]:
 
 
 async def dependencies(
-    *, bank_id: str = "chat:engineering"
+    *,
+    bank_id: str = "chat:engineering",
+    pi_failure_after_attachment: bool = False,
 ) -> tuple[list[web.AppRunner], str, str, dict]:
     received = {
         "recalls": [],
@@ -96,6 +102,25 @@ async def dependencies(
             headers={"Content-Type": "application/x-ndjson; charset=utf-8"}
         )
         await response.prepare(request)
+        terminal_events = (
+            (
+                {
+                    "type": "run_failed",
+                    "code": "PROVIDER_ERROR",
+                    "message": "Agent run failed",
+                },
+            )
+            if pi_failure_after_attachment
+            else (
+                {"type": "text_delta", "delta": "Alice owns it.", "reset": True},
+                {
+                    "type": "run_completed",
+                    "sessionId": "session-1",
+                    "entryId": "entry-1",
+                    "answer": "Alice owns it.",
+                },
+            )
+        )
         events = (
             {
                 "type": "memory_snapshot",
@@ -126,13 +151,14 @@ async def dependencies(
                 "tool": "memory_reflect",
                 "summary": "Memory reflection completed",
             },
-            {"type": "text_delta", "delta": "Alice owns it.", "reset": True},
             {
-                "type": "run_completed",
-                "sessionId": "session-1",
-                "entryId": "entry-1",
-                "answer": "Alice owns it.",
+                "type": "attachment",
+                "filename": "generated-image.png",
+                "mimeType": "image/png",
+                "displayAs": "image",
+                "data": PNG_DATA,
             },
+            *terminal_events,
         )
         for event in events:
             await response.write(json.dumps(event).encode() + b"\n")
@@ -611,6 +637,14 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
         assert events[-1]["answer"] == "Alice owns it."
         assert events[1]["type"] == "memory_snapshot"
         assert events[1]["memories"][0]["id"] == "memory-1"
+        attachment = next(event for event in events if event["type"] == "attachment")
+        assert attachment == {
+            "type": "attachment",
+            "filename": "generated-image.png",
+            "mimeType": "image/png",
+            "displayAs": "image",
+            "data": PNG_DATA,
+        }
 
         assert len(received["recalls"]) == 1
         pi_request = received["runs"][0]
@@ -644,6 +678,41 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
         ]
         assert "Earlier we discussed" in pi_request["context"][0]["text"]
         assert PI_TOKEN not in json.dumps(events)
+    finally:
+        await playground_runner.cleanup()
+        for runner in dependency_runners:
+            await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_discards_attachment_when_pi_run_fails():
+    dependency_runners, memory_url, pi_url, _ = await dependencies(
+        pi_failure_after_attachment=True
+    )
+    playground_runner, playground_url = await request_app(memory_url, pi_url)
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(
+                f"{playground_url}/api/runs",
+                json={
+                    "mode": "agent",
+                    "prompt": "Generate an image",
+                    "bankId": "chat:engineering",
+                    "sessionId": None,
+                    "parentEntryId": None,
+                },
+            ) as response,
+        ):
+            events = [json.loads(line) async for line in response.content]
+
+        assert response.status == 200
+        assert events[-1] == {
+            "type": "run_failed",
+            "code": "PROVIDER_ERROR",
+            "message": "Agent run failed",
+        }
+        assert all(event["type"] != "attachment" for event in events)
     finally:
         await playground_runner.cleanup()
         for runner in dependency_runners:
@@ -810,6 +879,9 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
             async with session.get(f"{playground_url}/") as response:
                 markup = await response.text()
                 assert response.status == 200
+                assert "img-src 'self' data:" in response.headers[
+                    "Content-Security-Policy"
+                ]
                 assert '<section id="audit-summary"' in markup
                 assert 'aria-live="polite"' in markup
 
@@ -819,6 +891,7 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 assert "textContent" in script
                 assert 'if (event.type === "run_started") return;' in script
                 assert 'if (event.type === "memory_snapshot")' in script
+                assert 'if (event.type === "attachment")' in script
                 assert (
                     "state.sessionId = event.sessionId || state.sessionId" not in script
                 )
@@ -835,6 +908,7 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 assert response.status == 200
                 assert ".trace-facts" in styles
                 assert ".trace-step" in styles
+                assert ".generated-attachment" in styles
     finally:
         assert received["runs"] == []
         await playground_runner.cleanup()
@@ -862,6 +936,37 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
     ),
 )
 def test_playground_rejects_malformed_pi_memory_events(event):
+    with pytest.raises(UpstreamUnavailable, match="malformed events"):
+        _parse_pi_event(json.dumps(event).encode())
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        {
+            "type": "attachment",
+            "filename": "generated-image.png",
+            "mimeType": "image/png",
+            "displayAs": "image",
+            "data": "not-base64",
+        },
+        {
+            "type": "attachment",
+            "filename": "../generated-image.png",
+            "mimeType": "image/png",
+            "displayAs": "image",
+            "data": PNG_DATA,
+        },
+        {
+            "type": "attachment",
+            "filename": "generated-image.png",
+            "mimeType": "text/html",
+            "displayAs": "image",
+            "data": PNG_DATA,
+        },
+    ),
+)
+def test_playground_rejects_malformed_pi_attachments(event):
     with pytest.raises(UpstreamUnavailable, match="malformed events"):
         _parse_pi_event(json.dumps(event).encode())
 

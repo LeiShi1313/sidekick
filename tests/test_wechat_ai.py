@@ -426,7 +426,9 @@ async def test_wechat_transport_replies_with_one_stably_identified_attachment(
     finally:
         await store.close()
 
-    assert first is second is None
+    assert first.id == second.id == "7158246912028861544"
+    assert first.text is second.text is None
+    assert first.sent is second.sent is True
     assert client.attachment_calls[0] == client.attachment_calls[1]
     assert client.attachment_calls[0]["request_id"].startswith(
         "sidekick.wechat.attachment."
