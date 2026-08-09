@@ -269,6 +269,109 @@ class WeChatChatList:
 
 
 @dataclass(frozen=True, slots=True)
+class WeChatUser:
+    id: str
+    display_name: str | None
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatUser:
+        _required_bool(payload, "isPartial")
+        return cls(
+            id=_required_user_id(payload, "id"),
+            display_name=_optional_text(payload, "displayName"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatUserList:
+    users: tuple[WeChatUser, ...]
+    cursor: str
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatUserList:
+        if not _required_bool(payload, "isPartial"):
+            raise WeChatAPIContractError("WeChat user directory must be partial")
+        _required_text(payload, "source")
+        users = tuple(
+            WeChatUser.parse(_object(row, "user"))
+            for row in _required_array(payload, "data")
+        )
+        if len({user.id for user in users}) != len(users):
+            raise WeChatAPIContractError("WeChat user directory contains duplicate IDs")
+        return cls(users=users, cursor=_required_id(payload, "cursor"))
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatGroupMember:
+    group_id: str
+    user_id: str
+    display_name: str | None
+    nickname: str | None
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatGroupMember:
+        _required_bool(payload, "isPartial")
+        return cls(
+            group_id=_required_group_id(payload, "groupId"),
+            user_id=_required_user_id(payload, "userId"),
+            display_name=_optional_text(payload, "displayName"),
+            nickname=_optional_text(payload, "nickname"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatGroupMemberList:
+    group_id: str
+    members: tuple[WeChatGroupMember, ...]
+    cursor: str
+
+    @classmethod
+    def parse(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        group_id: str,
+    ) -> WeChatGroupMemberList:
+        target_group_id = _group_id(group_id, "group_id")
+        if not _required_bool(payload, "isPartial"):
+            raise WeChatAPIContractError(
+                "WeChat group member directory must be partial"
+            )
+        _required_text(payload, "source")
+        members = tuple(
+            WeChatGroupMember.parse(_object(row, "group member"))
+            for row in _required_array(payload, "data")
+        )
+        if any(member.group_id != target_group_id for member in members):
+            raise WeChatAPIContractError(
+                "WeChat group member directory contains a different group"
+            )
+        if len({member.user_id for member in members}) != len(members):
+            raise WeChatAPIContractError(
+                "WeChat group member directory contains duplicate user IDs"
+            )
+        snapshot = _required_object(payload, "snapshot")
+        if _required_group_id(snapshot, "groupId") != target_group_id:
+            raise WeChatAPIContractError(
+                "WeChat group member snapshot belongs to a different group"
+            )
+        complete = _required_bool(snapshot, "complete")
+        current = _required_bool(snapshot, "current")
+        count = _required_nonnegative_int(snapshot, "count")
+        if complete and current and count != len(members):
+            raise WeChatAPIContractError(
+                "WeChat group member snapshot count is inconsistent"
+            )
+        if current:
+            _required_positive_int(snapshot, "connectionGeneration")
+        return cls(
+            group_id=target_group_id,
+            members=members,
+            cursor=_required_id(payload, "cursor"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WeChatSharedChatHistory:
     title: str
     item_count: int
@@ -614,6 +717,36 @@ class WeChatConnectorClient:
     async def get_chats(self) -> WeChatChatList:
         payload = await self._request_json("GET", "/chats")
         return WeChatChatList.parse(payload)
+
+    async def get_users(self) -> WeChatUserList:
+        payload = await self._request_json("GET", "/users")
+        return WeChatUserList.parse(payload)
+
+    async def get_user(self, user_id: str) -> WeChatUser | None:
+        target_user_id = _user_id(user_id, "user_id")
+        try:
+            payload = await self._request_json(
+                "GET",
+                f"/users/{quote(target_user_id, safe='')}",
+            )
+        except WeChatAPIError as exc:
+            if exc.status == 404 and exc.code == "NOT_FOUND":
+                return None
+            raise
+        user = WeChatUser.parse(payload)
+        if user.id != target_user_id:
+            raise WeChatAPIContractError(
+                "WeChat user response returned a different user"
+            )
+        return user
+
+    async def get_group_members(self, group_id: str) -> WeChatGroupMemberList:
+        target_group_id = _group_id(group_id, "group_id")
+        payload = await self._request_json(
+            "GET",
+            f"/groups/{quote(target_group_id, safe='')}/members",
+        )
+        return WeChatGroupMemberList.parse(payload, group_id=target_group_id)
 
     async def get_messages(
         self,
@@ -1115,6 +1248,28 @@ def _required_id(payload: Mapping[str, Any], field: str) -> str:
 
 def _required_wechat_id(payload: Mapping[str, Any], field: str) -> str:
     return _canonical_wechat_id(payload.get(field), field)
+
+
+def _user_id(value: Any, field: str) -> str:
+    user_id = _canonical_wechat_id(value, field)
+    if user_id.endswith("@chatroom"):
+        raise WeChatAPIContractError(f"WeChat {field} must be a user ID")
+    return user_id
+
+
+def _required_user_id(payload: Mapping[str, Any], field: str) -> str:
+    return _user_id(payload.get(field), field)
+
+
+def _group_id(value: Any, field: str) -> str:
+    group_id = _canonical_wechat_id(value, field)
+    if not group_id.endswith("@chatroom"):
+        raise WeChatAPIContractError(f"WeChat {field} must be a group ID")
+    return group_id
+
+
+def _required_group_id(payload: Mapping[str, Any], field: str) -> str:
+    return _group_id(payload.get(field), field)
 
 
 def _media_id(value: Any, field: str) -> str:
