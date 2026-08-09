@@ -423,6 +423,60 @@ def test_wechat_client_validates_recall_event_identity() -> None:
         malformed.removed_message()
 
 
+@pytest.mark.parametrize(
+    ("event_name", "status", "mode", "expected"),
+    (
+        ("group_member_snapshot", "begin", None, None),
+        (
+            "group_member_snapshot",
+            "end",
+            None,
+            "56825427596@chatroom",
+        ),
+        ("group_member", None, "cache_snapshot", None),
+        ("group_member", None, "delta", "56825427596@chatroom"),
+    ),
+)
+def test_wechat_identity_events_identify_directory_invalidations(
+    event_name: str,
+    status: str | None,
+    mode: str | None,
+    expected: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "schemaVersion": "wechat-bridge/v1alpha1",
+        "cursor": "11",
+        "event": event_name,
+        "connectionGeneration": 41,
+        "groupId": "56825427596@chatroom",
+    }
+    if status is not None:
+        payload["status"] = status
+    if mode is not None:
+        payload["raw"] = {"mode": mode}
+
+    event = WeChatEvent.parse(payload)
+
+    assert event.invalidated_group_id() == expected
+
+
+def test_wechat_user_profile_event_requires_canonical_user_identity() -> None:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "user_profile",
+            "status": "changed",
+            "id": "sha256:profile-1",
+            "userId": "56825427596@chatroom",
+            "connectionGeneration": 41,
+        }
+    )
+
+    with pytest.raises(WeChatAPIContractError, match="userId"):
+        event.changed_user_id()
+
+
 def test_wechat_message_list_skips_senderless_unsupported_history_rows() -> None:
     text = connector_message_payload("4159667620982040828")
     app = {

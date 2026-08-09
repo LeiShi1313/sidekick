@@ -644,6 +644,24 @@ class WeChatEvent:
             _required_native_message_id(self.payload, "id"),
         )
 
+    def changed_user_id(self) -> str:
+        if self.name != "user_profile" or self.payload.get("status") != "changed":
+            raise WeChatAPIContractError("Malformed WeChat user profile event")
+        _required_id(self.payload, "id")
+        return _required_user_id(self.payload, "userId")
+
+    def invalidated_group_id(self) -> str | None:
+        if self.name == "group_member_snapshot":
+            status = _required_enum(self.payload, "status", {"begin", "end"})
+            group_id = _required_group_id(self.payload, "groupId")
+            return group_id if status == "end" else None
+        if self.name == "group_member":
+            group_id = _required_group_id(self.payload, "groupId")
+            raw = _required_object(self.payload, "raw")
+            mode = _required_enum(raw, "mode", {"cache_snapshot", "delta"})
+            return group_id if mode == "delta" else None
+        raise WeChatAPIContractError("Event is not a WeChat group member event")
+
 
 @dataclass(frozen=True, slots=True)
 class WeChatSendOperation:

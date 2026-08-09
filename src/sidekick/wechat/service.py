@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+import logging
 from typing import Literal, Protocol
 
 from sidekick.ai import ReplyTarget
@@ -12,14 +13,19 @@ from sidekick.wechat.api import (
     WeChatCapabilities,
     WeChatChatList,
     WeChatEvent,
+    WeChatGroupMemberList,
     WeChatMessageList,
     WeChatSession,
+    WeChatUser,
+    WeChatUserList,
 )
 from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import WeChatStateRepository
 
 
 PumpResult = Literal["stopped", "reconnect", "rebootstrap"]
+_IDENTITY_DIRECTORY_CONCURRENCY = 8
+_LOGGER = logging.getLogger(__name__)
 
 
 class WeChatInboundHandler(Protocol):
@@ -34,6 +40,12 @@ class WeChatBootstrapClient(Protocol):
     async def get_chats(self) -> WeChatChatList: ...
 
     async def get_messages(self, *, limit: int) -> WeChatMessageList: ...
+
+    async def get_users(self) -> WeChatUserList: ...
+
+    async def get_user(self, user_id: str) -> WeChatUser | None: ...
+
+    async def get_group_members(self, group_id: str) -> WeChatGroupMemberList: ...
 
     def events(self, *, after: str) -> AsyncIterator[WeChatEvent]: ...
 
@@ -77,6 +89,7 @@ async def bootstrap_wechat_channel(
         chats=chats,
         messages=messages,
     )
+    await _hydrate_identity_directories(client, store, connector_key, chats)
     return WeChatBootstrap(
         session=session,
         capabilities=capabilities,
@@ -203,6 +216,18 @@ class WeChatEventPump:
             await self._refresh_chats(generation)
             return _PendingEvent(event=event)
 
+        if event.name == "user_profile":
+            user_id = event.changed_user_id()
+            user = await self._client.get_user(user_id)
+            await self._store.refresh_user(self._connector_key, user_id, user)
+            return _PendingEvent(event=event)
+
+        if event.name in {"group_member", "group_member_snapshot"}:
+            group_id = event.invalidated_group_id()
+            if group_id is not None:
+                await self._refresh_group_members(group_id)
+            return _PendingEvent(event=event)
+
         if event.name == "message":
             if event.is_senderless_unsupported_message():
                 return _PendingEvent(event=event)
@@ -286,6 +311,60 @@ class WeChatEventPump:
         chats = await self._client.get_chats()
         chats.require_current(generation)
         await self._store.refresh_chats(self._connector_key, chats)
+
+    async def _refresh_group_members(self, group_id: str) -> None:
+        members = await self._client.get_group_members(group_id)
+        await self._store.refresh_group_members(
+            self._connector_key,
+            group_id,
+            members,
+        )
+
+
+async def _hydrate_identity_directories(
+    client: WeChatBootstrapClient,
+    store: WeChatStateRepository,
+    connector_key: str,
+    chats: WeChatChatList,
+) -> None:
+    semaphore = asyncio.Semaphore(_IDENTITY_DIRECTORY_CONCURRENCY)
+
+    async def read_users() -> WeChatUserList | None:
+        try:
+            return await client.get_users()
+        except Exception:
+            _LOGGER.warning(
+                "Could not refresh the optional WeChat user directory",
+                exc_info=True,
+            )
+            return None
+
+    async def read_members(group_id: str) -> WeChatGroupMemberList | None:
+        async with semaphore:
+            try:
+                return await client.get_group_members(group_id)
+            except Exception:
+                _LOGGER.warning(
+                    "Could not refresh the optional WeChat group member directory",
+                    extra={"wechat_group_id": group_id},
+                    exc_info=True,
+                )
+                return None
+
+    users_task = asyncio.create_task(read_users())
+    group_ids = tuple(chat.id for chat in chats.chats if chat.type == "group")
+    member_tasks = tuple(
+        asyncio.create_task(read_members(group_id)) for group_id in group_ids
+    )
+    directory_results = await asyncio.gather(users_task, *member_tasks)
+    users = directory_results[0]
+    member_lists = directory_results[1:]
+
+    if users is not None:
+        await store.refresh_users(connector_key, users)
+    for group_id, members in zip(group_ids, member_lists, strict=True):
+        if members is not None:
+            await store.refresh_group_members(connector_key, group_id, members)
 
 
 def _dispatchable(message: WeChatMessage) -> bool:
