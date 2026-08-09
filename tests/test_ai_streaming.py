@@ -183,6 +183,7 @@ class FakeStore:
     def __init__(self):
         self.saved = []
         self.model_overrides: dict[str, str] = {}
+        self.ai_command_prefixes: dict[str, str] = {}
         self.memory_excluded: set[tuple[str, int, str]] = set()
 
     async def get_answer(self, scope_id, answer_message_id):
@@ -202,6 +203,13 @@ class FakeStore:
     async def save_answer(self, marker):
         self.saved.append(marker)
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        return {
+            marker.trigger_message_id: marker.command_prefix
+            for marker in self.saved
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids
+        }
+
     async def get_model_override(self, scope_id):
         return self.model_overrides.get(scope_id)
 
@@ -210,6 +218,15 @@ class FakeStore:
             self.model_overrides.pop(scope_id, None)
         else:
             self.model_overrides[scope_id] = model
+
+    async def get_ai_command_prefix(self, scope_id):
+        return self.ai_command_prefixes.get(scope_id)
+
+    async def set_ai_command_prefix(self, scope_id, prefix):
+        if prefix is None:
+            self.ai_command_prefixes.pop(scope_id, None)
+        else:
+            self.ai_command_prefixes[scope_id] = prefix
 
     async def get_ai_cooldown_override(self, scope_id):
         return None

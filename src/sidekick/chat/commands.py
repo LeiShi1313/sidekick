@@ -8,7 +8,9 @@ from typing import Literal, TypeAlias
 MAX_MEMORY_BACKFILL_DAYS = 30
 MAX_MEMORY_BACKFILL_MESSAGES = 5_000
 MAX_AI_COOLDOWN_SECONDS = 86_400
+DEFAULT_AI_COMMAND_PREFIX = "/ai"
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+AI_COMMAND_PREFIX_RE = re.compile(r"/[A-Za-z][A-Za-z0-9_]{0,30}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +46,20 @@ class AIModelCommand:
     def __post_init__(self) -> None:
         if (self.action == "set") != (self.model is not None):
             raise ValueError("Only a model-selection command accepts a model")
+
+
+@dataclass(frozen=True, slots=True)
+class AIPrefixCommand:
+    action: Literal["show", "set", "reset"]
+    prefix: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.action == "set") != (self.prefix is not None):
+            raise ValueError("Only a prefix-setting command accepts a prefix")
+        if self.prefix is not None and normalize_ai_command_prefix(self.prefix) != (
+            self.prefix
+        ):
+            raise ValueError("AI command prefixes must be normalized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +149,7 @@ ChatCommand: TypeAlias = (
     | AICancelCommand
     | AILimitCommand
     | AIModelCommand
+    | AIPrefixCommand
     | AccessCommand
     | ChatAccessCommand
     | DirectoryPublishCommand
@@ -147,9 +164,27 @@ ChatCommand: TypeAlias = (
 )
 
 
-def parse_chat_command(text: str | None) -> ChatCommand | None:
+def normalize_ai_command_prefix(prefix: str) -> str:
+    if AI_COMMAND_PREFIX_RE.fullmatch(prefix) is None:
+        raise ValueError("AI command prefix must be a slash command")
+    normalized = prefix.casefold()
+    if normalized.startswith("/ai_"):
+        raise ValueError("AI command prefix conflicts with the control namespace")
+    return normalized
+
+
+def parse_chat_command(
+    text: str | None,
+    *,
+    ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
+) -> ChatCommand | None:
     if text is None or not text.startswith("/"):
         return None
+    ai_prefix = normalize_ai_command_prefix(ai_prefix)
+
+    prefix = _parse_ai_prefix_control(text.strip())
+    if prefix is not None:
+        return prefix
 
     directory = _parse_directory_control(text)
     if directory is not None:
@@ -167,7 +202,7 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     if chat_access is not None:
         return chat_access
 
-    ai = _parse_ai(text)
+    ai = _parse_ai(text, ai_prefix)
     if ai is not None:
         return ai
 
@@ -187,6 +222,26 @@ def parse_chat_command(text: str | None) -> ChatCommand | None:
     if memory is not None:
         return memory
     return None
+
+
+def _parse_ai_prefix_control(text: str) -> AIPrefixCommand | InvalidCommand | None:
+    parts = text.split()
+    if not parts or parts[0] != "/ai_prefix":
+        return None
+    if len(parts) == 1:
+        return AIPrefixCommand(action="show")
+    if len(parts) != 2:
+        return InvalidCommand(name="/ai_prefix")
+    value = parts[1]
+    if value.casefold() == "default":
+        return AIPrefixCommand(action="reset")
+    try:
+        prefix = normalize_ai_command_prefix(value)
+    except ValueError:
+        return InvalidCommand(name="/ai_prefix")
+    if prefix == DEFAULT_AI_COMMAND_PREFIX:
+        return AIPrefixCommand(action="reset")
+    return AIPrefixCommand(action="set", prefix=prefix)
 
 
 def _parse_chat_access_control(
@@ -253,10 +308,10 @@ def _parse_directory_control(text: str) -> ChatCommand | None:
     return None
 
 
-def _parse_ai(text: str) -> AIAskCommand | None:
-    if not text.casefold().startswith("/ai"):
+def _parse_ai(text: str, prefix: str) -> AIAskCommand | None:
+    if not text.casefold().startswith(prefix):
         return None
-    cursor = 3
+    cursor = len(prefix)
     digit_start = cursor
     while cursor < len(text) and text[cursor].isascii() and text[cursor].isdigit():
         cursor += 1

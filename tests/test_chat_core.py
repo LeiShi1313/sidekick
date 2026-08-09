@@ -28,6 +28,7 @@ from sidekick.chat.commands import (
     AICancelCommand,
     AILimitCommand,
     AIModelCommand,
+    AIPrefixCommand,
     AccessCommand,
     ChatAccessCommand,
     InvalidCommand,
@@ -73,6 +74,15 @@ from sidekick.chat.transport import ChatPresentation
         ),
         ("/ai_model default", AIModelCommand(action="reset")),
         ("/ai_model two models", InvalidCommand(name="/ai_model")),
+        ("/ai_prefix", AIPrefixCommand(action="show")),
+        (
+            "/ai_prefix /Ask",
+            AIPrefixCommand(action="set", prefix="/ask"),
+        ),
+        ("/ai_prefix default", AIPrefixCommand(action="reset")),
+        ("/ai_prefix ask", InvalidCommand(name="/ai_prefix")),
+        ("/ai_prefix /123", InvalidCommand(name="/ai_prefix")),
+        ("/ai_prefix /ai_model", InvalidCommand(name="/ai_prefix")),
         ("/ai_allow", AccessCommand(allowed=True)),
         ("/ai_deny", AccessCommand(allowed=False)),
         ("/ai_access open", ChatAccessCommand(action="open")),
@@ -105,6 +115,18 @@ from sidekick.chat.transport import ChatPresentation
 )
 def test_chat_commands_are_parsed_without_transport_assumptions(text, expected):
     assert parse_chat_command(text) == expected
+
+
+def test_ai_trigger_uses_the_configured_group_command():
+    assert parse_chat_command(
+        "/Ask10@SidekickBot summarize",
+        ai_prefix="/ask",
+    ) == AIAskCommand(prompt="summarize", recent_messages=10)
+    assert parse_chat_command("/ai old command", ai_prefix="/ask") is None
+    assert parse_chat_command("/asker boundary", ai_prefix="/ask") is None
+    assert parse_chat_command("/ai_model", ai_prefix="/ask") == AIModelCommand(
+        action="show"
+    )
 
 
 def test_identity_codec_keeps_network_identities_disjoint():
@@ -210,6 +232,39 @@ async def test_chat_ai_limit_override_is_scoped_persistent_and_resettable(tmp_pa
         await restarted.set_ai_cooldown_override(first_scope, None)
 
         assert await restarted.get_ai_cooldown_override(first_scope) is None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_ai_command_prefix_is_scoped_persistent_and_resettable(tmp_path):
+    path = tmp_path / "ai.db"
+    first_scope = "telegram:chat:-1001"
+    second_scope = "telegram:chat:-1002"
+    store = await AIStateRepository(path).connect()
+    try:
+        assert await store.get_ai_command_prefix(first_scope) is None
+
+        await store.set_ai_command_prefix(first_scope, "/Ask")
+
+        assert await store.get_ai_command_prefix(first_scope) == "/ask"
+        assert await store.get_ai_command_prefix(second_scope) is None
+        with pytest.raises(ValueError, match="slash command"):
+            await store.set_ai_command_prefix(first_scope, "ask")
+        with pytest.raises(ValueError, match="control namespace"):
+            await store.set_ai_command_prefix(first_scope, "/ai_future")
+        with pytest.raises(ValueError, match="canonical chat identity"):
+            await store.get_ai_command_prefix("not a chat")
+    finally:
+        await store.close()
+
+    restarted = await AIStateRepository(path).connect()
+    try:
+        assert await restarted.get_ai_command_prefix(first_scope) == "/ask"
+
+        await restarted.set_ai_command_prefix(first_scope, None)
+
+        assert await restarted.get_ai_command_prefix(first_scope) is None
     finally:
         await restarted.close()
 
@@ -375,6 +430,7 @@ class MinimalMessage:
 class FakeStore:
     def __init__(self):
         self.saved = []
+        self.ai_command_prefixes: dict[str, str] = {}
 
     async def get_answer(self, scope_id, answer_message_id):
         return None
@@ -385,11 +441,27 @@ class FakeStore:
     async def save_answer(self, marker):
         self.saved.append(marker)
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        return {
+            marker.trigger_message_id: marker.command_prefix
+            for marker in self.saved
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids
+        }
+
     async def get_model_override(self, scope_id):
         return None
 
     async def set_model_override(self, scope_id, model):
         return None
+
+    async def get_ai_command_prefix(self, scope_id):
+        return self.ai_command_prefixes.get(scope_id)
+
+    async def set_ai_command_prefix(self, scope_id, prefix):
+        if prefix is None:
+            self.ai_command_prefixes.pop(scope_id, None)
+        else:
+            self.ai_command_prefixes[scope_id] = prefix
 
     async def get_ai_cooldown_override(self, scope_id):
         return None
@@ -726,6 +798,7 @@ async def test_state_repository_preserves_opaque_decimal_string_message_ids(tmp_
                 scope_id=scope_id,
                 answer_message_id=answer_id,
                 trigger_message_id=trigger_id,
+                command_prefix="/ai",
                 requester_id="wechat:user:wxid_example",
                 parent_answer_message_id=None,
                 agent_session_id="session-1",
