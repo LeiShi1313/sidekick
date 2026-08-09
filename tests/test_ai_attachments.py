@@ -104,7 +104,7 @@ def pdf_bytes(text: str) -> bytes:
 
 
 @pytest.mark.asyncio
-async def test_image_is_normalized_and_only_description_is_returned() -> None:
+async def test_image_is_normalized_for_description_and_model_input() -> None:
     raw = image_bytes()
     gateway = FakeGateway("Description: a red rectangle.\nVisible text: none.")
     message = FakeMessage(
@@ -125,6 +125,9 @@ async def test_image_is_normalized_and_only_description_is_returned() -> None:
     assert request.mime_type == "image/jpeg"
     assert request.data is not None and request.data != raw
     assert request.text is None
+    assert result.model_image is not None
+    assert result.model_image.mime_type == "image/jpeg"
+    assert result.model_image.data == request.data
 
 
 @pytest.mark.asyncio
@@ -147,6 +150,26 @@ async def test_preloaded_image_bytes_share_normalization_and_analysis() -> None:
     assert request.kind == "image"
     assert request.mime_type == "image/jpeg"
     assert request.data is not None and request.data != raw
+    assert result.model_image is not None
+    assert result.model_image.data == request.data
+
+
+@pytest.mark.asyncio
+async def test_normalized_image_remains_available_when_description_fails() -> None:
+    raw = image_bytes()
+    gateway = FakeGateway(ConnectionError("analysis unavailable"))
+    message = FakeMessage(
+        raw,
+        FakeFile(name="camera.png", mime_type="image/png", size=len(raw)),
+    )
+
+    result = await ChatAttachmentDescriber(gateway).describe(message)
+
+    assert result is not None
+    assert "description is unavailable" in result.context_text
+    assert result.model_image is not None
+    assert result.model_image.mime_type == "image/jpeg"
+    assert result.model_image.data == gateway.requests[0].data
 
 
 @pytest.mark.asyncio
@@ -167,6 +190,7 @@ async def test_plain_text_is_summarized_without_returning_raw_content() -> None:
     assert "Private raw document body" not in result.context_text
     assert "Private raw document body" not in result.memory_text
     assert "deployment checklist" in result.memory_text
+    assert result.model_image is None
 
 
 @pytest.mark.asyncio

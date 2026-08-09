@@ -21,6 +21,12 @@ const validRun = {
   },
 };
 
+const modelImageBytes = Buffer.concat([
+  Buffer.from([0xff, 0xd8, 0xff]),
+  Buffer.alloc(96 * 1024),
+  Buffer.from([0xff, 0xd9]),
+]);
+
 const OPERATOR_TOKEN = "test-agent-token-that-is-long-enough";
 
 const OPERATOR_CLIENT = {
@@ -80,6 +86,72 @@ test("streams a run as NDJSON", async () => {
       .map((line) => JSON.parse(line));
     assert.equal(events.at(-1).type, "run_completed");
     assert.equal(events.at(-1).entryId, "entry-1");
+  } finally {
+    await app.close();
+  }
+});
+
+test("accepts one bounded JPEG model input and rejects invalid image arrays", async () => {
+  const received = [];
+  const engine = {
+    async *run(request) {
+      received.push(request);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel() {
+      return false;
+    },
+  };
+  const app = await listen(engine);
+  const headers = {
+    "content-type": "application/json",
+    authorization: `Bearer ${OPERATOR_TOKEN}`,
+  };
+  const image = {
+    mimeType: "image/jpeg",
+    data: modelImageBytes.toString("base64"),
+  };
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...validRun, images: [image] }),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.equal(received.length, 1);
+    assert.equal(received[0].images.length, 1);
+    assert.equal(received[0].images[0].mimeType, "image/jpeg");
+    assert.deepEqual(received[0].images[0].data, modelImageBytes);
+
+    for (const images of [
+      [image, image],
+      [{ ...image, mimeType: "image/png" }],
+      [{ ...image, unexpected: true }],
+      [{ mimeType: "image/jpeg", data: "not-base64" }],
+    ]) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ ...validRun, images }),
+      });
+      assert.equal(rejected.status, 400);
+    }
+
+    const oversized = Buffer.concat([
+      Buffer.from([0xff, 0xd8, 0xff]),
+      Buffer.alloc(2 * 1024 * 1024),
+    ]).toString("base64");
+    const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        ...validRun,
+        images: [{ mimeType: "image/jpeg", data: oversized }],
+      }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(received.length, 1);
   } finally {
     await app.close();
   }

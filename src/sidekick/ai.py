@@ -33,7 +33,11 @@ from sidekick.ai_memory_segments import (
 from sidekick.ai_attachments import (
     AttachmentAnalysisRequest,
 )
-from sidekick.chat.attachments import AttachmentDescriber, AttachmentDescription
+from sidekick.chat.attachments import (
+    AttachmentDescriber,
+    AttachmentDescription,
+    ModelInputImage,
+)
 from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
@@ -166,6 +170,15 @@ class AgentRunRequest:
     origin: AgentRunOrigin
     memory: AgentMemoryTarget | None = None
     model: str | None = None
+    images: tuple[ModelInputImage, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.images, tuple)
+            or len(self.images) > 1
+            or any(not isinstance(image, ModelInputImage) for image in self.images)
+        ):
+            raise ValueError("Agent run accepts at most one image")
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +287,14 @@ class PiAgentGateway:
         }
         if request.model is not None:
             payload["model"] = request.model
+        if request.images:
+            payload["images"] = [
+                {
+                    "mimeType": image.mime_type,
+                    "data": base64.b64encode(image.data).decode("ascii"),
+                }
+                for image in request.images
+            ]
         if request.memory is not None:
             payload["memory"] = {
                 "primaryBankId": request.memory.primary_bank_id,
@@ -813,6 +834,7 @@ class ChatContextMessage:
 class ChatContext:
     messages: tuple[ChatContextMessage, ...] = ()
     current_reply_to_message_id: ExternalId | None = None
+    model_images: tuple[ModelInputImage, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1310,21 +1332,25 @@ class PromptBuilder:
         order_hints: dict[ExternalId, int] = {}
         used_chars = 0
         attachment_count = 0
+        quoted_model_image = None
         for key in priority:
             candidate = candidates[key]
             message = candidate.message
             text = (self.message_text(message) or "").strip()
             attachment = None
+            directly_quoted = (
+                current_reply_to_message_id is not None
+                and message.id == current_reply_to_message_id
+            )
             if attachment_count < self.max_attachments:
                 attachment = await self._describe_context_attachment(
                     message,
-                    directly_quoted=(
-                        current_reply_to_message_id is not None
-                        and message.id == current_reply_to_message_id
-                    ),
+                    directly_quoted=directly_quoted,
                 )
                 if attachment is not None:
                     attachment_count += 1
+                    if directly_quoted:
+                        quoted_model_image = attachment.model_image
             content = [text] if text else []
             if attachment is not None:
                 content.append(attachment.context_text)
@@ -1383,6 +1409,9 @@ class PromptBuilder:
         return ChatContext(
             messages=tuple(normalized),
             current_reply_to_message_id=current_reply_to_message_id,
+            model_images=(
+                (quoted_model_image,) if quoted_model_image is not None else ()
+            ),
         )
 
     def render_chat_context(
@@ -4157,6 +4186,7 @@ class AIConversationHandler:
         reference_context = ""
         anchor_observations: list[HumanObservation] = []
         retained_observations: list[HumanObservation] = []
+        quoted_model_images: tuple[ModelInputImage, ...] = ()
         has_current_attachment = self._prompt_builder.has_attachment(message)
         authored_prompt = ""
         if ai_trigger is not None:
@@ -4261,6 +4291,7 @@ class AIConversationHandler:
                             )
                         ),
                     )
+                    quoted_model_images = loaded_context.model_images
                 except ChatContextUnavailable:
                     await self._reply_memory_excluded(
                         message,
@@ -4316,6 +4347,12 @@ class AIConversationHandler:
                 ),
                 memory=memory_target,
                 model=await self._store.get_model_override(scope_id),
+                images=(
+                    (current_attachment.model_image,)
+                    if current_attachment is not None
+                    and current_attachment.model_image is not None
+                    else quoted_model_images
+                ),
             )
             await self._record_ai_run_running(run_id)
             self._active_runs[actor_id] = run_id

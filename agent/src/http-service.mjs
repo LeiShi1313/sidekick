@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { isModelId } from "./model-id.mjs";
 
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_RUN_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_ATTACHMENT_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACHMENT_TEXT_CHARS = 50_000;
@@ -116,6 +117,27 @@ function isActiveRunQuery(url) {
   );
 }
 
+function validateModelImages(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 1) return null;
+  const images = [];
+  for (const image of value) {
+    if (
+      !image ||
+      typeof image !== "object" ||
+      Array.isArray(image) ||
+      !hasOnlyKeys(image, new Set(["mimeType", "data"])) ||
+      image.mimeType !== "image/jpeg"
+    ) {
+      return null;
+    }
+    const data = decodeBase64(image.data);
+    if (!data || detectedImageMimeType(data) !== "image/jpeg") return null;
+    images.push({ mimeType: "image/jpeg", data });
+  }
+  return images;
+}
+
 export function validateRunRequest(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const sessionId = value.sessionId;
@@ -124,6 +146,7 @@ export function validateRunRequest(value) {
   const model = value.model;
   const suppliedOrigin = value.origin;
   const suppliedIdentity = value.identity;
+  const images = validateModelImages(value.images);
   const isRoot = sessionId === null && parentEntryId === null;
   const isContinuation =
     typeof sessionId === "string" &&
@@ -144,6 +167,7 @@ export function validateRunRequest(value) {
       includeMemorySnapshot === undefined ||
       typeof includeMemorySnapshot === "boolean"
     ) ||
+    images === null ||
     !Array.isArray(value.context) ||
     value.context.length > 4
   ) {
@@ -321,6 +345,7 @@ export function validateRunRequest(value) {
     ...(model ? { model } : {}),
     ...(includeMemorySnapshot ? { includeMemorySnapshot: true } : {}),
     ...(memory ? { memory } : {}),
+    ...(images.length > 0 ? { images } : {}),
   };
 }
 
@@ -735,7 +760,7 @@ export function createAgentServer({ engine, clients, logger = console }) {
 
     let run;
     try {
-      run = validateRunRequest(await readJson(request));
+      run = validateRunRequest(await readJson(request, MAX_RUN_BODY_BYTES));
     } catch {
       run = null;
     }

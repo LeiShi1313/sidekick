@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 
@@ -13,6 +13,7 @@ AttachmentKind = Literal[
     "sticker",
     "other",
 ]
+MAX_MODEL_IMAGE_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,9 +36,28 @@ class AttachmentReference:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelInputImage:
+    """One normalized image kept only long enough for the current model turn."""
+
+    mime_type: Literal["image/jpeg"]
+    data: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self.mime_type != "image/jpeg"
+            or type(self.data) is not bytes
+            or not self.data.startswith(b"\xff\xd8\xff")
+        ):
+            raise ValueError("Model input image must be a normalized JPEG")
+        if len(self.data) > MAX_MODEL_IMAGE_BYTES:
+            raise ValueError("Model input image exceeds the byte limit")
+
+
+@dataclass(frozen=True, slots=True)
 class AttachmentDescription:
     context_text: str
     memory_text: str
+    model_image: ModelInputImage | None = None
 
 
 class AttachmentDescriber(Protocol):

@@ -135,6 +135,7 @@ test("persists only allowlisted operational audit metadata", async () => {
       parentEntryId: null,
       promptChars: 19,
       contextCount: 1,
+      imageCount: 0,
       toolPolicy: "delegated",
       model: null,
       memoryEnabled: true,
@@ -151,6 +152,7 @@ test("persists only allowlisted operational audit metadata", async () => {
       tools: ["web_search"],
       promptChars: 23,
       sessionMessageCount: 1,
+      imageCount: 0,
     });
     assert.deepEqual(result.events[2].data, {
       turn: 1,

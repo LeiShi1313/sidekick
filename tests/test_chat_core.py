@@ -22,7 +22,12 @@ from sidekick.ai import (
     MemoryScopeState,
     PromptBuilder,
 )
-from sidekick.chat.attachments import AttachmentDescription, AttachmentReference
+from sidekick.chat.attachments import (
+    AttachmentDescription,
+    AttachmentReference,
+    MAX_MODEL_IMAGE_BYTES,
+    ModelInputImage,
+)
 from sidekick.chat.commands import (
     AIAskCommand,
     AICancelCommand,
@@ -182,6 +187,48 @@ def test_attachment_reference_contains_metadata_but_no_binary_payload():
     assert not any(
         isinstance(getattr(reference, item.name), bytes) for item in fields(reference)
     )
+
+
+def test_model_input_image_is_one_bounded_normalized_jpeg():
+    image = ModelInputImage(
+        mime_type="image/jpeg",
+        data=b"\xff\xd8\xff\xd9",
+    )
+
+    assert image.mime_type == "image/jpeg"
+    assert "data=" not in repr(image)
+    with pytest.raises(ValueError, match="JPEG"):
+        ModelInputImage(mime_type="image/png", data=b"\x89PNG")
+    with pytest.raises(ValueError, match="limit"):
+        ModelInputImage(
+            mime_type="image/jpeg",
+            data=b"\xff\xd8\xff" + b"0" * MAX_MODEL_IMAGE_BYTES,
+        )
+
+
+def test_agent_run_request_accepts_at_most_one_image():
+    image = ModelInputImage(
+        mime_type="image/jpeg",
+        data=b"\xff\xd8\xff\xd9",
+    )
+    values = {
+        "run_id": "run-1",
+        "session_id": None,
+        "parent_entry_id": None,
+        "prompt": "question",
+        "context": (),
+        "system_prompt": "system",
+        "tool_policy": "owner",
+        "identity": AgentRequestIdentity(
+            requester=AgentIdentityAnchor("test:user:1", "Tester"),
+            anchors=(AgentIdentityAnchor("test:user:1", "Tester"),),
+        ),
+        "origin": AgentRunOrigin("test:chat:1", "test-adapter"),
+    }
+
+    assert AgentRunRequest(**values, images=(image,)).images == (image,)
+    with pytest.raises(ValueError, match="one image"):
+        AgentRunRequest(**values, images=(image, image))
 
 
 @pytest.mark.asyncio
@@ -515,6 +562,11 @@ async def test_handler_uses_transport_for_sdk_operations():
 
 
 class OpaqueAttachmentDescriber:
+    image = ModelInputImage(
+        mime_type="image/jpeg",
+        data=b"\xff\xd8\xff\xd9",
+    )
+
     def has_attachment(self, message):
         return True
 
@@ -522,6 +574,7 @@ class OpaqueAttachmentDescriber:
         return AttachmentDescription(
             context_text="Generated image description",
             memory_text="The subject shared an image.",
+            model_image=self.image,
         )
 
 
@@ -587,6 +640,35 @@ async def test_quote_attachment_strategy_only_describes_the_direct_reply() -> No
     assert describer.described == [quoted.id]
     assert background_description is None
     assert [message.message_id for message in context.messages] == [quoted.id]
+    assert context.model_images == (describer.image,)
+
+
+@pytest.mark.asyncio
+async def test_handler_passes_the_directly_quoted_image_to_the_agent() -> None:
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    quoted = MinimalMessage("", message_id=2)
+    trigger = MinimalMessage(
+        "/ai explain this",
+        message_id=3,
+        reply_to_message_id=quoted.id,
+    )
+    transport.reply_targets[trigger] = quoted
+    describer = RecordingQuotedAttachmentDescriber()
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            quoted_attachment_describer=describer,
+        ),
+        transport=transport,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    assert gateway.requests[0].images == (describer.image,)
 
 
 @pytest.mark.asyncio

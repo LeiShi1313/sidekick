@@ -914,6 +914,8 @@ async def test_wechat_conversation_handler_uses_quoted_original_image_as_context
         assert max(normalized.size) == 1_600
     assert len(gateway.requests[0].context) == 1
     assert "A sign says high resolution." in gateway.requests[0].context[0].text
+    assert len(gateway.requests[0].images) == 1
+    assert gateway.requests[0].images[0].data == attachment_request.data
 
 
 @pytest.mark.asyncio
@@ -951,6 +953,8 @@ async def test_wechat_quoted_image_falls_back_to_preview_when_original_fails(
 
     assert result is not None
     assert "readable low-resolution sign" in result.context_text
+    assert result.model_image is not None
+    assert result.model_image.mime_type == "image/jpeg"
     assert client.media_calls == [
         ("original", media_id),
         ("preview", media_id),
@@ -992,6 +996,7 @@ async def test_wechat_quoted_image_uses_preview_without_original_capability(
 
     assert result is not None
     assert "preview-only description" in result.context_text
+    assert result.model_image is not None
     assert client.media_calls == [("preview", media_id)]
 
 
@@ -1026,6 +1031,7 @@ async def test_wechat_quoted_image_reports_when_no_image_variant_is_available(
 
     assert result is not None
     assert "quoted image content is unavailable" in result.context_text.lower()
+    assert result.model_image is None
     assert client.media_calls == []
     assert gateway.attachment_requests == []
 

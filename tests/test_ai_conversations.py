@@ -15,6 +15,7 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_attachments import AttachmentDescription
+from sidekick.chat.attachments import ModelInputImage
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 
 
@@ -200,6 +201,11 @@ def make_handler(gateway, store=None, **builder_options):
 
 
 class FakeAttachmentDescriber:
+    image = ModelInputImage(
+        mime_type="image/jpeg",
+        data=b"\xff\xd8\xff\xd9",
+    )
+
     def has_attachment(self, message):
         return message.file is not None
 
@@ -212,6 +218,7 @@ class FakeAttachmentDescriber:
                 "The subject shared an attachment. Generated content description: "
                 "a whiteboard diagram"
             ),
+            model_image=self.image,
         )
 
 
@@ -457,6 +464,7 @@ async def test_attachment_only_ai_trigger_gets_a_default_instruction():
     assert any(
         "whiteboard diagram" in item.text for item in gateway.requests[0].context
     )
+    assert gateway.requests[0].images == (FakeAttachmentDescriber.image,)
 
 
 @pytest.mark.asyncio

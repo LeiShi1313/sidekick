@@ -331,6 +331,50 @@ test("lists bounded provider models and selects one for a single run", async () 
   }
 });
 
+test("passes one image to the model without persisting or auditing its bytes", async () => {
+  const imageData = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const encoded = imageData.toString("base64");
+  const app = await fixture((_body, response) => {
+    sendText(response, "A tiny test image.");
+  });
+  const runId = "10101010-1010-4010-8010-101010101010";
+  try {
+    const events = await collect(
+      app.engine,
+      request(runId, {
+        images: [{ mimeType: "image/jpeg", data: imageData }],
+      }),
+    );
+
+    assert.equal(events.at(-1).type, "run_completed");
+    const providerPayload = JSON.stringify(app.provider.requests[0]);
+    assert.match(providerPayload, new RegExp(`data:image/jpeg;base64,${encoded}`));
+
+    const sessionFiles = (await readdir(app.engine.config.sessionDir)).filter(
+      (name) => name.endsWith(".jsonl"),
+    );
+    assert.equal(sessionFiles.length, 1);
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    assert.doesNotMatch(rawSession, new RegExp(encoded));
+
+    const audit = await app.engine.getRunAudit(runId);
+    assert.equal(
+      audit.events.find((event) => event.type === "run.request").data.imageCount,
+      1,
+    );
+    assert.equal(
+      audit.events.find((event) => event.type === "model.input").data.imageCount,
+      1,
+    );
+    assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
 test("delegates read-only session history and run audit queries", async () => {
   const calls = [];
   const sessionHistory = {
