@@ -392,6 +392,8 @@ class WeChatStateRepository:
         connector_key: str,
         group_id: str,
         members: WeChatGroupMemberList,
+        *,
+        replace_aliases: bool = False,
     ) -> None:
         if members.group_id != group_id or any(
             member.group_id != group_id for member in members.members
@@ -411,12 +413,15 @@ class WeChatStateRepository:
             raise WeChatAPIContractError(
                 "WeChat group member snapshot generation is stale"
             )
-        authoritative = members.snapshot_complete and members.snapshot_current
+        membership_authoritative = (
+            members.snapshot_complete and members.snapshot_current
+        )
+        replace_nicknames = replace_aliases
         now = time.time()
         await connection.execute("BEGIN IMMEDIATE")
         try:
             existing_user_ids: set[str] = set()
-            if authoritative:
+            if membership_authoritative:
                 cursor = await connection.execute(
                     """
                     SELECT user_id
@@ -429,6 +434,16 @@ class WeChatStateRepository:
                     str(row["user_id"]) async for row in cursor
                 }
                 await cursor.close()
+            if replace_aliases:
+                await connection.execute(
+                    """
+                    UPDATE wechat_group_members
+                    SET nickname = NULL, updated_at = ?
+                    WHERE connector_key = ? AND account_id = ? AND group_id = ?
+                      AND nickname IS NOT NULL
+                    """,
+                    (now, connector_key, account_id, group_id),
+                )
             await connection.executemany(
                 """
                 INSERT INTO wechat_group_members (
@@ -460,12 +475,12 @@ class WeChatStateRepository:
                         member.display_name,
                         member.nickname,
                         now,
-                        authoritative,
+                        replace_nicknames,
                     )
                     for member in members.members
                 ),
             )
-            if authoritative:
+            if membership_authoritative:
                 retained_user_ids = {
                     member.user_id for member in members.members
                 }

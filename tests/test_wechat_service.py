@@ -520,7 +520,7 @@ async def test_wechat_event_pump_refreshes_identity_before_ack(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_wechat_event_pump_replaces_group_alias_directory_before_ack(
+async def test_wechat_event_pump_clears_group_alias_directory_before_ack(
     tmp_path,
 ) -> None:
     directory_event = WeChatEvent.parse(
@@ -551,6 +551,19 @@ async def test_wechat_event_pump_replaces_group_alias_directory_before_ack(
                 source="wechat+localdb",
                 sequence=None,
             ),
+            WeChatConnectorMessage(
+                id="4159667620982040829",
+                chat_id=CHAT_ID,
+                direction="in",
+                message_type="text",
+                sender_id="wxid_bob",
+                reply_to_message_id=None,
+                content="The review is Tuesday",
+                content_redacted=False,
+                timestamp=1_783_772_735,
+                source="wechat+localdb",
+                sequence=None,
+            ),
         ),
         cursor="10",
     )
@@ -566,6 +579,12 @@ async def test_wechat_event_pump_replaces_group_alias_directory_before_ack(
                 user_id="wxid_alice",
                 display_name="Alice Global",
                 nickname="Old Group Alias",
+            ),
+            WeChatGroupMember(
+                group_id=CHAT_ID,
+                user_id="wxid_bob",
+                display_name="Bob Member",
+                nickname="Old Omitted Alias",
             ),
         ),
         cursor="10",
@@ -583,13 +602,13 @@ async def test_wechat_event_pump_replaces_group_alias_directory_before_ack(
                     group_id=CHAT_ID,
                     user_id="wxid_alice",
                     display_name="Alice Global",
-                    nickname="New Group Alias",
+                    nickname=None,
                 ),
             ),
             cursor="11",
-            snapshot_complete=True,
-            snapshot_current=True,
-            snapshot_connection_generation=41,
+            snapshot_complete=False,
+            snapshot_current=False,
+            snapshot_connection_generation=None,
         )
 
         result = await WeChatEventPump(
@@ -598,15 +617,22 @@ async def test_wechat_event_pump_replaces_group_alias_directory_before_ack(
             CONNECTOR_KEY,
             bootstrap,
         ).run(RecordingHandler(), asyncio.Event())
-        message = await store.get_message(
+        alice_message = await store.get_message(
             CONNECTOR_KEY,
             CHAT_ID,
             "4159667620982040828",
         )
+        bob_message = await store.get_message(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            "4159667620982040829",
+        )
 
         assert result == "reconnect"
-        assert message is not None
-        assert message.sender_display_name == "New Group Alias"
+        assert alice_message is not None
+        assert bob_message is not None
+        assert alice_message.sender_display_name == "Alice Global"
+        assert bob_message.sender_display_name == "Bob Member"
         assert client.group_member_reads == [CHAT_ID, CHAT_ID]
         assert await store.get_cursor(CONNECTOR_KEY) == "11"
     finally:

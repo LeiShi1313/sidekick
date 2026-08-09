@@ -327,7 +327,7 @@ async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> Non
         )
         assert aliased is not None
         assert removed_member is not None
-        assert aliased.sender_display_name == "Alice Renamed"
+        assert aliased.sender_display_name == "Alice in First"
         assert removed_member.sender_display_name == "wxid_bob"
     finally:
         await store.close()
