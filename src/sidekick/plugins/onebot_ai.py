@@ -214,6 +214,7 @@ class OneBotAI(metaclass=PluginMount):
             max_context_chars=self._settings.max_context_chars,
             attachment_describer=ChatAttachmentDescriber(
                 self._gateway,
+                allow_unknown_size=True,
                 logger=self.logger,
             ),
             identity_resolver=OneBotMessageIdentityResolver(),

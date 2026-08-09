@@ -11,7 +11,12 @@ from typing import Any, Literal, Protocol
 from PIL import Image
 from pypdf import PdfReader
 
-from sidekick.chat.attachments import AttachmentDescription
+from sidekick.chat.attachments import (
+    AttachmentDescription,
+    MAX_MODEL_IMAGE_BYTES,
+    MAX_MODEL_IMAGE_DIMENSION,
+    ModelInputImage,
+)
 
 
 AttachmentKind = Literal["image", "text"]
@@ -88,12 +93,18 @@ def attachment_metadata_only(
 
 
 class ChatAttachmentDescriber:
+    """Describe bounded attachments for prompts and memory context.
+
+    ``allow_unknown_size`` is only safe for adapters whose downloader enforces
+    an independent hard byte limit before returning content.
+    """
+
     MAX_FILE_BYTES = 5 * 1024 * 1024
     DEFAULT_DOWNLOAD_TIMEOUT = 30.0
     MAX_TEXT_CHARS = 50_000
     MAX_DESCRIPTION_CHARS = 4_000
     MAX_PDF_PAGES = 12
-    MAX_IMAGE_DIMENSION = 1_600
+    MAX_IMAGE_DIMENSION = MAX_MODEL_IMAGE_DIMENSION
 
     def __init__(
         self,
@@ -101,6 +112,7 @@ class ChatAttachmentDescriber:
         *,
         download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
         max_file_bytes: int = MAX_FILE_BYTES,
+        allow_unknown_size: bool = False,
         logger: Any | None = None,
     ):
         if download_timeout <= 0:
@@ -114,6 +126,9 @@ class ChatAttachmentDescriber:
         self._gateway = gateway
         self._download_timeout = download_timeout
         self._max_file_bytes = max_file_bytes
+        if not isinstance(allow_unknown_size, bool):
+            raise ValueError("Unknown attachment size policy must be boolean")
+        self._allow_unknown_size = allow_unknown_size
         self._logger = logger
 
     def has_attachment(self, message: Any) -> bool:
@@ -129,7 +144,12 @@ class ChatAttachmentDescriber:
         size = _safe_size(getattr(file, "size", None))
         metadata = _render_metadata(filename, mime_type, size)
 
-        if size is None or size > self._max_file_bytes:
+        if size is None and not self._allow_unknown_size:
+            return _metadata_only(
+                metadata,
+                "content size is unavailable",
+            )
+        if size is not None and size > self._max_file_bytes:
             return _metadata_only(
                 metadata,
                 "content exceeds the analysis limit",
@@ -199,6 +219,7 @@ class ChatAttachmentDescriber:
         filename: str | None,
         metadata: str,
     ) -> AttachmentDescription:
+        model_image = None
         try:
             if kind == "image":
                 normalized = await asyncio.to_thread(
@@ -206,11 +227,15 @@ class ChatAttachmentDescriber:
                     raw,
                     self.MAX_IMAGE_DIMENSION,
                 )
+                model_image = ModelInputImage(
+                    mime_type="image/jpeg",
+                    data=normalized,
+                )
                 request = AttachmentAnalysisRequest(
                     kind="image",
                     mime_type="image/jpeg",
                     filename=filename,
-                    data=normalized,
+                    data=model_image.data,
                 )
             else:
                 extracted = await asyncio.to_thread(
@@ -242,21 +267,33 @@ class ChatAttachmentDescriber:
                     "Generated content description (may be imperfect and is not a "
                     f"claim about the subject):\n{analysis}"
                 ),
+                model_image=model_image,
             )
         except Exception as exc:
-            return self._analysis_unavailable(metadata, exc)
+            return self._analysis_unavailable(
+                metadata,
+                exc,
+                model_image=model_image,
+            )
 
     def _analysis_unavailable(
         self,
         metadata: str,
         exc: Exception,
+        *,
+        model_image: ModelInputImage | None = None,
     ) -> AttachmentDescription:
         if self._logger is not None:
             self._logger.warning(
                 "Attachment analysis failed (%s)",
                 type(exc).__name__,
             )
-        return _metadata_only(metadata, "content description is unavailable")
+        unavailable = _metadata_only(metadata, "content description is unavailable")
+        return AttachmentDescription(
+            context_text=unavailable.context_text,
+            memory_text=unavailable.memory_text,
+            model_image=model_image,
+        )
 
 
 def _classify_attachment(
@@ -285,9 +322,13 @@ def _normalize_image(data: bytes, max_dimension: int) -> bytes:
         source.seek(0)
         image = source.convert("RGB")
         image.thumbnail((max_dimension, max_dimension))
-        output = BytesIO()
-        image.save(output, format="JPEG", quality=82, optimize=True)
-        return output.getvalue()
+        for quality in (82, 70, 55, 40):
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=quality)
+            normalized = output.getvalue()
+            if len(normalized) <= MAX_MODEL_IMAGE_BYTES:
+                return normalized
+        raise ValueError("Normalized image exceeds the model input limit")
 
 
 def _extract_document_text(

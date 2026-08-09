@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+from io import BytesIO
+
 import pytest
 from aiohttp import web
+from PIL import Image
 
 from sidekick.ai import (
     AgentContext,
@@ -15,6 +19,13 @@ from sidekick.ai import (
     PiAgentGateway,
 )
 from sidekick.ai_attachments import AttachmentAnalysisRequest
+from sidekick.chat.attachments import ModelInputImage
+
+
+def model_image_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(output, format="JPEG")
+    return output.getvalue()
 
 
 def test_pi_gateway_rejects_weak_credentials() -> None:
@@ -32,7 +43,11 @@ async def serve(app: web.Application) -> tuple[web.AppRunner, str]:
     return runner, f"http://127.0.0.1:{port}"
 
 
-def run_request(*, model: str | None = None) -> AgentRunRequest:
+def run_request(
+    *,
+    model: str | None = None,
+    images: tuple[ModelInputImage, ...] = (),
+) -> AgentRunRequest:
     return AgentRunRequest(
         run_id="11111111-1111-4111-8111-111111111111",
         session_id=None,
@@ -54,6 +69,7 @@ def run_request(*, model: str | None = None) -> AgentRunRequest:
             ),
         ),
         model=model,
+        images=images,
         origin=AgentRunOrigin(
             scope_id="telegram:chat:-1001",
             adapter_instance_id="telegram-default",
@@ -157,6 +173,50 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
     assert events[1].summary == "Calculation result: 42"
     assert events[-1].session_id == "session-1"
     assert events[-1].entry_id == "entry-1"
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_sends_one_model_image_as_base64() -> None:
+    received = None
+
+    async def runs(request: web.Request) -> web.StreamResponse:
+        nonlocal received
+        received = await request.json()
+        return web.Response(
+            text=(
+                '{"type":"run_completed","sessionId":"session-1",'
+                '"entryId":"entry-1","answer":"a fox"}\n'
+            ),
+            content_type="application/x-ndjson",
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
+    image = ModelInputImage(
+        mime_type="image/jpeg",
+        data=model_image_bytes(),
+    )
+    try:
+        events = [
+            event
+            async for event in gateway.run(run_request(images=(image,)))
+        ]
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert events[-1].answer == "a fox"
+    assert received is not None
+    assert received["images"] == [
+        {
+            "mimeType": "image/jpeg",
+            "data": base64.b64encode(model_image_bytes()).decode("ascii"),
+        }
+    ]
 
 
 @pytest.mark.asyncio

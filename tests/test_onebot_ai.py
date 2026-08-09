@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import UTC, datetime
+from io import BytesIO
 
 import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
+from PIL import Image
+
+from sidekick.ai_attachments import (
+    AttachmentAnalysisRequest,
+    ChatAttachmentDescriber,
+)
 
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -39,6 +47,15 @@ class RecordingActionClient:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class RecordingAttachmentGateway:
+    def __init__(self):
+        self.requests: list[AttachmentAnalysisRequest] = []
+
+    async def describe_attachment(self, request: AttachmentAnalysisRequest) -> str:
+        self.requests.append(request)
+        return "A red image."
 
 
 def group_event(
@@ -239,6 +256,36 @@ async def test_onebot_attachment_bytes_are_fetched_on_demand_only():
     assert await message.download_media(file=bytes) == b"hello"
     assert action_client.calls[0][0] == "get_file"
     assert not hasattr(message.file, "data")
+
+
+@pytest.mark.asyncio
+async def test_onebot_unknown_size_image_uses_its_bounded_downloader() -> None:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(output, format="PNG")
+    action_client = RecordingActionClient(
+        responses=[{"base64": base64.b64encode(output.getvalue()).decode("ascii")}]
+    )
+    message = OneBotMessage.from_payload(
+        group_event(
+            segments=[
+                {"type": "text", "data": {"text": "/ai describe"}},
+                {"type": "image", "data": {"file": "opaque-image-token"}},
+            ]
+        ),
+        action_client=action_client,
+    )
+    gateway = RecordingAttachmentGateway()
+
+    result = await ChatAttachmentDescriber(
+        gateway,
+        allow_unknown_size=True,
+    ).describe(message)
+
+    assert result is not None
+    assert result.model_image is not None
+    assert result.model_image.mime_type == "image/jpeg"
+    assert len(gateway.requests) == 1
+    assert action_client.calls[0][0] == "get_file"
 
 
 def test_onebot_private_self_message_uses_target_as_conversation_scope():

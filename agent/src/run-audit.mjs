@@ -100,6 +100,7 @@ export function minimizeAuditData(type, value = {}) {
         parentEntryId: safeString(data.parentEntryId, 128),
         promptChars: suppliedChars(data, "promptChars", "prompt"),
         contextCount: suppliedCount(data, "contextCount", "context"),
+        imageCount: safeInteger(data.imageCount) ?? 0,
         toolPolicy: safeString(data.toolPolicy, 32),
         model: safeString(data.model, 256),
         memoryEnabled:
@@ -171,6 +172,7 @@ export function minimizeAuditData(type, value = {}) {
           "sessionMessageCount",
           "sessionMessagesBeforePrompt",
         ),
+        imageCount: safeInteger(data.imageCount) ?? 0,
       };
     case "model.turn.started":
       return { turn: safeInteger(data.turn) };

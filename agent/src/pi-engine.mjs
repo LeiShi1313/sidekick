@@ -695,6 +695,7 @@ export class PiEngine {
       identity: request.identity,
       memory: request.memory ?? null,
       includeMemorySnapshot: Boolean(request.includeMemorySnapshot),
+      imageCount: request.images?.length ?? 0,
     });
     const cancelledEvent = async (sessionId = null) => {
       const failed = {
@@ -813,7 +814,7 @@ export class PiEngine {
               maxRetryDelayMs: 10_000,
             },
           },
-          images: { blockImages: true },
+          images: { blockImages: false },
           defaultProjectTrust: "never",
           packages: [],
         },
@@ -1014,6 +1015,7 @@ export class PiEngine {
         prompt: preparedPrompt,
         tools: toolNames,
         sessionMessagesBeforePrompt: session.messages,
+        imageCount: request.images?.length ?? 0,
       });
       if (activeRun.cancelRequested) {
         const event = await cancelledEvent(session.sessionId);
@@ -1037,6 +1039,11 @@ export class PiEngine {
           await session.prompt(preparedPrompt, {
             expandPromptTemplates: false,
             source: "rpc",
+            images: request.images?.map((image) => ({
+              type: "image",
+              data: image.data.toString("base64"),
+              mimeType: image.mimeType,
+            })),
           });
           const lastAssistant = [...session.messages]
             .reverse()
