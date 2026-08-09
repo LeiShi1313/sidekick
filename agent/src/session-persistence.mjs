@@ -13,7 +13,6 @@ import { join } from "node:path";
 
 import {
   redactSensitiveText,
-  pseudonymizeAccessBank,
   sanitizeMessageInPlace,
 } from "./privacy-redaction.mjs";
 
@@ -23,8 +22,6 @@ const PUBLIC_AGENT_CWD = "/workspace";
 const MAX_SESSION_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SAFE_SUMMARY_CHARS = 12_000;
 const SESSION_BINDING_VERSION = 1;
-const ACCESS_MANIFEST_TYPE = "sidekick-access-manifest";
-const BANK_DIGEST_RE = /^bank_[a-f0-9]{32}$/;
 const hardenedManagers = new WeakSet();
 
 function secureSessionFile(manager) {
@@ -44,47 +41,7 @@ function safeWebEntryMetadata(data) {
 
 function safeCustomEntry(customType, data) {
   if (customType === "web-search-results") return safeWebEntryMetadata(data);
-  if (customType === ACCESS_MANIFEST_TYPE) {
-    const bankDigests = Array.isArray(data?.bankDigests)
-      ? [...new Set(data.bankDigests.filter((value) => BANK_DIGEST_RE.test(value)))]
-          .sort()
-          .slice(0, 65)
-      : [];
-    return { bankDigests };
-  }
   return { omitted: true };
-}
-
-function memoryAccessBankIds(message) {
-  if (
-    message?.role !== "toolResult" ||
-    message.isError ||
-    !String(message.toolName ?? "").startsWith("memory_") ||
-    message.details?.unavailable
-  ) {
-    return [];
-  }
-  const details = message.details;
-  return [
-    details?.bankId,
-    ...(Array.isArray(details?.bankIds) ? details.bankIds : []),
-    ...(Array.isArray(details?.references)
-      ? details.references.map((reference) => reference?.bankId)
-      : []),
-  ].filter((value) => typeof value === "string" && value.length <= 512);
-}
-
-function safeToolDetails(message, state) {
-  const bankIds = memoryAccessBankIds(message);
-  if (bankIds.length === 0) return undefined;
-  const { identityAliasKey, identityScope } = state.privacyOptions ?? {};
-  return {
-    accessBankDigests: [...new Set(
-      bankIds.map((bankId) =>
-        pseudonymizeAccessBank(bankId, identityAliasKey, identityScope),
-      ),
-    )].sort(),
-  };
 }
 
 function safeContentPart(part) {
@@ -118,9 +75,7 @@ export function sessionSafeMessage(message, state = {}) {
     copy.content = copy.content.map(safeContentPart).filter(Boolean);
   } else if (copy.role === "toolResult") {
     copy.content = [{ type: "text", text: OMITTED_TOOL_RESULT }];
-    const details = safeToolDetails(message, state);
-    if (details === undefined) delete copy.details;
-    else copy.details = details;
+    delete copy.details;
   }
   return copy;
 }

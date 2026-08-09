@@ -169,10 +169,9 @@ test("minimizes live tool details and compaction content", async () => {
 
     const raw = await readFile(manager.getSessionFile(), "utf8");
     assert.match(raw, /Keep this request/);
-    assert.match(raw, /bank_[a-f0-9]{32}/);
     assert.doesNotMatch(
       raw,
-      /PRIVATE_REFERENCE|PRIVATE_MEMORY|PRIVATE_TOOL_RESULT|qq:group:686743769|Private Leadership|private-memory-1|PRIVATE_COMPACTION/,
+      /PRIVATE_REFERENCE|PRIVATE_MEMORY|PRIVATE_TOOL_RESULT|qq:group:686743769|Private Leadership|private-memory-1|PRIVATE_COMPACTION|bank_[a-f0-9]{32}/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

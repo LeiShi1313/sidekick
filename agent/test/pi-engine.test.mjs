@@ -11,10 +11,8 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   PiEngine,
   buildRunPrompt,
-  continuationAccessWarning,
   toolNamesForPolicy,
 } from "../src/pi-engine.mjs";
-import { pseudonymizeAccessBank } from "../src/privacy-redaction.mjs";
 import { bindSession } from "../src/session-persistence.mjs";
 
 const MCP_TEST_EXTENSION_PATH = fileURLToPath(
@@ -863,59 +861,10 @@ test(
   },
 );
 
-test("detects persisted source evidence no longer allowed to a continuation requester", () => {
-  const scopeId = "workspace:engineering";
-  const digest = (bankId) =>
-    pseudonymizeAccessBank(bankId, IDENTITY_ALIAS_KEY, scopeId);
-  const entries = [
-    {
-      type: "message",
-      message: {
-        role: "toolResult",
-        toolName: "memory_query_source",
-        isError: false,
-        details: { accessBankDigests: [digest("qq:group:686743769")] },
-      },
-    },
-    {
-      type: "custom",
-      customType: "sidekick-access-manifest",
-      data: { bankDigests: [digest("telegram:chat:-1002")] },
-    },
-    {
-      type: "message",
-      message: {
-        role: "toolResult",
-        toolName: "memory_query_source",
-        isError: false,
-        details: { accessBankDigests: [], unavailable: true },
-      },
-    },
-  ];
-
-  assert.deepEqual(
-    continuationAccessWarning(
-      entries,
-      memoryTarget({ grantedBankIds: ["telegram:chat:-1002"] }),
-      { identityAliasKey: IDENTITY_ALIAS_KEY, scopeId },
-    ),
-    {
-      historicalSourceCount: 2,
-      unavailableSourceCount: 1,
-    },
+test("continues when a legacy session records different source access", async () => {
+  const app = await fixture((_body, response) =>
+    sendText(response, "continued safely"),
   );
-  assert.equal(
-    continuationAccessWarning(
-      entries,
-      memoryTarget({ requesterIsOwner: true }),
-      { identityAliasKey: IDENTITY_ALIAS_KEY, scopeId },
-    ),
-    null,
-  );
-});
-
-test("fails closed before a continuation can use inaccessible source evidence", async () => {
-  const app = await fixture((_body, response) => sendText(response, "must not run"));
   try {
     const manager = SessionManager.create(
       app.engine.config.workspaceDir,
@@ -933,13 +882,7 @@ test("fails closed before a continuation can use inaccessible source evidence", 
     );
     manager.appendMessage({ role: "user", content: "root", timestamp: 1 });
     manager.appendCustomEntry("sidekick-access-manifest", {
-      bankDigests: [
-        pseudonymizeAccessBank(
-          "qq:group:private-source",
-          IDENTITY_ALIAS_KEY,
-          "workspace:engineering",
-        ),
-      ],
+      bankDigests: ["bank_00000000000000000000000000000000"],
     });
     const parentEntryId = manager.appendMessage({
       role: "assistant",
@@ -969,14 +912,14 @@ test("fails closed before a continuation can use inaccessible source evidence", 
       }),
     );
 
-    assert.deepEqual(events, [
-      {
-        type: "run_failed",
-        code: "SESSION_ACCESS_CHANGED",
-        message: "Start a new AI request because memory access changed",
-      },
-    ]);
-    assert.equal(app.provider.requests.length, 0);
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "continued safely");
+    assert.equal(app.provider.requests.length, 1);
+    assert.match(JSON.stringify(app.provider.requests[0].messages), /root answer/);
+    assert.doesNotMatch(
+      JSON.stringify(app.provider.requests[0].messages),
+      /bank_00000000000000000000000000000000/,
+    );
   } finally {
     await app.close();
   }
