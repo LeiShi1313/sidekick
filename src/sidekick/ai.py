@@ -34,9 +34,11 @@ from sidekick.ai_attachments import (
     AttachmentAnalysisRequest,
 )
 from sidekick.chat.attachments import (
+    MAX_OUTBOUND_ATTACHMENT_BYTES,
     AttachmentDescriber,
     AttachmentDescription,
     ModelInputImage,
+    OutboundAttachment,
 )
 from sidekick.chat.commands import (
     AIAskCommand,
@@ -91,10 +93,15 @@ AICommandPrefixLookup = Callable[
 AgentEventType = Literal[
     "run_started",
     "tool_snapshot",
+    "attachment",
     "text_delta",
     "run_completed",
     "run_failed",
 ]
+MAX_AGENT_TEXT_EVENT_BYTES = 256_000
+MAX_AGENT_ATTACHMENT_EVENT_BYTES = (
+    ((MAX_OUTBOUND_ATTACHMENT_BYTES + 2) // 3) * 4 + 2_048
+)
 MAX_AGENT_MEMORY_ANCHORS = 64
 MAX_AGENT_BANK_GRANTS = 64
 MAX_AGENT_PARTICIPANTS = 16
@@ -193,6 +200,7 @@ class AgentEvent:
     phase: Literal["started", "completed", "failed"] | None = None
     tool: str | None = None
     summary: str | None = None
+    attachment: OutboundAttachment | None = None
     code: str | None = None
     message: str | None = None
 
@@ -326,7 +334,7 @@ class PiAgentGateway:
             buffer = b""
             async for chunk in response.content.iter_chunked(4096):
                 buffer += chunk
-                if len(buffer) > 256_000:
+                if len(buffer) > MAX_AGENT_ATTACHMENT_EVENT_BYTES:
                     raise RuntimeError("Pi agent returned an oversized event")
                 while b"\n" in buffer:
                     raw_line, buffer = buffer.split(b"\n", 1)
@@ -886,6 +894,7 @@ class AIResponder:
                 presentation="plain",
             )
         text = ""
+        attachment: OutboundAttachment | None = None
         session_id: str | None = None
         entry_id: str | None = None
         try:
@@ -900,6 +909,13 @@ class AIResponder:
                             event.summary,
                             wait=False,
                         )
+                    continue
+                if event.type == "attachment":
+                    if event.attachment is None or attachment is not None:
+                        raise RuntimeError(
+                            "Pi agent returned invalid attachments"
+                        )
+                    attachment = event.attachment
                     continue
                 if event.type == "text_delta":
                     assert event.delta is not None
@@ -972,6 +988,24 @@ class AIResponder:
                     failure_code="DELIVERY_FAILED",
                 )
             succeeded = bool(text and session_id and entry_id)
+            if succeeded and attachment is not None:
+                try:
+                    await self._transport.reply_attachment(trigger, attachment)
+                except Exception as exc:
+                    self._log_failure(exc)
+                    failure = (
+                        "AI generated an attachment, but delivery failed. "
+                        "Try again later."
+                    )
+                    await self._edit_message(answer, failure, wait=True)
+                    return AnswerResult(
+                        message=answer,
+                        text=failure,
+                        succeeded=False,
+                        session_id=session_id,
+                        entry_id=entry_id,
+                        failure_code="DELIVERY_FAILED",
+                    )
             return AnswerResult(
                 message=answer,
                 text=final_text,
@@ -6080,6 +6114,8 @@ def _parse_agent_event(raw: bytes) -> AgentEvent:
     if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
         raise RuntimeError("Pi agent returned an invalid event")
     event_type = payload["type"]
+    if event_type != "attachment" and len(raw) > MAX_AGENT_TEXT_EVENT_BYTES:
+        raise RuntimeError("Pi agent returned an oversized event")
     if event_type == "run_started":
         if not _event_strings(payload, "runId", "sessionId"):
             raise RuntimeError("Pi agent returned an invalid event")
@@ -6101,6 +6137,34 @@ def _parse_agent_event(raw: bytes) -> AgentEvent:
             tool=payload["tool"],
             summary=payload["summary"],
         )
+    if event_type == "attachment":
+        if set(payload) != {
+            "type",
+            "filename",
+            "mimeType",
+            "displayAs",
+            "data",
+        } or not _event_strings(
+            payload,
+            "filename",
+            "mimeType",
+            "displayAs",
+            "data",
+        ):
+            raise RuntimeError("Pi agent returned an invalid event")
+        try:
+            data = base64.b64decode(payload["data"], validate=True)
+            if base64.b64encode(data).decode("ascii") != payload["data"]:
+                raise ValueError("Attachment data is not canonical base64")
+            attachment = OutboundAttachment(
+                data=data,
+                filename=payload["filename"],
+                mime_type=payload["mimeType"],
+                display_as=payload["displayAs"],
+            )
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("Pi agent returned an invalid event") from exc
+        return AgentEvent(type="attachment", attachment=attachment)
     if event_type == "text_delta":
         if not isinstance(payload.get("delta"), str) or not isinstance(
             payload.get("reset"), bool

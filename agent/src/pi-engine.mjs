@@ -13,9 +13,11 @@ import {
   InMemoryModelsStore,
 } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
+import OpenAI from "openai";
 import { Type } from "typebox";
 
 import { executeJavaScript } from "./code-exec.mjs";
+import { createImageTools, IMAGE_TOOL_NAME } from "./image-tools.mjs";
 import { retrieveMemoryContext } from "./memory-context.mjs";
 import { createMemoryTools, MEMORY_TOOL_NAMES } from "./memory-tools.mjs";
 import { isModelId } from "./model-id.mjs";
@@ -224,6 +226,7 @@ export function toolNamesForPolicy(
   policy,
   memoryEnabled = false,
   mcpEnabled = false,
+  imageEnabled = false,
 ) {
   if (!TOOL_POLICIES.has(policy)) throw new Error("Unknown tool policy");
   if (policy === "none") return [];
@@ -232,6 +235,7 @@ export function toolNamesForPolicy(
     ...RESTRICTED_TOOLS,
     ...memoryTools,
     ...(mcpEnabled ? ["mcp"] : []),
+    ...(imageEnabled ? [IMAGE_TOOL_NAME] : []),
   ];
 }
 
@@ -374,6 +378,7 @@ function toolStartSummary(name, args) {
     return `Fetching: ${boundedText(hosts.join(", "), 300) || "web page"}`;
   }
   if (name === "code_exec") return "Running calculation";
+  if (name === IMAGE_TOOL_NAME) return "Generating image";
   if (name === "mcp") return "Consulting TaiBu";
   if (name === "memory_reflect") return "Reasoning over memory";
   if (name === "memory_get_sources") return "Checking memory sources";
@@ -392,6 +397,7 @@ function toolEndSummary(name, result, isError) {
       .join("\n");
     return `Calculation result: ${boundedText(text, 300)}`;
   }
+  if (name === IMAGE_TOOL_NAME) return "Image generated";
   if (name === "web_search") return "Web search completed";
   if (name === "fetch_content") return "Web page retrieved";
   if (name === "memory_reflect") return "Memory reflection completed";
@@ -448,6 +454,16 @@ export class PiEngine {
     this.activeRuns = new Map();
     this.locks = new KeyedLock();
     this.codeTool = createCodeTool();
+    this.imageClient =
+      config.imageClient ??
+      (config.imageModel
+        ? new OpenAI({
+            apiKey: config.apiKey,
+            baseURL: config.baseUrl.replace(/\/$/, ""),
+            timeout: config.imageRequestTimeoutMs,
+            maxRetries: 1,
+          })
+        : null);
     this.sessionHistory =
       config.sessionHistory ??
       new SessionHistory({
@@ -529,7 +545,7 @@ export class PiEngine {
     }
     const models = new Set([this.model.id]);
     for (const item of payload.data) {
-      if (isModelId(item?.id)) {
+      if (isModelId(item?.id) && item.id !== this.config.imageModel) {
         models.add(item.id);
       }
     }
@@ -828,10 +844,19 @@ export class PiEngine {
         fetchImpl: this.config.memoryFetch,
         observe: observeMemory,
       });
+      const generatedArtifacts = new Map();
+      const imageTools = createImageTools({
+        client: this.imageClient,
+        model: this.config.imageModel,
+        onArtifact: (toolCallId, artifact) => {
+          generatedArtifacts.set(toolCallId, artifact);
+        },
+      });
       const toolNames = toolNamesForPolicy(
         request.toolPolicy,
         memoryTools.length > 0,
         mcpEnabled,
+        imageTools.length > 0,
       );
       const modelRuntime = await this.#modelRuntime();
       const { session } = await createAgentSession({
@@ -841,7 +866,7 @@ export class PiEngine {
         model,
         thinkingLevel: this.thinkingLevel,
         tools: toolNames,
-        customTools: [this.codeTool, ...memoryTools],
+        customTools: [this.codeTool, ...memoryTools, ...imageTools],
         resourceLoader,
         sessionManager,
         settingsManager,
@@ -980,6 +1005,11 @@ export class PiEngine {
               privacyOptions,
             ),
           });
+          const artifact = generatedArtifacts.get(event.toolCallId);
+          generatedArtifacts.delete(event.toolCallId);
+          if (!event.isError && artifact) {
+            queue.push({ type: "attachment", ...artifact });
+          }
         } else if (event.type === "turn_end") {
           emitText(textStream.flush());
           void record("model.turn.completed", {

@@ -123,6 +123,7 @@ export function loadConfig() {
       apiKey: required("AI_API_KEY"),
       identityAliasKey: requiredSecret("PI_IDENTITY_ALIAS_KEY"),
       model: required("AI_CHAT_MODEL"),
+      imageModel: process.env.AI_IMAGE_MODEL?.trim() || "gpt-image-2",
       reasoningEffort,
       maxOutputTokens: integer("AI_MAX_OUTPUT_TOKENS", 4_000, {
         max: 100_000,
@@ -132,6 +133,8 @@ export function loadConfig() {
       }),
       requestTimeoutMs:
         integer("AI_REQUEST_TIMEOUT", 90, { max: 3_600 }) * 1_000,
+      imageRequestTimeoutMs:
+        integer("AI_IMAGE_REQUEST_TIMEOUT", 180, { max: 600 }) * 1_000,
       memoryUrl,
       memoryToken: memoryUrl ? requiredSecret("MEMORY_API_TOKEN", 24) : null,
       workspaceDir: join(dataDir, "workspace"),

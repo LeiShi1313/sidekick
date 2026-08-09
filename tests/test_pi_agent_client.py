@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from io import BytesIO
 
 import pytest
@@ -19,7 +20,7 @@ from sidekick.ai import (
     PiAgentGateway,
 )
 from sidekick.ai_attachments import AttachmentAnalysisRequest
-from sidekick.chat.attachments import ModelInputImage
+from sidekick.chat.attachments import ModelInputImage, OutboundAttachment
 
 
 def model_image_bytes() -> bytes:
@@ -217,6 +218,62 @@ async def test_pi_gateway_sends_one_model_image_as_base64() -> None:
             "data": base64.b64encode(model_image_bytes()).decode("ascii"),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_streams_one_validated_attachment(make_jpeg) -> None:
+    image = make_jpeg()
+
+    async def runs(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
+        await response.prepare(request)
+        for event in (
+            {
+                "type": "run_started",
+                "runId": run_request().run_id,
+                "sessionId": "session-1",
+            },
+            {
+                "type": "attachment",
+                "filename": "generated-image.jpg",
+                "mimeType": "image/jpeg",
+                "displayAs": "image",
+                "data": base64.b64encode(image).decode("ascii"),
+            },
+            {
+                "type": "run_completed",
+                "sessionId": "session-1",
+                "entryId": "entry-1",
+                "answer": "Here is the generated image.",
+            },
+        ):
+            await response.write(json.dumps(event).encode() + b"\n")
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
+    try:
+        events = [event async for event in gateway.run(run_request())]
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert [event.type for event in events] == [
+        "run_started",
+        "attachment",
+        "run_completed",
+    ]
+    assert events[1].attachment == OutboundAttachment(
+        data=image,
+        filename="generated-image.jpg",
+        mime_type="image/jpeg",
+        display_as="image",
+    )
 
 
 @pytest.mark.asyncio

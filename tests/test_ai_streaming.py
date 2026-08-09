@@ -218,6 +218,112 @@ async def test_telegram_transport_replies_with_one_attachment(
     }
 
 
+@pytest.mark.asyncio
+async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
+    attachment = OutboundAttachment(
+        data=make_jpeg(),
+        filename="generated-image.jpg",
+        mime_type="image/jpeg",
+        display_as="image",
+    )
+
+    class AttachmentGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="attachment", attachment=attachment)
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer="Here is the generated image.",
+            )
+
+    class AttachmentTransport:
+        def __init__(self):
+            self.attachments = []
+
+        async def reply(self, _message, text, *, presentation):
+            assert presentation == "plain"
+            return FakeAnswer(text)
+
+        async def update(self, message, text, *, presentation, wait):
+            message.text = text
+            return True
+
+        async def reply_attachment(self, message, supplied):
+            self.attachments.append((message, supplied))
+
+    trigger = FakeMessage("/ai generate an image")
+    transport = AttachmentTransport()
+    responder = AIResponder(AttachmentGateway(), transport=transport)
+
+    result = await responder.answer(trigger, make_request("generate an image"))
+
+    assert result.succeeded is True
+    assert result.text == "Here is the generated image."
+    assert transport.attachments == [(trigger, attachment)]
+
+
+@pytest.mark.asyncio
+async def test_responder_reports_generated_attachment_delivery_failure(
+    make_jpeg,
+) -> None:
+    attachment = OutboundAttachment(
+        data=make_jpeg(),
+        filename="generated-image.jpg",
+        mime_type="image/jpeg",
+        display_as="image",
+    )
+
+    class AttachmentGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="attachment", attachment=attachment)
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer="Here is the generated image.",
+            )
+
+    class FailingAttachmentTransport:
+        async def reply(self, _message, text, *, presentation):
+            return FakeAnswer(text)
+
+        async def update(self, message, text, *, presentation, wait):
+            message.text = text
+            return True
+
+        async def reply_attachment(self, _message, _attachment):
+            raise RuntimeError("private transport details")
+
+    responder = AIResponder(
+        AttachmentGateway(),
+        transport=FailingAttachmentTransport(),
+    )
+
+    result = await responder.answer(
+        FakeMessage("/ai generate an image"),
+        make_request("generate an image"),
+    )
+
+    assert result.succeeded is False
+    assert result.failure_code == "DELIVERY_FAILED"
+    assert result.session_id == "session-1"
+    assert result.entry_id == "entry-1"
+    assert result.text == (
+        "AI generated an attachment, but delivery failed. Try again later."
+    )
+
+
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:
     async with asyncio.timeout(1):
         while len(answer.edits) < count:
