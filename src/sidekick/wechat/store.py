@@ -17,8 +17,11 @@ from sidekick.wechat.api import (
     WeChatChatList,
     WeChatConnectorMessage,
     WeChatEvent,
+    WeChatGroupMemberList,
     WeChatMessageList,
     WeChatSession,
+    WeChatUser,
+    WeChatUserList,
 )
 from sidekick.wechat.message import WeChatMessage
 
@@ -96,6 +99,24 @@ class WeChatStateRepository:
                 snapshot_id TEXT NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (connector_key, account_id, chat_id)
+            );
+            CREATE TABLE IF NOT EXISTS wechat_users (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                display_name TEXT,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (connector_key, account_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS wechat_group_members (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                display_name TEXT,
+                nickname TEXT,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (connector_key, account_id, group_id, user_id)
             );
             CREATE TABLE IF NOT EXISTS wechat_messages (
                 local_order INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,6 +299,183 @@ class WeChatStateRepository:
                 chats,
                 now=time.time(),
             )
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+
+    @_serialized
+    async def refresh_users(
+        self,
+        connector_key: str,
+        users: WeChatUserList,
+    ) -> None:
+        connection = self._require_connection()
+        state = await self._connector_state(connector_key)
+        account_id = str(state["account_id"])
+        now = time.time()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await connection.executemany(
+                """
+                INSERT INTO wechat_users (
+                    connector_key, account_id, user_id, display_name, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(connector_key, account_id, user_id) DO UPDATE SET
+                    display_name = COALESCE(
+                        excluded.display_name,
+                        wechat_users.display_name
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    (
+                        connector_key,
+                        account_id,
+                        user.id,
+                        user.display_name,
+                        now,
+                    )
+                    for user in users.users
+                ),
+            )
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+
+    @_serialized
+    async def refresh_user(
+        self,
+        connector_key: str,
+        user_id: str,
+        user: WeChatUser | None,
+    ) -> None:
+        if user is not None and user.id != user_id:
+            raise ValueError("WeChat user refresh returned a different user")
+        connection = self._require_connection()
+        state = await self._connector_state(connector_key)
+        account_id = str(state["account_id"])
+        if user is None:
+            return
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await connection.execute(
+                """
+                INSERT INTO wechat_users (
+                    connector_key, account_id, user_id,
+                    display_name, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(connector_key, account_id, user_id) DO UPDATE SET
+                    display_name = COALESCE(
+                        excluded.display_name,
+                        wechat_users.display_name
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    connector_key,
+                    account_id,
+                    user.id,
+                    user.display_name,
+                    time.time(),
+                ),
+            )
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+
+    @_serialized
+    async def refresh_group_members(
+        self,
+        connector_key: str,
+        group_id: str,
+        members: WeChatGroupMemberList,
+    ) -> None:
+        if members.group_id != group_id or any(
+            member.group_id != group_id for member in members.members
+        ):
+            raise ValueError("WeChat member refresh returned a different group")
+        connection = self._require_connection()
+        state = await self._connector_state(connector_key)
+        account_id = str(state["account_id"])
+        generation = int(state["connection_generation"])
+        if members.snapshot_current and not members.snapshot_complete:
+            raise WeChatAPIContractError(
+                "WeChat current group member snapshot is not complete"
+            )
+        if members.snapshot_current and (
+            members.snapshot_connection_generation != generation
+        ):
+            raise WeChatAPIContractError(
+                "WeChat group member snapshot generation is stale"
+            )
+        authoritative = members.snapshot_complete and members.snapshot_current
+        now = time.time()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing_user_ids: set[str] = set()
+            if authoritative:
+                cursor = await connection.execute(
+                    """
+                    SELECT user_id
+                    FROM wechat_group_members
+                    WHERE connector_key = ? AND account_id = ? AND group_id = ?
+                    """,
+                    (connector_key, account_id, group_id),
+                )
+                existing_user_ids = {
+                    str(row["user_id"]) async for row in cursor
+                }
+                await cursor.close()
+            await connection.executemany(
+                """
+                INSERT INTO wechat_group_members (
+                    connector_key, account_id, group_id, user_id,
+                    display_name, nickname, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    connector_key, account_id, group_id, user_id
+                ) DO UPDATE SET
+                    display_name = COALESCE(
+                        excluded.display_name,
+                        wechat_group_members.display_name
+                    ),
+                    nickname = COALESCE(
+                        excluded.nickname,
+                        wechat_group_members.nickname
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    (
+                        connector_key,
+                        account_id,
+                        group_id,
+                        member.user_id,
+                        member.display_name,
+                        member.nickname,
+                        now,
+                    )
+                    for member in members.members
+                ),
+            )
+            if authoritative:
+                retained_user_ids = {
+                    member.user_id for member in members.members
+                }
+                await connection.executemany(
+                    """
+                    DELETE FROM wechat_group_members
+                    WHERE connector_key = ? AND account_id = ?
+                      AND group_id = ? AND user_id = ?
+                    """,
+                    (
+                        (connector_key, account_id, group_id, user_id)
+                        for user_id in existing_user_ids - retained_user_ids
+                    ),
+                )
             await connection.commit()
         except BaseException:
             await connection.rollback()
@@ -895,7 +1093,23 @@ class WeChatStateRepository:
                 messages.*,
                 connectors.account_id AS self_id,
                 chats.chat_type,
-                chats.display_name AS chat_display_name
+                chats.display_name AS chat_display_name,
+                COALESCE(
+                    CASE
+                        WHEN chats.chat_type = 'group'
+                        THEN group_members.nickname
+                    END,
+                    users.display_name,
+                    CASE
+                        WHEN chats.chat_type = 'group'
+                        THEN group_members.display_name
+                    END,
+                    CASE
+                        WHEN messages.sender_id = connectors.account_id
+                        THEN connectors.self_display_name
+                    END,
+                    messages.sender_id
+                ) AS sender_display_name
             FROM wechat_messages AS messages
             JOIN wechat_connectors AS connectors
               ON connectors.connector_key = messages.connector_key
@@ -904,6 +1118,15 @@ class WeChatStateRepository:
               ON chats.connector_key = messages.connector_key
              AND chats.account_id = messages.account_id
              AND chats.chat_id = messages.chat_id
+            LEFT JOIN wechat_users AS users
+              ON users.connector_key = messages.connector_key
+             AND users.account_id = messages.account_id
+             AND users.user_id = messages.sender_id
+            LEFT JOIN wechat_group_members AS group_members
+              ON group_members.connector_key = messages.connector_key
+             AND group_members.account_id = messages.account_id
+             AND group_members.group_id = messages.chat_id
+             AND group_members.user_id = messages.sender_id
             WHERE messages.connector_key = ? AND messages.removed = 0
         """
         if include_unsupported:

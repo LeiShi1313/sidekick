@@ -54,6 +54,7 @@ MAX_PROJECTED_SHARED_CHAT_HISTORY_ITEMS = 100
 MAX_SHARED_CHAT_HISTORY_BYTES = 48 * 1024
 MAX_SHARED_CHAT_HISTORY_LABEL_CHARS = 240
 MAX_SHARED_CHAT_HISTORY_CONTENT_CHARS = 4_096
+MAX_GROUP_MEMBER_DELTA_ROWS = 100_000
 
 
 class WeChatAPIError(RuntimeError):
@@ -266,6 +267,133 @@ class WeChatChatList:
             )
         if self.snapshot.connection_generation != generation:
             raise WeChatAPIContractError("WeChat chat snapshot generation is stale")
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatUser:
+    id: str
+    display_name: str | None
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatUser:
+        _required_bool(payload, "isPartial")
+        return cls(
+            id=_required_user_id(payload, "id"),
+            display_name=_optional_text(payload, "displayName"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatUserList:
+    users: tuple[WeChatUser, ...]
+    cursor: str
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatUserList:
+        if not _required_bool(payload, "isPartial"):
+            raise WeChatAPIContractError("WeChat user directory must be partial")
+        _required_text(payload, "source")
+        users: list[WeChatUser] = []
+        user_ids: set[str] = set()
+        for value in _required_array(payload, "data"):
+            row = _object(value, "user")
+            try:
+                user_id = _user_id(row.get("id"), "id")
+            except WeChatAPIContractError:
+                continue
+            if user_id in user_ids:
+                raise WeChatAPIContractError(
+                    "WeChat user directory contains duplicate IDs"
+                )
+            user_ids.add(user_id)
+            users.append(WeChatUser.parse(row))
+        return cls(users=tuple(users), cursor=_required_id(payload, "cursor"))
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatGroupMember:
+    group_id: str
+    user_id: str
+    display_name: str | None
+    nickname: str | None
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatGroupMember:
+        _required_bool(payload, "isPartial")
+        return cls(
+            group_id=_required_group_id(payload, "groupId"),
+            user_id=_required_user_id(payload, "userId"),
+            display_name=_optional_text(payload, "displayName"),
+            nickname=_optional_text(payload, "nickname"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatGroupMemberList:
+    group_id: str
+    members: tuple[WeChatGroupMember, ...]
+    cursor: str
+    snapshot_complete: bool
+    snapshot_current: bool
+    snapshot_connection_generation: int | None
+
+    @classmethod
+    def parse(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        group_id: str,
+    ) -> WeChatGroupMemberList:
+        target_group_id = _group_id(group_id, "group_id")
+        if not _required_bool(payload, "isPartial"):
+            raise WeChatAPIContractError(
+                "WeChat group member directory must be partial"
+            )
+        _required_text(payload, "source")
+        members = tuple(
+            WeChatGroupMember.parse(_object(row, "group member"))
+            for row in _required_array(payload, "data")
+        )
+        if any(member.group_id != target_group_id for member in members):
+            raise WeChatAPIContractError(
+                "WeChat group member directory contains a different group"
+            )
+        if len({member.user_id for member in members}) != len(members):
+            raise WeChatAPIContractError(
+                "WeChat group member directory contains duplicate user IDs"
+            )
+        snapshot = _required_object(payload, "snapshot")
+        if _required_group_id(snapshot, "groupId") != target_group_id:
+            raise WeChatAPIContractError(
+                "WeChat group member snapshot belongs to a different group"
+            )
+        complete = _required_bool(snapshot, "complete")
+        current = _required_bool(snapshot, "current")
+        count = _required_nonnegative_int(snapshot, "count")
+        if current and not complete:
+            raise WeChatAPIContractError(
+                "WeChat current group member snapshot must be complete"
+            )
+        if complete and current and count != len(members):
+            raise WeChatAPIContractError(
+                "WeChat group member snapshot count is inconsistent"
+            )
+        connection_generation = _optional_positive_int(
+            snapshot,
+            "connectionGeneration",
+        )
+        if current and connection_generation is None:
+            raise WeChatAPIContractError(
+                "WeChat current group member snapshot generation is missing"
+            )
+        return cls(
+            group_id=target_group_id,
+            members=members,
+            cursor=_required_id(payload, "cursor"),
+            snapshot_complete=complete,
+            snapshot_current=current,
+            snapshot_connection_generation=connection_generation,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,6 +669,39 @@ class WeChatEvent:
             _required_native_message_id(self.payload, "id"),
         )
 
+    def changed_user_id(self) -> str:
+        if self.name != "user_profile" or self.payload.get("status") != "changed":
+            raise WeChatAPIContractError("Malformed WeChat user profile event")
+        _required_id(self.payload, "id")
+        return _required_user_id(self.payload, "userId")
+
+    def invalidated_group_id(self) -> str | None:
+        if self.name == "group_member_snapshot":
+            status = _required_enum(self.payload, "status", {"begin", "end"})
+            group_id = _required_group_id(self.payload, "groupId")
+            return group_id if status == "end" else None
+        if self.name == "group_member":
+            group_id = _required_group_id(self.payload, "groupId")
+            raw = _required_object(self.payload, "raw")
+            mode = _required_enum(raw, "mode", {"cache_snapshot", "delta"})
+            if mode == "cache_snapshot":
+                return None
+            _required_id(raw, "deltaId")
+            response_count = _required_bounded_decimal(
+                raw,
+                "responseCount",
+                minimum=1,
+                maximum=MAX_GROUP_MEMBER_DELTA_ROWS,
+            )
+            delta_index = _required_bounded_decimal(
+                raw,
+                "deltaIndex",
+                minimum=0,
+                maximum=response_count - 1,
+            )
+            return group_id if delta_index == response_count - 1 else None
+        raise WeChatAPIContractError("Event is not a WeChat group member event")
+
 
 @dataclass(frozen=True, slots=True)
 class WeChatSendOperation:
@@ -614,6 +775,36 @@ class WeChatConnectorClient:
     async def get_chats(self) -> WeChatChatList:
         payload = await self._request_json("GET", "/chats")
         return WeChatChatList.parse(payload)
+
+    async def get_users(self) -> WeChatUserList:
+        payload = await self._request_json("GET", "/users")
+        return WeChatUserList.parse(payload)
+
+    async def get_user(self, user_id: str) -> WeChatUser | None:
+        target_user_id = _user_id(user_id, "user_id")
+        try:
+            payload = await self._request_json(
+                "GET",
+                f"/users/{quote(target_user_id, safe='')}",
+            )
+        except WeChatAPIError as exc:
+            if exc.status == 404 and exc.code == "NOT_FOUND":
+                return None
+            raise
+        user = WeChatUser.parse(payload)
+        if user.id != target_user_id:
+            raise WeChatAPIContractError(
+                "WeChat user response returned a different user"
+            )
+        return user
+
+    async def get_group_members(self, group_id: str) -> WeChatGroupMemberList:
+        target_group_id = _group_id(group_id, "group_id")
+        payload = await self._request_json(
+            "GET",
+            f"/groups/{quote(target_group_id, safe='')}/members",
+        )
+        return WeChatGroupMemberList.parse(payload, group_id=target_group_id)
 
     async def get_messages(
         self,
@@ -1117,6 +1308,28 @@ def _required_wechat_id(payload: Mapping[str, Any], field: str) -> str:
     return _canonical_wechat_id(payload.get(field), field)
 
 
+def _user_id(value: Any, field: str) -> str:
+    user_id = _canonical_wechat_id(value, field)
+    if user_id.endswith("@chatroom"):
+        raise WeChatAPIContractError(f"WeChat {field} must be a user ID")
+    return user_id
+
+
+def _required_user_id(payload: Mapping[str, Any], field: str) -> str:
+    return _user_id(payload.get(field), field)
+
+
+def _group_id(value: Any, field: str) -> str:
+    group_id = _canonical_wechat_id(value, field)
+    if not group_id.endswith("@chatroom"):
+        raise WeChatAPIContractError(f"WeChat {field} must be a group ID")
+    return group_id
+
+
+def _required_group_id(payload: Mapping[str, Any], field: str) -> str:
+    return _group_id(payload.get(field), field)
+
+
 def _media_id(value: Any, field: str) -> str:
     if not isinstance(value, str) or MEDIA_ID_RE.fullmatch(value) is None:
         raise WeChatAPIContractError(
@@ -1224,6 +1437,44 @@ def _required_positive_int(payload: Mapping[str, Any], field: str) -> int:
     if value < 1:
         raise WeChatAPIContractError(f"WeChat {field} must be positive")
     return value
+
+
+def _optional_positive_int(
+    payload: Mapping[str, Any],
+    field: str,
+) -> int | None:
+    value = payload.get(field)
+    return None if value is None else _required_positive_int(payload, field)
+
+
+def _required_bounded_decimal(
+    payload: Mapping[str, Any],
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = payload.get(field)
+    maximum_text = str(maximum)
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or (len(value) > 1 and value[0] == "0")
+        or len(value) > len(maximum_text)
+        or (len(value) == len(maximum_text) and value > maximum_text)
+    ):
+        raise WeChatAPIContractError(
+            f"WeChat {field} must be a canonical decimal between "
+            f"{minimum} and {maximum}"
+        )
+    parsed = int(value)
+    if parsed < minimum:
+        raise WeChatAPIContractError(
+            f"WeChat {field} must be a canonical decimal between "
+            f"{minimum} and {maximum}"
+        )
+    return parsed
 
 
 def _required_enum(

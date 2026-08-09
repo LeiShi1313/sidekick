@@ -14,9 +14,12 @@ from sidekick.wechat.api import (
     WeChatConnectorMessage,
     WeChatConnectorClient,
     WeChatEvent,
+    WeChatGroupMemberList,
     WeChatMessageList,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
+    WeChatUser,
+    WeChatUserList,
 )
 
 
@@ -37,6 +40,240 @@ def connector_message_payload(message_id: str) -> dict[str, object]:
 
 def json_response(payload: object, *, status: int = 200) -> web.Response:
     return web.json_response(payload, status=status, headers=API_HEADERS)
+
+
+def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
+    users = WeChatUserList.parse(
+        {
+            "data": [
+                {
+                    "id": "wxid_alice",
+                    "displayName": " Alice Global ",
+                    "source": "learned-hook-events",
+                    "isPartial": True,
+                },
+                {
+                    "id": "56825427596@chatroom",
+                    "displayName": "Project group",
+                    "source": "learned-message-events",
+                    "isPartial": True,
+                },
+                {
+                    "id": "_1234567",
+                    "displayName": "Unsupported learned identity",
+                    "source": "native-group-member-snapshot",
+                    "isPartial": True,
+                }
+            ],
+            "isPartial": True,
+            "source": "learned-hook-events",
+            "cursor": "users-10",
+        }
+    )
+    members = WeChatGroupMemberList.parse(
+        {
+            "data": [
+                {
+                    "groupId": "56825427596@chatroom",
+                    "userId": "wxid_alice",
+                    "displayName": "Alice Global",
+                    "nickname": " Alice in this group ",
+                    "source": "wechat+0x5cf0af0",
+                    "isPartial": False,
+                }
+            ],
+            "isPartial": True,
+            "source": "native-group-member-snapshot",
+            "snapshot": {
+                "id": "members-10",
+                "groupId": "56825427596@chatroom",
+                "complete": True,
+                "current": True,
+                "count": 1,
+                "connectionGeneration": 41,
+            },
+            "cursor": "members-10",
+        },
+        group_id="56825427596@chatroom",
+    )
+
+    assert users.users == (
+        WeChatUser(id="wxid_alice", display_name="Alice Global"),
+    )
+    assert members.members[0].display_name == "Alice Global"
+    assert members.members[0].nickname == "Alice in this group"
+    assert members.snapshot_complete is True
+    assert members.snapshot_current is True
+    assert members.snapshot_connection_generation == 41
+
+
+@pytest.mark.parametrize(
+    ("identity_id", "expected"),
+    (
+        ("56825427596@chatroom", "must be a user ID"),
+        ("_1234567", "must be a canonical WeChat ID"),
+    ),
+)
+def test_wechat_user_profile_rejects_non_user_identity(
+    identity_id: str,
+    expected: str,
+) -> None:
+    with pytest.raises(WeChatAPIContractError, match=expected):
+        WeChatUser.parse(
+            {
+                "id": identity_id,
+                "displayName": "Not a user",
+                "isPartial": True,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("complete", "connection_generation", "expected"),
+    (
+        (False, 41, "must be complete"),
+        (True, None, "generation is missing"),
+    ),
+)
+def test_wechat_client_rejects_invalid_current_group_member_snapshots(
+    complete: bool,
+    connection_generation: int | None,
+    expected: str,
+) -> None:
+    snapshot: dict[str, object] = {
+        "groupId": "56825427596@chatroom",
+        "complete": complete,
+        "current": True,
+        "count": 0,
+    }
+    if connection_generation is not None:
+        snapshot["connectionGeneration"] = connection_generation
+
+    with pytest.raises(WeChatAPIContractError, match=expected):
+        WeChatGroupMemberList.parse(
+            {
+                "data": [],
+                "isPartial": True,
+                "source": "native-group-member-snapshot",
+                "snapshot": snapshot,
+                "cursor": "members-10",
+            },
+            group_id="56825427596@chatroom",
+        )
+
+
+def test_wechat_client_rejects_group_members_from_another_group() -> None:
+    with pytest.raises(WeChatAPIContractError, match="different group"):
+        WeChatGroupMemberList.parse(
+            {
+                "data": [
+                    {
+                        "groupId": "56825427597@chatroom",
+                        "userId": "wxid_alice",
+                        "isPartial": True,
+                    }
+                ],
+                "isPartial": True,
+                "source": "learned-hook-events",
+                "snapshot": {
+                    "groupId": "56825427596@chatroom",
+                    "complete": False,
+                    "current": False,
+                    "count": 0,
+                },
+                "cursor": "members-10",
+            },
+            group_id="56825427596@chatroom",
+        )
+
+
+@pytest.mark.asyncio
+async def test_wechat_client_reads_identity_directories_and_missing_users() -> None:
+    requested: list[str] = []
+
+    async def users(_request: web.Request) -> web.Response:
+        return json_response(
+            {
+                "data": [
+                    {
+                        "id": "wxid_alice",
+                        "displayName": "Alice",
+                        "isPartial": True,
+                    }
+                ],
+                "isPartial": True,
+                "source": "learned-hook-events",
+                "cursor": "users-10",
+            }
+        )
+
+    async def user(request: web.Request) -> web.Response:
+        user_id = request.match_info["user_id"]
+        requested.append(user_id)
+        if user_id == "wxid_missing":
+            return json_response(
+                {"error": {"code": "NOT_FOUND", "message": "User not found"}},
+                status=404,
+            )
+        return json_response(
+            {
+                "id": user_id,
+                "displayName": "Alice Updated",
+                "isPartial": True,
+            }
+        )
+
+    async def members(request: web.Request) -> web.Response:
+        group_id = request.match_info["group_id"]
+        requested.append(group_id)
+        return json_response(
+            {
+                "data": [
+                    {
+                        "groupId": group_id,
+                        "userId": "wxid_alice",
+                        "nickname": "Group Alice",
+                        "isPartial": True,
+                    }
+                ],
+                "isPartial": True,
+                "source": "learned-hook-events",
+                "snapshot": {
+                    "groupId": group_id,
+                    "complete": False,
+                    "current": False,
+                    "count": 0,
+                },
+                "cursor": "members-10",
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/users", users)
+    app.router.add_get("/users/{user_id}", user)
+    app.router.add_get("/groups/{group_id}/members", members)
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(str(server.make_url("/")))
+        try:
+            observed_users = await client.get_users()
+            observed_user = await client.get_user("wxid_alice")
+            missing_user = await client.get_user("wxid_missing")
+            observed_members = await client.get_group_members(
+                "56825427596@chatroom"
+            )
+        finally:
+            await client.close()
+
+    assert observed_users.users[0].display_name == "Alice"
+    assert observed_user is not None
+    assert observed_user.display_name == "Alice Updated"
+    assert missing_user is None
+    assert observed_members.members[0].nickname == "Group Alice"
+    assert requested == [
+        "wxid_alice",
+        "wxid_missing",
+        "56825427596@chatroom",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -257,6 +494,123 @@ def test_wechat_client_validates_recall_event_identity() -> None:
 
     with pytest.raises(WeChatAPIContractError, match="chatId"):
         malformed.removed_message()
+
+
+@pytest.mark.parametrize(
+    ("event_name", "status", "raw", "expected"),
+    (
+        ("group_member_snapshot", "begin", None, None),
+        (
+            "group_member_snapshot",
+            "end",
+            None,
+            "56825427596@chatroom",
+        ),
+        ("group_member", None, {"mode": "cache_snapshot"}, None),
+        (
+            "group_member",
+            None,
+            {
+                "mode": "delta",
+                "deltaId": "delta-1",
+                "deltaIndex": "0",
+                "responseCount": "2",
+            },
+            None,
+        ),
+        (
+            "group_member",
+            None,
+            {
+                "mode": "delta",
+                "deltaId": "delta-1",
+                "deltaIndex": "1",
+                "responseCount": "2",
+            },
+            "56825427596@chatroom",
+        ),
+    ),
+)
+def test_wechat_identity_events_identify_directory_invalidations(
+    event_name: str,
+    status: str | None,
+    raw: dict[str, str] | None,
+    expected: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "schemaVersion": "wechat-bridge/v1alpha1",
+        "cursor": "11",
+        "event": event_name,
+        "connectionGeneration": 41,
+        "groupId": "56825427596@chatroom",
+    }
+    if status is not None:
+        payload["status"] = status
+    if raw is not None:
+        payload["raw"] = raw
+
+    event = WeChatEvent.parse(payload)
+
+    assert event.invalidated_group_id() == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        {"mode": "delta", "deltaIndex": "0", "responseCount": "1"},
+        {
+            "mode": "delta",
+            "deltaId": "delta-1",
+            "deltaIndex": "0",
+            "responseCount": "0",
+        },
+        {
+            "mode": "delta",
+            "deltaId": "delta-1",
+            "deltaIndex": "2",
+            "responseCount": "2",
+        },
+        {
+            "mode": "delta",
+            "deltaId": "delta-1",
+            "deltaIndex": "00",
+            "responseCount": "1",
+        },
+    ),
+)
+def test_wechat_member_delta_rejects_invalid_batch_metadata(
+    raw: dict[str, str],
+) -> None:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "group_member",
+            "connectionGeneration": 41,
+            "groupId": "56825427596@chatroom",
+            "raw": raw,
+        }
+    )
+
+    with pytest.raises(WeChatAPIContractError):
+        event.invalidated_group_id()
+
+
+def test_wechat_user_profile_event_requires_canonical_user_identity() -> None:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "user_profile",
+            "status": "changed",
+            "id": "sha256:profile-1",
+            "userId": "56825427596@chatroom",
+            "connectionGeneration": 41,
+        }
+    )
+
+    with pytest.raises(WeChatAPIContractError, match="userId"):
+        event.changed_user_id()
 
 
 def test_wechat_message_list_skips_senderless_unsupported_history_rows() -> None:

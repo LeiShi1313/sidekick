@@ -13,13 +13,18 @@ from sidekick.wechat.ai import (
     WeChatMemoryScopeTargetResolver,
 )
 from sidekick.wechat.api import (
+    WeChatAPIContractError,
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
     WeChatConnectorMessage,
     WeChatEvent,
+    WeChatGroupMember,
+    WeChatGroupMemberList,
     WeChatMessageList,
     WeChatSession,
+    WeChatUser,
+    WeChatUserList,
 )
 from sidekick.wechat.store import WeChatStateRepository
 
@@ -65,6 +70,8 @@ def connector_message(
     message_id: str,
     content: str,
     *,
+    chat_id: str = GROUP_ID,
+    direction: str = "in",
     sender_id: str = "wxid_alice",
     reply_to_message_id: str | None = None,
     timestamp: int = 1_783_772_734,
@@ -74,8 +81,8 @@ def connector_message(
 ) -> WeChatConnectorMessage:
     return WeChatConnectorMessage(
         id=message_id,
-        chat_id=GROUP_ID,
-        direction="in",
+        chat_id=chat_id,
+        direction=direction,
         message_type=message_type,
         sender_id=sender_id,
         reply_to_message_id=reply_to_message_id,
@@ -86,6 +93,244 @@ def connector_message(
         sequence=None,
         media_id=media_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> None:
+    other_group_id = "56825427597@chatroom"
+    direct_chat_id = "wxid_alice"
+    chats = (
+        WeChatChat(id=GROUP_ID, type="group", display_name="First group"),
+        WeChatChat(id=other_group_id, type="group", display_name="Second group"),
+        WeChatChat(id=direct_chat_id, type="direct", display_name="Alice"),
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=WeChatChatList(
+                chats=chats,
+                snapshot=WeChatChatSnapshot(
+                    id="identity-snapshot",
+                    complete=True,
+                    current=True,
+                    count=len(chats),
+                    cursor="identity-chats",
+                    connection_generation=41,
+                ),
+                cursor="identity-chats",
+            ),
+            messages=WeChatMessageList(
+                messages=(
+                    connector_message("1001", "first", chat_id=GROUP_ID),
+                    connector_message("1002", "second", chat_id=other_group_id),
+                    connector_message("1003", "direct", chat_id=direct_chat_id),
+                    connector_message(
+                        "1004",
+                        "member fallback",
+                        chat_id=GROUP_ID,
+                        sender_id="wxid_bob",
+                    ),
+                    connector_message(
+                        "1005",
+                        "identifier fallback",
+                        chat_id=other_group_id,
+                        sender_id="wxid_unknown",
+                    ),
+                ),
+                cursor="identity-messages",
+            ),
+        )
+        await store.refresh_users(
+            CONNECTOR_KEY,
+            WeChatUserList(
+                users=(WeChatUser(id="wxid_alice", display_name="Alice Global"),),
+                cursor="users-1",
+            ),
+        )
+        await store.refresh_group_members(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            WeChatGroupMemberList(
+                group_id=GROUP_ID,
+                members=(
+                    WeChatGroupMember(
+                        group_id=GROUP_ID,
+                        user_id="wxid_alice",
+                        display_name="Alice Stale",
+                        nickname="Alice in First",
+                    ),
+                    WeChatGroupMember(
+                        group_id=GROUP_ID,
+                        user_id="wxid_bob",
+                        display_name="Bob Member",
+                        nickname=None,
+                    ),
+                ),
+                cursor="members-first",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
+            ),
+        )
+        await store.refresh_group_members(
+            CONNECTOR_KEY,
+            other_group_id,
+            WeChatGroupMemberList(
+                group_id=other_group_id,
+                members=(
+                    WeChatGroupMember(
+                        group_id=other_group_id,
+                        user_id="wxid_alice",
+                        display_name="Alice Stale",
+                        nickname=None,
+                    ),
+                ),
+                cursor="members-second",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
+            ),
+        )
+
+        resolved = []
+        for chat_id, message_id in (
+            (GROUP_ID, "1001"),
+            (other_group_id, "1002"),
+            (direct_chat_id, "1003"),
+            (GROUP_ID, "1004"),
+            (other_group_id, "1005"),
+        ):
+            message = await store.get_message(CONNECTOR_KEY, chat_id, message_id)
+            assert message is not None
+            resolved.append(message.sender_display_name)
+
+        assert resolved == [
+            "Alice in First",
+            "Alice Global",
+            "Alice Global",
+            "Bob Member",
+            "wxid_unknown",
+        ]
+
+        await store.refresh_user(
+            CONNECTOR_KEY,
+            "wxid_alice",
+            WeChatUser(id="wxid_alice", display_name="Alice Renamed"),
+        )
+        await store.refresh_user(
+            CONNECTOR_KEY,
+            "wxid_alice",
+            WeChatUser(id="wxid_alice", display_name=None),
+        )
+        await store.refresh_user(CONNECTOR_KEY, "wxid_alice", None)
+        group_message = await store.get_message(
+            CONNECTOR_KEY,
+            other_group_id,
+            "1002",
+        )
+        direct_message = await store.get_message(
+            CONNECTOR_KEY,
+            direct_chat_id,
+            "1003",
+        )
+        assert group_message is not None
+        assert direct_message is not None
+        assert group_message.sender_display_name == "Alice Renamed"
+        assert direct_message.sender_display_name == "Alice Renamed"
+
+        await store.refresh_users(
+            CONNECTOR_KEY,
+            WeChatUserList(
+                users=(WeChatUser(id="wxid_alice", display_name=None),),
+                cursor="users-partial-omitted-name",
+            ),
+        )
+        await store.refresh_group_members(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            WeChatGroupMemberList(
+                group_id=GROUP_ID,
+                members=(
+                    WeChatGroupMember(
+                        group_id=GROUP_ID,
+                        user_id="wxid_alice",
+                        display_name=None,
+                        nickname=None,
+                    ),
+                ),
+                cursor="members-partial-omitted-name",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
+            ),
+        )
+
+        aliased = await store.get_message(CONNECTOR_KEY, GROUP_ID, "1001")
+        member_fallback = await store.get_message(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            "1004",
+        )
+        direct_message = await store.get_message(
+            CONNECTOR_KEY,
+            direct_chat_id,
+            "1003",
+        )
+        assert aliased is not None
+        assert member_fallback is not None
+        assert direct_message is not None
+        assert aliased.sender_display_name == "Alice in First"
+        assert member_fallback.sender_display_name == "Bob Member"
+        assert direct_message.sender_display_name == "Alice Renamed"
+
+        with pytest.raises(WeChatAPIContractError, match="generation is stale"):
+            await store.refresh_group_members(
+                CONNECTOR_KEY,
+                GROUP_ID,
+                WeChatGroupMemberList(
+                    group_id=GROUP_ID,
+                    members=(),
+                    cursor="members-stale",
+                    snapshot_complete=True,
+                    snapshot_current=True,
+                    snapshot_connection_generation=42,
+                ),
+            )
+
+        await store.refresh_group_members(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            WeChatGroupMemberList(
+                group_id=GROUP_ID,
+                members=(
+                    WeChatGroupMember(
+                        group_id=GROUP_ID,
+                        user_id="wxid_alice",
+                        display_name=None,
+                        nickname=None,
+                    ),
+                ),
+                cursor="members-authoritative",
+                snapshot_complete=True,
+                snapshot_current=True,
+                snapshot_connection_generation=41,
+            ),
+        )
+
+        aliased = await store.get_message(CONNECTOR_KEY, GROUP_ID, "1001")
+        removed_member = await store.get_message(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            "1004",
+        )
+        assert aliased is not None
+        assert removed_member is not None
+        assert aliased.sender_display_name == "Alice in First"
+        assert removed_member.sender_display_name == "wxid_bob"
+    finally:
+        await store.close()
 
 
 def session(
