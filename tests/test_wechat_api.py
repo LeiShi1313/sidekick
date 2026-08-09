@@ -18,6 +18,7 @@ from sidekick.wechat.api import (
     WeChatMessageList,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
+    WeChatUser,
     WeChatUserList,
 )
 
@@ -49,6 +50,18 @@ def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
                     "id": "wxid_alice",
                     "displayName": " Alice Global ",
                     "source": "learned-hook-events",
+                    "isPartial": True,
+                },
+                {
+                    "id": "56825427596@chatroom",
+                    "displayName": "Project group",
+                    "source": "learned-message-events",
+                    "isPartial": True,
+                },
+                {
+                    "id": "_1234567",
+                    "displayName": "Unsupported learned identity",
+                    "source": "native-group-member-snapshot",
                     "isPartial": True,
                 }
             ],
@@ -84,12 +97,35 @@ def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
         group_id="56825427596@chatroom",
     )
 
-    assert users.users[0].display_name == "Alice Global"
+    assert users.users == (
+        WeChatUser(id="wxid_alice", display_name="Alice Global"),
+    )
     assert members.members[0].display_name == "Alice Global"
     assert members.members[0].nickname == "Alice in this group"
     assert members.snapshot_complete is True
     assert members.snapshot_current is True
     assert members.snapshot_connection_generation == 41
+
+
+@pytest.mark.parametrize(
+    ("identity_id", "expected"),
+    (
+        ("56825427596@chatroom", "must be a user ID"),
+        ("_1234567", "must be a canonical WeChat ID"),
+    ),
+)
+def test_wechat_user_profile_rejects_non_user_identity(
+    identity_id: str,
+    expected: str,
+) -> None:
+    with pytest.raises(WeChatAPIContractError, match=expected):
+        WeChatUser.parse(
+            {
+                "id": identity_id,
+                "displayName": "Not a user",
+                "isPartial": True,
+            }
+        )
 
 
 @pytest.mark.parametrize(

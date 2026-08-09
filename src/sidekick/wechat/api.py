@@ -293,13 +293,21 @@ class WeChatUserList:
         if not _required_bool(payload, "isPartial"):
             raise WeChatAPIContractError("WeChat user directory must be partial")
         _required_text(payload, "source")
-        users = tuple(
-            WeChatUser.parse(_object(row, "user"))
-            for row in _required_array(payload, "data")
-        )
-        if len({user.id for user in users}) != len(users):
-            raise WeChatAPIContractError("WeChat user directory contains duplicate IDs")
-        return cls(users=users, cursor=_required_id(payload, "cursor"))
+        users: list[WeChatUser] = []
+        user_ids: set[str] = set()
+        for value in _required_array(payload, "data"):
+            row = _object(value, "user")
+            try:
+                user_id = _user_id(row.get("id"), "id")
+            except WeChatAPIContractError:
+                continue
+            if user_id in user_ids:
+                raise WeChatAPIContractError(
+                    "WeChat user directory contains duplicate IDs"
+                )
+            user_ids.add(user_id)
+            users.append(WeChatUser.parse(row))
+        return cls(users=tuple(users), cursor=_required_id(payload, "cursor"))
 
 
 @dataclass(frozen=True, slots=True)
