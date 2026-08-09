@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import sharp from "sharp";
+
 import { createAgentServer } from "../src/http-service.mjs";
 
 const validRun = {
@@ -21,11 +23,35 @@ const validRun = {
   },
 };
 
-const modelImageBytes = Buffer.concat([
-  Buffer.from([0xff, 0xd8, 0xff]),
-  Buffer.alloc(96 * 1024),
-  Buffer.from([0xff, 0xd9]),
-]);
+const malformedJpegBytes = Buffer.from(
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgj/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdAAyqX//Z",
+  "base64",
+);
+const malformedOversizedJpegBytes = Buffer.from(
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCAABBkEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAYI/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AnQCGapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAf/2Q==",
+  "base64",
+);
+
+const modelImageBytes = await sharp({
+  create: {
+    width: 64,
+    height: 32,
+    channels: 3,
+    background: { r: 20, g: 80, b: 160 },
+  },
+})
+  .jpeg({ quality: 82 })
+  .toBuffer();
+const oversizedDimensionImageBytes = await sharp({
+  create: {
+    width: 1601,
+    height: 1,
+    channels: 3,
+    background: { r: 20, g: 80, b: 160 },
+  },
+})
+  .jpeg({ quality: 82 })
+  .toBuffer();
 
 const OPERATOR_TOKEN = "test-agent-token-that-is-long-enough";
 
@@ -115,7 +141,14 @@ test("accepts one bounded JPEG model input and rejects invalid image arrays", as
     const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ ...validRun, images: [image] }),
+      body: JSON.stringify({
+        ...validRun,
+        context: Array.from({ length: 4 }, (_, index) => ({
+          kind: "reference",
+          text: `${index}${"x".repeat(15_999)}`,
+        })),
+        images: [image],
+      }),
     });
     assert.equal(accepted.status, 200);
     await accepted.text();
@@ -129,6 +162,23 @@ test("accepts one bounded JPEG model input and rejects invalid image arrays", as
       [{ ...image, mimeType: "image/png" }],
       [{ ...image, unexpected: true }],
       [{ mimeType: "image/jpeg", data: "not-base64" }],
+      [{ mimeType: "image/jpeg", data: "/9j/2Q==" }],
+      [{
+        mimeType: "image/jpeg",
+        data: malformedJpegBytes.toString("base64"),
+      }],
+      [{
+        mimeType: "image/jpeg",
+        data: malformedOversizedJpegBytes.toString("base64"),
+      }],
+      [{
+        mimeType: "image/jpeg",
+        data: modelImageBytes.subarray(0, -10).toString("base64"),
+      }],
+      [{
+        mimeType: "image/jpeg",
+        data: oversizedDimensionImageBytes.toString("base64"),
+      }],
     ]) {
       const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
         method: "POST",

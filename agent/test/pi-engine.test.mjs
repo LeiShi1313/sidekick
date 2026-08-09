@@ -332,7 +332,10 @@ test("lists bounded provider models and selects one for a single run", async () 
 });
 
 test("passes one image to the model without persisting or auditing its bytes", async () => {
-  const imageData = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const imageData = Buffer.from(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgj/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdAAyqX//Z",
+    "base64",
+  );
   const encoded = imageData.toString("base64");
   const app = await fixture((_body, response) => {
     sendText(response, "A tiny test image.");

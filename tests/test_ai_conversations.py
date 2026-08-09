@@ -1,9 +1,11 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 import sqlite3
 import stat
 
 import pytest
+from PIL import Image
 
 from sidekick.ai import (
     AIAnswerMarker,
@@ -17,6 +19,12 @@ from sidekick.ai import (
 from sidekick.ai_attachments import AttachmentDescription
 from sidekick.chat.attachments import ModelInputImage
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
+
+
+def model_image_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(output, format="JPEG")
+    return output.getvalue()
 
 
 class FakeAnswer:
@@ -203,7 +211,7 @@ def make_handler(gateway, store=None, **builder_options):
 class FakeAttachmentDescriber:
     image = ModelInputImage(
         mime_type="image/jpeg",
-        data=b"\xff\xd8\xff\xd9",
+        data=model_image_bytes(),
     )
 
     def has_attachment(self, message):

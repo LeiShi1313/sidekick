@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from io import BytesIO
+import struct
+import zlib
 
 import pytest
 from PIL import Image
@@ -255,6 +257,16 @@ def image_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (2_000, 1_000), (255, 255, 255)).save(output, format="PNG")
     return output.getvalue()
+
+
+def oversized_png_header() -> bytes:
+    dimensions = struct.pack(">IIBBBBB", 5_001, 5_000, 8, 2, 0, 0, 0)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", dimensions) + chunk(b"IEND", b"")
 
 
 async def project_quoted_reply(
@@ -959,6 +971,53 @@ async def test_wechat_quoted_image_falls_back_to_preview_when_original_fails(
         ("original", media_id),
         ("preview", media_id),
     ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_quoted_image_falls_back_when_original_cannot_normalize(
+    tmp_path,
+) -> None:
+    media_id = "0123456789abcdef0123456789abcdef"
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="",
+        direction="in",
+        message_type="image",
+        media_id=media_id,
+    )
+    gateway = ImageFinalGateway("A usable preview.")
+    client = RecordingMediaConnectorClient(
+        (),
+        original=WeChatDownloadedImage(
+            data=oversized_png_header(),
+            mime_type="image/png",
+            variant="original",
+        ),
+        preview=WeChatDownloadedImage(
+            data=image_bytes(),
+            mime_type="image/png",
+            variant="preview",
+        ),
+    )
+    describer = WeChatQuotedImageDescriber(
+        client,
+        gateway,
+        request_original=True,
+        download_preview=True,
+    )
+    try:
+        result = await describer.describe(target)
+    finally:
+        await wechat_store.close()
+
+    assert result is not None
+    assert result.model_image is not None
+    assert "usable preview" in result.context_text.lower()
+    assert client.media_calls == [
+        ("original", media_id),
+        ("preview", media_id),
+    ]
+    assert len(gateway.attachment_requests) == 1
 
 
 @pytest.mark.asyncio

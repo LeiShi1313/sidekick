@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+from io import BytesIO
+
 import pytest
 from aiohttp import web
+from PIL import Image
 
 from sidekick.ai import (
     AgentContext,
@@ -16,6 +20,12 @@ from sidekick.ai import (
 )
 from sidekick.ai_attachments import AttachmentAnalysisRequest
 from sidekick.chat.attachments import ModelInputImage
+
+
+def model_image_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(output, format="JPEG")
+    return output.getvalue()
 
 
 def test_pi_gateway_rejects_weak_credentials() -> None:
@@ -188,7 +198,7 @@ async def test_pi_gateway_sends_one_model_image_as_base64() -> None:
     )
     image = ModelInputImage(
         mime_type="image/jpeg",
-        data=b"\xff\xd8\xff\xd9",
+        data=model_image_bytes(),
     )
     try:
         events = [
@@ -202,7 +212,10 @@ async def test_pi_gateway_sends_one_model_image_as_base64() -> None:
     assert events[-1].answer == "a fox"
     assert received is not None
     assert received["images"] == [
-        {"mimeType": "image/jpeg", "data": "/9j/2Q=="}
+        {
+            "mimeType": "image/jpeg",
+            "data": base64.b64encode(model_image_bytes()).decode("ascii"),
+        }
     ]
 
 

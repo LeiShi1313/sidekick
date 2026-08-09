@@ -14,6 +14,7 @@ from pypdf import PdfReader
 from sidekick.chat.attachments import (
     AttachmentDescription,
     MAX_MODEL_IMAGE_BYTES,
+    MAX_MODEL_IMAGE_DIMENSION,
     ModelInputImage,
 )
 
@@ -97,7 +98,7 @@ class ChatAttachmentDescriber:
     MAX_TEXT_CHARS = 50_000
     MAX_DESCRIPTION_CHARS = 4_000
     MAX_PDF_PAGES = 12
-    MAX_IMAGE_DIMENSION = 1_600
+    MAX_IMAGE_DIMENSION = MAX_MODEL_IMAGE_DIMENSION
 
     def __init__(
         self,
@@ -105,6 +106,7 @@ class ChatAttachmentDescriber:
         *,
         download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
         max_file_bytes: int = MAX_FILE_BYTES,
+        allow_unknown_size: bool = False,
         logger: Any | None = None,
     ):
         if download_timeout <= 0:
@@ -118,6 +120,9 @@ class ChatAttachmentDescriber:
         self._gateway = gateway
         self._download_timeout = download_timeout
         self._max_file_bytes = max_file_bytes
+        if not isinstance(allow_unknown_size, bool):
+            raise ValueError("Unknown attachment size policy must be boolean")
+        self._allow_unknown_size = allow_unknown_size
         self._logger = logger
 
     def has_attachment(self, message: Any) -> bool:
@@ -133,7 +138,12 @@ class ChatAttachmentDescriber:
         size = _safe_size(getattr(file, "size", None))
         metadata = _render_metadata(filename, mime_type, size)
 
-        if size is None or size > self._max_file_bytes:
+        if size is None and not self._allow_unknown_size:
+            return _metadata_only(
+                metadata,
+                "content size is unavailable",
+            )
+        if size is not None and size > self._max_file_bytes:
             return _metadata_only(
                 metadata,
                 "content exceeds the analysis limit",
@@ -308,7 +318,7 @@ def _normalize_image(data: bytes, max_dimension: int) -> bytes:
         image.thumbnail((max_dimension, max_dimension))
         for quality in (82, 70, 55, 40):
             output = BytesIO()
-            image.save(output, format="JPEG", quality=quality, optimize=True)
+            image.save(output, format="JPEG", quality=quality)
             normalized = output.getvalue()
             if len(normalized) <= MAX_MODEL_IMAGE_BYTES:
                 return normalized

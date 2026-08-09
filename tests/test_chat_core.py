@@ -4,10 +4,12 @@ import ast
 from collections.abc import AsyncIterator
 from dataclasses import fields
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 import sqlite3
 
 import pytest
+from PIL import Image
 
 from sidekick.ai import (
     AIAnswerMarker,
@@ -45,6 +47,12 @@ from sidekick.chat.commands import (
 )
 from sidekick.chat.identity import NamespacedIdentityCodec
 from sidekick.chat.transport import ChatPresentation
+
+
+def model_input_image(color: tuple[int, int, int] = (255, 0, 0)) -> ModelInputImage:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), color).save(output, format="JPEG")
+    return ModelInputImage(mime_type="image/jpeg", data=output.getvalue())
 
 
 @pytest.mark.parametrize(
@@ -190,15 +198,14 @@ def test_attachment_reference_contains_metadata_but_no_binary_payload():
 
 
 def test_model_input_image_is_one_bounded_normalized_jpeg():
-    image = ModelInputImage(
-        mime_type="image/jpeg",
-        data=b"\xff\xd8\xff\xd9",
-    )
+    image = model_input_image()
 
     assert image.mime_type == "image/jpeg"
     assert "data=" not in repr(image)
     with pytest.raises(ValueError, match="JPEG"):
         ModelInputImage(mime_type="image/png", data=b"\x89PNG")
+    with pytest.raises(ValueError, match="decodable"):
+        ModelInputImage(mime_type="image/jpeg", data=b"\xff\xd8\xff\xd9")
     with pytest.raises(ValueError, match="limit"):
         ModelInputImage(
             mime_type="image/jpeg",
@@ -207,10 +214,7 @@ def test_model_input_image_is_one_bounded_normalized_jpeg():
 
 
 def test_agent_run_request_accepts_at_most_one_image():
-    image = ModelInputImage(
-        mime_type="image/jpeg",
-        data=b"\xff\xd8\xff\xd9",
-    )
+    image = model_input_image()
     values = {
         "run_id": "run-1",
         "session_id": None,
@@ -562,10 +566,7 @@ async def test_handler_uses_transport_for_sdk_operations():
 
 
 class OpaqueAttachmentDescriber:
-    image = ModelInputImage(
-        mime_type="image/jpeg",
-        data=b"\xff\xd8\xff\xd9",
-    )
+    image = model_input_image()
 
     def has_attachment(self, message):
         return True
@@ -649,7 +650,7 @@ async def test_handler_passes_the_directly_quoted_image_to_the_agent() -> None:
     gateway = FakeGateway()
     quoted = MinimalMessage("", message_id=2)
     trigger = MinimalMessage(
-        "/ai explain this",
+        "/ai",
         message_id=3,
         reply_to_message_id=quoted.id,
     )
@@ -668,7 +669,98 @@ async def test_handler_passes_the_directly_quoted_image_to_the_agent() -> None:
 
     assert await handler.handle(trigger) is True
 
+    assert gateway.requests[0].prompt == "Describe the attached content."
     assert gateway.requests[0].images == (describer.image,)
+
+
+@pytest.mark.asyncio
+async def test_current_image_wins_over_a_distinct_directly_quoted_image() -> None:
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    quoted = MinimalMessage("", message_id=2)
+    trigger = MinimalMessage(
+        "/ai compare",
+        message_id=3,
+        reply_to_message_id=quoted.id,
+    )
+    transport.reply_targets[trigger] = quoted
+    current_image = model_input_image((255, 0, 0))
+    quoted_image = model_input_image((0, 255, 0))
+
+    class CurrentDescriber(OpaqueAttachmentDescriber):
+        async def describe(self, message):
+            description = await super().describe(message)
+            return AttachmentDescription(
+                context_text=description.context_text,
+                memory_text=description.memory_text,
+                model_image=current_image,
+            )
+
+    class QuoteDescriber(OpaqueAttachmentDescriber):
+        async def describe(self, message):
+            description = await super().describe(message)
+            return AttachmentDescription(
+                context_text=description.context_text,
+                memory_text=description.memory_text,
+                model_image=quoted_image,
+            )
+
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            attachment_describer=CurrentDescriber(),
+            quoted_attachment_describer=QuoteDescriber(),
+        ),
+        transport=transport,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    assert gateway.requests[0].images == (current_image,)
+
+
+@pytest.mark.asyncio
+async def test_historical_image_keeps_description_but_not_model_bytes() -> None:
+    transport = FakeTransport()
+    quoted = MinimalMessage("", message_id=2)
+    ambient = MinimalMessage("", message_id=3)
+    trigger = MinimalMessage(
+        "/ai2 explain",
+        message_id=4,
+        reply_to_message_id=quoted.id,
+    )
+    transport.reply_targets[trigger] = quoted
+    quoted_image = model_input_image((255, 0, 0))
+    ambient_image = model_input_image((0, 0, 255))
+
+    class History:
+        async def fetch_recent(self, _trigger, *, before, limit):
+            return (ambient,)
+
+    class Describer(OpaqueAttachmentDescriber):
+        async def describe(self, message):
+            image = quoted_image if message is quoted else ambient_image
+            return AttachmentDescription(
+                context_text=f"description-{message.id}",
+                memory_text=f"memory-{message.id}",
+                model_image=image,
+            )
+
+    context = await PromptBuilder(
+        transport=transport,
+        history_source=History(),
+        attachment_describer=Describer(),
+    ).load_chat_context(trigger, recent_messages=2)
+
+    assert [message.content for message in context.messages] == [
+        f"description-{quoted.id}",
+        f"description-{ambient.id}",
+    ]
+    assert context.model_images == (quoted_image,)
+    assert ambient_image not in context.model_images
 
 
 @pytest.mark.asyncio

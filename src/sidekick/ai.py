@@ -1141,6 +1141,26 @@ class PromptBuilder:
             and self.attachment_describer.has_attachment(message)
         )
 
+    async def has_direct_reply_attachment(self, message: ReplyTarget) -> bool:
+        try:
+            target = await self._transport.get_reply(message)
+        except Exception:
+            return False
+        if target is None:
+            return False
+        for describer in (
+            self.quoted_attachment_describer,
+            self.attachment_describer,
+        ):
+            if describer is None:
+                continue
+            try:
+                if describer.has_attachment(target):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def describe_attachment(
         self,
         message: ReplyTarget,
@@ -4188,9 +4208,18 @@ class AIConversationHandler:
         retained_observations: list[HumanObservation] = []
         quoted_model_images: tuple[ModelInputImage, ...] = ()
         has_current_attachment = self._prompt_builder.has_attachment(message)
+        has_quoted_attachment = False
         authored_prompt = ""
         if ai_trigger is not None:
             if not ai_trigger.prompt and not has_current_attachment:
+                has_quoted_attachment = (
+                    await self._prompt_builder.has_direct_reply_attachment(message)
+                )
+            if (
+                not ai_trigger.prompt
+                and not has_current_attachment
+                and not has_quoted_attachment
+            ):
                 command_usage = (
                     f"{ai_prefix}{ai_trigger.recent_messages} <question>"
                     if ai_trigger.recent_messages is not None

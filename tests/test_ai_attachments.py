@@ -247,6 +247,33 @@ async def test_unsupported_and_oversized_files_use_metadata_without_download() -
 
 
 @pytest.mark.asyncio
+async def test_unknown_size_requires_a_bounded_transport_opt_in() -> None:
+    raw = image_bytes()
+    default_message = FakeMessage(
+        raw,
+        FakeFile(name="camera.png", mime_type="image/png", size=None),
+    )
+    bounded_message = FakeMessage(
+        raw,
+        FakeFile(name="camera.png", mime_type="image/png", size=None),
+    )
+    gateway = FakeGateway("A red image.")
+
+    default_result = await ChatAttachmentDescriber(gateway).describe(default_message)
+    bounded_result = await ChatAttachmentDescriber(
+        gateway,
+        allow_unknown_size=True,
+    ).describe(bounded_message)
+
+    assert default_result is not None
+    assert default_result.model_image is None
+    assert default_message.downloads == 0
+    assert bounded_result is not None
+    assert bounded_result.model_image is not None
+    assert bounded_message.downloads == 1
+
+
+@pytest.mark.asyncio
 async def test_attachment_download_timeout_falls_back_to_metadata() -> None:
     gateway = FakeGateway()
     message = BlockingDownloadMessage(

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import Any, Literal, Protocol
+
+from PIL import Image
 
 
 AttachmentKind = Literal[
@@ -14,6 +17,7 @@ AttachmentKind = Literal[
     "other",
 ]
 MAX_MODEL_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_MODEL_IMAGE_DIMENSION = 1_600
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,19 @@ class ModelInputImage:
             raise ValueError("Model input image must be a normalized JPEG")
         if len(self.data) > MAX_MODEL_IMAGE_BYTES:
             raise ValueError("Model input image exceeds the byte limit")
+        try:
+            source = Image.open(BytesIO(self.data))
+        except Exception as exc:
+            raise ValueError("Model input image must be a decodable JPEG") from exc
+        with source:
+            if source.format != "JPEG":
+                raise ValueError("Model input image must be a decodable JPEG")
+            if max(source.size) > MAX_MODEL_IMAGE_DIMENSION:
+                raise ValueError("Model input image exceeds the dimension limit")
+            try:
+                source.load()
+            except Exception as exc:
+                raise ValueError("Model input image must be a decodable JPEG") from exc
 
 
 @dataclass(frozen=True, slots=True)

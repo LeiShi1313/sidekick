@@ -1,12 +1,15 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 
+import sharp from "sharp";
+
 import { isModelId } from "./model-id.mjs";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_RUN_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_ATTACHMENT_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
+const MAX_MODEL_IMAGE_DIMENSION = 1_600;
 const MAX_ATTACHMENT_TEXT_CHARS = 50_000;
 const MAX_MEMORY_ANCHORS = 64;
 const MAX_BANK_GRANTS = 64;
@@ -136,6 +139,34 @@ function validateModelImages(value) {
     images.push({ mimeType: "image/jpeg", data });
   }
   return images;
+}
+
+async function modelImagesAreDecodable(images = []) {
+  for (const image of images) {
+    try {
+      const decoder = sharp(image.data, {
+        failOn: "warning",
+        limitInputPixels: MAX_MODEL_IMAGE_DIMENSION ** 2,
+      });
+      const metadata = await decoder.metadata();
+      if (
+        metadata.format !== "jpeg" ||
+        !Number.isInteger(metadata.width) ||
+        !Number.isInteger(metadata.height) ||
+        metadata.width < 1 ||
+        metadata.height < 1 ||
+        metadata.width > MAX_MODEL_IMAGE_DIMENSION ||
+        metadata.height > MAX_MODEL_IMAGE_DIMENSION ||
+        (metadata.pages ?? 1) !== 1
+      ) {
+        return false;
+      }
+      await decoder.raw().toBuffer();
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function validateRunRequest(value) {
@@ -761,6 +792,7 @@ export function createAgentServer({ engine, clients, logger = console }) {
     let run;
     try {
       run = validateRunRequest(await readJson(request, MAX_RUN_BODY_BYTES));
+      if (run && !(await modelImagesAreDecodable(run.images))) run = null;
     } catch {
       run = null;
     }

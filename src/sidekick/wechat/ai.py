@@ -178,7 +178,7 @@ class WeChatQuotedImageDescriber:
         assert isinstance(message, WeChatMessage)
         assert message.media_id is not None
 
-        downloaded: WeChatDownloadedImage | None = None
+        fallback: AttachmentDescription | None = None
         if self._request_original:
             try:
                 downloaded = await self._client.download_original_image(
@@ -187,16 +187,30 @@ class WeChatQuotedImageDescriber:
                     message_id=message.id,
                     media_id=message.media_id,
                 )
+                described = await self._content_describer.describe_image_bytes(
+                    downloaded.data,
+                    mime_type=downloaded.mime_type,
+                )
+                if described.model_image is not None:
+                    return described
+                fallback = described
             except Exception as exc:
                 self._log_unavailable("original", exc)
-        if downloaded is None and self._download_preview:
+        if self._download_preview:
             try:
                 downloaded = await self._client.download_image_preview(
                     media_id=message.media_id,
                 )
+                described = await self._content_describer.describe_image_bytes(
+                    downloaded.data,
+                    mime_type=downloaded.mime_type,
+                )
+                if described.model_image is not None:
+                    return described
+                fallback = described
             except Exception as exc:
                 self._log_unavailable("preview", exc)
-        if downloaded is None:
+        if fallback is None:
             return AttachmentDescription(
                 context_text=(
                     "Quoted image content is unavailable; neither the original "
@@ -207,10 +221,7 @@ class WeChatQuotedImageDescriber:
                     "low-resolution preview were unavailable for analysis."
                 ),
             )
-        return await self._content_describer.describe_image_bytes(
-            downloaded.data,
-            mime_type=downloaded.mime_type,
-        )
+        return fallback
 
     def _log_unavailable(self, variant: str, exc: Exception) -> None:
         if self._logger is not None:
