@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,6 +80,10 @@ from sidekick.memory_directory import (
 
 
 ToolPolicy = Literal["owner", "delegated", "none"]
+AICommandPrefixLookup = Callable[
+    [tuple[ExternalId, ...]],
+    Awaitable[dict[ExternalId, str]],
+]
 AgentEventType = Literal[
     "run_started",
     "tool_snapshot",
@@ -500,6 +504,12 @@ class ConversationStore(Protocol):
 
     async def save_answer(self, marker: AIAnswerMarker) -> None: ...
 
+    async def get_ai_trigger_command_prefixes(
+        self,
+        scope_id: str,
+        message_ids: tuple[ExternalId, ...],
+    ) -> dict[ExternalId, str]: ...
+
     async def get_model_override(self, scope_id: str) -> str | None: ...
 
     async def set_model_override(
@@ -755,6 +765,7 @@ class AIAnswerMarker:
     scope_id: str
     answer_message_id: ExternalId
     trigger_message_id: ExternalId
+    command_prefix: str
     requester_id: str
     parent_answer_message_id: ExternalId | None
     agent_session_id: str | None
@@ -1168,6 +1179,7 @@ class PromptBuilder:
         *,
         recent_messages: int | None = None,
         ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
+        ai_prefix_lookup: AICommandPrefixLookup | None = None,
     ) -> ChatContext:
         reply_target = await self._transport.get_reply(trigger)
         reply_path = await self._load_reply_path(reply_target)
@@ -1213,6 +1225,7 @@ class PromptBuilder:
             recent,
             current_reply_to_message_id=trigger.reply_to_msg_id,
             ai_prefix=ai_prefix,
+            ai_prefix_lookup=ai_prefix_lookup,
         )
 
     async def load_reply_chain(
@@ -1220,12 +1233,14 @@ class PromptBuilder:
         current: ReplyTarget | None,
         *,
         ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
+        ai_prefix_lookup: AICommandPrefixLookup | None = None,
     ) -> ChatContext:
         return await self._build_chat_context(
             await self._load_reply_path(current),
             (),
             current_reply_to_message_id=None,
             ai_prefix=ai_prefix,
+            ai_prefix_lookup=ai_prefix_lookup,
         )
 
     async def _load_reply_path(
@@ -1250,6 +1265,7 @@ class PromptBuilder:
         *,
         current_reply_to_message_id: ExternalId | None,
         ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
+        ai_prefix_lookup: AICommandPrefixLookup | None = None,
     ) -> ChatContext:
         candidates: dict[
             tuple[ExternalId | None, ExternalId],
@@ -1281,6 +1297,14 @@ class PromptBuilder:
             candidate = candidates.get(key)
             if candidate is not None:
                 candidate.order_hint = order_hint
+
+        message_prefixes = (
+            await ai_prefix_lookup(
+                tuple(candidate.message.id for candidate in candidates.values())
+            )
+            if ai_prefix_lookup is not None and candidates
+            else {}
+        )
 
         normalized: list[ChatContextMessage] = []
         order_hints: dict[ExternalId, int] = {}
@@ -1314,7 +1338,7 @@ class PromptBuilder:
                 observation_text = self.build_observation_text(
                     text,
                     attachment,
-                    ai_prefix=ai_prefix,
+                    ai_prefix=message_prefixes.get(message.id, ai_prefix),
                 )
                 message_identity = await self.resolve_identity(message)
                 observation = None
@@ -1659,6 +1683,7 @@ class AIStateRepository:
             "scope_id",
             "answer_message_id",
             "trigger_message_id",
+            "command_prefix",
             "requester_id",
             "parent_answer_message_id",
             "agent_session_id",
@@ -1683,6 +1708,9 @@ class AIStateRepository:
             if "parent_answer_message_id" in columns
             else "NULL"
         )
+        command_prefix_value = (
+            "command_prefix" if "command_prefix" in columns else "'/ai'"
+        )
         await connection.execute("DROP INDEX IF EXISTS ai_answers_by_trigger")
         await connection.execute("ALTER TABLE ai_answers RENAME TO ai_answers_legacy")
         await self._create_ai_answers_table()
@@ -1698,13 +1726,15 @@ class AIStateRepository:
             f"""
             INSERT INTO ai_answers (
                 scope_id, answer_message_id, trigger_message_id, requester_id,
-                parent_answer_message_id, agent_session_id, agent_entry_id
+                command_prefix, parent_answer_message_id,
+                agent_session_id, agent_entry_id
             )
             SELECT
                 {scope_value},
                 answer_message_id,
                 trigger_message_id,
                 {requester_value},
+                {command_prefix_value},
                 {parent_value},
                 {session_value},
                 {entry_value}
@@ -1721,6 +1751,7 @@ class AIStateRepository:
                 scope_id TEXT NOT NULL,
                 answer_message_id BLOB NOT NULL,
                 trigger_message_id BLOB NOT NULL,
+                command_prefix TEXT NOT NULL,
                 requester_id TEXT NOT NULL,
                 parent_answer_message_id BLOB,
                 agent_session_id TEXT,
@@ -2120,11 +2151,25 @@ class AIStateRepository:
             """
             INSERT INTO ai_answers (
                 scope_id, answer_message_id, trigger_message_id, requester_id,
-                parent_answer_message_id, agent_session_id, agent_entry_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                command_prefix, parent_answer_message_id,
+                agent_session_id, agent_entry_id
+            ) VALUES (
+                ?, ?, ?, ?,
+                COALESCE(
+                    (
+                        SELECT command_prefix
+                        FROM ai_answers
+                        WHERE scope_id = ? AND trigger_message_id = ?
+                        LIMIT 1
+                    ),
+                    ?
+                ),
+                ?, ?, ?
+            )
             ON CONFLICT(scope_id, answer_message_id) DO UPDATE SET
                 trigger_message_id = excluded.trigger_message_id,
                 requester_id = excluded.requester_id,
+                command_prefix = excluded.command_prefix,
                 parent_answer_message_id = excluded.parent_answer_message_id,
                 agent_session_id = excluded.agent_session_id,
                 agent_entry_id = excluded.agent_entry_id
@@ -2134,6 +2179,9 @@ class AIStateRepository:
                 marker.answer_message_id,
                 marker.trigger_message_id,
                 marker.requester_id,
+                marker.scope_id,
+                marker.trigger_message_id,
+                normalize_ai_command_prefix(marker.command_prefix),
                 marker.parent_answer_message_id,
                 marker.agent_session_id,
                 marker.agent_entry_id,
@@ -3786,6 +3834,30 @@ class AIStateRepository:
                 answers.add(row["answer_message_id"])
         return frozenset(answers)
 
+    async def get_ai_trigger_command_prefixes(
+        self,
+        scope_id: str,
+        message_ids: tuple[ExternalId, ...],
+    ) -> dict[ExternalId, str]:
+        connection = self._require_connection()
+        unique_ids = tuple(dict.fromkeys(message_ids))
+        prefixes: dict[ExternalId, str] = {}
+        for start in range(0, len(unique_ids), 500):
+            batch = unique_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            cursor = await connection.execute(
+                "SELECT trigger_message_id, command_prefix "  # nosec B608
+                "FROM ai_answers "
+                f"WHERE scope_id = ? AND trigger_message_id IN ({placeholders})",
+                (scope_id, *batch),
+            )
+            async for row in cursor:
+                prefixes.setdefault(
+                    row["trigger_message_id"],
+                    str(row["command_prefix"]),
+                )
+        return prefixes
+
     def _require_connection(self) -> aiosqlite.Connection:
         if self._connection is None:
             raise RuntimeError("AI state repository is not connected")
@@ -4182,6 +4254,12 @@ class AIConversationHandler:
                             else None
                         ),
                         ai_prefix=ai_prefix,
+                        ai_prefix_lookup=lambda message_ids: (
+                            self._store.get_ai_trigger_command_prefixes(
+                                scope_id,
+                                message_ids,
+                            )
+                        ),
                     )
                 except ChatContextUnavailable:
                     await self._reply_memory_excluded(
@@ -4275,6 +4353,7 @@ class AIConversationHandler:
                         scope_id=scope_id,
                         answer_message_id=result.message.id,
                         trigger_message_id=message.id,
+                        command_prefix=ai_prefix,
                         requester_id=actor_id,
                         parent_answer_message_id=parent_answer_id,
                         agent_session_id=result.session_id,
@@ -4291,6 +4370,7 @@ class AIConversationHandler:
                     current_observation = self._prompt_builder.build_observation_text(
                         authored_prompt,
                         current_attachment,
+                        ai_prefix=ai_prefix,
                     )
                     if current_observation and current_identity.is_memory_source:
                         retained_observations.append(
@@ -5478,6 +5558,12 @@ class AIConversationHandler:
         loaded_context = await self._prompt_builder.load_reply_chain(
             target,
             ai_prefix=await self._ai_command_prefix_for(scope_id),
+            ai_prefix_lookup=lambda message_ids: (
+                self._store.get_ai_trigger_command_prefixes(
+                    scope_id,
+                    message_ids,
+                )
+            ),
         )
         _, _, observations = await self._classify_chat_context(
             scope_id,
@@ -5610,6 +5696,7 @@ def _marker_from_row(row: aiosqlite.Row) -> AIAnswerMarker:
         scope_id=str(row["scope_id"]),
         answer_message_id=row["answer_message_id"],
         trigger_message_id=row["trigger_message_id"],
+        command_prefix=str(row["command_prefix"]),
         requester_id=str(row["requester_id"]),
         parent_answer_message_id=row["parent_answer_message_id"],
         agent_session_id=row["agent_session_id"],

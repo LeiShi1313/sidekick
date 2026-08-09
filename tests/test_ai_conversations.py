@@ -130,6 +130,13 @@ class FakeStore:
     async def save_answer(self, marker: AIAnswerMarker):
         self.markers[(marker.scope_id, marker.answer_message_id)] = marker
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        return {
+            marker.trigger_message_id: marker.command_prefix
+            for marker in self.markers.values()
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids
+        }
+
     async def get_model_override(self, scope_id: str):
         return None
 
@@ -585,6 +592,7 @@ async def test_answer_marker_survives_repository_restart(tmp_path):
         scope_id=TELEGRAM_IDENTITY_CODEC.scope_id(-1001),
         answer_message_id=50,
         trigger_message_id=40,
+        command_prefix="/ask",
         requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(10),
         parent_answer_message_id=None,
         agent_session_id="persisted-session",
@@ -595,6 +603,11 @@ async def test_answer_marker_survives_repository_restart(tmp_path):
 
     second_store = await AIStateRepository(path).connect()
     try:
+        persisted = await second_store.get_answer(marker.scope_id, 50)
+        historical_prefixes = await second_store.get_ai_trigger_command_prefixes(
+            marker.scope_id,
+            (40, 41),
+        )
         gateway = FakeGateway(["continued"])
         handler, _ = make_handler(gateway, store=second_store)
         prior_answer = FakeAnswer("persisted answer", -1001, 40)
@@ -605,8 +618,58 @@ async def test_answer_marker_survives_repository_restart(tmp_path):
         assert gateway.requests[0].prompt == "after restart"
         assert gateway.requests[0].session_id == "persisted-session"
         assert gateway.requests[0].parent_entry_id == "persisted-entry"
+        assert persisted == marker
+        assert historical_prefixes == {40: "/ask"}
     finally:
         await second_store.close()
+
+
+@pytest.mark.asyncio
+async def test_answer_rows_preserve_the_first_prefix_recorded_for_a_trigger(tmp_path):
+    path = tmp_path / "ai-state.db"
+    scope_id = TELEGRAM_IDENTITY_CODEC.scope_id(-1001)
+    store = await AIStateRepository(path).connect()
+    try:
+        await store.save_answer(
+            AIAnswerMarker(
+                scope_id=scope_id,
+                answer_message_id=50,
+                trigger_message_id=40,
+                command_prefix="/ask",
+                requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(10),
+                parent_answer_message_id=None,
+                agent_session_id="session-1",
+                agent_entry_id="entry-1",
+            )
+        )
+        await store.save_answer(
+            AIAnswerMarker(
+                scope_id=scope_id,
+                answer_message_id=51,
+                trigger_message_id=40,
+                command_prefix="/new",
+                requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(10),
+                parent_answer_message_id=None,
+                agent_session_id="session-2",
+                agent_entry_id="entry-2",
+            )
+        )
+    finally:
+        await store.close()
+
+    reopened = await AIStateRepository(path).connect()
+    try:
+        first = await reopened.get_answer(scope_id, 50)
+        second = await reopened.get_answer(scope_id, 51)
+        prefixes = await reopened.get_ai_trigger_command_prefixes(scope_id, (40,))
+    finally:
+        await reopened.close()
+
+    assert first is not None
+    assert second is not None
+    assert first.command_prefix == "/ask"
+    assert second.command_prefix == "/ask"
+    assert prefixes == {40: "/ask"}
 
 
 @pytest.mark.asyncio
@@ -657,6 +720,7 @@ async def test_state_repository_migrates_pre_pi_answer_rows(tmp_path):
     assert marker is not None
     assert marker.agent_session_id is None
     assert marker.agent_entry_id is None
+    assert marker.command_prefix == "/ai"
     assert turn_from_answer == marker
     assert turn_from_trigger == marker
 
@@ -671,9 +735,85 @@ async def test_state_repository_migrates_pre_pi_answer_rows(tmp_path):
             if isinstance(value, str)
         )
 
+    assert "command_prefix" in columns
     assert {"prompt", "answer_text", "reference_context"}.isdisjoint(columns)
     assert "old prompt" not in serialized
     assert "old answer" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_state_repository_adds_prefix_to_the_predecessor_answer_schema(tmp_path):
+    path = tmp_path / "previous-state.db"
+    scope_id = "wechat:room:group-1"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE ai_answers (
+                scope_id TEXT NOT NULL,
+                answer_message_id BLOB NOT NULL,
+                trigger_message_id BLOB NOT NULL,
+                requester_id TEXT NOT NULL,
+                parent_answer_message_id BLOB,
+                agent_session_id TEXT,
+                agent_entry_id TEXT,
+                PRIMARY KEY (scope_id, answer_message_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX ai_answers_by_trigger
+            ON ai_answers (scope_id, trigger_message_id, answer_message_id DESC)
+            """
+        )
+        connection.execute(
+            "INSERT INTO ai_answers VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                scope_id,
+                "answer:opaque",
+                "trigger:opaque",
+                "wechat:user:owner",
+                "parent:opaque",
+                "session-old",
+                "entry-old",
+            ),
+        )
+
+    store = await AIStateRepository(path).connect()
+    try:
+        marker = await store.get_answer(scope_id, "answer:opaque")
+        prefixes = await store.get_ai_trigger_command_prefixes(
+            scope_id,
+            ("trigger:opaque",),
+        )
+    finally:
+        await store.close()
+
+    assert marker == AIAnswerMarker(
+        scope_id=scope_id,
+        answer_message_id="answer:opaque",
+        trigger_message_id="trigger:opaque",
+        command_prefix="/ai",
+        requester_id="wechat:user:owner",
+        parent_answer_message_id="parent:opaque",
+        agent_session_id="session-old",
+        agent_entry_id="entry-old",
+    )
+    assert prefixes == {"trigger:opaque": "/ai"}
+
+    with sqlite3.connect(path) as connection:
+        column_types = {
+            row[1]: row[2] for row in connection.execute("PRAGMA table_info(ai_answers)")
+        }
+        indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(ai_answers)")
+        }
+
+    assert column_types["answer_message_id"] == "BLOB"
+    assert column_types["trigger_message_id"] == "BLOB"
+    assert column_types["parent_answer_message_id"] == "BLOB"
+    assert column_types["command_prefix"] == "TEXT"
+    assert "ai_answers_by_trigger" in indexes
 
 
 @pytest.mark.asyncio

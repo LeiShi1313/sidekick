@@ -1347,9 +1347,15 @@ class ChatMemoryIngestor:
     ) -> dict[ExternalId, HumanObservation]:
         message_ids = tuple(message.id for message in messages)
         scope_id = self._identity_codec.scope_id(chat_id)
-        excluded_ids, answer_ids, ai_prefix_override = await asyncio.gather(
+        (
+            excluded_ids,
+            answer_ids,
+            trigger_command_prefixes,
+            ai_prefix_override,
+        ) = await asyncio.gather(
             self._store.get_memory_excluded_message_ids(scope_id, message_ids),
             self._store.get_ai_answer_message_ids(scope_id, message_ids),
+            self._store.get_ai_trigger_command_prefixes(scope_id, message_ids),
             self._store.get_ai_command_prefix(scope_id),
         )
         ai_prefix = ai_prefix_override or DEFAULT_AI_COMMAND_PREFIX
@@ -1406,7 +1412,7 @@ class ChatMemoryIngestor:
                 observation_text = self._prompt_builder.build_observation_text(
                     text,
                     attachment,
-                    ai_prefix=ai_prefix,
+                    ai_prefix=trigger_command_prefixes.get(message.id, ai_prefix),
                 )
                 if not observation_text:
                     return None

@@ -490,6 +490,7 @@ async def test_manual_dream_retains_standalone_and_complete_reply_tree(tmp_path)
             scope_id=TELEGRAM_IDENTITY_CODEC.scope_id(-1001),
             answer_message_id=ai_answer.id,
             trigger_message_id=999,
+            command_prefix="/ai",
             requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
             parent_answer_message_id=None,
             agent_session_id="session-old",
@@ -547,6 +548,37 @@ async def test_dream_memory_strips_the_group_ai_command_prefix(tmp_path):
         assert result.messages_retained == 1
         retained_event = memory.retain_calls[0]["episode"].events[0]
         assert retained_event.text == "record the launch decision"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_dream_memory_uses_the_prefix_recorded_for_a_historical_turn(tmp_path):
+    trigger = FakeMessage(1, "/Ask record the historical launch decision")
+    source = FakeSource([trigger])
+    memory = FakeMemory()
+    store, scanner = await make_scanner(tmp_path, source, memory)
+    scope_id = TELEGRAM_IDENTITY_CODEC.scope_id(-1001)
+    try:
+        await store.save_answer(
+            AIAnswerMarker(
+                scope_id=scope_id,
+                answer_message_id=2,
+                trigger_message_id=trigger.id,
+                command_prefix="/ask",
+                requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
+                parent_answer_message_id=None,
+                agent_session_id="session-old",
+                agent_entry_id="entry-old",
+            )
+        )
+        await store.set_ai_command_prefix(scope_id, "/new")
+
+        result = await scanner.run_scope(-1001)
+
+        assert result.messages_retained == 1
+        retained_event = memory.retain_calls[0]["episode"].events[0]
+        assert retained_event.text == "record the historical launch decision"
     finally:
         await store.close()
 

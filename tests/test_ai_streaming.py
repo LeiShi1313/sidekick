@@ -203,6 +203,13 @@ class FakeStore:
     async def save_answer(self, marker):
         self.saved.append(marker)
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        return {
+            marker.trigger_message_id: marker.command_prefix
+            for marker in self.saved
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids
+        }
+
     async def get_model_override(self, scope_id):
         return self.model_overrides.get(scope_id)
 

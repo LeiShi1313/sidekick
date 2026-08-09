@@ -180,6 +180,13 @@ class FakeStore:
     async def save_answer(self, marker):
         self.markers[(marker.scope_id, marker.answer_message_id)] = marker
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        prefixes = {}
+        for marker in self.markers.values():
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids:
+                prefixes.setdefault(marker.trigger_message_id, marker.command_prefix)
+        return prefixes
+
     async def get_model_override(self, scope_id):
         return self.model_overrides.get(scope_id)
 
@@ -789,10 +796,82 @@ async def test_matrix_bridge_uses_the_group_ai_command_for_prompt_and_memory():
     request = gateway.requests[0]
     assert request.prompt == "can I use CaiBao?"
     assert request.identity.requester.identity == attribution.actor_id
+    marker = next(iter(store.markers.values()))
+    assert marker.command_prefix == "/ask"
     retained_event = memory.retain_calls[0]["episode"].events[0]
     assert retained_event.actor_id == attribution.actor_id
     assert retained_event.actor_display_name == "SteamedFish"
     assert retained_event.text == "can I use CaiBao?"
+
+
+@pytest.mark.asyncio
+async def test_reply_memory_preserves_default_command_as_text_after_custom_prefix():
+    store = FakeStore()
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
+    memory = FakeMemory()
+    gateway = FakeGateway(["first answer", "second answer"])
+    handler = make_handler(gateway, memory, store=store)
+    root = FakeMessage("/ask initial question", sender_id=10)
+
+    assert await handler.handle(root) is True
+
+    follow_up = FakeMessage(
+        "/ai should remain literal",
+        sender_id=10,
+        reply_to=root.replies[0],
+    )
+    assert await handler.handle(follow_up) is True
+
+    assert gateway.requests[1].prompt == "/ai should remain literal"
+    retained_texts = [
+        event.text
+        for call in memory.retain_calls
+        for event in call["episode"].events
+    ]
+    assert "/ai should remain literal" in retained_texts
+
+
+@pytest.mark.asyncio
+async def test_reply_chain_memory_uses_the_prefix_recorded_before_group_change():
+    store = FakeStore()
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
+    root_handler = make_handler(FakeGateway(["first answer"]), None, store=store)
+    root = FakeMessage("/ask historical question", sender_id=10)
+    assert await root_handler.handle(root) is True
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/new")
+
+    memory = FakeMemory()
+    follow_handler = make_handler(FakeGateway(["second answer"]), memory, store=store)
+    follow_up = FakeMessage("continue", sender_id=10, reply_to=root.replies[0])
+
+    assert await follow_handler.handle(follow_up) is True
+
+    retained_texts = [
+        event.text
+        for call in memory.retain_calls
+        for event in call["episode"].events
+    ]
+    assert "historical question" in retained_texts
+    assert "/ask historical question" not in retained_texts
+
+
+@pytest.mark.asyncio
+async def test_manual_memory_uses_the_prefix_recorded_before_group_change():
+    store = FakeStore()
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
+    root_handler = make_handler(FakeGateway(["answer"]), None, store=store)
+    root = FakeMessage("/ask historical decision", sender_id=10)
+    assert await root_handler.handle(root) is True
+    await store.set_ai_command_prefix("telegram:chat:-1001", "/new")
+
+    memory = FakeMemory()
+    memory_handler = make_handler(FakeGateway(["unused"]), memory, store=store)
+    command = FakeMessage("/ai_memory", sender_id=10, reply_to=root)
+
+    assert await memory_handler.handle(command) is True
+
+    retained_event = memory.retain_calls[0]["episode"].events[0]
+    assert retained_event.text == "historical decision"
 
 
 @pytest.mark.asyncio
@@ -1204,6 +1283,7 @@ async def test_ai_generated_chain_message_is_context_but_not_retained_evidence()
         scope_id=scope_id,
         answer_message_id=ai_output.id,
         trigger_message_id=999,
+        command_prefix="/ai",
         requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
         parent_answer_message_id=None,
         agent_session_id="session-old",
@@ -1426,6 +1506,7 @@ async def test_revision_requires_direct_human_target_and_owner():
         scope_id=scope_id,
         answer_message_id=ai_output.id,
         trigger_message_id=999,
+        command_prefix="/ai",
         requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(20),
         parent_answer_message_id=None,
         agent_session_id="session-old",

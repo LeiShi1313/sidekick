@@ -441,6 +441,13 @@ class FakeStore:
     async def save_answer(self, marker):
         self.saved.append(marker)
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        return {
+            marker.trigger_message_id: marker.command_prefix
+            for marker in self.saved
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids
+        }
+
     async def get_model_override(self, scope_id):
         return None
 
@@ -791,6 +798,7 @@ async def test_state_repository_preserves_opaque_decimal_string_message_ids(tmp_
                 scope_id=scope_id,
                 answer_message_id=answer_id,
                 trigger_message_id=trigger_id,
+                command_prefix="/ai",
                 requester_id="wechat:user:wxid_example",
                 parent_answer_message_id=None,
                 agent_session_id="session-1",

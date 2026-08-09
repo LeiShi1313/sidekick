@@ -154,6 +154,13 @@ class FakeStore:
     async def save_answer(self, marker):
         self.markers[(marker.scope_id, marker.answer_message_id)] = marker
 
+    async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
+        return {
+            marker.trigger_message_id: marker.command_prefix
+            for marker in self.markers.values()
+            if marker.scope_id == scope_id and marker.trigger_message_id in message_ids
+        }
+
     async def get_model_override(self, scope_id):
         return None
 
