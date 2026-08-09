@@ -222,7 +222,11 @@ class WeChatEventPump:
             await self._store.refresh_user(self._connector_key, user_id, user)
             return _PendingEvent(event=event)
 
-        if event.name in {"group_member", "group_member_snapshot"}:
+        if event.name in {
+            "group_member",
+            "group_member_snapshot",
+            "group_member_directory",
+        }:
             group_id = event.invalidated_group_id()
             if group_id is not None:
                 await self._refresh_group_members(group_id)

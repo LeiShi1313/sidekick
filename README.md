@@ -71,6 +71,11 @@ cannot be safely attributed; text rows still require a canonical sender.
 Bounded `chat_history` rows are retained as one provenance-marked text message
 under the outer stable ID; nested media remains descriptive text rather than a
 separate download or message.
+Group messages prefer the connector's room-local member nickname over the
+member's global display name. A `group_member_directory` event refreshes only
+the affected group; a successful complete/current response also clears aliases
+that disappeared. New memory episodes capture the refreshed room-local label,
+while already-retained historical memory is not rewritten.
 Keep an unauthenticated connector bound to loopback; use its bearer token (and
 TLS outside a trusted local network) whenever it is reachable by another host.
 

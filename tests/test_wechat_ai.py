@@ -1086,7 +1086,7 @@ async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
 
 
 @pytest.mark.asyncio
-async def test_wechat_manual_memory_command_retains_stored_reply_chain(
+async def test_wechat_manual_memory_command_uses_refreshed_group_alias(
     tmp_path,
 ) -> None:
     wechat_store, target = await bootstrap_store(
@@ -1111,13 +1111,32 @@ async def test_wechat_manual_memory_command_retains_stored_reply_chain(
                     group_id=GROUP_ID,
                     user_id="wxid_alice",
                     display_name="Alice Global",
-                    nickname="项目阿丽",
+                    nickname="旧项目阿丽",
                 ),
             ),
             cursor="members-10",
             snapshot_complete=False,
             snapshot_current=False,
             snapshot_connection_generation=None,
+        ),
+    )
+    await wechat_store.refresh_group_members(
+        CONNECTOR_KEY,
+        GROUP_ID,
+        WeChatGroupMemberList(
+            group_id=GROUP_ID,
+            members=(
+                WeChatGroupMember(
+                    group_id=GROUP_ID,
+                    user_id="wxid_alice",
+                    display_name="Alice Global",
+                    nickname="项目阿丽",
+                ),
+            ),
+            cursor="members-11",
+            snapshot_complete=True,
+            snapshot_current=True,
+            snapshot_connection_generation=41,
         ),
     )
     command_event = WeChatEvent.parse(

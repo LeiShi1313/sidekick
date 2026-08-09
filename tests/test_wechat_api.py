@@ -554,6 +554,54 @@ def test_wechat_identity_events_identify_directory_invalidations(
     assert event.invalidated_group_id() == expected
 
 
+def test_wechat_group_member_directory_event_identifies_changed_group() -> None:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "group_member_directory",
+            "connectionGeneration": 41,
+            "status": "changed",
+            "source": "wechat+localdb-contact",
+            "id": "sha256:directory-1",
+            "groupId": "56825427596@chatroom",
+        }
+    )
+
+    assert event.invalidated_group_id() == "56825427596@chatroom"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("connectionGeneration", None),
+        ("status", "unchanged"),
+        ("source", "wechat+hook"),
+        ("id", None),
+        ("groupId", "wxid_alice"),
+    ),
+)
+def test_wechat_group_member_directory_event_rejects_malformed_identity(
+    field: str,
+    value: object,
+) -> None:
+    payload: dict[str, object] = {
+        "schemaVersion": "wechat-bridge/v1alpha1",
+        "cursor": "11",
+        "event": "group_member_directory",
+        "connectionGeneration": 41,
+        "status": "changed",
+        "source": "wechat+localdb-contact",
+        "id": "sha256:directory-1",
+        "groupId": "56825427596@chatroom",
+    }
+    payload[field] = value
+    event = WeChatEvent.parse(payload)
+
+    with pytest.raises(WeChatAPIContractError):
+        event.invalidated_group_id()
+
+
 @pytest.mark.parametrize(
     "raw",
     (

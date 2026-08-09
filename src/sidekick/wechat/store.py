@@ -442,10 +442,13 @@ class WeChatStateRepository:
                         excluded.display_name,
                         wechat_group_members.display_name
                     ),
-                    nickname = COALESCE(
-                        excluded.nickname,
-                        wechat_group_members.nickname
-                    ),
+                    nickname = CASE
+                        WHEN ? THEN excluded.nickname
+                        ELSE COALESCE(
+                            excluded.nickname,
+                            wechat_group_members.nickname
+                        )
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -457,6 +460,7 @@ class WeChatStateRepository:
                         member.display_name,
                         member.nickname,
                         now,
+                        authoritative,
                     )
                     for member in members.members
                 ),
