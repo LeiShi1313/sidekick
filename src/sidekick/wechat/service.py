@@ -222,10 +222,17 @@ class WeChatEventPump:
             await self._store.refresh_user(self._connector_key, user_id, user)
             return _PendingEvent(event=event)
 
-        if event.name in {"group_member", "group_member_snapshot"}:
+        if event.name in {
+            "group_member",
+            "group_member_snapshot",
+            "group_member_directory",
+        }:
             group_id = event.invalidated_group_id()
             if group_id is not None:
-                await self._refresh_group_members(group_id)
+                await self._refresh_group_members(
+                    group_id,
+                    replace_aliases=event.name == "group_member_directory",
+                )
             return _PendingEvent(event=event)
 
         if event.name == "message":
@@ -312,12 +319,18 @@ class WeChatEventPump:
         chats.require_current(generation)
         await self._store.refresh_chats(self._connector_key, chats)
 
-    async def _refresh_group_members(self, group_id: str) -> None:
+    async def _refresh_group_members(
+        self,
+        group_id: str,
+        *,
+        replace_aliases: bool = False,
+    ) -> None:
         members = await self._client.get_group_members(group_id)
         await self._store.refresh_group_members(
             self._connector_key,
             group_id,
             members,
+            replace_aliases=replace_aliases,
         )
 
 

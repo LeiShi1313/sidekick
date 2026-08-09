@@ -520,6 +520,126 @@ async def test_wechat_event_pump_refreshes_identity_before_ack(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_wechat_event_pump_clears_group_alias_directory_before_ack(
+    tmp_path,
+) -> None:
+    directory_event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "group_member_directory",
+            "connectionGeneration": 41,
+            "status": "changed",
+            "source": "wechat+localdb-contact",
+            "id": "sha256:directory-2",
+            "groupId": CHAT_ID,
+        }
+    )
+    client = FakeConnectorClient((directory_event,))
+    client.messages = WeChatMessageList(
+        messages=(
+            WeChatConnectorMessage(
+                id="4159667620982040828",
+                chat_id=CHAT_ID,
+                direction="in",
+                message_type="text",
+                sender_id="wxid_alice",
+                reply_to_message_id=None,
+                content="The launch is Monday",
+                content_redacted=False,
+                timestamp=1_783_772_734,
+                source="wechat+localdb",
+                sequence=None,
+            ),
+            WeChatConnectorMessage(
+                id="4159667620982040829",
+                chat_id=CHAT_ID,
+                direction="in",
+                message_type="text",
+                sender_id="wxid_bob",
+                reply_to_message_id=None,
+                content="The review is Tuesday",
+                content_redacted=False,
+                timestamp=1_783_772_735,
+                source="wechat+localdb",
+                sequence=None,
+            ),
+        ),
+        cursor="10",
+    )
+    client.users = WeChatUserList(
+        users=(WeChatUser(id="wxid_alice", display_name="Alice Global"),),
+        cursor="10",
+    )
+    client.group_members[CHAT_ID] = WeChatGroupMemberList(
+        group_id=CHAT_ID,
+        members=(
+            WeChatGroupMember(
+                group_id=CHAT_ID,
+                user_id="wxid_alice",
+                display_name="Alice Global",
+                nickname="Old Group Alias",
+            ),
+            WeChatGroupMember(
+                group_id=CHAT_ID,
+                user_id="wxid_bob",
+                display_name="Bob Member",
+                nickname="Old Omitted Alias",
+            ),
+        ),
+        cursor="10",
+        snapshot_complete=True,
+        snapshot_current=True,
+        snapshot_connection_generation=41,
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        client.group_members[CHAT_ID] = WeChatGroupMemberList(
+            group_id=CHAT_ID,
+            members=(
+                WeChatGroupMember(
+                    group_id=CHAT_ID,
+                    user_id="wxid_alice",
+                    display_name="Alice Global",
+                    nickname=None,
+                ),
+            ),
+            cursor="11",
+            snapshot_complete=False,
+            snapshot_current=False,
+            snapshot_connection_generation=None,
+        )
+
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(RecordingHandler(), asyncio.Event())
+        alice_message = await store.get_message(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            "4159667620982040828",
+        )
+        bob_message = await store.get_message(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            "4159667620982040829",
+        )
+
+        assert result == "reconnect"
+        assert alice_message is not None
+        assert bob_message is not None
+        assert alice_message.sender_display_name == "Alice Global"
+        assert bob_message.sender_display_name == "Bob Member"
+        assert client.group_member_reads == [CHAT_ID, CHAT_ID]
+        assert await store.get_cursor(CONNECTOR_KEY) == "11"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_wechat_event_pump_refreshes_once_at_member_delta_end(tmp_path) -> None:
     events = tuple(
         WeChatEvent.parse(

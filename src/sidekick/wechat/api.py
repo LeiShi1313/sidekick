@@ -676,6 +676,19 @@ class WeChatEvent:
         return _required_user_id(self.payload, "userId")
 
     def invalidated_group_id(self) -> str | None:
+        if self.name == "group_member_directory":
+            if self.connection_generation is None:
+                raise WeChatAPIContractError(
+                    "WeChat group member directory generation is missing"
+                )
+            _required_enum(self.payload, "status", {"changed"})
+            _required_enum(
+                self.payload,
+                "source",
+                {"wechat+localdb-contact"},
+            )
+            _required_id(self.payload, "id")
+            return _required_group_id(self.payload, "groupId")
         if self.name == "group_member_snapshot":
             status = _required_enum(self.payload, "status", {"begin", "end"})
             group_id = _required_group_id(self.payload, "groupId")
