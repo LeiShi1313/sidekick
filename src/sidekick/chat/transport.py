@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from io import BytesIO
 from typing import Any, Literal, Protocol
 
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.identity import ExternalId
 
 
@@ -23,6 +25,12 @@ class ChatTransport(Protocol):
         *,
         presentation: ChatPresentation,
     ) -> SentMessage: ...
+
+    async def reply_attachment(
+        self,
+        message: Any,
+        attachment: OutboundAttachment,
+    ) -> None: ...
 
     async def update(
         self,
@@ -58,6 +66,24 @@ class ObjectChatTransport:
         if not callable(operation):
             raise RuntimeError("Chat transport cannot reply to this message")
         return await operation(text)
+
+    async def reply_attachment(
+        self,
+        message: Any,
+        attachment: OutboundAttachment,
+    ) -> None:
+        operation = getattr(message, "reply", None)
+        if not callable(operation):
+            raise RuntimeError("Chat transport cannot reply to this message")
+        upload = BytesIO(attachment.data)
+        upload.name = attachment.filename
+        try:
+            await operation(
+                file=upload,
+                force_document=attachment.display_as == "file",
+            )
+        finally:
+            upload.close()
 
     async def update(
         self,

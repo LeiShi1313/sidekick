@@ -11,7 +11,7 @@ from sidekick.ai_attachments import (
     AttachmentAnalysisGateway,
     ChatAttachmentDescriber,
 )
-from sidekick.chat.attachments import AttachmentDescription
+from sidekick.chat.attachments import AttachmentDescription, OutboundAttachment
 from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.chat.transport import ChatPresentation, SentMessage
@@ -117,7 +117,7 @@ class WeChatIdentityCodec:
 WECHAT_IDENTITY_CODEC: IdentityCodec = WeChatIdentityCodec()
 
 
-class WeChatTextSender(Protocol):
+class WeChatMessageSender(Protocol):
     async def send_text_and_wait(
         self,
         *,
@@ -125,6 +125,14 @@ class WeChatTextSender(Protocol):
         to: str,
         content: str,
         reply_to_message_id: str | None,
+    ) -> WeChatSendOperation: ...
+
+    async def send_attachment_and_wait(
+        self,
+        *,
+        request_id: str,
+        to: str,
+        attachment: OutboundAttachment,
     ) -> WeChatSendOperation: ...
 
 
@@ -246,7 +254,7 @@ class WeChatSentMessage:
 class WeChatChatTransport:
     def __init__(
         self,
-        client: WeChatTextSender,
+        client: WeChatMessageSender,
         store: WeChatStateRepository,
         connector_key: str,
         *,
@@ -303,6 +311,57 @@ class WeChatChatTransport:
         )
         await self._send(sent, rendered)
         return sent
+
+    async def reply_attachment(
+        self,
+        message: Any,
+        attachment: OutboundAttachment,
+    ) -> None:
+        trigger = self._trigger(message)
+        payload_fingerprint = sha256(
+            b"\0".join(
+                (
+                    attachment.display_as.encode("ascii"),
+                    attachment.filename.encode("utf-8"),
+                    attachment.mime_type.encode("ascii"),
+                    attachment.data,
+                )
+            )
+        ).hexdigest()[:32]
+        attempt = await self._store.get_attachment_send_attempt(
+            self._connector_key,
+            trigger.account_id,
+            trigger.chat_id,
+            trigger.id,
+            payload_fingerprint,
+        )
+        purpose = f"attachment.{payload_fingerprint}"
+        if attempt:
+            purpose = f"{purpose}.{attempt}"
+        request_id = _request_id(trigger, purpose)
+        try:
+            operation = await self._client.send_attachment_and_wait(
+                request_id=request_id,
+                to=trigger.chat_id,
+                attachment=attachment,
+            )
+        except WeChatSendFailed:
+            await self._store.advance_attachment_send_attempt(
+                self._connector_key,
+                trigger.account_id,
+                trigger.chat_id,
+                trigger.id,
+                payload_fingerprint,
+                expected_attempt=attempt,
+            )
+            raise
+        assert operation.message_id is not None
+        await self._store.mark_processed_identity(
+            self._connector_key,
+            trigger.account_id,
+            trigger.chat_id,
+            operation.message_id,
+        )
 
     async def update(
         self,

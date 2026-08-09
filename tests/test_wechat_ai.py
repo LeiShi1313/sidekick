@@ -31,6 +31,7 @@ from sidekick.ai_memory_ingestion import (
     MemoryIngestionSettings,
 )
 from sidekick.ai_memory_segments import MemorySegmentationSettings
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.wechat.ai import (
     WECHAT_IDENTITY_CODEC,
     WeChatChatTransport,
@@ -71,6 +72,7 @@ class RecordingConnectorClient:
     def __init__(self, responses: tuple[object, ...]):
         self.responses = list(responses)
         self.calls: list[dict[str, str | None]] = []
+        self.attachment_calls: list[dict[str, object]] = []
 
     async def send_text_and_wait(
         self,
@@ -86,6 +88,27 @@ class RecordingConnectorClient:
                 "to": to,
                 "content": content,
                 "reply_to_message_id": reply_to_message_id,
+            }
+        )
+        if not self.responses:
+            raise AssertionError("No WeChat send response prepared")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def send_attachment_and_wait(
+        self,
+        *,
+        request_id,
+        to,
+        attachment,
+    ):
+        self.attachment_calls.append(
+            {
+                "request_id": request_id,
+                "to": to,
+                "attachment": attachment,
             }
         )
         if not self.responses:
@@ -369,6 +392,160 @@ async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
     assert first.id == second.id == "7158246912028861544"
     assert client.calls[0]["request_id"] == client.calls[1]["request_id"]
     assert client.calls[0]["request_id"].startswith("sidekick.wechat.reply.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display_as", ("image", "file"))
+async def test_wechat_transport_replies_with_one_stably_identified_attachment(
+    tmp_path,
+    display_as,
+    make_png,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient(
+        (
+            submitted(message_id="7158246912028861544"),
+            submitted(message_id="7158246912028861544"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    attachment = OutboundAttachment(
+        data=make_png() if display_as == "image" else b"attachment-bytes",
+        filename="answer.png" if display_as == "image" else "answer.txt",
+        mime_type="image/png" if display_as == "image" else "text/plain",
+        display_as=display_as,
+    )
+    try:
+        first = await transport.reply_attachment(trigger, attachment)
+        second = await transport.reply_attachment(trigger, attachment)
+    finally:
+        await store.close()
+
+    assert first is second is None
+    assert client.attachment_calls[0] == client.attachment_calls[1]
+    assert client.attachment_calls[0]["request_id"].startswith(
+        "sidekick.wechat.attachment."
+    )
+    assert client.attachment_calls[0]["to"] == trigger.chat_id
+    assert client.attachment_calls[0]["attachment"] is attachment
+
+
+@pytest.mark.asyncio
+async def test_wechat_attachment_retry_rotates_after_terminal_failure(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    store, trigger = await bootstrap_store(state_path)
+    failure = WeChatSendFailed(
+        WeChatSendOperation(
+            request_id="placeholder",
+            status="failed",
+            message_id=None,
+            error_code="SEND_FAILED",
+            to=GROUP_ID,
+        ),
+        "send failed",
+    )
+    client = RecordingConnectorClient((failure, submitted()))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    attachment = OutboundAttachment(
+        data=b"report",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+    try:
+        with pytest.raises(WeChatSendFailed):
+            await transport.reply_attachment(trigger, attachment)
+        await transport.reply_attachment(trigger, attachment)
+    finally:
+        await store.close()
+
+    restarted_store = await WeChatStateRepository(state_path).connect()
+    restarted_client = RecordingConnectorClient((submitted(),))
+    restarted_transport = WeChatChatTransport(
+        restarted_client,
+        restarted_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        await restarted_transport.reply_attachment(trigger, attachment)
+    finally:
+        await restarted_store.close()
+
+    assert (
+        client.attachment_calls[0]["request_id"]
+        != client.attachment_calls[1]["request_id"]
+    )
+    assert (
+        restarted_client.attachment_calls[0]["request_id"]
+        == client.attachment_calls[1]["request_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_wechat_attachment_retry_preserves_id_after_unknown_outcome(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    store, trigger = await bootstrap_store(state_path)
+    unknown = WeChatSendOutcomeUnknown(
+        WeChatSendOperation(
+            request_id="placeholder",
+            status="unknown",
+            message_id=None,
+            error_code="CONFIRMATION_TIMEOUT",
+            to=GROUP_ID,
+        ),
+        "send outcome unknown",
+    )
+    client = RecordingConnectorClient((unknown,))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    attachment = OutboundAttachment(
+        data=b"report",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+    try:
+        with pytest.raises(WeChatSendOutcomeUnknown):
+            await transport.reply_attachment(trigger, attachment)
+    finally:
+        await store.close()
+
+    restarted_store = await WeChatStateRepository(state_path).connect()
+    restarted_client = RecordingConnectorClient((submitted(),))
+    restarted_transport = WeChatChatTransport(
+        restarted_client,
+        restarted_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        await restarted_transport.reply_attachment(trigger, attachment)
+    finally:
+        await restarted_store.close()
+
+    assert (
+        client.attachment_calls[0]["request_id"]
+        == restarted_client.attachment_calls[0]["request_id"]
+    )
 
 
 @pytest.mark.asyncio

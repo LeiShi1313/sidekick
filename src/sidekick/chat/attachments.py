@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from io import BytesIO
+import re
 from typing import Any, Literal, Protocol
 
 from PIL import Image
@@ -18,6 +19,22 @@ AttachmentKind = Literal[
 ]
 MAX_MODEL_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_MODEL_IMAGE_DIMENSION = 1_600
+OutboundAttachmentDisplay = Literal["image", "file"]
+MAX_OUTBOUND_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_OUTBOUND_IMAGE_DIMENSION = 4_096
+MAX_OUTBOUND_IMAGE_PIXELS = MAX_OUTBOUND_IMAGE_DIMENSION**2
+_OUTBOUND_IMAGE_SUFFIXES = {
+    "image/jpeg": frozenset({".jpg", ".jpeg"}),
+    "image/png": frozenset({".png"}),
+}
+_OUTBOUND_IMAGE_MIME_TYPES = frozenset(_OUTBOUND_IMAGE_SUFFIXES)
+_OUTBOUND_IMAGE_FORMATS = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+}
+_MIME_TYPE_RE = re.compile(
+    r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +92,88 @@ class AttachmentDescription:
     context_text: str
     memory_text: str
     model_image: ModelInputImage | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundAttachment:
+    """One in-memory attachment ready for a chat transport to send."""
+
+    data: bytes = field(repr=False)
+    filename: str
+    mime_type: str
+    display_as: OutboundAttachmentDisplay
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes) or not self.data:
+            raise ValueError("Outbound attachment data cannot be empty")
+        if len(self.data) > MAX_OUTBOUND_ATTACHMENT_BYTES:
+            raise ValueError("Outbound attachment exceeds the byte limit")
+        if (
+            not isinstance(self.filename, str)
+            or not self.filename
+            or self.filename != self.filename.strip()
+            or self.filename in {".", ".."}
+            or "/" in self.filename
+            or "\\" in self.filename
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in self.filename
+            )
+            or len(self.filename.encode("utf-8")) > 255
+        ):
+            raise ValueError("Outbound attachment filename is invalid")
+        if (
+            not isinstance(self.mime_type, str)
+            or _MIME_TYPE_RE.fullmatch(self.mime_type) is None
+        ):
+            raise ValueError("Outbound attachment MIME type is invalid")
+        if self.display_as not in {"image", "file"}:
+            raise ValueError("Outbound attachment display must be image or file")
+        if (
+            self.display_as == "image"
+            and self.mime_type not in _OUTBOUND_IMAGE_MIME_TYPES
+        ):
+            raise ValueError("Outbound images must be PNG or JPEG")
+        if self.display_as == "image":
+            suffix = (
+                f".{self.filename.rsplit('.', 1)[-1].lower()}"
+                if "." in self.filename
+                else ""
+            )
+            if suffix not in _OUTBOUND_IMAGE_SUFFIXES[self.mime_type]:
+                raise ValueError(
+                    "Outbound image filename extension must match its MIME type"
+                )
+            _validate_outbound_image(self.data, self.mime_type)
+
+
+def _validate_outbound_image(data: bytes, mime_type: str) -> None:
+    try:
+        source = Image.open(BytesIO(data))
+    except Exception as exc:
+        raise ValueError("Outbound image must be decodable") from exc
+    with source:
+        if source.format != _OUTBOUND_IMAGE_FORMATS[mime_type]:
+            raise ValueError("Outbound image format must match its MIME type")
+        if (
+            source.width < 1
+            or source.height < 1
+            or source.width > MAX_OUTBOUND_IMAGE_DIMENSION
+            or source.height > MAX_OUTBOUND_IMAGE_DIMENSION
+            or source.width * source.height > MAX_OUTBOUND_IMAGE_PIXELS
+        ):
+            raise ValueError("Outbound image exceeds the dimension limit")
+        if getattr(source, "n_frames", 1) != 1:
+            raise ValueError("Outbound image must contain one frame")
+        try:
+            source.verify()
+        except Exception as exc:
+            raise ValueError("Outbound image must be decodable") from exc
+    try:
+        with Image.open(BytesIO(data)) as decoded:
+            decoded.load()
+    except Exception as exc:
+        raise ValueError("Outbound image must be decodable") from exc
 
 
 class AttachmentDescriber(Protocol):

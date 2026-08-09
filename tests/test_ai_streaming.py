@@ -28,6 +28,7 @@ from sidekick.chat.commands import (
     MemoryRememberCommand,
     parse_chat_command,
 )
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.plugins.base import command_registry
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 from sidekick.telegram.ai_transport import (
@@ -171,6 +172,50 @@ def test_telegram_transport_distinguishes_group_messages():
 
     assert transport.is_group(SimpleNamespace(is_group=True)) is True
     assert transport.is_group(SimpleNamespace(is_group=False)) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("display_as", "force_document"),
+    (("image", False), ("file", True)),
+)
+async def test_telegram_transport_replies_with_one_attachment(
+    display_as,
+    force_document,
+    make_png,
+) -> None:
+    class AttachmentMessage:
+        def __init__(self) -> None:
+            self.observed = None
+
+        async def reply(self, *args, **kwargs):
+            assert args == ()
+            uploaded = kwargs["file"]
+            self.observed = {
+                "name": uploaded.name,
+                "data": uploaded.getvalue(),
+                "force_document": kwargs["force_document"],
+            }
+            return FakeAnswer("")
+
+    message = AttachmentMessage()
+    attachment = OutboundAttachment(
+        data=make_png() if display_as == "image" else b"attachment-bytes",
+        filename="answer.png" if display_as == "image" else "answer.bin",
+        mime_type=(
+            "image/png" if display_as == "image" else "application/octet-stream"
+        ),
+        display_as=display_as,
+    )
+
+    result = await TelegramChatTransport().reply_attachment(message, attachment)
+
+    assert result is None
+    assert message.observed == {
+        "name": attachment.filename,
+        "data": attachment.data,
+        "force_document": force_document,
+    }
 
 
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:

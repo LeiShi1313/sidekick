@@ -152,6 +152,21 @@ class WeChatStateRepository:
                 processed_at REAL NOT NULL,
                 PRIMARY KEY (connector_key, account_id, chat_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS wechat_attachment_send_attempts (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                trigger_message_id TEXT NOT NULL,
+                payload_fingerprint TEXT NOT NULL,
+                attempt INTEGER NOT NULL CHECK (attempt >= 0),
+                PRIMARY KEY (
+                    connector_key,
+                    account_id,
+                    chat_id,
+                    trigger_message_id,
+                    payload_fingerprint
+                )
+            );
             CREATE TABLE IF NOT EXISTS wechat_projection_counters (
                 connector_key TEXT NOT NULL,
                 account_id TEXT NOT NULL,
@@ -647,6 +662,72 @@ class WeChatStateRepository:
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (connector_key, account_id, chat_id, message_id, time.time()),
+        )
+        await connection.commit()
+
+    @_serialized
+    async def get_attachment_send_attempt(
+        self,
+        connector_key: str,
+        account_id: str,
+        chat_id: str,
+        trigger_message_id: str,
+        payload_fingerprint: str,
+    ) -> int:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT attempt FROM wechat_attachment_send_attempts
+            WHERE connector_key = ? AND account_id = ? AND chat_id = ?
+              AND trigger_message_id = ? AND payload_fingerprint = ?
+            """,
+            (
+                connector_key,
+                account_id,
+                chat_id,
+                trigger_message_id,
+                payload_fingerprint,
+            ),
+        )
+        row = await cursor.fetchone()
+        return int(row["attempt"]) if row is not None else 0
+
+    @_serialized
+    async def advance_attachment_send_attempt(
+        self,
+        connector_key: str,
+        account_id: str,
+        chat_id: str,
+        trigger_message_id: str,
+        payload_fingerprint: str,
+        *,
+        expected_attempt: int,
+    ) -> None:
+        if expected_attempt < 0:
+            raise ValueError("WeChat attachment send attempt cannot be negative")
+        connection = self._require_connection()
+        await connection.execute(
+            """
+            INSERT INTO wechat_attachment_send_attempts (
+                connector_key, account_id, chat_id, trigger_message_id,
+                payload_fingerprint, attempt
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                connector_key, account_id, chat_id, trigger_message_id,
+                payload_fingerprint
+            ) DO UPDATE SET
+                attempt = MAX(
+                    wechat_attachment_send_attempts.attempt,
+                    excluded.attempt
+                )
+            """,
+            (
+                connector_key,
+                account_id,
+                chat_id,
+                trigger_message_id,
+                payload_fingerprint,
+                expected_attempt + 1,
+            ),
         )
         await connection.commit()
 

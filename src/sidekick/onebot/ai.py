@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import time
@@ -14,6 +15,7 @@ from sidekick.ai import (
     MessageIdentity,
     ReplyTarget,
 )
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
 from sidekick.chat.transport import ChatPresentation, SentMessage
@@ -208,6 +210,41 @@ class OneBotChatTransport:
             trigger=message,
         )
 
+    async def reply_attachment(
+        self,
+        message: Any,
+        attachment: OutboundAttachment,
+    ) -> None:
+        if not isinstance(message, OneBotMessage):
+            raise RuntimeError("OneBot transport requires a OneBot message")
+        encoded = "base64://" + base64.b64encode(attachment.data).decode("ascii")
+        if attachment.display_as == "image":
+            await self._send_segments(
+                message,
+                [
+                    {"type": "reply", "data": {"id": str(message.id)}},
+                    {"type": "image", "data": {"file": encoded}},
+                ],
+                timeout=120,
+            )
+            return
+
+        if message.chat_id > 0:
+            action = "upload_group_file"
+            target = {"group_id": str(message.chat_id)}
+        else:
+            action = "upload_private_file"
+            target = {"user_id": str(abs(message.chat_id))}
+        await self._client.call(
+            action,
+            {
+                **target,
+                "file": encoded,
+                "name": attachment.filename,
+            },
+            timeout=120,
+        )
+
     async def update(
         self,
         message: SentMessage,
@@ -259,17 +296,31 @@ class OneBotChatTransport:
         return text
 
     async def _send(self, trigger: OneBotMessage, text: str) -> int:
-        message = [
-            {"type": "reply", "data": {"id": str(trigger.id)}},
-            {"type": "text", "data": {"text": text}},
-        ]
+        return await self._send_segments(
+            trigger,
+            [
+                {"type": "reply", "data": {"id": str(trigger.id)}},
+                {"type": "text", "data": {"text": text}},
+            ],
+        )
+
+    async def _send_segments(
+        self,
+        trigger: OneBotMessage,
+        message: list[dict[str, Any]],
+        *,
+        timeout: float | None = None,
+    ) -> int:
         if trigger.chat_id > 0:
             action = "send_group_msg"
             params = {"group_id": str(trigger.chat_id), "message": message}
         else:
             action = "send_private_msg"
             params = {"user_id": str(abs(trigger.chat_id)), "message": message}
-        response = await self._client.call(action, params)
+        if timeout is None:
+            response = await self._client.call(action, params)
+        else:
+            response = await self._client.call(action, params, timeout=timeout)
         if not isinstance(response, dict):
             raise RuntimeError("OneBot send response is malformed")
         message_id = response.get("message_id")
