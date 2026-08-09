@@ -43,6 +43,7 @@ def connector_message_payload(message_id: str) -> dict[str, object]:
 @pytest.mark.parametrize("display_as", ("image", "file"))
 async def test_wechat_client_uploads_one_attachment_and_waits_for_submission(
     display_as,
+    make_png,
 ) -> None:
     posted: list[dict[str, object]] = []
     request_id = f"sidekick.wechat.attachment.{display_as}"
@@ -85,7 +86,7 @@ async def test_wechat_client_uploads_one_attachment_and_waits_for_submission(
     app.router.add_post(f"/messages/{display_as}", send_attachment)
     app.router.add_get("/sends/{request_id}", get_send)
     attachment = OutboundAttachment(
-        data=b"attachment-bytes",
+        data=make_png() if display_as == "image" else b"attachment-bytes",
         filename="answer.png" if display_as == "image" else "answer.txt",
         mime_type="image/png" if display_as == "image" else "text/plain",
         display_as=display_as,

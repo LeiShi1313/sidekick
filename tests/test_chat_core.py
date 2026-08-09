@@ -28,8 +28,9 @@ from sidekick.chat.attachments import (
     AttachmentDescription,
     AttachmentReference,
     MAX_MODEL_IMAGE_BYTES,
-    ModelInputImage,
     MAX_OUTBOUND_ATTACHMENT_BYTES,
+    MAX_OUTBOUND_IMAGE_DIMENSION,
+    ModelInputImage,
     OutboundAttachment,
 )
 from sidekick.chat.commands import (
@@ -237,16 +238,17 @@ def test_agent_run_request_accepts_at_most_one_image():
         AgentRunRequest(**values, images=(image, image))
 
 
-def test_outbound_attachment_is_one_bounded_safe_named_payload() -> None:
+def test_outbound_attachment_is_one_bounded_safe_named_payload(make_png) -> None:
+    valid_png = make_png()
     attachment = OutboundAttachment(
-        data=b"png-bytes",
+        data=valid_png,
         filename="answer.png",
         mime_type="image/png",
         display_as="image",
     )
 
-    assert attachment.data == b"png-bytes"
-    assert "png-bytes" not in repr(attachment)
+    assert attachment.data == valid_png
+    assert repr(valid_png) not in repr(attachment)
     with pytest.raises(ValueError, match="empty"):
         OutboundAttachment(
             data=b"",
@@ -268,6 +270,14 @@ def test_outbound_attachment_is_one_bounded_safe_named_payload() -> None:
             mime_type="text/plain",
             display_as="file",
         )
+    for control in ("\r", "\n", "\t", "\x7f"):
+        with pytest.raises(ValueError, match="filename"):
+            OutboundAttachment(
+                data=b"x",
+                filename=f"answer{control}name.txt",
+                mime_type="text/plain",
+                display_as="file",
+            )
     with pytest.raises(ValueError, match="PNG or JPEG"):
         OutboundAttachment(
             data=b"x",
@@ -279,6 +289,34 @@ def test_outbound_attachment_is_one_bounded_safe_named_payload() -> None:
         OutboundAttachment(
             data=b"x",
             filename="answer.bin",
+            mime_type="image/png",
+            display_as="image",
+        )
+    with pytest.raises(ValueError, match="decodable"):
+        OutboundAttachment(
+            data=b"not-a-png",
+            filename="answer.png",
+            mime_type="image/png",
+            display_as="image",
+        )
+    with pytest.raises(ValueError, match="decodable"):
+        OutboundAttachment(
+            data=valid_png[:-16],
+            filename="answer.png",
+            mime_type="image/png",
+            display_as="image",
+        )
+    with pytest.raises(ValueError, match="format"):
+        OutboundAttachment(
+            data=valid_png,
+            filename="answer.jpg",
+            mime_type="image/jpeg",
+            display_as="image",
+        )
+    with pytest.raises(ValueError, match="dimension"):
+        OutboundAttachment(
+            data=make_png(width=MAX_OUTBOUND_IMAGE_DIMENSION + 1, height=1),
+            filename="answer.png",
             mime_type="image/png",
             display_as="image",
         )

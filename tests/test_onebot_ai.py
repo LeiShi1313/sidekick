@@ -405,11 +405,11 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
 
 
 @pytest.mark.asyncio
-async def test_onebot_transport_replies_with_an_inline_image() -> None:
+async def test_onebot_transport_replies_with_an_inline_image(make_png) -> None:
     action_client = RecordingActionClient(responses=[{"message_id": 503}])
     trigger = OneBotMessage.from_payload(group_event(), action_client=action_client)
     attachment = OutboundAttachment(
-        data=b"png-bytes",
+        data=make_png(),
         filename="answer.png",
         mime_type="image/png",
         display_as="image",

@@ -182,6 +182,7 @@ def test_telegram_transport_distinguishes_group_messages():
 async def test_telegram_transport_replies_with_one_attachment(
     display_as,
     force_document,
+    make_png,
 ) -> None:
     class AttachmentMessage:
         def __init__(self) -> None:
@@ -199,7 +200,7 @@ async def test_telegram_transport_replies_with_one_attachment(
 
     message = AttachmentMessage()
     attachment = OutboundAttachment(
-        data=b"attachment-bytes",
+        data=make_png() if display_as == "image" else b"attachment-bytes",
         filename="answer.png" if display_as == "image" else "answer.bin",
         mime_type=(
             "image/png" if display_as == "image" else "application/octet-stream"

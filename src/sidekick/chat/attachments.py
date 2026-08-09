@@ -21,11 +21,17 @@ MAX_MODEL_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_MODEL_IMAGE_DIMENSION = 1_600
 OutboundAttachmentDisplay = Literal["image", "file"]
 MAX_OUTBOUND_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_OUTBOUND_IMAGE_DIMENSION = 4_096
+MAX_OUTBOUND_IMAGE_PIXELS = MAX_OUTBOUND_IMAGE_DIMENSION**2
 _OUTBOUND_IMAGE_SUFFIXES = {
     "image/jpeg": frozenset({".jpg", ".jpeg"}),
     "image/png": frozenset({".png"}),
 }
 _OUTBOUND_IMAGE_MIME_TYPES = frozenset(_OUTBOUND_IMAGE_SUFFIXES)
+_OUTBOUND_IMAGE_FORMATS = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+}
 _MIME_TYPE_RE = re.compile(
     r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*"
 )
@@ -109,7 +115,10 @@ class OutboundAttachment:
             or self.filename in {".", ".."}
             or "/" in self.filename
             or "\\" in self.filename
-            or "\x00" in self.filename
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in self.filename
+            )
             or len(self.filename.encode("utf-8")) > 255
         ):
             raise ValueError("Outbound attachment filename is invalid")
@@ -135,6 +144,36 @@ class OutboundAttachment:
                 raise ValueError(
                     "Outbound image filename extension must match its MIME type"
                 )
+            _validate_outbound_image(self.data, self.mime_type)
+
+
+def _validate_outbound_image(data: bytes, mime_type: str) -> None:
+    try:
+        source = Image.open(BytesIO(data))
+    except Exception as exc:
+        raise ValueError("Outbound image must be decodable") from exc
+    with source:
+        if source.format != _OUTBOUND_IMAGE_FORMATS[mime_type]:
+            raise ValueError("Outbound image format must match its MIME type")
+        if (
+            source.width < 1
+            or source.height < 1
+            or source.width > MAX_OUTBOUND_IMAGE_DIMENSION
+            or source.height > MAX_OUTBOUND_IMAGE_DIMENSION
+            or source.width * source.height > MAX_OUTBOUND_IMAGE_PIXELS
+        ):
+            raise ValueError("Outbound image exceeds the dimension limit")
+        if getattr(source, "n_frames", 1) != 1:
+            raise ValueError("Outbound image must contain one frame")
+        try:
+            source.verify()
+        except Exception as exc:
+            raise ValueError("Outbound image must be decodable") from exc
+    try:
+        with Image.open(BytesIO(data)) as decoded:
+            decoded.load()
+    except Exception as exc:
+        raise ValueError("Outbound image must be decodable") from exc
 
 
 class AttachmentDescriber(Protocol):

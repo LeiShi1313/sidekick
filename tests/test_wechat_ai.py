@@ -399,6 +399,7 @@ async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
 async def test_wechat_transport_replies_with_one_stably_identified_attachment(
     tmp_path,
     display_as,
+    make_png,
 ) -> None:
     store, trigger = await bootstrap_store(tmp_path / "wechat.db")
     client = RecordingConnectorClient(
@@ -414,7 +415,7 @@ async def test_wechat_transport_replies_with_one_stably_identified_attachment(
         native_reply_ready=False,
     )
     attachment = OutboundAttachment(
-        data=b"attachment-bytes",
+        data=make_png() if display_as == "image" else b"attachment-bytes",
         filename="answer.png" if display_as == "image" else "answer.txt",
         mime_type="image/png" if display_as == "image" else "text/plain",
         display_as=display_as,
@@ -432,6 +433,88 @@ async def test_wechat_transport_replies_with_one_stably_identified_attachment(
     )
     assert client.attachment_calls[0]["to"] == trigger.chat_id
     assert client.attachment_calls[0]["attachment"] is attachment
+
+
+@pytest.mark.asyncio
+async def test_wechat_attachment_retry_rotates_after_terminal_failure(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    failure = WeChatSendFailed(
+        WeChatSendOperation(
+            request_id="placeholder",
+            status="failed",
+            message_id=None,
+            error_code="SEND_FAILED",
+            to=GROUP_ID,
+        ),
+        "send failed",
+    )
+    client = RecordingConnectorClient((failure, submitted()))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    attachment = OutboundAttachment(
+        data=b"report",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+    try:
+        with pytest.raises(WeChatSendFailed):
+            await transport.reply_attachment(trigger, attachment)
+        await transport.reply_attachment(trigger, attachment)
+    finally:
+        await store.close()
+
+    assert (
+        client.attachment_calls[0]["request_id"]
+        != client.attachment_calls[1]["request_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_wechat_attachment_retry_preserves_id_after_unknown_outcome(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    unknown = WeChatSendOutcomeUnknown(
+        WeChatSendOperation(
+            request_id="placeholder",
+            status="unknown",
+            message_id=None,
+            error_code="CONFIRMATION_TIMEOUT",
+            to=GROUP_ID,
+        ),
+        "send outcome unknown",
+    )
+    client = RecordingConnectorClient((unknown, submitted()))
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    attachment = OutboundAttachment(
+        data=b"report",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+    try:
+        with pytest.raises(WeChatSendOutcomeUnknown):
+            await transport.reply_attachment(trigger, attachment)
+        await transport.reply_attachment(trigger, attachment)
+    finally:
+        await store.close()
+
+    assert (
+        client.attachment_calls[0]["request_id"]
+        == client.attachment_calls[1]["request_id"]
+    )
 
 
 @pytest.mark.asyncio
