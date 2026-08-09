@@ -1382,8 +1382,25 @@ async def _runs(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
     try:
         await _write_event(response, prepared.event)
+        attachment_event: dict[str, Any] | None = None
+        terminal_event: dict[str, Any] | None = None
         async for event in request.app[DATA_KEY].stream(prepared):
+            if terminal_event is not None:
+                raise UpstreamUnavailable("Pi agent returned events after completion")
+            if event["type"] == "attachment":
+                if attachment_event is not None:
+                    raise UpstreamUnavailable("Pi agent returned multiple attachments")
+                attachment_event = event
+                continue
+            if event["type"] in {"run_completed", "run_failed"}:
+                terminal_event = event
+                continue
             await _write_event(response, event)
+        if terminal_event is None:
+            raise UpstreamUnavailable("Pi agent ended without a result")
+        if terminal_event["type"] == "run_completed" and attachment_event is not None:
+            await _write_event(response, attachment_event)
+        await _write_event(response, terminal_event)
     except (ConnectionError, asyncio.CancelledError):
         raise
     except Exception:

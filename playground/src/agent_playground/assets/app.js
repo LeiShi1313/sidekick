@@ -209,6 +209,7 @@ async function runPrompt(prompt) {
     }
     await readEvents(response, (event) => handleEvent(event, assistant));
   } catch (error) {
+    assistant.media.replaceChildren();
     assistant.message.text = `Run failed: ${error.message}`;
     assistant.body.textContent = assistant.message.text;
     setRunning(false, "Failed");
@@ -288,6 +289,7 @@ function handleEvent(event, assistant) {
     return;
   }
   if (event.type === "run_failed") {
+    assistant.media.replaceChildren();
     assistant.message.text = event.message || "Agent run failed";
     assistant.body.textContent = assistant.message.text;
     setRunning(false, event.code === "CANCELLED" ? "Cancelled" : "Failed");

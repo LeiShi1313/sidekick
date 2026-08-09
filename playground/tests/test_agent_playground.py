@@ -33,7 +33,9 @@ async def start(app: web.Application) -> tuple[web.AppRunner, str]:
 
 
 async def dependencies(
-    *, bank_id: str = "chat:engineering"
+    *,
+    bank_id: str = "chat:engineering",
+    pi_failure_after_attachment: bool = False,
 ) -> tuple[list[web.AppRunner], str, str, dict]:
     received = {
         "recalls": [],
@@ -100,6 +102,25 @@ async def dependencies(
             headers={"Content-Type": "application/x-ndjson; charset=utf-8"}
         )
         await response.prepare(request)
+        terminal_events = (
+            (
+                {
+                    "type": "run_failed",
+                    "code": "PROVIDER_ERROR",
+                    "message": "Agent run failed",
+                },
+            )
+            if pi_failure_after_attachment
+            else (
+                {"type": "text_delta", "delta": "Alice owns it.", "reset": True},
+                {
+                    "type": "run_completed",
+                    "sessionId": "session-1",
+                    "entryId": "entry-1",
+                    "answer": "Alice owns it.",
+                },
+            )
+        )
         events = (
             {
                 "type": "memory_snapshot",
@@ -137,13 +158,7 @@ async def dependencies(
                 "displayAs": "image",
                 "data": PNG_DATA,
             },
-            {"type": "text_delta", "delta": "Alice owns it.", "reset": True},
-            {
-                "type": "run_completed",
-                "sessionId": "session-1",
-                "entryId": "entry-1",
-                "answer": "Alice owns it.",
-            },
+            *terminal_events,
         )
         for event in events:
             await response.write(json.dumps(event).encode() + b"\n")
@@ -663,6 +678,41 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
         ]
         assert "Earlier we discussed" in pi_request["context"][0]["text"]
         assert PI_TOKEN not in json.dumps(events)
+    finally:
+        await playground_runner.cleanup()
+        for runner in dependency_runners:
+            await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_discards_attachment_when_pi_run_fails():
+    dependency_runners, memory_url, pi_url, _ = await dependencies(
+        pi_failure_after_attachment=True
+    )
+    playground_runner, playground_url = await request_app(memory_url, pi_url)
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(
+                f"{playground_url}/api/runs",
+                json={
+                    "mode": "agent",
+                    "prompt": "Generate an image",
+                    "bankId": "chat:engineering",
+                    "sessionId": None,
+                    "parentEntryId": None,
+                },
+            ) as response,
+        ):
+            events = [json.loads(line) async for line in response.content]
+
+        assert response.status == 200
+        assert events[-1] == {
+            "type": "run_failed",
+            "code": "PROVIDER_ERROR",
+            "message": "Agent run failed",
+        }
+        assert all(event["type"] != "attachment" for event in events)
     finally:
         await playground_runner.cleanup()
         for runner in dependency_runners:
