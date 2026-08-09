@@ -130,12 +130,20 @@ function validateModelImages(value) {
       typeof image !== "object" ||
       Array.isArray(image) ||
       !hasOnlyKeys(image, new Set(["mimeType", "data"])) ||
-      image.mimeType !== "image/jpeg"
+      image.mimeType !== "image/jpeg" ||
+      typeof image.data !== "string" ||
+      image.data.length % 4 !== 0
     ) {
       return null;
     }
     const data = decodeBase64(image.data);
-    if (!data || detectedImageMimeType(data) !== "image/jpeg") return null;
+    if (
+      !data ||
+      data.toString("base64") !== image.data ||
+      detectedImageMimeType(data) !== "image/jpeg"
+    ) {
+      return null;
+    }
     images.push({ mimeType: "image/jpeg", data });
   }
   return images;

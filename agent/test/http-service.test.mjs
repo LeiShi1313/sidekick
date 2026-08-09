@@ -161,6 +161,7 @@ test("accepts one bounded JPEG model input and rejects invalid image arrays", as
       [image, image],
       [{ ...image, mimeType: "image/png" }],
       [{ ...image, unexpected: true }],
+      [{ ...image, data: `${image.data}=` }],
       [{ mimeType: "image/jpeg", data: "not-base64" }],
       [{ mimeType: "image/jpeg", data: "/9j/2Q==" }],
       [{

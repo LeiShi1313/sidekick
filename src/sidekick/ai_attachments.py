@@ -93,6 +93,12 @@ def attachment_metadata_only(
 
 
 class ChatAttachmentDescriber:
+    """Describe bounded attachments for prompts and memory context.
+
+    ``allow_unknown_size`` is only safe for adapters whose downloader enforces
+    an independent hard byte limit before returning content.
+    """
+
     MAX_FILE_BYTES = 5 * 1024 * 1024
     DEFAULT_DOWNLOAD_TIMEOUT = 30.0
     MAX_TEXT_CHARS = 50_000
