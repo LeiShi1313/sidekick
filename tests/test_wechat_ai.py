@@ -439,7 +439,8 @@ async def test_wechat_transport_replies_with_one_stably_identified_attachment(
 async def test_wechat_attachment_retry_rotates_after_terminal_failure(
     tmp_path,
 ) -> None:
-    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    state_path = tmp_path / "wechat.db"
+    store, trigger = await bootstrap_store(state_path)
     failure = WeChatSendFailed(
         WeChatSendOperation(
             request_id="placeholder",
@@ -470,9 +471,26 @@ async def test_wechat_attachment_retry_rotates_after_terminal_failure(
     finally:
         await store.close()
 
+    restarted_store = await WeChatStateRepository(state_path).connect()
+    restarted_client = RecordingConnectorClient((submitted(),))
+    restarted_transport = WeChatChatTransport(
+        restarted_client,
+        restarted_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        await restarted_transport.reply_attachment(trigger, attachment)
+    finally:
+        await restarted_store.close()
+
     assert (
         client.attachment_calls[0]["request_id"]
         != client.attachment_calls[1]["request_id"]
+    )
+    assert (
+        restarted_client.attachment_calls[0]["request_id"]
+        == client.attachment_calls[1]["request_id"]
     )
 
 
@@ -480,7 +498,8 @@ async def test_wechat_attachment_retry_rotates_after_terminal_failure(
 async def test_wechat_attachment_retry_preserves_id_after_unknown_outcome(
     tmp_path,
 ) -> None:
-    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    state_path = tmp_path / "wechat.db"
+    store, trigger = await bootstrap_store(state_path)
     unknown = WeChatSendOutcomeUnknown(
         WeChatSendOperation(
             request_id="placeholder",
@@ -491,7 +510,7 @@ async def test_wechat_attachment_retry_preserves_id_after_unknown_outcome(
         ),
         "send outcome unknown",
     )
-    client = RecordingConnectorClient((unknown, submitted()))
+    client = RecordingConnectorClient((unknown,))
     transport = WeChatChatTransport(
         client,
         store,
@@ -507,13 +526,25 @@ async def test_wechat_attachment_retry_preserves_id_after_unknown_outcome(
     try:
         with pytest.raises(WeChatSendOutcomeUnknown):
             await transport.reply_attachment(trigger, attachment)
-        await transport.reply_attachment(trigger, attachment)
     finally:
         await store.close()
 
+    restarted_store = await WeChatStateRepository(state_path).connect()
+    restarted_client = RecordingConnectorClient((submitted(),))
+    restarted_transport = WeChatChatTransport(
+        restarted_client,
+        restarted_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        await restarted_transport.reply_attachment(trigger, attachment)
+    finally:
+        await restarted_store.close()
+
     assert (
         client.attachment_calls[0]["request_id"]
-        == client.attachment_calls[1]["request_id"]
+        == restarted_client.attachment_calls[0]["request_id"]
     )
 
 

@@ -266,7 +266,6 @@ class WeChatChatTransport:
         self._connector_key = connector_key
         self._native_reply_ready = native_reply_ready
         self._logger = logger
-        self._attachment_attempts: dict[tuple[str, str, str, str], int] = {}
 
     async def draft_reply(self, message: Any) -> WeChatSentMessage:
         trigger = self._trigger(message)
@@ -329,13 +328,13 @@ class WeChatChatTransport:
                 )
             )
         ).hexdigest()[:32]
-        logical_key = (
+        attempt = await self._store.get_attachment_send_attempt(
+            self._connector_key,
             trigger.account_id,
             trigger.chat_id,
             trigger.id,
             payload_fingerprint,
         )
-        attempt = self._attachment_attempts.get(logical_key, 0)
         purpose = f"attachment.{payload_fingerprint}"
         if attempt:
             purpose = f"{purpose}.{attempt}"
@@ -347,7 +346,14 @@ class WeChatChatTransport:
                 attachment=attachment,
             )
         except WeChatSendFailed:
-            self._attachment_attempts[logical_key] = attempt + 1
+            await self._store.advance_attachment_send_attempt(
+                self._connector_key,
+                trigger.account_id,
+                trigger.chat_id,
+                trigger.id,
+                payload_fingerprint,
+                expected_attempt=attempt,
+            )
             raise
         assert operation.message_id is not None
         await self._store.mark_processed_identity(
