@@ -41,6 +41,7 @@ class FakeAnswer:
         self._reply_to = reply_to if hasattr(reply_to, "id") else None
         self.file = None
         self.edits: list[str] = []
+        self.deleted = False
 
     async def get_reply_message(self):
         return self._reply_to
@@ -49,6 +50,9 @@ class FakeAnswer:
         self.text = text
         self.edits.append(text)
         return self
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeMessage:
@@ -330,6 +334,55 @@ async def test_generated_image_is_excluded_and_can_anchor_a_continuation(
         agent_session_id="session-image",
         agent_entry_id="entry-1",
     )
+
+    follow_up = FakeMessage("make it more colorful", reply_to=image_answer)
+    assert await handler.handle(follow_up) is True
+    assert gateway.requests[1].session_id == "session-image"
+    assert gateway.requests[1].parent_entry_id == "entry-1"
+
+
+@pytest.mark.parametrize("caption", ["", " \n\t"])
+@pytest.mark.asyncio
+async def test_generated_image_without_visible_caption_is_the_primary_answer(
+    make_png,
+    caption,
+):
+    image = OutboundAttachment(
+        data=make_png(),
+        filename="generated-image.png",
+        mime_type="image/png",
+        display_as="image",
+    )
+
+    class ImageOnlyGateway(FakeGateway):
+        async def run(self, request):
+            self.requests.append(request)
+            session_id = request.session_id or "session-image"
+            yield AgentEvent(type="run_started", session_id=session_id)
+            if len(self.requests) == 1:
+                yield AgentEvent(type="attachment", attachment=image)
+                answer = caption
+            else:
+                answer = "I kept the same thread."
+                yield AgentEvent(type="text_delta", delta=answer, reset=True)
+            yield AgentEvent(
+                type="run_completed",
+                session_id=session_id,
+                entry_id=f"entry-{len(self.requests)}",
+                answer=answer,
+            )
+
+    gateway = ImageOnlyGateway([])
+    handler, store = make_handler(gateway)
+    trigger = FakeMessage("/ai generate an image")
+
+    assert await handler.handle(trigger) is True
+
+    status_answer, image_answer = trigger.replies
+    scope_id = TELEGRAM_IDENTITY_CODEC.scope_id(trigger.chat_id)
+    assert status_answer.deleted is True
+    assert store.excluded == {(scope_id, image_answer.id): "ai-answer"}
+    assert store.markers[(scope_id, image_answer.id)].agent_entry_id == "entry-1"
 
     follow_up = FakeMessage("make it more colorful", reply_to=image_answer)
     assert await handler.handle(follow_up) is True

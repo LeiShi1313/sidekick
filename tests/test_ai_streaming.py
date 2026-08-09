@@ -45,12 +45,16 @@ class FakeAnswer:
         self.text = text
         self.edits: list[str] = []
         self.edit_calls: list[tuple[str, dict]] = []
+        self.deleted = False
 
     async def edit(self, text: str, **kwargs):
         self.text = text
         self.edits.append(text)
         self.edit_calls.append((text, kwargs))
         return self
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeMessage:
@@ -326,6 +330,67 @@ async def test_responder_reports_generated_attachment_delivery_failure(
     assert result.text == (
         "AI generated an attachment, but delivery failed. Try again later."
     )
+
+
+@pytest.mark.asyncio
+async def test_image_only_cleanup_failure_preserves_both_message_identities(
+    make_jpeg,
+) -> None:
+    attachment = OutboundAttachment(
+        data=make_jpeg(),
+        filename="generated-image.jpg",
+        mime_type="image/jpeg",
+        display_as="image",
+    )
+
+    class AttachmentGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="attachment", attachment=attachment)
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer="",
+            )
+
+    class CleanupFailingTransport:
+        def __init__(self):
+            self.status = FakeAnswer("Thinking...")
+            self.attachment_answer = SimpleNamespace(id=101, text=None)
+
+        async def reply(self, _message, _text, *, presentation):
+            assert presentation == "plain"
+            return self.status
+
+        async def update(self, message, text, *, presentation, wait):
+            message.text = text
+            return True
+
+        async def reply_attachment(self, _message, _attachment):
+            return self.attachment_answer
+
+        async def delete(self, _message):
+            raise RuntimeError("temporary cleanup failure")
+
+    transport = CleanupFailingTransport()
+    responder = AIResponder(AttachmentGateway(), transport=transport)
+
+    result = await responder.answer(
+        FakeMessage("/ai generate an image"),
+        make_request("generate an image"),
+    )
+
+    assert result.succeeded is True
+    assert result.text == ""
+    assert result.message is transport.status
+    assert result.attachment_message is transport.attachment_answer
+    assert result.session_id == "session-1"
+    assert result.entry_id == "entry-1"
 
 
 @pytest.mark.asyncio
@@ -1129,6 +1194,50 @@ async def test_final_answer_supersedes_a_queued_tool_status_and_closes_state():
     assert trigger.replies[0].text == final_answer
     assert "Searching web" not in trigger.replies[0].edits
     assert responder.transport._update_states == {}
+
+
+@pytest.mark.asyncio
+async def test_deleting_telegram_status_cancels_queued_updates():
+    now = [0.0]
+    cooldown_started = asyncio.Event()
+    release_cooldown = asyncio.Event()
+
+    async def controlled_sleep(seconds):
+        assert seconds == 4.0
+        cooldown_started.set()
+        await release_cooldown.wait()
+        now[0] += seconds
+
+    transport = TelegramChatTransport(
+        edit_cadence=4,
+        clock=lambda: now[0],
+        sleep=controlled_sleep,
+    )
+    answer = FakeAnswer("Thinking...")
+    first_update = "A" * 100
+
+    assert await transport.update(
+        answer,
+        first_update,
+        presentation="agent",
+        wait=False,
+    )
+    assert not await transport.update(
+        answer,
+        "Generating image",
+        presentation="agent",
+        wait=False,
+    )
+    await asyncio.wait_for(cooldown_started.wait(), timeout=1)
+
+    await transport.delete(answer)
+    state_closed = transport._update_states == {}
+    release_cooldown.set()
+    await asyncio.sleep(0)
+
+    assert state_closed is True
+    assert answer.deleted is True
+    assert answer.edits == [first_update]
 
 
 @pytest.mark.asyncio

@@ -234,6 +234,17 @@ class TelegramChatTransport:
         return await self._offer_agent_update(state, text)
 
     async def delete(self, message: Any) -> None:
+        state = self._update_states.pop(id(message), None)
+        if state is not None:
+            state.active = False
+            await self._cancel_initial_timer(state)
+            worker = state.worker
+            if worker is not None and worker is not asyncio.current_task():
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
         operation = getattr(message, "delete", None)
         if callable(operation):
             await operation()
