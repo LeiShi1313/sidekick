@@ -87,6 +87,43 @@ def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
     assert users.users[0].display_name == "Alice Global"
     assert members.members[0].display_name == "Alice Global"
     assert members.members[0].nickname == "Alice in this group"
+    assert members.snapshot_complete is True
+    assert members.snapshot_current is True
+    assert members.snapshot_connection_generation == 41
+
+
+@pytest.mark.parametrize(
+    ("complete", "connection_generation", "expected"),
+    (
+        (False, 41, "must be complete"),
+        (True, None, "generation is missing"),
+    ),
+)
+def test_wechat_client_rejects_invalid_current_group_member_snapshots(
+    complete: bool,
+    connection_generation: int | None,
+    expected: str,
+) -> None:
+    snapshot: dict[str, object] = {
+        "groupId": "56825427596@chatroom",
+        "complete": complete,
+        "current": True,
+        "count": 0,
+    }
+    if connection_generation is not None:
+        snapshot["connectionGeneration"] = connection_generation
+
+    with pytest.raises(WeChatAPIContractError, match=expected):
+        WeChatGroupMemberList.parse(
+            {
+                "data": [],
+                "isPartial": True,
+                "source": "native-group-member-snapshot",
+                "snapshot": snapshot,
+                "cursor": "members-10",
+            },
+            group_id="56825427596@chatroom",
+        )
 
 
 def test_wechat_client_rejects_group_members_from_another_group() -> None:
@@ -424,7 +461,7 @@ def test_wechat_client_validates_recall_event_identity() -> None:
 
 
 @pytest.mark.parametrize(
-    ("event_name", "status", "mode", "expected"),
+    ("event_name", "status", "raw", "expected"),
     (
         ("group_member_snapshot", "begin", None, None),
         (
@@ -433,14 +470,35 @@ def test_wechat_client_validates_recall_event_identity() -> None:
             None,
             "56825427596@chatroom",
         ),
-        ("group_member", None, "cache_snapshot", None),
-        ("group_member", None, "delta", "56825427596@chatroom"),
+        ("group_member", None, {"mode": "cache_snapshot"}, None),
+        (
+            "group_member",
+            None,
+            {
+                "mode": "delta",
+                "deltaId": "delta-1",
+                "deltaIndex": "0",
+                "responseCount": "2",
+            },
+            None,
+        ),
+        (
+            "group_member",
+            None,
+            {
+                "mode": "delta",
+                "deltaId": "delta-1",
+                "deltaIndex": "1",
+                "responseCount": "2",
+            },
+            "56825427596@chatroom",
+        ),
     ),
 )
 def test_wechat_identity_events_identify_directory_invalidations(
     event_name: str,
     status: str | None,
-    mode: str | None,
+    raw: dict[str, str] | None,
     expected: str | None,
 ) -> None:
     payload: dict[str, object] = {
@@ -452,12 +510,54 @@ def test_wechat_identity_events_identify_directory_invalidations(
     }
     if status is not None:
         payload["status"] = status
-    if mode is not None:
-        payload["raw"] = {"mode": mode}
+    if raw is not None:
+        payload["raw"] = raw
 
     event = WeChatEvent.parse(payload)
 
     assert event.invalidated_group_id() == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        {"mode": "delta", "deltaIndex": "0", "responseCount": "1"},
+        {
+            "mode": "delta",
+            "deltaId": "delta-1",
+            "deltaIndex": "0",
+            "responseCount": "0",
+        },
+        {
+            "mode": "delta",
+            "deltaId": "delta-1",
+            "deltaIndex": "2",
+            "responseCount": "2",
+        },
+        {
+            "mode": "delta",
+            "deltaId": "delta-1",
+            "deltaIndex": "00",
+            "responseCount": "1",
+        },
+    ),
+)
+def test_wechat_member_delta_rejects_invalid_batch_metadata(
+    raw: dict[str, str],
+) -> None:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "11",
+            "event": "group_member",
+            "connectionGeneration": 41,
+            "groupId": "56825427596@chatroom",
+            "raw": raw,
+        }
+    )
+
+    with pytest.raises(WeChatAPIContractError):
+        event.invalidated_group_id()
 
 
 def test_wechat_user_profile_event_requires_canonical_user_identity() -> None:

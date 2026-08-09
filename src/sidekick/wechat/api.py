@@ -54,6 +54,7 @@ MAX_PROJECTED_SHARED_CHAT_HISTORY_ITEMS = 100
 MAX_SHARED_CHAT_HISTORY_BYTES = 48 * 1024
 MAX_SHARED_CHAT_HISTORY_LABEL_CHARS = 240
 MAX_SHARED_CHAT_HISTORY_CONTENT_CHARS = 4_096
+MAX_GROUP_MEMBER_DELTA_ROWS = 100_000
 
 
 class WeChatAPIError(RuntimeError):
@@ -324,6 +325,9 @@ class WeChatGroupMemberList:
     group_id: str
     members: tuple[WeChatGroupMember, ...]
     cursor: str
+    snapshot_complete: bool
+    snapshot_current: bool
+    snapshot_connection_generation: int | None
 
     @classmethod
     def parse(
@@ -358,16 +362,29 @@ class WeChatGroupMemberList:
         complete = _required_bool(snapshot, "complete")
         current = _required_bool(snapshot, "current")
         count = _required_nonnegative_int(snapshot, "count")
+        if current and not complete:
+            raise WeChatAPIContractError(
+                "WeChat current group member snapshot must be complete"
+            )
         if complete and current and count != len(members):
             raise WeChatAPIContractError(
                 "WeChat group member snapshot count is inconsistent"
             )
-        if current:
-            _required_positive_int(snapshot, "connectionGeneration")
+        connection_generation = _optional_positive_int(
+            snapshot,
+            "connectionGeneration",
+        )
+        if current and connection_generation is None:
+            raise WeChatAPIContractError(
+                "WeChat current group member snapshot generation is missing"
+            )
         return cls(
             group_id=target_group_id,
             members=members,
             cursor=_required_id(payload, "cursor"),
+            snapshot_complete=complete,
+            snapshot_current=current,
+            snapshot_connection_generation=connection_generation,
         )
 
 
@@ -659,7 +676,22 @@ class WeChatEvent:
             group_id = _required_group_id(self.payload, "groupId")
             raw = _required_object(self.payload, "raw")
             mode = _required_enum(raw, "mode", {"cache_snapshot", "delta"})
-            return group_id if mode == "delta" else None
+            if mode == "cache_snapshot":
+                return None
+            _required_id(raw, "deltaId")
+            response_count = _required_bounded_decimal(
+                raw,
+                "responseCount",
+                minimum=1,
+                maximum=MAX_GROUP_MEMBER_DELTA_ROWS,
+            )
+            delta_index = _required_bounded_decimal(
+                raw,
+                "deltaIndex",
+                minimum=0,
+                maximum=response_count - 1,
+            )
+            return group_id if delta_index == response_count - 1 else None
         raise WeChatAPIContractError("Event is not a WeChat group member event")
 
 
@@ -1397,6 +1429,44 @@ def _required_positive_int(payload: Mapping[str, Any], field: str) -> int:
     if value < 1:
         raise WeChatAPIContractError(f"WeChat {field} must be positive")
     return value
+
+
+def _optional_positive_int(
+    payload: Mapping[str, Any],
+    field: str,
+) -> int | None:
+    value = payload.get(field)
+    return None if value is None else _required_positive_int(payload, field)
+
+
+def _required_bounded_decimal(
+    payload: Mapping[str, Any],
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = payload.get(field)
+    maximum_text = str(maximum)
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or (len(value) > 1 and value[0] == "0")
+        or len(value) > len(maximum_text)
+        or (len(value) == len(maximum_text) and value > maximum_text)
+    ):
+        raise WeChatAPIContractError(
+            f"WeChat {field} must be a canonical decimal between "
+            f"{minimum} and {maximum}"
+        )
+    parsed = int(value)
+    if parsed < minimum:
+        raise WeChatAPIContractError(
+            f"WeChat {field} must be a canonical decimal between "
+            f"{minimum} and {maximum}"
+        )
+    return parsed
 
 
 def _required_enum(

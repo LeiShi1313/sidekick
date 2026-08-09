@@ -13,6 +13,7 @@ from sidekick.wechat.ai import (
     WeChatMemoryScopeTargetResolver,
 )
 from sidekick.wechat.api import (
+    WeChatAPIContractError,
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
@@ -168,6 +169,9 @@ async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> Non
                     ),
                 ),
                 cursor="members-first",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
             ),
         )
         await store.refresh_group_members(
@@ -184,6 +188,9 @@ async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> Non
                     ),
                 ),
                 cursor="members-second",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
             ),
         )
 
@@ -212,6 +219,12 @@ async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> Non
             "wxid_alice",
             WeChatUser(id="wxid_alice", display_name="Alice Renamed"),
         )
+        await store.refresh_user(
+            CONNECTOR_KEY,
+            "wxid_alice",
+            WeChatUser(id="wxid_alice", display_name=None),
+        )
+        await store.refresh_user(CONNECTOR_KEY, "wxid_alice", None)
         group_message = await store.get_message(
             CONNECTOR_KEY,
             other_group_id,
@@ -226,6 +239,96 @@ async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> Non
         assert direct_message is not None
         assert group_message.sender_display_name == "Alice Renamed"
         assert direct_message.sender_display_name == "Alice Renamed"
+
+        await store.refresh_users(
+            CONNECTOR_KEY,
+            WeChatUserList(
+                users=(WeChatUser(id="wxid_alice", display_name=None),),
+                cursor="users-partial-omitted-name",
+            ),
+        )
+        await store.refresh_group_members(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            WeChatGroupMemberList(
+                group_id=GROUP_ID,
+                members=(
+                    WeChatGroupMember(
+                        group_id=GROUP_ID,
+                        user_id="wxid_alice",
+                        display_name=None,
+                        nickname=None,
+                    ),
+                ),
+                cursor="members-partial-omitted-name",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
+            ),
+        )
+
+        aliased = await store.get_message(CONNECTOR_KEY, GROUP_ID, "1001")
+        member_fallback = await store.get_message(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            "1004",
+        )
+        direct_message = await store.get_message(
+            CONNECTOR_KEY,
+            direct_chat_id,
+            "1003",
+        )
+        assert aliased is not None
+        assert member_fallback is not None
+        assert direct_message is not None
+        assert aliased.sender_display_name == "Alice in First"
+        assert member_fallback.sender_display_name == "Bob Member"
+        assert direct_message.sender_display_name == "Alice Renamed"
+
+        with pytest.raises(WeChatAPIContractError, match="generation is stale"):
+            await store.refresh_group_members(
+                CONNECTOR_KEY,
+                GROUP_ID,
+                WeChatGroupMemberList(
+                    group_id=GROUP_ID,
+                    members=(),
+                    cursor="members-stale",
+                    snapshot_complete=True,
+                    snapshot_current=True,
+                    snapshot_connection_generation=42,
+                ),
+            )
+
+        await store.refresh_group_members(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            WeChatGroupMemberList(
+                group_id=GROUP_ID,
+                members=(
+                    WeChatGroupMember(
+                        group_id=GROUP_ID,
+                        user_id="wxid_alice",
+                        display_name=None,
+                        nickname=None,
+                    ),
+                ),
+                cursor="members-authoritative",
+                snapshot_complete=True,
+                snapshot_current=True,
+                snapshot_connection_generation=41,
+            ),
+        )
+
+        aliased = await store.get_message(CONNECTOR_KEY, GROUP_ID, "1001")
+        removed_member = await store.get_message(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            "1004",
+        )
+        assert aliased is not None
+        assert removed_member is not None
+        assert aliased.sender_display_name == "Alice in First"
+        assert removed_member.sender_display_name == "wxid_bob"
     finally:
         await store.close()
 

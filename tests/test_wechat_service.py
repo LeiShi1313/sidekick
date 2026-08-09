@@ -193,6 +193,9 @@ class FakeConnectorClient:
                 group_id=CHAT_ID,
                 members=(),
                 cursor="10",
+                snapshot_complete=False,
+                snapshot_current=False,
+                snapshot_connection_generation=None,
             )
         }
         self.user_details: dict[str, WeChatUser | None] = {}
@@ -320,6 +323,9 @@ async def test_wechat_bootstrap_hydrates_readable_sender_labels(tmp_path) -> Non
             ),
         ),
         cursor="10",
+        snapshot_complete=False,
+        snapshot_current=False,
+        snapshot_connection_generation=None,
     )
     store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
     try:
@@ -464,6 +470,9 @@ async def test_wechat_event_pump_refreshes_identity_before_ack(tmp_path) -> None
             ),
         ),
         cursor="10",
+        snapshot_complete=False,
+        snapshot_current=False,
+        snapshot_connection_generation=None,
     )
     store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
     try:
@@ -483,6 +492,9 @@ async def test_wechat_event_pump_refreshes_identity_before_ack(tmp_path) -> None
                 ),
             ),
             cursor="14",
+            snapshot_complete=False,
+            snapshot_current=False,
+            snapshot_connection_generation=None,
         )
 
         result = await WeChatEventPump(
@@ -503,6 +515,46 @@ async def test_wechat_event_pump_refreshes_identity_before_ack(tmp_path) -> None
         assert client.user_detail_reads == ["wxid_alice"]
         assert client.group_member_reads == [CHAT_ID, CHAT_ID]
         assert await store.get_cursor(CONNECTOR_KEY) == "14"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_refreshes_once_at_member_delta_end(tmp_path) -> None:
+    events = tuple(
+        WeChatEvent.parse(
+            {
+                "schemaVersion": "wechat-bridge/v1alpha1",
+                "cursor": str(11 + index),
+                "event": "group_member",
+                "groupId": CHAT_ID,
+                "userId": f"wxid_member_{index}",
+                "connectionGeneration": 41,
+                "raw": {
+                    "mode": "delta",
+                    "deltaId": "delta-1",
+                    "deltaIndex": str(index),
+                    "responseCount": "3",
+                },
+            }
+        )
+        for index in range(3)
+    )
+    client = FakeConnectorClient(events)
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(RecordingHandler(), asyncio.Event())
+
+        assert result == "reconnect"
+        assert client.group_member_reads == [CHAT_ID, CHAT_ID]
+        assert await store.get_cursor(CONNECTOR_KEY) == "13"
     finally:
         await store.close()
 

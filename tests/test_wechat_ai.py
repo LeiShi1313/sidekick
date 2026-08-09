@@ -1115,6 +1115,9 @@ async def test_wechat_manual_memory_command_retains_stored_reply_chain(
                 ),
             ),
             cursor="members-10",
+            snapshot_complete=False,
+            snapshot_current=False,
+            snapshot_connection_generation=None,
         ),
     )
     command_event = WeChatEvent.parse(

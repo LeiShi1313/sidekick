@@ -316,16 +316,17 @@ class WeChatStateRepository:
         now = time.time()
         await connection.execute("BEGIN IMMEDIATE")
         try:
-            await connection.execute(
-                "DELETE FROM wechat_users "
-                "WHERE connector_key = ? AND account_id = ?",
-                (connector_key, account_id),
-            )
             await connection.executemany(
                 """
                 INSERT INTO wechat_users (
                     connector_key, account_id, user_id, display_name, updated_at
                 ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(connector_key, account_id, user_id) DO UPDATE SET
+                    display_name = COALESCE(
+                        excluded.display_name,
+                        wechat_users.display_name
+                    ),
+                    updated_at = excluded.updated_at
                 """,
                 (
                     (
@@ -355,33 +356,31 @@ class WeChatStateRepository:
         connection = self._require_connection()
         state = await self._connector_state(connector_key)
         account_id = str(state["account_id"])
+        if user is None:
+            return
         await connection.execute("BEGIN IMMEDIATE")
         try:
-            if user is None:
-                await connection.execute(
-                    "DELETE FROM wechat_users "
-                    "WHERE connector_key = ? AND account_id = ? AND user_id = ?",
-                    (connector_key, account_id, user_id),
-                )
-            else:
-                await connection.execute(
-                    """
-                    INSERT INTO wechat_users (
-                        connector_key, account_id, user_id,
-                        display_name, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(connector_key, account_id, user_id) DO UPDATE SET
-                        display_name = excluded.display_name,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        connector_key,
-                        account_id,
-                        user.id,
-                        user.display_name,
-                        time.time(),
+            await connection.execute(
+                """
+                INSERT INTO wechat_users (
+                    connector_key, account_id, user_id,
+                    display_name, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(connector_key, account_id, user_id) DO UPDATE SET
+                    display_name = COALESCE(
+                        excluded.display_name,
+                        wechat_users.display_name
                     ),
-                )
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    connector_key,
+                    account_id,
+                    user.id,
+                    user.display_name,
+                    time.time(),
+                ),
+            )
             await connection.commit()
         except BaseException:
             await connection.rollback()
@@ -401,20 +400,53 @@ class WeChatStateRepository:
         connection = self._require_connection()
         state = await self._connector_state(connector_key)
         account_id = str(state["account_id"])
+        generation = int(state["connection_generation"])
+        if members.snapshot_current and not members.snapshot_complete:
+            raise WeChatAPIContractError(
+                "WeChat current group member snapshot is not complete"
+            )
+        if members.snapshot_current and (
+            members.snapshot_connection_generation != generation
+        ):
+            raise WeChatAPIContractError(
+                "WeChat group member snapshot generation is stale"
+            )
+        authoritative = members.snapshot_complete and members.snapshot_current
         now = time.time()
         await connection.execute("BEGIN IMMEDIATE")
         try:
-            await connection.execute(
-                "DELETE FROM wechat_group_members "
-                "WHERE connector_key = ? AND account_id = ? AND group_id = ?",
-                (connector_key, account_id, group_id),
-            )
+            existing_user_ids: set[str] = set()
+            if authoritative:
+                cursor = await connection.execute(
+                    """
+                    SELECT user_id
+                    FROM wechat_group_members
+                    WHERE connector_key = ? AND account_id = ? AND group_id = ?
+                    """,
+                    (connector_key, account_id, group_id),
+                )
+                existing_user_ids = {
+                    str(row["user_id"]) async for row in cursor
+                }
+                await cursor.close()
             await connection.executemany(
                 """
                 INSERT INTO wechat_group_members (
                     connector_key, account_id, group_id, user_id,
                     display_name, nickname, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    connector_key, account_id, group_id, user_id
+                ) DO UPDATE SET
+                    display_name = COALESCE(
+                        excluded.display_name,
+                        wechat_group_members.display_name
+                    ),
+                    nickname = COALESCE(
+                        excluded.nickname,
+                        wechat_group_members.nickname
+                    ),
+                    updated_at = excluded.updated_at
                 """,
                 (
                     (
@@ -429,6 +461,21 @@ class WeChatStateRepository:
                     for member in members.members
                 ),
             )
+            if authoritative:
+                retained_user_ids = {
+                    member.user_id for member in members.members
+                }
+                await connection.executemany(
+                    """
+                    DELETE FROM wechat_group_members
+                    WHERE connector_key = ? AND account_id = ?
+                      AND group_id = ? AND user_id = ?
+                    """,
+                    (
+                        (connector_key, account_id, group_id, user_id)
+                        for user_id in existing_user_ids - retained_user_ids
+                    ),
+                )
             await connection.commit()
         except BaseException:
             await connection.rollback()
