@@ -885,6 +885,7 @@ export class PiEngine {
         privacyOptions,
         userMessageContent: buildRunPrompt({
           ...request,
+          context: [],
           continuation: request.sessionId !== null,
           identityAliasKey: this.config.identityAliasKey,
         }),
