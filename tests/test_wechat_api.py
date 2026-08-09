@@ -188,6 +188,41 @@ def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
     assert members.snapshot_connection_generation == 41
 
 
+def test_wechat_group_member_directory_filters_native_placeholder_id() -> None:
+    members = WeChatGroupMemberList.parse(
+        {
+            "data": [
+                {
+                    "groupId": "56825427596@chatroom",
+                    "userId": "wxid_alice",
+                    "displayName": "Alice",
+                    "isPartial": False,
+                },
+                {
+                    "groupId": "56825427596@chatroom",
+                    "userId": "_1234567",
+                    "displayName": "Unsupported native identity",
+                    "isPartial": False,
+                },
+            ],
+            "isPartial": True,
+            "source": "native-group-member-snapshot",
+            "snapshot": {
+                "id": "members-10",
+                "groupId": "56825427596@chatroom",
+                "complete": True,
+                "current": True,
+                "count": 2,
+                "connectionGeneration": 41,
+            },
+            "cursor": "members-10",
+        },
+        group_id="56825427596@chatroom",
+    )
+
+    assert [member.user_id for member in members.members] == ["wxid_alice"]
+
+
 @pytest.mark.parametrize(
     ("identity_id", "expected"),
     (

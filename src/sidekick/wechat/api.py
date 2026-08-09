@@ -352,10 +352,15 @@ class WeChatGroupMemberList:
                 "WeChat group member directory must be partial"
             )
         _required_text(payload, "source")
-        members = tuple(
-            WeChatGroupMember.parse(_object(row, "group member"))
-            for row in _required_array(payload, "data")
-        )
+        rows = _required_array(payload, "data")
+        members: list[WeChatGroupMember] = []
+        for value in rows:
+            row = _object(value, "group member")
+            try:
+                _user_id(row.get("userId"), "userId")
+            except WeChatAPIContractError:
+                continue
+            members.append(WeChatGroupMember.parse(row))
         if any(member.group_id != target_group_id for member in members):
             raise WeChatAPIContractError(
                 "WeChat group member directory contains a different group"
@@ -376,7 +381,7 @@ class WeChatGroupMemberList:
             raise WeChatAPIContractError(
                 "WeChat current group member snapshot must be complete"
             )
-        if complete and current and count != len(members):
+        if complete and current and count != len(rows):
             raise WeChatAPIContractError(
                 "WeChat group member snapshot count is inconsistent"
             )
@@ -390,7 +395,7 @@ class WeChatGroupMemberList:
             )
         return cls(
             group_id=target_group_id,
-            members=members,
+            members=tuple(members),
             cursor=_required_id(payload, "cursor"),
             snapshot_complete=complete,
             snapshot_current=current,
