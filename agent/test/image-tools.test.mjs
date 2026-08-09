@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createImageTools } from "../src/image-tools.mjs";
+import {
+  createBoundedImageFetch,
+  createImageGenerationGate,
+  createImageTools,
+} from "../src/image-tools.mjs";
 
 
 const JPEG_BYTES = Buffer.from([
@@ -113,6 +117,100 @@ test("does not expose provider failures to the model", async () => {
     app.tool.execute("call-image-1", { prompt: "A landscape" }),
     /^Error: Image generation is unavailable$/,
   );
+});
+
+
+test("passes cancellation to a pending provider request", async () => {
+  const controller = new AbortController();
+  let providerSignal;
+  const client = {
+    images: {
+      async generate(_request, options) {
+        providerSignal = options.signal;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener(
+            "abort",
+            () => reject(options.signal.reason),
+            { once: true },
+          );
+        });
+      },
+    },
+  };
+  const [tool] = createImageTools({
+    client,
+    model: "gpt-image-2",
+    onArtifact: () => assert.fail(),
+  });
+
+  const pending = tool.execute(
+    "call-image-1",
+    { prompt: "A landscape" },
+    controller.signal,
+  );
+  controller.abort(new Error("cancelled by user"));
+
+  await assert.rejects(pending, /cancelled by user/i);
+  assert.equal(providerSignal, controller.signal);
+});
+
+
+test("rejects a chunked provider response before it can grow without bound", async () => {
+  const boundedFetch = createBoundedImageFetch(async () => {
+    const body = new ReadableStream({
+      start(controller) {
+        for (let index = 0; index < 8; index += 1) {
+          controller.enqueue(Buffer.alloc(1024 * 1024));
+        }
+        controller.close();
+      },
+    });
+    return new Response(body, { status: 200 });
+  });
+
+  await assert.rejects(
+    boundedFetch("https://provider.example/v1/images/generations"),
+    /oversized response/i,
+  );
+});
+
+
+test("allows only one image provider request at a time", async () => {
+  let finish;
+  let calls = 0;
+  const providerResult = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const client = {
+    images: {
+      async generate() {
+        calls += 1;
+        return providerResult;
+      },
+    },
+  };
+  const gate = createImageGenerationGate();
+  const options = {
+    client,
+    model: "gpt-image-2",
+    onArtifact: () => {},
+    tryAcquire: () => gate.tryAcquire(),
+  };
+  const [first] = createImageTools(options);
+  const [second] = createImageTools(options);
+
+  const pending = first.execute("call-image-1", { prompt: "A landscape" });
+  await assert.rejects(
+    second.execute("call-image-2", { prompt: "Another landscape" }),
+    /busy/i,
+  );
+  assert.equal(calls, 1);
+
+  finish({ data: [{ b64_json: JPEG_BYTES.toString("base64") }] });
+  await pending;
+  const [third] = createImageTools(options);
+  await third.execute("call-image-3", { prompt: "After the first" });
+  assert.equal(calls, 2);
 });
 
 

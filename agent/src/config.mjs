@@ -123,7 +123,7 @@ export function loadConfig() {
       apiKey: required("AI_API_KEY"),
       identityAliasKey: requiredSecret("PI_IDENTITY_ALIAS_KEY"),
       model: required("AI_CHAT_MODEL"),
-      imageModel: process.env.AI_IMAGE_MODEL?.trim() || "gpt-image-2",
+      imageModel: process.env.AI_IMAGE_MODEL?.trim() || null,
       reasoningEffort,
       maxOutputTokens: integer("AI_MAX_OUTPUT_TOKENS", 4_000, {
         max: 100_000,

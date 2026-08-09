@@ -17,6 +17,10 @@ from agent_playground.app import (
 PI_TOKEN = "private-pi-token-that-is-long-enough"
 MEMORY_TOKEN = "private-memory-token-that-is-long-enough"
 CHANNEL_TOKEN = "private-channel-token-that-is-long-enough"
+PNG_DATA = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42Y"
+    "AAAAASUVORK5CYII="
+)
 
 
 async def start(app: web.Application) -> tuple[web.AppRunner, str]:
@@ -125,6 +129,13 @@ async def dependencies(
                 "phase": "completed",
                 "tool": "memory_reflect",
                 "summary": "Memory reflection completed",
+            },
+            {
+                "type": "attachment",
+                "filename": "generated-image.png",
+                "mimeType": "image/png",
+                "displayAs": "image",
+                "data": PNG_DATA,
             },
             {"type": "text_delta", "delta": "Alice owns it.", "reset": True},
             {
@@ -611,6 +622,14 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
         assert events[-1]["answer"] == "Alice owns it."
         assert events[1]["type"] == "memory_snapshot"
         assert events[1]["memories"][0]["id"] == "memory-1"
+        attachment = next(event for event in events if event["type"] == "attachment")
+        assert attachment == {
+            "type": "attachment",
+            "filename": "generated-image.png",
+            "mimeType": "image/png",
+            "displayAs": "image",
+            "data": PNG_DATA,
+        }
 
         assert len(received["recalls"]) == 1
         pi_request = received["runs"][0]
@@ -810,6 +829,9 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
             async with session.get(f"{playground_url}/") as response:
                 markup = await response.text()
                 assert response.status == 200
+                assert "img-src 'self' data:" in response.headers[
+                    "Content-Security-Policy"
+                ]
                 assert '<section id="audit-summary"' in markup
                 assert 'aria-live="polite"' in markup
 
@@ -819,6 +841,7 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 assert "textContent" in script
                 assert 'if (event.type === "run_started") return;' in script
                 assert 'if (event.type === "memory_snapshot")' in script
+                assert 'if (event.type === "attachment")' in script
                 assert (
                     "state.sessionId = event.sessionId || state.sessionId" not in script
                 )
@@ -835,6 +858,7 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 assert response.status == 200
                 assert ".trace-facts" in styles
                 assert ".trace-step" in styles
+                assert ".generated-attachment" in styles
     finally:
         assert received["runs"] == []
         await playground_runner.cleanup()
@@ -862,6 +886,37 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
     ),
 )
 def test_playground_rejects_malformed_pi_memory_events(event):
+    with pytest.raises(UpstreamUnavailable, match="malformed events"):
+        _parse_pi_event(json.dumps(event).encode())
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        {
+            "type": "attachment",
+            "filename": "generated-image.png",
+            "mimeType": "image/png",
+            "displayAs": "image",
+            "data": "not-base64",
+        },
+        {
+            "type": "attachment",
+            "filename": "../generated-image.png",
+            "mimeType": "image/png",
+            "displayAs": "image",
+            "data": PNG_DATA,
+        },
+        {
+            "type": "attachment",
+            "filename": "generated-image.png",
+            "mimeType": "text/html",
+            "displayAs": "image",
+            "data": PNG_DATA,
+        },
+    ),
+)
+def test_playground_rejects_malformed_pi_attachments(event):
     with pytest.raises(UpstreamUnavailable, match="malformed events"):
         _parse_pi_event(json.dumps(event).encode())
 

@@ -17,7 +17,7 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_attachments import AttachmentDescription
-from sidekick.chat.attachments import ModelInputImage
+from sidekick.chat.attachments import ModelInputImage, OutboundAttachment
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 
 
@@ -78,8 +78,9 @@ class FakeMessage:
     async def get_reply_message(self):
         return self._reply_to
 
-    async def reply(self, text: str, **kwargs):
-        answer = FakeAnswer(text, self.chat_id, self)
+    async def reply(self, text: str | None = None, **kwargs):
+        answer = FakeAnswer(text or "", self.chat_id, self)
+        answer.file = kwargs.get("file")
         self.replies.append(answer)
         return answer
 
@@ -120,6 +121,7 @@ class FakeStore:
     def __init__(self):
         self.markers: dict[tuple[str, int], AIAnswerMarker] = {}
         self.ai_command_prefixes: dict[str, str] = {}
+        self.excluded: dict[tuple[str, int], str] = {}
 
     async def get_answer(self, scope_id: str, answer_message_id: int):
         return self.markers.get((scope_id, answer_message_id))
@@ -138,6 +140,14 @@ class FakeStore:
 
     async def save_answer(self, marker: AIAnswerMarker):
         self.markers[(marker.scope_id, marker.answer_message_id)] = marker
+
+    async def mark_memory_excluded_message(
+        self,
+        scope_id: str,
+        message_id: int,
+        kind: str,
+    ):
+        self.excluded[(scope_id, message_id)] = kind
 
     async def get_ai_trigger_command_prefixes(self, scope_id, message_ids):
         return {
@@ -266,6 +276,65 @@ async def test_trigger_in_reply_chain_labels_ancestors_as_untrusted_context():
     marker = next(iter(store.markers.values()))
     assert marker.agent_session_id == "session-1"
     assert marker.agent_entry_id == "entry-1"
+
+
+@pytest.mark.asyncio
+async def test_generated_image_is_excluded_and_can_anchor_a_continuation(
+    make_png,
+):
+    image = OutboundAttachment(
+        data=make_png(),
+        filename="generated-image.png",
+        mime_type="image/png",
+        display_as="image",
+    )
+
+    class ImageGateway(FakeGateway):
+        async def run(self, request):
+            self.requests.append(request)
+            session_id = request.session_id or "session-image"
+            if len(self.requests) == 1:
+                yield AgentEvent(type="run_started", session_id=session_id)
+                yield AgentEvent(type="attachment", attachment=image)
+                answer = "Here is the generated image."
+            else:
+                yield AgentEvent(type="run_started", session_id=session_id)
+                answer = "I kept the same thread."
+            yield AgentEvent(type="text_delta", delta=answer, reset=True)
+            yield AgentEvent(
+                type="run_completed",
+                session_id=session_id,
+                entry_id=f"entry-{len(self.requests)}",
+                answer=answer,
+            )
+
+    gateway = ImageGateway([])
+    handler, store = make_handler(gateway)
+    trigger = FakeMessage("/ai generate an image")
+
+    assert await handler.handle(trigger) is True
+
+    text_answer, image_answer = trigger.replies
+    scope_id = TELEGRAM_IDENTITY_CODEC.scope_id(trigger.chat_id)
+    assert store.excluded == {
+        (scope_id, text_answer.id): "ai-answer",
+        (scope_id, image_answer.id): "ai-attachment",
+    }
+    assert store.markers[(scope_id, image_answer.id)] == AIAnswerMarker(
+        scope_id=scope_id,
+        answer_message_id=image_answer.id,
+        trigger_message_id=trigger.id,
+        command_prefix="/ai",
+        requester_id=TELEGRAM_IDENTITY_CODEC.actor_id(trigger.sender_id),
+        parent_answer_message_id=None,
+        agent_session_id="session-image",
+        agent_entry_id="entry-1",
+    )
+
+    follow_up = FakeMessage("make it more colorful", reply_to=image_answer)
+    assert await handler.handle(follow_up) is True
+    assert gateway.requests[1].session_id == "session-image"
+    assert gateway.requests[1].parent_entry_id == "entry-1"
 
 
 @pytest.mark.asyncio

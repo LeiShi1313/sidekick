@@ -334,12 +334,14 @@ class PiAgentGateway:
             buffer = b""
             async for chunk in response.content.iter_chunked(4096):
                 buffer += chunk
-                if len(buffer) > MAX_AGENT_ATTACHMENT_EVENT_BYTES:
-                    raise RuntimeError("Pi agent returned an oversized event")
                 while b"\n" in buffer:
                     raw_line, buffer = buffer.split(b"\n", 1)
                     if not raw_line.strip():
                         continue
+                    if len(raw_line) > MAX_AGENT_ATTACHMENT_EVENT_BYTES:
+                        raise RuntimeError(
+                            "Pi agent returned an oversized event"
+                        )
                     event = _parse_agent_event(raw_line)
                     if terminal:
                         raise RuntimeError(
@@ -347,6 +349,8 @@ class PiAgentGateway:
                         )
                     terminal = event.type in {"run_completed", "run_failed"}
                     yield event
+                if len(buffer) > MAX_AGENT_ATTACHMENT_EVENT_BYTES:
+                    raise RuntimeError("Pi agent returned an oversized event")
             if buffer.strip():
                 event = _parse_agent_event(buffer)
                 if terminal:
@@ -806,6 +810,7 @@ class AnswerResult:
     message: SentMessage
     text: str
     succeeded: bool
+    attachment_message: SentMessage | None = None
     session_id: str | None = None
     entry_id: str | None = None
     failure_code: str | None = None
@@ -895,6 +900,7 @@ class AIResponder:
             )
         text = ""
         attachment: OutboundAttachment | None = None
+        attachment_message: SentMessage | None = None
         session_id: str | None = None
         entry_id: str | None = None
         try:
@@ -990,7 +996,17 @@ class AIResponder:
             succeeded = bool(text and session_id and entry_id)
             if succeeded and attachment is not None:
                 try:
-                    await self._transport.reply_attachment(trigger, attachment)
+                    attachment_message = await self._transport.reply_attachment(
+                        trigger,
+                        attachment,
+                    )
+                    if (
+                        attachment.display_as == "image"
+                        and attachment_message is None
+                    ):
+                        raise RuntimeError(
+                            "Chat transport returned no image message identity"
+                        )
                 except Exception as exc:
                     self._log_failure(exc)
                     failure = (
@@ -1010,6 +1026,7 @@ class AIResponder:
                 message=answer,
                 text=final_text,
                 succeeded=succeeded,
+                attachment_message=attachment_message,
                 session_id=session_id,
                 entry_id=entry_id,
                 failure_code=None if succeeded else "EMPTY_RESPONSE",
@@ -4436,11 +4453,17 @@ class AIConversationHandler:
                 session_id=terminal_session_id,
                 error_code=terminal_error_code,
             )
-            await self._mark_memory_excluded(
-                scope_id,
-                result.message.id,
-                "ai-answer",
-            )
+            answer_messages = [(result.message, "ai-answer")]
+            if result.attachment_message is not None:
+                answer_messages.append(
+                    (result.attachment_message, "ai-attachment")
+                )
+            for answer_message, kind in answer_messages:
+                await self._mark_memory_excluded(
+                    scope_id,
+                    answer_message.id,
+                    kind,
+                )
             if self._active_runs.get(actor_id) == run_id:
                 self._active_runs.pop(actor_id, None)
             if self._active_request_runs.get(active_request_key) == run_id:
@@ -4448,18 +4471,19 @@ class AIConversationHandler:
             if result.succeeded:
                 assert result.session_id is not None
                 assert result.entry_id is not None
-                await self._store.save_answer(
-                    AIAnswerMarker(
-                        scope_id=scope_id,
-                        answer_message_id=result.message.id,
-                        trigger_message_id=message.id,
-                        command_prefix=ai_prefix,
-                        requester_id=actor_id,
-                        parent_answer_message_id=parent_answer_id,
-                        agent_session_id=result.session_id,
-                        agent_entry_id=result.entry_id,
+                for answer_message, _kind in answer_messages:
+                    await self._store.save_answer(
+                        AIAnswerMarker(
+                            scope_id=scope_id,
+                            answer_message_id=answer_message.id,
+                            trigger_message_id=message.id,
+                            command_prefix=ai_prefix,
+                            requester_id=actor_id,
+                            parent_answer_message_id=parent_answer_id,
+                            agent_session_id=result.session_id,
+                            agent_entry_id=result.entry_id,
+                        )
                     )
-                )
                 await self._rate_limiter.release(
                     scope_id=scope_id,
                     actor_id=actor_id,

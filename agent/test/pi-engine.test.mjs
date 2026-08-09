@@ -319,10 +319,12 @@ test("lists bounded provider models and selects one for a single run", async () 
     (body, response) => sendText(response, body.model),
     {
       imageModel: "gpt-image-2",
-      imageClient: { images: { generate: async () => assert.fail() } },
     },
   );
   try {
+    assert.equal(app.engine.imageClient.maxRetries, 0);
+    assert.equal(app.engine.imageClient.logLevel, "off");
+    assert.notEqual(app.engine.imageClient.logger, console);
     assert.deepEqual(await app.engine.listModels(), {
       defaultModel: "test-model",
       models: ["alternate-model", "test-model"],
@@ -383,6 +385,18 @@ test("passes one image to the model without persisting or auditing its bytes", a
       1,
     );
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
+test("keeps the known image-only model out of chat selection when disabled", async () => {
+  const app = await fixture((body, response) => sendText(response, body.model));
+  try {
+    assert.deepEqual(await app.engine.listModels(), {
+      defaultModel: "test-model",
+      models: ["alternate-model", "test-model"],
+    });
   } finally {
     await app.close();
   }

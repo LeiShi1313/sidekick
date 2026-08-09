@@ -149,11 +149,12 @@ function addMessage(role, text = "") {
   const row = node("article", null, `message ${role}`);
   row.append(node("div", role === "user" ? "You" : state.mode === "agent" ? "Pi Agent" : "LLM", "message-author"));
   const body = node("pre", text, "message-body");
-  row.append(body);
+  const media = node("div", null, "message-media");
+  row.append(body, media);
   elements.transcript.append(row);
   elements.emptyChat.hidden = true;
   elements.transcript.scrollTop = elements.transcript.scrollHeight;
-  return { message, body };
+  return { message, body, media };
 }
 
 function recentConversation() {
@@ -257,6 +258,14 @@ function handleEvent(event, assistant) {
     return;
   }
   if (event.type === "run_started") return;
+  if (event.type === "attachment") {
+    const generated = node("img", null, "generated-attachment");
+    generated.alt = event.filename;
+    generated.src = `data:${event.mimeType};base64,${event.data}`;
+    assistant.media.replaceChildren(generated);
+    elements.transcript.scrollTop = elements.transcript.scrollHeight;
+    return;
+  }
   if (event.type === "tool_snapshot") {
     state.tools.push(event);
     setRunning(true, event.summary || "Using tool");

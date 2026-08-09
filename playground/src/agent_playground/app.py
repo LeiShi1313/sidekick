@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import json
@@ -36,6 +37,11 @@ _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _DOCUMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:@_.%-]{0,511}$")
 _CHANNEL_FILTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MAX_UPSTREAM_BYTES = 64 * 1024 * 1024
+_MAX_PI_TEXT_EVENT_BYTES = 256_000
+_MAX_PI_ATTACHMENT_BYTES = 5 * 1024 * 1024
+_MAX_PI_ATTACHMENT_EVENT_BYTES = (
+    ((_MAX_PI_ATTACHMENT_BYTES + 2) // 3) * 4 + 2_048
+)
 _LOCALHOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _HOST_RE = re.compile(
     rf"^(?:(?:{_LOCALHOST_LABEL}\.)*localhost|127\.0\.0\.1|\[::1\])"
@@ -47,7 +53,8 @@ _PRIVATE_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; base-uri 'none'; connect-src 'self'; "
         "font-src 'self'; form-action 'none'; frame-ancestors 'none'; "
-        "img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'"
+        "img-src 'self' data:; object-src 'none'; script-src 'self'; "
+        "style-src 'self'"
     ),
     "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
@@ -344,14 +351,18 @@ class PlaygroundData:
                 buffer = b""
                 async for chunk in response.content.iter_chunked(4096):
                     buffer += chunk
-                    if len(buffer) > 256_000:
-                        raise UpstreamUnavailable(
-                            "Pi agent returned an oversized event"
-                        )
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         if line.strip():
+                            if len(line) > _MAX_PI_ATTACHMENT_EVENT_BYTES:
+                                raise UpstreamUnavailable(
+                                    "Pi agent returned an oversized event"
+                                )
                             yield _parse_pi_event(line)
+                    if len(buffer) > _MAX_PI_ATTACHMENT_EVENT_BYTES:
+                        raise UpstreamUnavailable(
+                            "Pi agent returned an oversized event"
+                        )
                 if buffer.strip():
                     yield _parse_pi_event(buffer)
         except (aiohttp.ClientError, TimeoutError) as exc:
@@ -1075,6 +1086,10 @@ def _parse_pi_event(raw: bytes) -> dict[str, Any]:
     event_type = value.get("type")
     if not isinstance(event_type, str):
         raise UpstreamUnavailable("Pi agent returned malformed events")
+    if event_type != "attachment" and len(raw) > _MAX_PI_TEXT_EVENT_BYTES:
+        raise UpstreamUnavailable("Pi agent returned an oversized event")
+    if event_type == "attachment":
+        return _parse_pi_attachment(value)
     if event_type == "memory_snapshot":
         primary_bank_id = value.get("primaryBankId")
         queries = value.get("queries")
@@ -1111,6 +1126,66 @@ def _parse_pi_event(raw: bytes) -> dict[str, Any]:
             raise UpstreamUnavailable("Pi agent returned malformed events")
         result[field] = supplied
     return result
+
+
+def _parse_pi_attachment(value: dict[str, Any]) -> dict[str, Any]:
+    if set(value) != {
+        "type",
+        "filename",
+        "mimeType",
+        "displayAs",
+        "data",
+    }:
+        raise UpstreamUnavailable("Pi agent returned malformed events")
+    filename = value.get("filename")
+    mime_type = value.get("mimeType")
+    encoded = value.get("data")
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or filename != filename.strip()
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in filename
+        )
+        or len(filename.encode("utf-8")) > 255
+        or value.get("displayAs") != "image"
+        or mime_type not in {"image/jpeg", "image/png"}
+        or not isinstance(encoded, str)
+    ):
+        raise UpstreamUnavailable("Pi agent returned malformed events")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise UpstreamUnavailable("Pi agent returned malformed events") from exc
+    if (
+        not data
+        or len(data) > _MAX_PI_ATTACHMENT_BYTES
+        or base64.b64encode(data).decode("ascii") != encoded
+    ):
+        raise UpstreamUnavailable("Pi agent returned malformed events")
+    if mime_type == "image/png":
+        valid_image = data.startswith(b"\x89PNG\r\n\x1a\n") and filename.lower().endswith(
+            ".png"
+        )
+    else:
+        valid_image = (
+            data.startswith(b"\xff\xd8\xff")
+            and data.endswith(b"\xff\xd9")
+            and filename.lower().endswith((".jpg", ".jpeg"))
+        )
+    if not valid_image:
+        raise UpstreamUnavailable("Pi agent returned malformed events")
+    return {
+        "type": "attachment",
+        "filename": filename,
+        "mimeType": mime_type,
+        "displayAs": "image",
+        "data": encoded,
+    }
 
 
 def _parse_snapshot_memory(value: Any) -> dict[str, Any]:

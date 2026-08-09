@@ -20,7 +20,11 @@ from sidekick.ai import (
     PiAgentGateway,
 )
 from sidekick.ai_attachments import AttachmentAnalysisRequest
-from sidekick.chat.attachments import ModelInputImage, OutboundAttachment
+from sidekick.chat.attachments import (
+    MAX_OUTBOUND_ATTACHMENT_BYTES,
+    ModelInputImage,
+    OutboundAttachment,
+)
 
 
 def model_image_bytes() -> bytes:
@@ -274,6 +278,66 @@ async def test_pi_gateway_streams_one_validated_attachment(make_jpeg) -> None:
         mime_type="image/jpeg",
         display_as="image",
     )
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_accepts_a_maximum_attachment_next_to_another_event() -> None:
+    attachment_data = b"x" * MAX_OUTBOUND_ATTACHMENT_BYTES
+
+    async def runs(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
+        await response.prepare(request)
+        events = (
+            {
+                "type": "text_delta",
+                "delta": "p" * 1_300,
+                "reset": True,
+            },
+            {
+                "type": "attachment",
+                "filename": "generated.bin",
+                "mimeType": "application/octet-stream",
+                "displayAs": "file",
+                "data": base64.b64encode(attachment_data).decode("ascii"),
+            },
+            {
+                "type": "text_delta",
+                "delta": "p" * 4_000,
+                "reset": True,
+            },
+            {
+                "type": "run_completed",
+                "sessionId": "session-1",
+                "entryId": "entry-1",
+                "answer": "Attached.",
+            },
+        )
+        payload = b"".join(json.dumps(event).encode() + b"\n" for event in events)
+        await response.write(payload)
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
+    try:
+        events = [event async for event in gateway.run(run_request())]
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert [event.type for event in events] == [
+        "text_delta",
+        "attachment",
+        "text_delta",
+        "run_completed",
+    ]
+    assert events[1].attachment is not None
+    assert len(events[1].attachment.data) == MAX_OUTBOUND_ATTACHMENT_BYTES
+    assert events[3].answer == "Attached."
 
 
 @pytest.mark.asyncio

@@ -210,7 +210,8 @@ async def test_telegram_transport_replies_with_one_attachment(
 
     result = await TelegramChatTransport().reply_attachment(message, attachment)
 
-    assert result is None
+    assert isinstance(result, FakeAnswer)
+    assert result.id == 100
     assert message.observed == {
         "name": attachment.filename,
         "data": attachment.data,
@@ -245,6 +246,7 @@ async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
     class AttachmentTransport:
         def __init__(self):
             self.attachments = []
+            self.attachment_answer = SimpleNamespace(id=101, text=None)
 
         async def reply(self, _message, text, *, presentation):
             assert presentation == "plain"
@@ -256,6 +258,7 @@ async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
 
         async def reply_attachment(self, message, supplied):
             self.attachments.append((message, supplied))
+            return self.attachment_answer
 
     trigger = FakeMessage("/ai generate an image")
     transport = AttachmentTransport()
@@ -265,6 +268,7 @@ async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
 
     assert result.succeeded is True
     assert result.text == "Here is the generated image."
+    assert result.attachment_message is transport.attachment_answer
     assert transport.attachments == [(trigger, attachment)]
 
 
@@ -322,6 +326,59 @@ async def test_responder_reports_generated_attachment_delivery_failure(
     assert result.text == (
         "AI generated an attachment, but delivery failed. Try again later."
     )
+
+
+@pytest.mark.asyncio
+async def test_responder_does_not_deliver_an_attachment_from_a_failed_run(
+    make_jpeg,
+) -> None:
+    attachment = OutboundAttachment(
+        data=make_jpeg(),
+        filename="generated-image.jpg",
+        mime_type="image/jpeg",
+        display_as="image",
+    )
+
+    class FailedGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="attachment", attachment=attachment)
+            yield AgentEvent(
+                type="run_failed",
+                code="AGENT_ERROR",
+                message="private failure",
+            )
+
+    class TrackingTransport:
+        def __init__(self):
+            self.attachments = []
+
+        async def reply(self, _message, text, *, presentation):
+            return FakeAnswer(text)
+
+        async def update(self, message, text, *, presentation, wait):
+            message.text = text
+            return True
+
+        async def reply_attachment(self, _message, supplied):
+            self.attachments.append(supplied)
+            return SimpleNamespace(id=101, text=None)
+
+    transport = TrackingTransport()
+    responder = AIResponder(FailedGateway(), transport=transport)
+
+    result = await responder.answer(
+        FakeMessage("/ai generate an image"),
+        make_request("generate an image"),
+    )
+
+    assert result.succeeded is False
+    assert result.failure_code == "AGENT_ERROR"
+    assert transport.attachments == []
 
 
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:

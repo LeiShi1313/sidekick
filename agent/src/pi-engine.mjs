@@ -17,7 +17,12 @@ import OpenAI from "openai";
 import { Type } from "typebox";
 
 import { executeJavaScript } from "./code-exec.mjs";
-import { createImageTools, IMAGE_TOOL_NAME } from "./image-tools.mjs";
+import {
+  createBoundedImageFetch,
+  createImageGenerationGate,
+  createImageTools,
+  IMAGE_TOOL_NAME,
+} from "./image-tools.mjs";
 import { retrieveMemoryContext } from "./memory-context.mjs";
 import { createMemoryTools, MEMORY_TOOL_NAMES } from "./memory-tools.mjs";
 import { isModelId } from "./model-id.mjs";
@@ -43,6 +48,12 @@ import { constrainWebTools } from "./web-tools.mjs";
 
 const PROVIDER = "openai-compatible";
 const MAX_CATALOG_MODELS = 256;
+const SILENT_PROVIDER_LOGGER = Object.freeze({
+  debug() {},
+  error() {},
+  info() {},
+  warn() {},
+});
 const RESTRICTED_TOOLS = Object.freeze([
   "web_search",
   "fetch_content",
@@ -454,6 +465,8 @@ export class PiEngine {
     this.activeRuns = new Map();
     this.locks = new KeyedLock();
     this.codeTool = createCodeTool();
+    this.imageGenerationGate =
+      config.imageGenerationGate ?? createImageGenerationGate();
     this.imageClient =
       config.imageClient ??
       (config.imageModel
@@ -461,7 +474,10 @@ export class PiEngine {
             apiKey: config.apiKey,
             baseURL: config.baseUrl.replace(/\/$/, ""),
             timeout: config.imageRequestTimeoutMs,
-            maxRetries: 1,
+            maxRetries: 0,
+            fetch: createBoundedImageFetch(config.imageFetch),
+            logLevel: "off",
+            logger: SILENT_PROVIDER_LOGGER,
           })
         : null);
     this.sessionHistory =
@@ -545,7 +561,11 @@ export class PiEngine {
     }
     const models = new Set([this.model.id]);
     for (const item of payload.data) {
-      if (isModelId(item?.id) && item.id !== this.config.imageModel) {
+      if (
+        isModelId(item?.id) &&
+        item.id !== "gpt-image-2" &&
+        item.id !== this.config.imageModel
+      ) {
         models.add(item.id);
       }
     }
@@ -851,6 +871,7 @@ export class PiEngine {
         onArtifact: (toolCallId, artifact) => {
           generatedArtifacts.set(toolCallId, artifact);
         },
+        tryAcquire: () => this.imageGenerationGate.tryAcquire(),
       });
       const toolNames = toolNamesForPolicy(
         request.toolPolicy,

@@ -84,4 +84,7 @@ test("loads the standalone agent configuration without Sidekick names", () => {
   delete process.env.MEMORY_API_TOKEN;
   assert.throws(() => loadConfig(), /MEMORY_API_TOKEN/);
   process.env.MEMORY_API_TOKEN = "memory-api-token-that-is-long-enough";
+
+  delete process.env.AI_IMAGE_MODEL;
+  assert.equal(loadConfig().engine.imageModel, null);
 });
