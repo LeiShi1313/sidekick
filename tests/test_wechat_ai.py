@@ -31,6 +31,7 @@ from sidekick.ai_memory_ingestion import (
     MemoryIngestionSettings,
 )
 from sidekick.ai_memory_segments import MemorySegmentationSettings
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.wechat.ai import (
     WECHAT_IDENTITY_CODEC,
     WeChatChatTransport,
@@ -71,6 +72,7 @@ class RecordingConnectorClient:
     def __init__(self, responses: tuple[object, ...]):
         self.responses = list(responses)
         self.calls: list[dict[str, str | None]] = []
+        self.attachment_calls: list[dict[str, object]] = []
 
     async def send_text_and_wait(
         self,
@@ -86,6 +88,27 @@ class RecordingConnectorClient:
                 "to": to,
                 "content": content,
                 "reply_to_message_id": reply_to_message_id,
+            }
+        )
+        if not self.responses:
+            raise AssertionError("No WeChat send response prepared")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def send_attachment_and_wait(
+        self,
+        *,
+        request_id,
+        to,
+        attachment,
+    ):
+        self.attachment_calls.append(
+            {
+                "request_id": request_id,
+                "to": to,
+                "attachment": attachment,
             }
         )
         if not self.responses:
@@ -369,6 +392,46 @@ async def test_wechat_transport_uses_stable_request_id_for_same_trigger(
     assert first.id == second.id == "7158246912028861544"
     assert client.calls[0]["request_id"] == client.calls[1]["request_id"]
     assert client.calls[0]["request_id"].startswith("sidekick.wechat.reply.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display_as", ("image", "file"))
+async def test_wechat_transport_replies_with_one_stably_identified_attachment(
+    tmp_path,
+    display_as,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient(
+        (
+            submitted(message_id="7158246912028861544"),
+            submitted(message_id="7158246912028861544"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    attachment = OutboundAttachment(
+        data=b"attachment-bytes",
+        filename="answer.png" if display_as == "image" else "answer.txt",
+        mime_type="image/png" if display_as == "image" else "text/plain",
+        display_as=display_as,
+    )
+    try:
+        first = await transport.reply_attachment(trigger, attachment)
+        second = await transport.reply_attachment(trigger, attachment)
+    finally:
+        await store.close()
+
+    assert first is second is None
+    assert client.attachment_calls[0] == client.attachment_calls[1]
+    assert client.attachment_calls[0]["request_id"].startswith(
+        "sidekick.wechat.attachment."
+    )
+    assert client.attachment_calls[0]["to"] == trigger.chat_id
+    assert client.attachment_calls[0]["attachment"] is attachment
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,8 @@ from urllib.parse import quote, urlsplit
 import aiohttp
 from aiohttp import WSMsgType
 
+from sidekick.chat.attachments import OutboundAttachment
+
 
 API_VERSION = "v1alpha1"
 API_VERSION_HEADER = "X-WeChat-Bridge-API-Version"
@@ -926,6 +928,44 @@ class WeChatConnectorClient:
         )
         operation = WeChatSendOperation.parse(payload)
         self._validate_send_identity(operation, request_id=request_id, to=target)
+        return await self._wait_for_send(operation, request_id=request_id, to=target)
+
+    async def send_attachment_and_wait(
+        self,
+        *,
+        request_id: str,
+        to: str,
+        attachment: OutboundAttachment,
+    ) -> WeChatSendOperation:
+        if REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise ValueError("WeChat request ID must be 1-128 URL-safe characters")
+        target = _canonical_wechat_id(to, "to")
+        form = aiohttp.FormData()
+        form.add_field("requestId", request_id)
+        form.add_field("to", target)
+        form.add_field(
+            "file",
+            attachment.data,
+            filename=attachment.filename,
+            content_type=attachment.mime_type,
+        )
+        payload = await self._request_json(
+            "POST",
+            f"/messages/{attachment.display_as}",
+            multipart_body=form,
+            expected_statuses=frozenset({200, 202}),
+        )
+        operation = WeChatSendOperation.parse(payload)
+        self._validate_send_identity(operation, request_id=request_id, to=target)
+        return await self._wait_for_send(operation, request_id=request_id, to=target)
+
+    async def _wait_for_send(
+        self,
+        operation: WeChatSendOperation,
+        *,
+        request_id: str,
+        to: str,
+    ) -> WeChatSendOperation:
         deadline = asyncio.get_running_loop().time() + self._send_settle_timeout
         while operation.status in {"queued", "dispatching"}:
             if asyncio.get_running_loop().time() >= deadline:
@@ -942,7 +982,7 @@ class WeChatConnectorClient:
             self._validate_send_identity(
                 operation,
                 request_id=request_id,
-                to=target,
+                to=to,
             )
         if operation.status == "submitted":
             if operation.message_id is None:
@@ -1010,15 +1050,19 @@ class WeChatConnectorClient:
         *,
         params: Mapping[str, str] | None = None,
         json_body: Mapping[str, Any] | None = None,
+        multipart_body: aiohttp.FormData | None = None,
         expected_statuses: frozenset[int] = frozenset({200}),
         allow_redirects: bool = True,
     ) -> Mapping[str, Any]:
+        if json_body is not None and multipart_body is not None:
+            raise ValueError("WeChat request cannot combine JSON and multipart bodies")
         session = self._get_session()
         async with session.request(
             method,
             f"{self.base_url}{path}",
             params=params,
             json=json_body,
+            data=multipart_body,
             headers=self._headers,
             allow_redirects=allow_redirects,
         ) as response:

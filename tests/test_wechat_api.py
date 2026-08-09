@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 import pytest
 
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.wechat.api import (
     MAX_MEDIA_BYTES,
     WeChatAPIContractError,
@@ -36,6 +37,85 @@ def connector_message_payload(message_id: str) -> dict[str, object]:
         "content": "hello",
         "timestamp": 1_783_772_734,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display_as", ("image", "file"))
+async def test_wechat_client_uploads_one_attachment_and_waits_for_submission(
+    display_as,
+) -> None:
+    posted: list[dict[str, object]] = []
+    request_id = f"sidekick.wechat.attachment.{display_as}"
+
+    async def send_attachment(request: web.Request) -> web.Response:
+        reader = await request.multipart()
+        fields: dict[str, object] = {}
+        while part := await reader.next():
+            if part.name == "file":
+                fields["filename"] = part.filename
+                fields["mime_type"] = part.headers["Content-Type"]
+                fields["data"] = await part.read()
+            else:
+                fields[part.name] = await part.text()
+        posted.append(fields)
+        return json_response(
+            {
+                "requestId": request_id,
+                "status": "queued",
+                "to": "filehelper",
+                "messageType": display_as,
+                "method": "bridge-send-queue",
+            },
+            status=202,
+        )
+
+    async def get_send(_request: web.Request) -> web.Response:
+        return json_response(
+            {
+                "requestId": request_id,
+                "status": "submitted",
+                "messageId": "7158246912028861544",
+                "to": "filehelper",
+                "messageType": display_as,
+                "method": "gui-fallback-media",
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post(f"/messages/{display_as}", send_attachment)
+    app.router.add_get("/sends/{request_id}", get_send)
+    attachment = OutboundAttachment(
+        data=b"attachment-bytes",
+        filename="answer.png" if display_as == "image" else "answer.txt",
+        mime_type="image/png" if display_as == "image" else "text/plain",
+        display_as=display_as,
+    )
+
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(
+            str(server.make_url("/")),
+            token="bridge-secret",
+            send_poll_interval=0,
+        )
+        try:
+            operation = await client.send_attachment_and_wait(
+                request_id=request_id,
+                to="filehelper",
+                attachment=attachment,
+            )
+        finally:
+            await client.close()
+
+    assert operation.message_id == "7158246912028861544"
+    assert posted == [
+        {
+            "requestId": request_id,
+            "to": "filehelper",
+            "filename": attachment.filename,
+            "mime_type": attachment.mime_type,
+            "data": attachment.data,
+        }
+    ]
 
 
 def json_response(payload: object, *, status: int = 200) -> web.Response:

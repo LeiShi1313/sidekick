@@ -29,6 +29,8 @@ from sidekick.chat.attachments import (
     AttachmentReference,
     MAX_MODEL_IMAGE_BYTES,
     ModelInputImage,
+    MAX_OUTBOUND_ATTACHMENT_BYTES,
+    OutboundAttachment,
 )
 from sidekick.chat.commands import (
     AIAskCommand,
@@ -46,7 +48,7 @@ from sidekick.chat.commands import (
     parse_chat_command,
 )
 from sidekick.chat.identity import NamespacedIdentityCodec
-from sidekick.chat.transport import ChatPresentation
+from sidekick.chat.transport import ChatPresentation, ObjectChatTransport
 
 
 def model_input_image(color: tuple[int, int, int] = (255, 0, 0)) -> ModelInputImage:
@@ -233,6 +235,83 @@ def test_agent_run_request_accepts_at_most_one_image():
     assert AgentRunRequest(**values, images=(image,)).images == (image,)
     with pytest.raises(ValueError, match="one image"):
         AgentRunRequest(**values, images=(image, image))
+
+
+def test_outbound_attachment_is_one_bounded_safe_named_payload() -> None:
+    attachment = OutboundAttachment(
+        data=b"png-bytes",
+        filename="answer.png",
+        mime_type="image/png",
+        display_as="image",
+    )
+
+    assert attachment.data == b"png-bytes"
+    assert "png-bytes" not in repr(attachment)
+    with pytest.raises(ValueError, match="empty"):
+        OutboundAttachment(
+            data=b"",
+            filename="answer.png",
+            mime_type="image/png",
+            display_as="image",
+        )
+    with pytest.raises(ValueError, match="limit"):
+        OutboundAttachment(
+            data=b"x" * (MAX_OUTBOUND_ATTACHMENT_BYTES + 1),
+            filename="answer.bin",
+            mime_type="application/octet-stream",
+            display_as="file",
+        )
+    with pytest.raises(ValueError, match="filename"):
+        OutboundAttachment(
+            data=b"x",
+            filename="../answer.txt",
+            mime_type="text/plain",
+            display_as="file",
+        )
+    with pytest.raises(ValueError, match="PNG or JPEG"):
+        OutboundAttachment(
+            data=b"x",
+            filename="answer.webp",
+            mime_type="image/webp",
+            display_as="image",
+        )
+    with pytest.raises(ValueError, match="filename extension"):
+        OutboundAttachment(
+            data=b"x",
+            filename="answer.bin",
+            mime_type="image/png",
+            display_as="image",
+        )
+
+
+@pytest.mark.asyncio
+async def test_object_transport_replies_with_a_named_file() -> None:
+    class Message:
+        def __init__(self) -> None:
+            self.observed: tuple[str, bytes, bool] | None = None
+
+        async def reply(self, *args, **kwargs):
+            assert args == ()
+            uploaded = kwargs["file"]
+            self.observed = (
+                uploaded.name,
+                uploaded.getvalue(),
+                kwargs["force_document"],
+            )
+            return FakeSentMessage()
+
+    message = Message()
+    attachment = OutboundAttachment(
+        data=b"report",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+
+    result = await ObjectChatTransport().reply_attachment(message, attachment)
+
+    assert result is None
+    assert message.observed == ("report.txt", b"report", True)
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from telethon.extensions import markdown as telegram_markdown
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.formatting import (
     PORTABLE_LINK_RE,
     has_streamable_markdown_content,
@@ -164,6 +166,24 @@ class TelegramChatTransport:
         if not callable(operation):
             raise RuntimeError("Telegram message cannot be replied to")
         return await operation(text, parse_mode=None)
+
+    async def reply_attachment(
+        self,
+        message: Any,
+        attachment: OutboundAttachment,
+    ) -> None:
+        operation = getattr(message, "reply", None)
+        if not callable(operation):
+            raise RuntimeError("Telegram message cannot be replied to")
+        upload = BytesIO(attachment.data)
+        upload.name = attachment.filename
+        try:
+            await operation(
+                file=upload,
+                force_document=attachment.display_as == "file",
+            )
+        finally:
+            upload.close()
 
     async def update(
         self,

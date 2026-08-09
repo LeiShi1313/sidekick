@@ -15,6 +15,7 @@ from sidekick.ai_attachments import (
     ChatAttachmentDescriber,
 )
 
+from sidekick.chat.attachments import OutboundAttachment
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
     OneBotChatTransport,
@@ -400,6 +401,76 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
                 "and 这是重点内容。"
             )
         },
+    }
+
+
+@pytest.mark.asyncio
+async def test_onebot_transport_replies_with_an_inline_image() -> None:
+    action_client = RecordingActionClient(responses=[{"message_id": 503}])
+    trigger = OneBotMessage.from_payload(group_event(), action_client=action_client)
+    attachment = OutboundAttachment(
+        data=b"png-bytes",
+        filename="answer.png",
+        mime_type="image/png",
+        display_as="image",
+    )
+
+    result = await OneBotChatTransport(action_client).reply_attachment(
+        trigger,
+        attachment,
+    )
+
+    assert result is None
+    action, params, timeout = action_client.calls[0]
+    assert action == "send_group_msg"
+    assert timeout == 120
+    assert params == {
+        "group_id": "700",
+        "message": [
+            {"type": "reply", "data": {"id": "101"}},
+            {
+                "type": "image",
+                "data": {
+                    "file": "base64://"
+                    + base64.b64encode(attachment.data).decode("ascii")
+                },
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_kind", ("group", "private"))
+async def test_onebot_transport_uploads_a_file(chat_kind) -> None:
+    action_client = RecordingActionClient(responses=[{"file_id": "file-503"}])
+    trigger = OneBotMessage.from_payload(
+        group_event() if chat_kind == "group" else private_event(),
+        action_client=action_client,
+    )
+    attachment = OutboundAttachment(
+        data=b"report-bytes",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+
+    result = await OneBotChatTransport(action_client).reply_attachment(
+        trigger,
+        attachment,
+    )
+
+    assert result is None
+    action, params, timeout = action_client.calls[0]
+    target = {"group_id": "700"} if chat_kind == "group" else {"user_id": "42"}
+    assert action == (
+        "upload_group_file" if chat_kind == "group" else "upload_private_file"
+    )
+    assert timeout == 120
+    assert params == {
+        **target,
+        "file": "base64://"
+        + base64.b64encode(attachment.data).decode("ascii"),
+        "name": "report.txt",
     }
 
 
