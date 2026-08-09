@@ -46,11 +46,15 @@ from sidekick.wechat.api import (
     WeChatConnectorMessage,
     WeChatDownloadedImage,
     WeChatEvent,
+    WeChatGroupMember,
+    WeChatGroupMemberList,
     WeChatMessageList,
     WeChatSendFailed,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
     WeChatSession,
+    WeChatUser,
+    WeChatUserList,
 )
 from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import WeChatStateRepository
@@ -1090,6 +1094,29 @@ async def test_wechat_manual_memory_command_retains_stored_reply_chain(
         trigger_text="Remember the launch date is Friday",
         direction="in",
     )
+    await wechat_store.refresh_users(
+        CONNECTOR_KEY,
+        WeChatUserList(
+            users=(WeChatUser(id="wxid_alice", display_name="Alice Global"),),
+            cursor="users-10",
+        ),
+    )
+    await wechat_store.refresh_group_members(
+        CONNECTOR_KEY,
+        GROUP_ID,
+        WeChatGroupMemberList(
+            group_id=GROUP_ID,
+            members=(
+                WeChatGroupMember(
+                    group_id=GROUP_ID,
+                    user_id="wxid_alice",
+                    display_name="Alice Global",
+                    nickname="项目阿丽",
+                ),
+            ),
+            cursor="members-10",
+        ),
+    )
     command_event = WeChatEvent.parse(
         {
             "schemaVersion": "wechat-bridge/v1alpha1",
@@ -1152,6 +1179,10 @@ async def test_wechat_manual_memory_command_retains_stored_reply_chain(
     assert memory.episodes[0].events[0].source_id == (
         identity_codec.message_source_id(GROUP_ID, target.id)
     )
+    assert memory.episodes[0].events[0].actor_id == identity_codec.actor_id(
+        "wxid_alice"
+    )
+    assert memory.episodes[0].events[0].actor_display_name == "项目阿丽"
     assert memory.episodes[0].events[0].text == ("Remember the launch date is Friday")
 
 

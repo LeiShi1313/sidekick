@@ -51,7 +51,7 @@ class WeChatMessage:
             self_id=str(values["self_id"]),
             message_type=str(values["message_type"]),
             chat_type=str(values["chat_type"]),
-            sender_display_name=None,
+            sender_display_name=str(values["sender_display_name"]),
             scope_display_name=(
                 str(values["chat_display_name"])
                 if values["chat_display_name"] is not None
