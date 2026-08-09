@@ -203,17 +203,6 @@ export function pseudonymizeIdentity(identity, key, scope) {
   return `actor_${digest.slice(0, 16)}`;
 }
 
-export function pseudonymizeAccessBank(bankId, key, scope) {
-  requirePseudonymContext(key, scope);
-  const digest = createHmac("sha256", key)
-    .update("sidekick:session-bank-access:v1\0")
-    .update(scope)
-    .update("\0")
-    .update(String(bankId ?? ""))
-    .digest("hex");
-  return `bank_${digest.slice(0, 32)}`;
-}
-
 export function pseudonymizeActorIdentities(value, key, scope) {
   const text = String(value ?? "");
   requirePseudonymContext(key, scope);

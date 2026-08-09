@@ -13,7 +13,6 @@ import { join } from "node:path";
 
 import {
   redactSensitiveText,
-  pseudonymizeAccessBank,
   sanitizeMessageInPlace,
 } from "./privacy-redaction.mjs";
 
@@ -23,8 +22,7 @@ const PUBLIC_AGENT_CWD = "/workspace";
 const MAX_SESSION_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SAFE_SUMMARY_CHARS = 12_000;
 const SESSION_BINDING_VERSION = 1;
-const ACCESS_MANIFEST_TYPE = "sidekick-access-manifest";
-const BANK_DIGEST_RE = /^bank_[a-f0-9]{32}$/;
+const PUBLIC_ASSISTANT_STOP_REASONS = new Set(["stop", "length"]);
 const hardenedManagers = new WeakSet();
 
 function secureSessionFile(manager) {
@@ -44,47 +42,7 @@ function safeWebEntryMetadata(data) {
 
 function safeCustomEntry(customType, data) {
   if (customType === "web-search-results") return safeWebEntryMetadata(data);
-  if (customType === ACCESS_MANIFEST_TYPE) {
-    const bankDigests = Array.isArray(data?.bankDigests)
-      ? [...new Set(data.bankDigests.filter((value) => BANK_DIGEST_RE.test(value)))]
-          .sort()
-          .slice(0, 65)
-      : [];
-    return { bankDigests };
-  }
   return { omitted: true };
-}
-
-function memoryAccessBankIds(message) {
-  if (
-    message?.role !== "toolResult" ||
-    message.isError ||
-    !String(message.toolName ?? "").startsWith("memory_") ||
-    message.details?.unavailable
-  ) {
-    return [];
-  }
-  const details = message.details;
-  return [
-    details?.bankId,
-    ...(Array.isArray(details?.bankIds) ? details.bankIds : []),
-    ...(Array.isArray(details?.references)
-      ? details.references.map((reference) => reference?.bankId)
-      : []),
-  ].filter((value) => typeof value === "string" && value.length <= 512);
-}
-
-function safeToolDetails(message, state) {
-  const bankIds = memoryAccessBankIds(message);
-  if (bankIds.length === 0) return undefined;
-  const { identityAliasKey, identityScope } = state.privacyOptions ?? {};
-  return {
-    accessBankDigests: [...new Set(
-      bankIds.map((bankId) =>
-        pseudonymizeAccessBank(bankId, identityAliasKey, identityScope),
-      ),
-    )].sort(),
-  };
 }
 
 function safeContentPart(part) {
@@ -105,22 +63,35 @@ function safeContentPart(part) {
   return null;
 }
 
+function safeAssistantContent(message) {
+  if (!Array.isArray(message.content)) return [];
+  if (message.stopReason === "toolUse") {
+    return message.content
+      .filter((part) => part?.type === "toolCall")
+      .map(safeContentPart)
+      .filter(Boolean);
+  }
+  if (!PUBLIC_ASSISTANT_STOP_REASONS.has(message.stopReason)) return [];
+  return message.content.map(safeContentPart).filter(Boolean);
+}
+
 export function sessionSafeMessage(message, state = {}) {
   let copy = structuredClone(message);
-  if (copy.role === "user" && state.userMessageContent !== undefined) {
+  const hasTrustedUserContent =
+    copy.role === "user" && state.userMessageContent !== undefined;
+  if (hasTrustedUserContent) {
     copy.content = state.userMessageContent;
+  } else {
+    copy = stripMessageInjectedContext(copy);
   }
-  copy = stripMessageInjectedContext(copy);
   sanitizeMessageInPlace(copy, state.privacyOptions);
-  if (copy.role === "assistant" && Array.isArray(copy.content)) {
-    copy.content = copy.content.map(safeContentPart).filter(Boolean);
+  if (copy.role === "assistant") {
+    copy.content = safeAssistantContent(copy);
   } else if (copy.role === "user" && Array.isArray(copy.content)) {
     copy.content = copy.content.map(safeContentPart).filter(Boolean);
   } else if (copy.role === "toolResult") {
     copy.content = [{ type: "text", text: OMITTED_TOOL_RESULT }];
-    const details = safeToolDetails(message, state);
-    if (details === undefined) delete copy.details;
-    else copy.details = details;
+    delete copy.details;
   }
   return copy;
 }
@@ -230,17 +201,24 @@ const OMITTED_CONTEXT_BLOCKS = new Set([
 function stripInjectedContext(value) {
   if (typeof value !== "string") return value;
   const lines = value.split("\n");
-  const kept = [];
-  let omittedBlock = null;
-  for (const line of lines) {
-    const open = /^<([a-z_]+)>$/.exec(line)?.[1];
-    if (omittedBlock === null && OMITTED_CONTEXT_BLOCKS.has(open)) {
-      omittedBlock = open;
-    } else if (omittedBlock !== null && line === `</${omittedBlock}>`) {
-      omittedBlock = null;
-    } else if (omittedBlock === null) {
-      kept.push(line);
+  const lastCloseByBlock = new Map();
+  for (const [index, line] of lines.entries()) {
+    const close = /^<\/([a-z_]+)>$/.exec(line)?.[1];
+    if (OMITTED_CONTEXT_BLOCKS.has(close)) {
+      lastCloseByBlock.set(close, index);
     }
+  }
+  const kept = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const open = /^<([a-z_]+)>$/.exec(line)?.[1];
+    if (OMITTED_CONTEXT_BLOCKS.has(open)) {
+      const closeIndex = lastCloseByBlock.get(open);
+      if (closeIndex === undefined || closeIndex < index) break;
+      index = closeIndex;
+      continue;
+    }
+    kept.push(line);
   }
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }

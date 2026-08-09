@@ -23,7 +23,6 @@ import {
   SensitiveTextStream,
   collectSensitiveLiterals,
   pseudonymizeActorIdentities,
-  pseudonymizeAccessBank,
   pseudonymizeIdentity,
   redactSensitiveText,
   sanitizeConversationHistoryInPlace,
@@ -157,54 +156,6 @@ function replaceModelIdentityIds(value, aliases) {
     result = result.split(identity).join(alias);
   }
   return result;
-}
-
-export function continuationAccessWarning(
-  entries,
-  memory,
-  { identityAliasKey, scopeId },
-) {
-  if (memory?.requesterIsOwner) return null;
-  const historical = new Set();
-  for (const entry of entries ?? []) {
-    if (
-      entry?.type === "custom" &&
-      entry.customType === "sidekick-access-manifest"
-    ) {
-      for (const digest of entry.data?.bankDigests ?? []) {
-        if (/^bank_[a-f0-9]{32}$/.test(digest)) historical.add(digest);
-      }
-      continue;
-    }
-    const message = entry?.type === "message" ? entry.message : null;
-    if (
-      message?.role !== "toolResult" ||
-      message.isError ||
-      !String(message.toolName ?? "").startsWith("memory_") ||
-      message.details?.unavailable
-    ) {
-      continue;
-    }
-    for (const digest of message.details?.accessBankDigests ?? []) {
-      if (/^bank_[a-f0-9]{32}$/.test(digest)) historical.add(digest);
-    }
-  }
-  if (historical.size === 0) return null;
-  const effective = new Set(
-    memory
-      ? [memory.primaryBankId, ...(memory.grantedBankIds ?? [])].map((bankId) =>
-          pseudonymizeAccessBank(bankId, identityAliasKey, scopeId),
-        )
-      : [],
-  );
-  const unavailable = [...historical].filter(
-    (digest) => !effective.has(digest),
-  );
-  if (unavailable.length === 0) return null;
-  return {
-    historicalSourceCount: historical.size,
-    unavailableSourceCount: unavailable.length,
-  };
 }
 
 export function buildRunPrompt({
@@ -844,50 +795,6 @@ export class PiEngine {
             ],
           }
         : request;
-      const accessWarning = continuationAccessWarning(
-        sessionManager.getEntries(),
-        request.memory,
-        {
-          identityAliasKey: this.config.identityAliasKey,
-          scopeId: request.origin.scopeId,
-        },
-      );
-      if (accessWarning) {
-        const failed = {
-          code: "SESSION_ACCESS_CHANGED",
-          message: "Start a new AI request because memory access changed",
-          sessionId: sessionManager.getSessionId(),
-        };
-        await record("memory.access.denied", {
-          ...accessWarning,
-          reason: "continuation_contains_less_accessible_bank_evidence",
-        });
-        terminalRecorded = true;
-        await record("run.failed", failed);
-        yield {
-          type: "run_failed",
-          code: failed.code,
-          message: failed.message,
-        };
-        return;
-      }
-      const evidenceBankIds = new Set(
-        (recalled.access?.sourceCapabilities ?? []).map(({ bankId }) => bankId),
-      );
-      if (recalled.memories.length > 0 && recalled.access?.primaryBankId) {
-        evidenceBankIds.add(recalled.access.primaryBankId);
-      }
-      if (evidenceBankIds.size > 0) {
-        sessionManager.appendCustomEntry("sidekick-access-manifest", {
-          bankDigests: [...evidenceBankIds].map((bankId) =>
-            pseudonymizeAccessBank(
-              bankId,
-              this.config.identityAliasKey,
-              request.origin.scopeId,
-            ),
-          ),
-        });
-      }
       const mcpEnabled =
         request.toolPolicy !== "none" && Boolean(this.config.mcpExtensionPath);
       const resourceLoader = await this.#resourceLoader(request.systemPrompt, {
@@ -978,6 +885,7 @@ export class PiEngine {
         privacyOptions,
         userMessageContent: buildRunPrompt({
           ...request,
+          context: [],
           continuation: request.sessionId !== null,
           identityAliasKey: this.config.identityAliasKey,
         }),

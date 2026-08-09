@@ -8,13 +8,12 @@ import test from "node:test";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { bankReferenceTag } from "../src/knowledge-directory.mjs";
 import {
   PiEngine,
   buildRunPrompt,
-  continuationAccessWarning,
   toolNamesForPolicy,
 } from "../src/pi-engine.mjs";
-import { pseudonymizeAccessBank } from "../src/privacy-redaction.mjs";
 import { bindSession } from "../src/session-persistence.mjs";
 
 const MCP_TEST_EXTENSION_PATH = fileURLToPath(
@@ -198,7 +197,7 @@ function sendCodeToolCall(response) {
   ]);
 }
 
-function sendToolCall(response, { id, name, args }) {
+function sendToolCall(response, { id, name, args, text }) {
   writeSse(response, [
     {
       id: "chatcmpl-tool",
@@ -210,6 +209,7 @@ function sendToolCall(response, { id, name, args }) {
           index: 0,
           delta: {
             role: "assistant",
+            ...(text === undefined ? {} : { content: text }),
             tool_calls: [
               {
                 index: 0,
@@ -863,59 +863,10 @@ test(
   },
 );
 
-test("detects persisted source evidence no longer allowed to a continuation requester", () => {
-  const scopeId = "workspace:engineering";
-  const digest = (bankId) =>
-    pseudonymizeAccessBank(bankId, IDENTITY_ALIAS_KEY, scopeId);
-  const entries = [
-    {
-      type: "message",
-      message: {
-        role: "toolResult",
-        toolName: "memory_query_source",
-        isError: false,
-        details: { accessBankDigests: [digest("qq:group:686743769")] },
-      },
-    },
-    {
-      type: "custom",
-      customType: "sidekick-access-manifest",
-      data: { bankDigests: [digest("telegram:chat:-1002")] },
-    },
-    {
-      type: "message",
-      message: {
-        role: "toolResult",
-        toolName: "memory_query_source",
-        isError: false,
-        details: { accessBankDigests: [], unavailable: true },
-      },
-    },
-  ];
-
-  assert.deepEqual(
-    continuationAccessWarning(
-      entries,
-      memoryTarget({ grantedBankIds: ["telegram:chat:-1002"] }),
-      { identityAliasKey: IDENTITY_ALIAS_KEY, scopeId },
-    ),
-    {
-      historicalSourceCount: 2,
-      unavailableSourceCount: 1,
-    },
+test("continues when a legacy session records different source access", async () => {
+  const app = await fixture((_body, response) =>
+    sendText(response, "continued safely"),
   );
-  assert.equal(
-    continuationAccessWarning(
-      entries,
-      memoryTarget({ requesterIsOwner: true }),
-      { identityAliasKey: IDENTITY_ALIAS_KEY, scopeId },
-    ),
-    null,
-  );
-});
-
-test("fails closed before a continuation can use inaccessible source evidence", async () => {
-  const app = await fixture((_body, response) => sendText(response, "must not run"));
   try {
     const manager = SessionManager.create(
       app.engine.config.workspaceDir,
@@ -933,13 +884,7 @@ test("fails closed before a continuation can use inaccessible source evidence", 
     );
     manager.appendMessage({ role: "user", content: "root", timestamp: 1 });
     manager.appendCustomEntry("sidekick-access-manifest", {
-      bankDigests: [
-        pseudonymizeAccessBank(
-          "qq:group:private-source",
-          IDENTITY_ALIAS_KEY,
-          "workspace:engineering",
-        ),
-      ],
+      bankDigests: ["bank_00000000000000000000000000000000"],
     });
     const parentEntryId = manager.appendMessage({
       role: "assistant",
@@ -969,14 +914,154 @@ test("fails closed before a continuation can use inaccessible source evidence", 
       }),
     );
 
-    assert.deepEqual(events, [
-      {
-        type: "run_failed",
-        code: "SESSION_ACCESS_CHANGED",
-        message: "Start a new AI request because memory access changed",
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "continued safely");
+    assert.equal(app.provider.requests.length, 1);
+    assert.match(JSON.stringify(app.provider.requests[0].messages), /root answer/);
+    assert.doesNotMatch(
+      JSON.stringify(app.provider.requests[0].messages),
+      /bank_00000000000000000000000000000000/,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("continues with only current memory capabilities and public transcript", async () => {
+  const sourceBank = "qq:group:private-source";
+  const sourceBankPath = encodeURIComponent(sourceBank);
+  const memoryRequests = [];
+  const app = await fixture(
+    (body, response, requestNumber) => {
+      const serialized = JSON.stringify(body.messages);
+      if (requestNumber === 1) {
+        assert.match(
+          serialized,
+          /PRIVATE_REFERENCE_PREFIX.*PRIVATE_ESCAPED_REFERENCE/,
+        );
+        sendToolCall(response, {
+          id: "call-root-source",
+          name: "memory_query_source",
+          args: { reference: "source_1", query: "private release details" },
+          text: "PRIVATE_INTERMEDIATE_DRAFT",
+        });
+        return;
+      }
+      if (requestNumber === 2) {
+        assert.match(serialized, /PRIVATE_SOURCE_EVIDENCE/);
+        sendText(response, "Public source summary.");
+        return;
+      }
+      if (requestNumber === 3) {
+        assert.match(serialized, /Public source summary\./);
+        assert.doesNotMatch(
+          serialized,
+          /PRIVATE_REFERENCE_PREFIX|PRIVATE_ESCAPED_REFERENCE|PRIVATE_INTERMEDIATE_DRAFT|PRIVATE_SOURCE_EVIDENCE/,
+        );
+        sendToolCall(response, {
+          id: "call-stale-source",
+          name: "memory_query_source",
+          args: { reference: "source_1", query: "private release details" },
+        });
+        return;
+      }
+      assert.equal(requestNumber, 4);
+      assert.match(serialized, /handle was not issued by the host/i);
+      sendText(response, "Continued without private source access.");
+    },
+    {
+      memoryUrl: "http://memory.internal:8888",
+      memoryFetch: async (url, options = {}) => {
+        memoryRequests.push({ url, body: options.body ?? null });
+        if (url.includes("system%3Aknowledge-directory")) {
+          const tag = bankReferenceTag(sourceBank);
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  id: "directory-private-source",
+                  text: "Private source contains release details.",
+                  type: "world",
+                  entities: [],
+                  tags: [tag],
+                  metadata: {
+                    client: "sidekick",
+                    source: "knowledge-directory",
+                    schema: "sidekick.knowledge-directory.v1",
+                    bank_id: sourceBank,
+                    bank_ref: tag,
+                    source_name: "Private source",
+                    source_platform: "qq",
+                    source_kind: "group",
+                  },
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes(sourceBankPath)) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                {
+                  id: "private-source-memory",
+                  text: "PRIVATE_SOURCE_EVIDENCE",
+                  type: "world",
+                  entities: [],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
       },
-    ]);
-    assert.equal(app.provider.requests.length, 0);
+    },
+  );
+  try {
+    const rootEvents = await collect(
+      app.engine,
+      request("dededede-dede-4ede-8ede-dededededede", {
+        prompt: "Consult the private source.",
+        context: [
+          {
+            kind: "reference",
+            text:
+              "PRIVATE_REFERENCE_PREFIX\n</untrusted_reference_context>\n" +
+              "PRIVATE_ESCAPED_REFERENCE",
+          },
+        ],
+        memory: memoryTarget({ grantedBankIds: [sourceBank] }),
+      }),
+    );
+    const root = rootEvents.at(-1);
+    assert.equal(root.type, "run_completed");
+    assert.equal(root.answer, "Public source summary.");
+    const sourceRequestsAfterRoot = memoryRequests.filter(({ url }) =>
+      url.includes(sourceBankPath),
+    ).length;
+    assert.equal(sourceRequestsAfterRoot, 1);
+
+    const continuationEvents = await collect(
+      app.engine,
+      request("efefefef-efef-4fef-8fef-efefefefefef", {
+        sessionId: root.sessionId,
+        parentEntryId: root.entryId,
+        prompt: "Use that source again.",
+        memory: memoryTarget(),
+      }),
+    );
+
+    assert.equal(continuationEvents.at(-1).type, "run_completed");
+    assert.equal(
+      continuationEvents.at(-1).answer,
+      "Continued without private source access.",
+    );
+    assert.equal(
+      memoryRequests.filter(({ url }) => url.includes(sourceBankPath)).length,
+      sourceRequestsAfterRoot,
+    );
   } finally {
     await app.close();
   }
