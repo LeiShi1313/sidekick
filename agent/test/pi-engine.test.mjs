@@ -83,6 +83,25 @@ function sendText(response, text) {
   sendTextChunks(response, [text]);
 }
 
+function sendEmptyText(response) {
+  writeSse(response, [
+    {
+      id: "chatcmpl-empty",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    },
+    {
+      id: "chatcmpl-empty",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ]);
+}
+
 function sendTextChunks(response, chunks) {
   writeSse(response, [
     {
@@ -825,6 +844,124 @@ test("streams generated image bytes without persisting them", async () => {
     const audit = await app.engine.getRunAudit(runId);
     assert.doesNotMatch(rawSession, new RegExp(encoded));
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
+test("completes a generated image when the model returns no caption", async () => {
+  const imageBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]);
+  const encoded = imageBytes.toString("base64");
+  const imageClient = {
+    images: {
+      async generate() {
+        return { data: [{ b64_json: encoded }] };
+      },
+    },
+  };
+  const app = await fixture(
+    (_body, response, requestNumber) => {
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-image-empty-caption",
+          name: "image_generate",
+          args: { prompt: "A new logo" },
+        });
+        return;
+      }
+      sendEmptyText(response);
+    },
+    { imageModel: "gpt-image-2", imageClient },
+  );
+  try {
+    const runId = "49494949-4949-4949-8949-494949494949";
+    const events = await collect(
+      app.engine,
+      request(runId, { prompt: "Generate a new logo" }),
+    );
+
+    assert.ok(events.some((event) => event.type === "attachment"));
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "");
+    assert.equal((await app.engine.getRunAudit(runId)).summary.status, "completed");
+  } finally {
+    await app.close();
+  }
+});
+
+test("normalizes a whitespace-only image caption to empty", async () => {
+  const imageBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]);
+  const encoded = imageBytes.toString("base64");
+  const imageClient = {
+    images: {
+      async generate() {
+        return { data: [{ b64_json: encoded }] };
+      },
+    },
+  };
+  const app = await fixture(
+    (_body, response, requestNumber) => {
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-image-whitespace-caption",
+          name: "image_generate",
+          args: { prompt: "A new logo" },
+        });
+        return;
+      }
+      sendText(response, " \n\t");
+    },
+    { imageModel: "gpt-image-2", imageClient },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("51515151-5151-4151-8151-515151515151", {
+        prompt: "Generate a new logo",
+      }),
+    );
+
+    assert.ok(events.some((event) => event.type === "attachment"));
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "");
+  } finally {
+    await app.close();
+  }
+});
+
+test("rejects an empty model response without a generated attachment", async () => {
+  const app = await fixture((_body, response) => sendEmptyText(response));
+  try {
+    await assert.rejects(
+      collect(
+        app.engine,
+        request("50505050-5050-4050-8050-505050505050", {
+          prompt: "Answer without using a tool",
+        }),
+      ),
+      /Agent returned no final answer/,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("rejects a whitespace-only response without a generated attachment", async () => {
+  const app = await fixture((_body, response) => sendText(response, " \n\t"));
+  try {
+    await assert.rejects(
+      collect(
+        app.engine,
+        request("52525252-5252-4252-8252-525252525252", {
+          prompt: "Answer without using a tool",
+        }),
+      ),
+      /Agent returned no final answer/,
+    );
   } finally {
     await app.close();
   }

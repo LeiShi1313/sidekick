@@ -944,6 +944,7 @@ export class PiEngine {
       let firstTextInTurn = true;
       let textStream = new SensitiveTextStream(privacyOptions);
       let finalAnswer = "";
+      let hasGeneratedAttachment = false;
       let turnNumber = 0;
       let turnStartedAt = null;
       const emitText = (delta) => {
@@ -1029,6 +1030,7 @@ export class PiEngine {
           const artifact = generatedArtifacts.get(event.toolCallId);
           generatedArtifacts.delete(event.toolCallId);
           if (!event.isError && artifact) {
+            hasGeneratedAttachment = true;
             queue.push({ type: "attachment", ...artifact });
           }
         } else if (event.type === "turn_end") {
@@ -1129,12 +1131,13 @@ export class PiEngine {
               message: failed.message,
             });
           } else {
-            const answer = redactSensitiveText(
+            const rawAnswer = redactSensitiveText(
               finalAnswer || extractText(lastAssistant),
               privacyOptions,
             );
+            const answer = rawAnswer.trim() ? rawAnswer : "";
             const entryId = sessionManager.getLeafId();
-            if (!answer || !entryId) {
+            if ((!answer && !hasGeneratedAttachment) || !entryId) {
               throw new Error("Agent returned no final answer");
             }
             const completed = {

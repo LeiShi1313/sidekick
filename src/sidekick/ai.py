@@ -978,22 +978,33 @@ class AIResponder:
                     session_id = event.session_id
                     entry_id = event.entry_id
 
-            final_text = text or "AI returned an empty response."
-            final_text = self._truncate(final_text)
-            if not await self._edit_formatted(answer, final_text, wait=True):
+            if not text.strip():
+                text = ""
+            succeeded = bool(
+                (text or attachment is not None) and session_id and entry_id
+            )
+            final_text = self._truncate(text) if text else ""
+            if text:
+                if not await self._edit_formatted(answer, final_text, wait=True):
+                    final_text = "AI returned an empty response."
+                    await self._edit_message(
+                        answer,
+                        final_text,
+                        wait=True,
+                    )
+                    return AnswerResult(
+                        message=answer,
+                        text=final_text,
+                        succeeded=False,
+                        failure_code="DELIVERY_FAILED",
+                    )
+            elif not succeeded:
                 final_text = "AI returned an empty response."
                 await self._edit_message(
                     answer,
                     final_text,
                     wait=True,
                 )
-                return AnswerResult(
-                    message=answer,
-                    text=final_text,
-                    succeeded=False,
-                    failure_code="DELIVERY_FAILED",
-                )
-            succeeded = bool(text and session_id and entry_id)
             if succeeded and attachment is not None:
                 try:
                     attachment_message = await self._transport.reply_attachment(
@@ -1022,6 +1033,30 @@ class AIResponder:
                         entry_id=entry_id,
                         failure_code="DELIVERY_FAILED",
                     )
+            if succeeded and not text:
+                if attachment_message is None:
+                    raise RuntimeError(
+                        "Chat transport returned no attachment message identity"
+                    )
+                try:
+                    await self._transport.delete(answer)
+                except Exception as exc:
+                    self._log_failure(exc)
+                    return AnswerResult(
+                        message=answer,
+                        text="",
+                        succeeded=True,
+                        attachment_message=attachment_message,
+                        session_id=session_id,
+                        entry_id=entry_id,
+                    )
+                return AnswerResult(
+                    message=attachment_message,
+                    text="",
+                    succeeded=True,
+                    session_id=session_id,
+                    entry_id=entry_id,
+                )
             return AnswerResult(
                 message=answer,
                 text=final_text,
