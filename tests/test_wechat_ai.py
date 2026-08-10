@@ -1232,12 +1232,19 @@ async def test_wechat_reconciliation_has_bounded_concurrency(tmp_path) -> None:
         has_attachment=False,
     ).digest
     for index in range(WeChatChatTransport.RECONCILIATION_CONCURRENCY + 1):
-        await store.reserve_generated_send(
+        request_id = f"request-{index}"
+        lease_id = await store.reserve_generated_send(
             CONNECTOR_KEY,
             ACCOUNT_ID,
             GROUP_ID,
-            f"request-{index}",
+            request_id,
             fingerprint,
+        )
+        await store.defer_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            request_id,
+            lease_id,
         )
 
     class BlockingClient:
@@ -1418,8 +1425,8 @@ async def test_wechat_reconciliation_skips_active_send_callers(tmp_path) -> None
         has_attachment=False,
     ).digest
     try:
-        # The first cycle recovers only leases inherited from an older
-        # transport. A lease created afterward belongs to a live caller.
+        # Startup recovery is separate from reconciliation, so a lease created
+        # by a live caller cannot be cleared by a later reconciliation cycle.
         assert await transport.reconcile_pending(ACCOUNT_ID) == 0
         lease_id = await store.reserve_generated_send(
             CONNECTOR_KEY,
@@ -1441,6 +1448,187 @@ async def test_wechat_reconciliation_skips_active_send_callers(tmp_path) -> None
         client.responses.append(submitted(request_id="request-active"))
         assert await transport.reconcile_pending(ACCOUNT_ID) == 0
         assert len(client.reconcile_calls) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_reconciliation_cannot_erase_another_adapter_live_lease(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    sender, _ = await bootstrap_store(state_path)
+    reconciler = await WeChatStateRepository(state_path).connect()
+    await sender.acquire_adapter_ownership()
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    lease_id = await sender.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-live-sender",
+        fingerprint,
+    )
+    client = RecordingConnectorClient((None,))
+    transport = WeChatChatTransport(
+        client,
+        reconciler,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        clock=lambda: 1_000.0,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            await reconciler.acquire_adapter_ownership()
+
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 1
+        assert client.reconcile_calls == []
+        assert len(
+            await sender.list_generated_send_reservations(
+                CONNECTOR_KEY,
+                ACCOUNT_ID,
+            )
+        ) == 1
+    finally:
+        await sender.defer_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            "request-live-sender",
+            lease_id,
+        )
+        await reconciler.close()
+        await sender.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_reconciler_cannot_clear_a_replacement_send_lease(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    owner, _ = await bootstrap_store(state_path)
+    stale_worker = await WeChatStateRepository(state_path).connect()
+    await owner.acquire_adapter_ownership()
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    original_lease = await owner.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-replaced",
+        fingerprint,
+    )
+    await owner.defer_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "request-replaced",
+        original_lease,
+    )
+
+    class BlockingNotFoundClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def reconcile_send_and_wait(self, *, request_id, to):
+            self.started.set()
+            await self.release.wait()
+            return None
+
+    client = BlockingNotFoundClient()
+    transport = WeChatChatTransport(
+        client,  # type: ignore[arg-type]
+        stale_worker,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        clock=lambda: 1_000.0,
+    )
+    reconciling = asyncio.create_task(transport.reconcile_pending(ACCOUNT_ID))
+    replacement_lease: str | None = None
+    try:
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        await owner.recover_generated_send_leases(CONNECTOR_KEY)
+        replacement_lease = await owner.reserve_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            GROUP_ID,
+            "request-replaced",
+            fingerprint,
+        )
+        client.release.set()
+        assert await asyncio.wait_for(reconciling, timeout=1) == 1
+
+        reservations = await owner.list_generated_send_reservations(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+        )
+        assert len(reservations) == 1
+        cursor = await owner._require_connection().execute(
+            """
+            SELECT lease_id
+            FROM wechat_generated_send_leases
+            WHERE connector_key = ? AND account_id = ? AND request_id = ?
+            """,
+            (CONNECTOR_KEY, ACCOUNT_ID, "request-replaced"),
+        )
+        row = await cursor.fetchone()
+        assert row is not None and row["lease_id"] == replacement_lease
+    finally:
+        client.release.set()
+        if not reconciling.done():
+            reconciling.cancel()
+        if replacement_lease is not None:
+            await owner.defer_generated_send(
+                CONNECTOR_KEY,
+                ACCOUNT_ID,
+                "request-replaced",
+                replacement_lease,
+            )
+        await stale_worker.close()
+        await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_indeterminate_health_includes_previous_account(
+    tmp_path,
+) -> None:
+    store, _ = await bootstrap_store(tmp_path / "wechat.db")
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    lease_id = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-previous-account",
+        fingerprint,
+    )
+    await store.defer_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "request-previous-account",
+        lease_id,
+    )
+    current_account = "wxid_replacement"
+    client = RecordingConnectorClient(())
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        clock=lambda: 1_000.0,
+    )
+    try:
+        assert await transport.reconcile_pending(current_account) == 0
+        assert transport.indeterminate_outbound_count == 1
+        assert client.reconcile_calls == []
     finally:
         await store.close()
 

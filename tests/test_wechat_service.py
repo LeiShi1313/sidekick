@@ -55,6 +55,57 @@ def test_wechat_runtime_settings_and_cli_command(monkeypatch, tmp_path) -> None:
     assert command_registry.as_fire_commands()["wechat"]["ai"]
 
 
+@pytest.mark.asyncio
+async def test_duplicate_wechat_adapter_fails_before_opening_ai_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    owner = await WeChatStateRepository(state_path).connect()
+    await owner.acquire_adapter_ownership()
+
+    class RecordingAIStore:
+        def __init__(self) -> None:
+            self.connect_calls = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+
+        async def close(self) -> None:
+            pass
+
+    class AsyncCloser:
+        async def close(self) -> None:
+            pass
+
+    class AdapterStatus:
+        def update(self, **_values) -> None:
+            pass
+
+    ai_store = RecordingAIStore()
+    plugin = object.__new__(WeChatAI)
+    plugin._wechat_store = WeChatStateRepository(state_path)
+    plugin._ai_store = ai_store
+    plugin._client = SimpleNamespace(
+        base_url=CONNECTOR_KEY,
+        close=AsyncCloser().close,
+    )
+    plugin._gateway = AsyncCloser()
+    plugin._memory = None
+    plugin._ops_server = AsyncCloser()
+    plugin._adapter_status = AdapterStatus()
+    plugin._channel_runtime = None
+    plugin._generated_send_reconciliation_task = None
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "add_signal_handler", lambda *_args: None)
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            await plugin._run()
+        assert ai_store.connect_calls == 0
+    finally:
+        await owner.close()
+
+
 def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
     memory = object()
     plugin = object.__new__(WeChatAI)

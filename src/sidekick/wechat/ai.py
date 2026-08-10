@@ -296,8 +296,6 @@ class WeChatChatTransport:
         self._clock = clock
         self._generated_messages = GeneratedMessageTracker()
         self._durable_indeterminate_count: int | None = None
-        self._reconciliation_accounts: set[str] = set()
-        self._reconciliation_initialization_lock = asyncio.Lock()
         self._deferred_reconciliation_errors: Counter[str] = Counter()
         self._next_reconciliation_log_at = 0.0
 
@@ -480,6 +478,7 @@ class WeChatChatTransport:
                 trigger.chat_id,
                 request_id,
                 operation.message_id,
+                lease_id,
             )
             reservation.confirm(operation.message_id, echo_expected=False)
         return WeChatSentMessage(
@@ -686,6 +685,7 @@ class WeChatChatTransport:
                     message.trigger.chat_id,
                     message.request_id,
                     operation.message_id,
+                    lease_id,
                 )
                 reservation.confirm(operation.message_id, echo_expected=False)
                 break
@@ -697,7 +697,6 @@ class WeChatChatTransport:
 
     async def reconcile_pending(self, account_id: str) -> int:
         self._durable_indeterminate_count = None
-        await self._initialize_reconciliation(account_id)
         reservations = await self._store.list_due_generated_send_reservations(
             self._connector_key,
             account_id,
@@ -708,24 +707,14 @@ class WeChatChatTransport:
         if deferred:
             self._log_reconciliation_deferred(deferred)
         self._durable_indeterminate_count = (
-            await self._store.count_generated_send_reservations(
+            await self._store.count_connector_generated_send_reservations(
                 self._connector_key,
-                account_id,
             )
         )
-        return self._durable_indeterminate_count
-
-    async def _initialize_reconciliation(self, account_id: str) -> None:
-        if account_id in self._reconciliation_accounts:
-            return
-        async with self._reconciliation_initialization_lock:
-            if account_id in self._reconciliation_accounts:
-                return
-            await self._store.recover_generated_send_leases(
-                self._connector_key,
-                account_id,
-            )
-            self._reconciliation_accounts.add(account_id)
+        return await self._store.count_generated_send_reservations(
+            self._connector_key,
+            account_id,
+        )
 
     async def _reconcile_reservations(
         self,
@@ -765,31 +754,35 @@ class WeChatChatTransport:
                 to=reservation.chat_id,
             )
             if operation is None:
-                await self._store.fail_generated_send(
+                settled = await self._store.fail_generated_send(
                     self._connector_key,
                     account_id,
                     reservation.request_id,
+                    reconciliation_lease,
                 )
-                self._generated_messages.clear_uncertain(
-                    reservation.chat_id,
-                    MessageFingerprint(reservation.fingerprint),
-                )
+                if settled:
+                    self._generated_messages.clear_uncertain(
+                        reservation.chat_id,
+                        MessageFingerprint(reservation.fingerprint),
+                    )
                 return None
             if operation.message_id is None:
                 raise RuntimeError(
                     "WeChat generated-send reconciliation returned no message ID"
                 )
-            await self._store.confirm_generated_send(
+            settled = await self._store.confirm_generated_send(
                 self._connector_key,
                 account_id,
                 reservation.chat_id,
                 reservation.request_id,
                 operation.message_id,
+                reconciliation_lease,
             )
-            self._generated_messages.clear_uncertain(
-                reservation.chat_id,
-                MessageFingerprint(reservation.fingerprint),
-            )
+            if settled:
+                self._generated_messages.clear_uncertain(
+                    reservation.chat_id,
+                    MessageFingerprint(reservation.fingerprint),
+                )
             return None
         except asyncio.CancelledError:
             await self._defer_generated_send_after_cancellation(
@@ -800,15 +793,17 @@ class WeChatChatTransport:
             raise
         except WeChatSendFailed:
             try:
-                await self._store.fail_generated_send(
+                settled = await self._store.fail_generated_send(
                     self._connector_key,
                     account_id,
                     reservation.request_id,
+                    reconciliation_lease,
                 )
-                self._generated_messages.clear_uncertain(
-                    reservation.chat_id,
-                    MessageFingerprint(reservation.fingerprint),
-                )
+                if settled:
+                    self._generated_messages.clear_uncertain(
+                        reservation.chat_id,
+                        MessageFingerprint(reservation.fingerprint),
+                    )
             except Exception as exc:
                 return await self._defer_reconciliation(
                     account_id,

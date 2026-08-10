@@ -132,21 +132,34 @@ The authenticated channel `/health` and `/v1/channels` responses expose
 reached the native chat without a trustworthy receipt, so outgoing controls in
 the affected chat remain fail-closed; `null` means the adapter cannot yet prove
 the count. WeChat reconciles these sends from the connector's idempotency
-ledger with bounded, persisted backoff. Telegram and
-OneBot retain genuinely ambiguous sends in memory for deliberate operator
-review; inspect the native chat and allow delayed events to arrive before
-restarting either adapter, because restart clears that in-memory quarantine.
+ledger with bounded, persisted backoff. Telegram and OneBot retain genuinely
+ambiguous sends in memory for deliberate operator review. The exposed value is
+aggregate, so use adapter logs and active-run context to identify the affected
+native chat. Do not restart either adapter while the value is non-zero; restart
+clears that in-memory quarantine.
 
-For a provenance-aware release, quiesce new AI commands and let the existing
-adapter run for at least the connector's 30-second send-settlement window.
-Then update one worker at a time, verify its authenticated health reports zero
-indeterminate outbound sends, and smoke-test one text response and one
-attachment response without a repeated command. Do not roll a WeChat worker
-back to a build that predates durable generated-send provenance while the
-count is non-zero: the older build cannot read the reconciliation ledger and
+The first upgrade from a build without durable provenance needs a separate
+pre-upgrade audit. The new counter has no record of ambiguous sends created by
+the old build, and a zero after startup cannot prove that none exist. Before
+stopping an old worker, quiesce new AI commands, verify that it has no active
+runs, and wait 30 seconds for ordinary connector polling to finish. Audit the
+old adapter and connector logs since the last clean start for terminal-unknown
+or other post-admission send failures. Resolve every recorded request ID through
+the connector send journal: proceed only when each is definitely failed or its
+stable message ID and outbound event have been observed. If the audit is
+incomplete or any operation remains unknown, keep the worker and affected chat
+quarantined and do not treat the new worker's zero as a release gate.
+
+After that first audit, update one provenance-aware worker at a time. WeChat
+startup takes exclusive ownership of its state database, so a duplicate worker
+must fail startup instead of overlapping. Verify authenticated health reports a
+connector-wide zero, then smoke-test one text response and one attachment
+response without a repeated command. Do not roll a WeChat worker back to a
+build that predates durable generated-send provenance while the value is
+non-zero or `null`: the older build cannot read the reconciliation ledger and
 could treat a delayed generated echo as a manual command. Keep the new worker
-running until reconciliation reaches zero, then quiesce for the same settlement
-window before rollback.
+running until reconciliation reaches zero, then quiesce and repeat the active
+run and send-journal audit before rollback.
 
 ## Containers
 

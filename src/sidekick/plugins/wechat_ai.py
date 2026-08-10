@@ -190,8 +190,12 @@ class WeChatAI(metaclass=PluginMount):
             except NotImplementedError:
                 pass
         await self._wechat_store.connect()
-        await self._ai_store.connect()
         try:
+            await self._wechat_store.acquire_adapter_ownership()
+            await self._wechat_store.recover_generated_send_leases(
+                self._client.base_url
+            )
+            await self._ai_store.connect()
             try:
                 account_id = await self._wechat_store.get_account_id(
                     self._client.base_url

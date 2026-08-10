@@ -4,7 +4,9 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+import fcntl
 from functools import wraps
+import os
 from pathlib import Path
 import time
 from typing import Concatenate, Literal, ParamSpec, TypeVar
@@ -126,6 +128,7 @@ class WeChatStateRepository:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._connection: aiosqlite.Connection | None = None
+        self._adapter_lock_fd: int | None = None
         # aiosqlite serializes statements, not multi-statement transactions.
         # Readers share this lock so they cannot observe an in-progress refresh.
         self._access_lock = asyncio.Lock()
@@ -371,6 +374,43 @@ class WeChatStateRepository:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
+        self._release_adapter_ownership()
+
+    @_serialized
+    async def acquire_adapter_ownership(self) -> None:
+        """Exclusively own adapter mutations for this state database."""
+        self._require_connection()
+        if self._adapter_lock_fd is not None:
+            raise RuntimeError("WeChat adapter ownership is already held")
+        lock_path = self.path.with_name(f"{self.path.name}.adapter.lock")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RuntimeError(
+                f"WeChat adapter is already active for {self.path}"
+            ) from exc
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._adapter_lock_fd = descriptor
+
+    def _release_adapter_ownership(self) -> None:
+        descriptor = self._adapter_lock_fd
+        if descriptor is None:
+            return
+        self._adapter_lock_fd = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     @_serialized
     async def bootstrap(
@@ -964,18 +1004,26 @@ class WeChatStateRepository:
     async def recover_generated_send_leases(
         self,
         connector_key: str,
-        account_id: str,
     ) -> None:
-        """Release caller leases left behind by a prior transport instance."""
+        """Release stale leases after exclusive adapter startup."""
+        if self._adapter_lock_fd is None:
+            raise RuntimeError(
+                "WeChat generated-send recovery requires adapter ownership"
+            )
         connection = self._require_connection()
-        await connection.execute(
-            """
-            DELETE FROM wechat_generated_send_leases
-            WHERE connector_key = ? AND account_id = ?
-            """,
-            (connector_key, account_id),
-        )
-        await connection.commit()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ?
+                """,
+                (connector_key,),
+            )
+            await connection.commit()
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
 
     @_serialized
     async def claim_generated_send_reconciliation(
@@ -1020,35 +1068,21 @@ class WeChatStateRepository:
         connector_key: str,
         account_id: str,
         request_id: str,
-        lease_id: str | None = None,
-    ) -> None:
+        lease_id: str,
+    ) -> bool:
         connection = self._require_connection()
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            if lease_id is None:
-                await connection.execute(
-                    """
-                    DELETE FROM wechat_generated_send_leases
-                    WHERE connector_key = ? AND account_id = ? AND request_id = ?
-                    """,
-                    (connector_key, account_id, request_id),
-                )
-                await connection.execute(
-                    """
-                    DELETE FROM wechat_generated_send_reservations
-                    WHERE connector_key = ? AND account_id = ? AND request_id = ?
-                    """,
-                    (connector_key, account_id, request_id),
-                )
-            else:
-                await connection.execute(
-                    """
-                    DELETE FROM wechat_generated_send_leases
-                    WHERE connector_key = ? AND account_id = ?
-                      AND request_id = ? AND lease_id = ?
-                    """,
-                    (connector_key, account_id, request_id, lease_id),
-                )
+            cursor = await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ?
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            owned = cursor.rowcount == 1
+            if owned:
                 await connection.execute(
                     """
                     DELETE FROM wechat_generated_send_reservations
@@ -1069,6 +1103,7 @@ class WeChatStateRepository:
                     ),
                 )
             await connection.commit()
+            return owned
         except BaseException:
             await _rollback_quietly(connection)
             raise
@@ -1081,10 +1116,24 @@ class WeChatStateRepository:
         chat_id: str,
         request_id: str,
         message_id: str,
-    ) -> None:
+        lease_id: str,
+    ) -> bool:
         connection = self._require_connection()
         try:
             await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                SELECT 1
+                FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ?
+                LIMIT 1
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            if await cursor.fetchone() is None:
+                await connection.commit()
+                return False
             await connection.execute(
                 """
                 INSERT OR IGNORE INTO wechat_processed_messages (
@@ -1116,8 +1165,9 @@ class WeChatStateRepository:
                 (connector_key, account_id, request_id),
             )
             await connection.commit()
+            return True
         except BaseException:
-            await connection.rollback()
+            await _rollback_quietly(connection)
             raise
 
     @_serialized
@@ -1229,19 +1279,35 @@ class WeChatStateRepository:
         lease_id: str,
         *,
         next_attempt_at: float,
-    ) -> None:
+    ) -> bool:
         connection = self._require_connection()
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            await connection.execute(
+            cursor = await connection.execute(
                 """
                 UPDATE wechat_generated_send_reservations
                 SET reconciliation_attempts = reconciliation_attempts + 1,
                     next_reconciliation_at = ?
                 WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM wechat_generated_send_leases
+                      WHERE connector_key = ? AND account_id = ?
+                        AND request_id = ? AND lease_id = ?
+                        AND kind = 'reconcile'
+                  )
                 """,
-                (next_attempt_at, connector_key, account_id, request_id),
+                (
+                    next_attempt_at,
+                    connector_key,
+                    account_id,
+                    request_id,
+                    connector_key,
+                    account_id,
+                    request_id,
+                    lease_id,
+                ),
             )
+            owned = cursor.rowcount == 1
             await connection.execute(
                 """
                 DELETE FROM wechat_generated_send_leases
@@ -1251,6 +1317,7 @@ class WeChatStateRepository:
                 (connector_key, account_id, request_id, lease_id),
             )
             await connection.commit()
+            return owned
         except BaseException:
             await _rollback_quietly(connection)
             raise
@@ -1268,6 +1335,22 @@ class WeChatStateRepository:
             WHERE connector_key = ? AND account_id = ?
             """,
             (connector_key, account_id),
+        )
+        row = await cursor.fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    @_serialized
+    async def count_connector_generated_send_reservations(
+        self,
+        connector_key: str,
+    ) -> int:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM wechat_generated_send_reservations
+            WHERE connector_key = ?
+            """,
+            (connector_key,),
         )
         row = await cursor.fetchone()
         return int(row["count"]) if row is not None else 0

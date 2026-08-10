@@ -113,7 +113,8 @@ async def test_wechat_store_upgrades_existing_generated_send_queue(tmp_path) -> 
 
     store = await WeChatStateRepository(state_path).connect()
     try:
-        await store.recover_generated_send_leases(CONNECTOR_KEY, ACCOUNT_ID)
+        await store.acquire_adapter_ownership()
+        await store.recover_generated_send_leases(CONNECTOR_KEY)
         reservations = await store.list_due_generated_send_reservations(
             CONNECTOR_KEY,
             ACCOUNT_ID,
@@ -125,6 +126,150 @@ async def test_wechat_store_upgrades_existing_generated_send_queue(tmp_path) -> 
         assert reservations[0].request_id == "request-existing"
         assert reservations[0].reconciliation_attempts == 0
     finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_adapter_ownership_is_exclusive_and_released_on_close(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    first = await WeChatStateRepository(state_path).connect()
+    second = await WeChatStateRepository(state_path).connect()
+    try:
+        await first.acquire_adapter_ownership()
+        with pytest.raises(RuntimeError, match="already active"):
+            await second.acquire_adapter_ownership()
+        with pytest.raises(RuntimeError, match="requires adapter ownership"):
+            await second.recover_generated_send_leases(CONNECTOR_KEY)
+
+        await first.close()
+        await second.acquire_adapter_ownership()
+    finally:
+        await second.close()
+        await first.close()
+
+
+@pytest.mark.asyncio
+async def test_generated_send_lease_recovery_rolls_back_on_cancellation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    await store.acquire_adapter_ownership()
+    lease_id = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-cancelled-recovery",
+        b"x" * 32,
+    )
+    connection = store._require_connection()
+    original_commit = connection.commit
+
+    async def cancelled_commit() -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(connection, "commit", cancelled_commit)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await store.recover_generated_send_leases(CONNECTOR_KEY)
+
+        monkeypatch.setattr(connection, "commit", original_commit)
+        assert connection.in_transaction is False
+        await store.defer_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            "request-cancelled-recovery",
+            lease_id,
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_reconciliation_lease_cannot_mutate_replacement(
+    tmp_path,
+) -> None:
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    await store.acquire_adapter_ownership()
+    original_lease = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-replaced",
+        b"x" * 32,
+    )
+    await store.defer_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "request-replaced",
+        original_lease,
+    )
+    stale_lease = await store.claim_generated_send_reconciliation(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "request-replaced",
+    )
+    assert stale_lease is not None
+    await store.recover_generated_send_leases(CONNECTOR_KEY)
+    replacement_lease = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-replaced",
+        b"x" * 32,
+    )
+    try:
+        assert await store.confirm_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            GROUP_ID,
+            "request-replaced",
+            "message-stale",
+            stale_lease,
+        ) is False
+        assert await store.defer_generated_send_reconciliation(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            "request-replaced",
+            stale_lease,
+            next_attempt_at=123.0,
+        ) is False
+
+        reservations = await store.list_generated_send_reservations(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+        )
+        assert len(reservations) == 1
+        assert reservations[0].reconciliation_attempts == 0
+        cursor = await store._require_connection().execute(
+            """
+            SELECT lease_id
+            FROM wechat_generated_send_leases
+            WHERE connector_key = ? AND account_id = ? AND request_id = ?
+            """,
+            (CONNECTOR_KEY, ACCOUNT_ID, "request-replaced"),
+        )
+        row = await cursor.fetchone()
+        assert row is not None and row["lease_id"] == replacement_lease
+        cursor = await store._require_connection().execute(
+            """
+            SELECT 1
+            FROM wechat_generated_messages
+            WHERE connector_key = ? AND account_id = ?
+              AND chat_id = ? AND message_id = ?
+            """,
+            (CONNECTOR_KEY, ACCOUNT_ID, GROUP_ID, "message-stale"),
+        )
+        assert await cursor.fetchone() is None
+    finally:
+        await store.defer_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            "request-replaced",
+            replacement_lease,
+        )
         await store.close()
 
 
