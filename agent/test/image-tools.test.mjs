@@ -42,6 +42,8 @@ function fixture(result = { data: [{ b64_json: JPEG_BYTES.toString("base64") }] 
 test("generates one bounded JPEG without returning bytes to the model", async () => {
   const app = fixture();
 
+  assert.match(app.tool.promptSnippet, /host delivers.*ends the turn/i);
+
   const result = await app.tool.execute("call-image-1", {
     prompt: "A fox and Devon Rex cat visiting Xiamen",
   });
