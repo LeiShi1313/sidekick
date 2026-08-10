@@ -102,6 +102,7 @@ async def test_duplicate_wechat_adapter_fails_before_opening_ai_state(
         with pytest.raises(RuntimeError, match="already active"):
             await plugin._run()
         assert ai_store.connect_calls == 0
+        assert plugin._wechat_store._connection is None
     finally:
         await owner.close()
 

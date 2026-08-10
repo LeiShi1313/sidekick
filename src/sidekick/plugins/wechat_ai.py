@@ -189,9 +189,9 @@ class WeChatAI(metaclass=PluginMount):
                 loop.add_signal_handler(stop_signal, stop.set)
             except NotImplementedError:
                 pass
-        await self._wechat_store.connect()
+        await self._wechat_store.acquire_adapter_ownership()
         try:
-            await self._wechat_store.acquire_adapter_ownership()
+            await self._wechat_store.connect()
             await self._wechat_store.recover_generated_send_leases(
                 self._client.base_url
             )

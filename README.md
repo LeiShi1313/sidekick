@@ -165,6 +165,10 @@ and could treat a delayed generated echo as a manual command. Keep the new
 worker running until reconciliation reaches zero, then quiesce and repeat the
 active-run and send-journal audit before rollback.
 
+Mount each WeChat state database through its whole parent directory or a named
+volume so SQLite WAL and ownership sidecars share the same filesystem identity.
+Hard-linked databases and file-only bind mounts are unsupported.
+
 ## Containers
 
 The stack is deliberately split by ownership so each layer can run on its own:

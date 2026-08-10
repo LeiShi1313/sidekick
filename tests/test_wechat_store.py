@@ -134,10 +134,11 @@ async def test_wechat_adapter_ownership_is_exclusive_and_released_on_close(
     tmp_path,
 ) -> None:
     state_path = tmp_path / "wechat.db"
-    first = await WeChatStateRepository(state_path).connect()
-    second = await WeChatStateRepository(state_path).connect()
+    first = WeChatStateRepository(state_path)
+    second = WeChatStateRepository(state_path)
     try:
         await first.acquire_adapter_ownership()
+        await first.connect()
         with pytest.raises(RuntimeError, match="already active"):
             await second.acquire_adapter_ownership()
         with pytest.raises(RuntimeError, match="requires adapter ownership"):
@@ -145,6 +146,7 @@ async def test_wechat_adapter_ownership_is_exclusive_and_released_on_close(
 
         await first.close()
         await second.acquire_adapter_ownership()
+        await second.connect()
     finally:
         await second.close()
         await first.close()
@@ -154,12 +156,28 @@ async def test_wechat_adapter_ownership_is_exclusive_and_released_on_close(
 async def test_wechat_adapter_ownership_rejects_symlink_alias(tmp_path) -> None:
     state_path = tmp_path / "wechat.db"
     owner = await WeChatStateRepository(state_path).connect()
+    await owner.acquire_adapter_ownership()
     alias_path = tmp_path / "wechat-alias.db"
     alias_path.symlink_to(state_path.name)
-    alias = await WeChatStateRepository(alias_path).connect()
+    alias = WeChatStateRepository(alias_path)
     try:
-        await owner.acquire_adapter_ownership()
         with pytest.raises(RuntimeError, match="already active"):
+            await alias.acquire_adapter_ownership()
+    finally:
+        await alias.close()
+        await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_adapter_ownership_rejects_hard_link_alias(tmp_path) -> None:
+    state_path = tmp_path / "wechat.db"
+    owner = await WeChatStateRepository(state_path).connect()
+    await owner.acquire_adapter_ownership()
+    alias_path = tmp_path / "wechat-hard-link.db"
+    alias_path.hardlink_to(state_path)
+    alias = WeChatStateRepository(alias_path)
+    try:
+        with pytest.raises(RuntimeError, match="hard-linked"):
             await alias.acquire_adapter_ownership()
     finally:
         await alias.close()

@@ -135,10 +135,7 @@ class WeChatStateRepository:
 
     @_serialized
     async def connect(self) -> WeChatStateRepository:
-        parent_existed = self.path.parent.exists()
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not parent_existed:
-            self.path.parent.chmod(0o700)
+        self._ensure_parent_directory()
         connection = await aiosqlite.connect(self.path)
         connection.row_factory = aiosqlite.Row
         await connection.execute("PRAGMA journal_mode=WAL")
@@ -379,9 +376,16 @@ class WeChatStateRepository:
     @_serialized
     async def acquire_adapter_ownership(self) -> None:
         """Exclusively own adapter mutations for this state database."""
-        self._require_connection()
         if self._adapter_lock_fd is not None:
             raise RuntimeError("WeChat adapter ownership is already held")
+        self._ensure_parent_directory()
+        if self.path.exists():
+            if not self.path.is_file():
+                raise RuntimeError("WeChat state path must be a regular file")
+            if self.path.stat().st_nlink != 1:
+                raise RuntimeError(
+                    "WeChat state databases must not be hard-linked"
+                )
         lock_path = self.path.with_name(f"{self.path.name}.adapter.lock")
         flags = os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_CLOEXEC"):
@@ -411,6 +415,12 @@ class WeChatStateRepository:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+    def _ensure_parent_directory(self) -> None:
+        parent_existed = self.path.parent.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not parent_existed:
+            self.path.parent.chmod(0o700)
 
     @_serialized
     async def bootstrap(
