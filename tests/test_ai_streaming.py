@@ -446,6 +446,31 @@ async def test_responder_does_not_deliver_an_attachment_from_a_failed_run(
     assert transport.attachments == []
 
 
+@pytest.mark.asyncio
+async def test_responder_surfaces_an_empty_model_response() -> None:
+    class EmptyResponseGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(
+                type="run_failed",
+                code="EMPTY_RESPONSE",
+                message="Agent returned an empty response",
+            )
+
+    responder = make_telegram_responder(EmptyResponseGateway())
+    trigger = FakeMessage("/ai answer")
+
+    result = await responder.answer(trigger, make_request("answer"))
+
+    assert result.succeeded is False
+    assert result.failure_code == "EMPTY_RESPONSE"
+    assert trigger.replies[0].text == "AI returned an empty response. Try again."
+
+
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:
     async with asyncio.timeout(1):
         while len(answer.edits) < count:

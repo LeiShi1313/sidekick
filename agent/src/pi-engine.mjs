@@ -61,6 +61,9 @@ const RESTRICTED_TOOLS = Object.freeze([
 ]);
 const TOOL_POLICIES = new Set(["owner", "delegated", "none"]);
 const PUBLIC_AGENT_CWD = "/workspace";
+const EMPTY_RESPONSE_RETRY_PROMPT =
+  "Your previous response was empty. Complete the original request now, " +
+  "using an appropriate tool if needed.";
 
 class SessionUnavailableError extends Error {
   constructor() {
@@ -945,6 +948,7 @@ export class PiEngine {
       let textStream = new SensitiveTextStream(privacyOptions);
       let finalAnswer = "";
       let hasGeneratedAttachment = false;
+      let toolExecutionStarted = false;
       let turnNumber = 0;
       let turnStartedAt = null;
       const emitText = (delta) => {
@@ -975,6 +979,7 @@ export class PiEngine {
         } else if (event.type === "message_end") {
           sanitizeMessageInPlace(event.message, privacyOptions);
         } else if (event.type === "tool_execution_start") {
+          toolExecutionStarted = true;
           toolStartedAt.set(event.toolCallId, {
             startedAt: Date.now(),
             toolName: event.toolName,
@@ -1098,9 +1103,26 @@ export class PiEngine {
               mimeType: image.mimeType,
             })),
           });
-          const lastAssistant = [...session.messages]
+          let lastAssistant = [...session.messages]
             .reverse()
             .find((message) => message.role === "assistant");
+          if (
+            lastAssistant?.stopReason === "stop" &&
+            !toolExecutionStarted &&
+            !extractText(lastAssistant).trim()
+          ) {
+            await session.sendCustomMessage(
+              {
+                customType: "empty-response-retry",
+                content: EMPTY_RESPONSE_RETRY_PROMPT,
+                display: false,
+              },
+              { triggerTurn: true },
+            );
+            lastAssistant = [...session.messages]
+              .reverse()
+              .find((message) => message.role === "assistant");
+          }
           if (lastAssistant?.stopReason === "aborted") {
             const failed = {
               code: "CANCELLED",
@@ -1137,17 +1159,30 @@ export class PiEngine {
             );
             const answer = rawAnswer.trim() ? rawAnswer : "";
             const entryId = sessionManager.getLeafId();
-            if ((!answer && !hasGeneratedAttachment) || !entryId) {
-              throw new Error("Agent returned no final answer");
+            if (!answer && !hasGeneratedAttachment) {
+              const failed = {
+                code: "EMPTY_RESPONSE",
+                message: "Agent returned an empty response",
+                sessionId: session.sessionId,
+              };
+              terminalRecorded = true;
+              await record("run.failed", failed);
+              queue.push({
+                type: "run_failed",
+                code: failed.code,
+                message: failed.message,
+              });
+            } else {
+              if (!entryId) throw new Error("Agent returned no final answer");
+              const completed = {
+                sessionId: session.sessionId,
+                entryId,
+                answer,
+              };
+              terminalRecorded = true;
+              await record("run.completed", completed);
+              queue.push({ type: "run_completed", ...completed });
             }
-            const completed = {
-              sessionId: session.sessionId,
-              entryId,
-              answer,
-            };
-            terminalRecorded = true;
-            await record("run.completed", completed);
-            queue.push({ type: "run_completed", ...completed });
           }
           queue.close();
         } catch (error) {

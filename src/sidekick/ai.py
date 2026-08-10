@@ -971,6 +971,19 @@ class AIResponder:
                             succeeded=False,
                             failure_code="SESSION_UNAVAILABLE",
                         )
+                    if event.code == "EMPTY_RESPONSE":
+                        empty = "AI returned an empty response. Try again."
+                        await self._edit_message(
+                            answer,
+                            empty,
+                            wait=True,
+                        )
+                        return AnswerResult(
+                            message=answer,
+                            text=empty,
+                            succeeded=False,
+                            failure_code="EMPTY_RESPONSE",
+                        )
                     raise RuntimeError(event.message or "Agent run failed")
                 if event.type == "run_completed":
                     assert event.answer is not None

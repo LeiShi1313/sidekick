@@ -934,35 +934,89 @@ test("normalizes a whitespace-only image caption to empty", async () => {
   }
 });
 
-test("rejects an empty model response without a generated attachment", async () => {
-  const app = await fixture((_body, response) => sendEmptyText(response));
+test("retries an empty model response once and can select a tool", async () => {
+  const app = await fixture((body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendEmptyText(response);
+      return;
+    }
+    if (requestNumber === 2) {
+      sendCodeToolCall(response);
+      return;
+    }
+    assert.equal(body.messages.at(-1)?.role, "tool");
+    sendText(response, "The result is 42.");
+  });
   try {
-    await assert.rejects(
-      collect(
-        app.engine,
-        request("50505050-5050-4050-8050-505050505050", {
-          prompt: "Answer without using a tool",
-        }),
-      ),
-      /Agent returned no final answer/,
+    const events = await collect(
+      app.engine,
+      request("50505050-5050-4050-8050-505050505050", {
+        prompt: "Calculate 6 * 7",
+      }),
     );
+
+    assert.equal(app.provider.requests.length, 3);
+    assert.equal(
+      textOf(app.provider.requests[1].messages.at(-1)?.content),
+      "Your previous response was empty. Complete the original request now, " +
+        "using an appropriate tool if needed.",
+    );
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "The result is 42.");
   } finally {
     await app.close();
   }
 });
 
-test("rejects a whitespace-only response without a generated attachment", async () => {
-  const app = await fixture((_body, response) => sendText(response, " \n\t"));
+test("returns an empty-response failure after one retry", async () => {
+  const app = await fixture((_body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendText(response, " \n\t");
+      return;
+    }
+    sendEmptyText(response);
+  });
   try {
-    await assert.rejects(
-      collect(
-        app.engine,
-        request("52525252-5252-4252-8252-525252525252", {
-          prompt: "Answer without using a tool",
-        }),
-      ),
-      /Agent returned no final answer/,
+    const events = await collect(
+      app.engine,
+      request("52525252-5252-4252-8252-525252525252", {
+        prompt: "Answer without using a tool",
+      }),
     );
+
+    assert.equal(app.provider.requests.length, 2);
+    assert.deepEqual(events.at(-1), {
+      type: "run_failed",
+      code: "EMPTY_RESPONSE",
+      message: "Agent returned an empty response",
+    });
+  } finally {
+    await app.close();
+  }
+});
+
+test("does not retry an empty response after a tool starts", async () => {
+  const app = await fixture((_body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendCodeToolCall(response);
+      return;
+    }
+    sendEmptyText(response);
+  });
+  try {
+    const events = await collect(
+      app.engine,
+      request("53535353-5353-4353-8353-535353535353", {
+        prompt: "Calculate 6 * 7",
+      }),
+    );
+
+    assert.equal(app.provider.requests.length, 2);
+    assert.deepEqual(events.at(-1), {
+      type: "run_failed",
+      code: "EMPTY_RESPONSE",
+      message: "Agent returned an empty response",
+    });
   } finally {
     await app.close();
   }
