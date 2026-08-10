@@ -114,10 +114,13 @@ Hindsight; that memory must be revised or removed through the memory service.
 The root Compose stack declares `wechat-host-ai` and `wechat-peer-ai`. Each
 worker joins only its matching bridge network, uses its own WeChat projection
 and AI state databases, and shares the existing Pi agent and Hindsight services.
-Start or update both workers without recreating the Telegram or OneBot adapters:
+Start or update them one at a time without recreating the Telegram or OneBot
+adapters, completing the rollout gates below before advancing:
 
 ```bash
-docker compose up -d --build wechat-host-ai wechat-peer-ai
+docker compose up -d --build wechat-host-ai
+# Complete the generated-send rollout gates, then:
+docker compose up -d --build wechat-peer-ai
 ```
 
 The Compose healthcheck applies the same live capability gates and parses the
@@ -154,12 +157,13 @@ After that first audit, update one provenance-aware worker at a time. WeChat
 startup takes exclusive ownership of its state database, so a duplicate worker
 must fail startup instead of overlapping. Verify authenticated health reports a
 connector-wide zero, then smoke-test one text response and one attachment
-response without a repeated command. Do not roll a WeChat worker back to a
-build that predates durable generated-send provenance while the value is
-non-zero or `null`: the older build cannot read the reconciliation ledger and
-could treat a delayed generated echo as a manual command. Keep the new worker
-running until reconciliation reaches zero, then quiesce and repeat the active
-run and send-journal audit before rollback.
+response without a repeated command. Re-check that the value is zero after the
+smoke tests before advancing to the next worker. Do not roll a WeChat worker
+back to a build that predates durable generated-send provenance while the value
+is non-zero or `null`: the older build cannot read the reconciliation ledger
+and could treat a delayed generated echo as a manual command. Keep the new
+worker running until reconciliation reaches zero, then quiesce and repeat the
+active-run and send-journal audit before rollback.
 
 ## Containers
 

@@ -126,7 +126,7 @@ async def _release_generated_send_lease(
 
 class WeChatStateRepository:
     def __init__(self, path: Path):
-        self.path = Path(path)
+        self.path = Path(path).resolve(strict=False)
         self._connection: aiosqlite.Connection | None = None
         self._adapter_lock_fd: int | None = None
         # aiosqlite serializes statements, not multi-statement transactions.

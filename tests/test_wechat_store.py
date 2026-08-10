@@ -151,6 +151,22 @@ async def test_wechat_adapter_ownership_is_exclusive_and_released_on_close(
 
 
 @pytest.mark.asyncio
+async def test_wechat_adapter_ownership_rejects_symlink_alias(tmp_path) -> None:
+    state_path = tmp_path / "wechat.db"
+    owner = await WeChatStateRepository(state_path).connect()
+    alias_path = tmp_path / "wechat-alias.db"
+    alias_path.symlink_to(state_path.name)
+    alias = await WeChatStateRepository(alias_path).connect()
+    try:
+        await owner.acquire_adapter_ownership()
+        with pytest.raises(RuntimeError, match="already active"):
+            await alias.acquire_adapter_ownership()
+    finally:
+        await alias.close()
+        await owner.close()
+
+
+@pytest.mark.asyncio
 async def test_generated_send_lease_recovery_rolls_back_on_cancellation(
     tmp_path,
     monkeypatch,
