@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import quote, unquote
 
 from sidekick.ai import MemoryScopeTarget, MessageIdentity, MentionedUser, ReplyTarget
@@ -32,7 +32,6 @@ from sidekick.wechat.api import (
     WeChatDownloadedImage,
     WeChatSendFailed,
     WeChatSendOperation,
-    WeChatSendOutcomeUnknown,
 )
 from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import (
@@ -44,6 +43,12 @@ from sidekick.wechat.store import (
 _SAFE_PRE_ACTIVATION_CODES = frozenset(
     {"REPLY_UNSUPPORTED", "SEND_NOT_READY", "SEND_UNAVAILABLE"}
 )
+
+
+def _is_definitely_unsent(exc: Exception) -> bool:
+    return isinstance(exc, WeChatSendFailed) or (
+        isinstance(exc, WeChatAPIError) and exc.code in _SAFE_PRE_ACTIVATION_CODES
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,103 +391,33 @@ class WeChatChatTransport:
             reply_to_message_id=None,
             has_attachment=True,
         )
-        with self._generated_messages.reserve(
-            trigger.chat_id,
-            fingerprint,
-        ) as reservation:
-            try:
-                lease_id = await self._store.reserve_generated_send(
-                    self._connector_key,
-                    trigger.account_id,
-                    trigger.chat_id,
-                    request_id,
-                    fingerprint.digest,
-                )
-            except Exception:
-                reservation.failed()
-                raise
-            try:
-                operation = await self._client.send_attachment_and_wait(
+
+        try:
+            message_id = await self._execute_generated_send(
+                trigger=trigger,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                dispatch=lambda: self._client.send_attachment_and_wait(
                     request_id=request_id,
                     to=trigger.chat_id,
                     attachment=attachment,
-                )
-            except asyncio.CancelledError:
-                await self._defer_generated_send_after_cancellation(
-                    trigger.account_id,
-                    request_id,
-                    lease_id,
-                )
-                raise
-            except WeChatSendOutcomeUnknown:
-                await self._store.defer_generated_send(
-                    self._connector_key,
-                    trigger.account_id,
-                    request_id,
-                    lease_id,
-                )
-                raise
-            except WeChatSendFailed:
-                reservation.failed()
-                await self._store.fail_generated_send(
-                    self._connector_key,
-                    trigger.account_id,
-                    request_id,
-                    lease_id,
-                )
-                await self._store.advance_attachment_send_attempt(
-                    self._connector_key,
-                    trigger.account_id,
-                    trigger.chat_id,
-                    trigger.id,
-                    payload_fingerprint,
-                    expected_attempt=attempt,
-                )
-                raise
-            except WeChatAPIError as exc:
-                if exc.code in _SAFE_PRE_ACTIVATION_CODES:
-                    reservation.failed()
-                    await self._store.fail_generated_send(
-                        self._connector_key,
-                        trigger.account_id,
-                        request_id,
-                        lease_id,
-                    )
-                else:
-                    await self._store.defer_generated_send(
-                        self._connector_key,
-                        trigger.account_id,
-                        request_id,
-                        lease_id,
-                    )
-                raise
-            except Exception:
-                await self._store.defer_generated_send(
-                    self._connector_key,
-                    trigger.account_id,
-                    request_id,
-                    lease_id,
-                )
-                raise
-            if operation.message_id is None:
-                await self._store.defer_generated_send(
-                    self._connector_key,
-                    trigger.account_id,
-                    request_id,
-                    lease_id,
-                )
-                raise RuntimeError("WeChat attachment send returned no message ID")
-            await self._store.confirm_generated_send(
+                ),
+                missing_message_id_error=(
+                    "WeChat attachment send returned no message ID"
+                ),
+            )
+        except WeChatSendFailed:
+            await self._store.advance_attachment_send_attempt(
                 self._connector_key,
                 trigger.account_id,
                 trigger.chat_id,
-                request_id,
-                operation.message_id,
-                lease_id,
+                trigger.id,
+                payload_fingerprint,
+                expected_attempt=attempt,
             )
-            reservation.confirm(operation.message_id, echo_expected=False)
+            raise
         return WeChatSentMessage(
-            id=operation.message_id,
+            id=message_id,
             text=None,
             trigger=trigger,
             request_id=request_id,
@@ -564,136 +499,130 @@ class WeChatChatTransport:
     async def _send(self, message: WeChatSentMessage, text: str) -> None:
         reply_to_message_id = self._native_reply_target(message.trigger)
         plain_fallback_available = reply_to_message_id is not None
+
+        def mark_uncertain() -> None:
+            message.uncertain = True
+            message.text = text
+
         while True:
             fingerprint = message_fingerprint(
                 text=text,
                 reply_to_message_id=reply_to_message_id,
                 has_attachment=False,
             )
-            with self._generated_messages.reserve(
-                message.trigger.chat_id,
-                fingerprint,
-            ) as reservation:
-                try:
-                    lease_id = await self._store.reserve_generated_send(
-                        self._connector_key,
-                        message.trigger.account_id,
-                        message.trigger.chat_id,
-                        message.request_id,
-                        fingerprint.digest,
-                    )
-                except Exception:
-                    reservation.failed()
-                    raise
-                try:
-                    operation = await self._client.send_text_and_wait(
+            try:
+                message_id = await self._execute_generated_send(
+                    trigger=message.trigger,
+                    request_id=message.request_id,
+                    fingerprint=fingerprint,
+                    dispatch=lambda: self._client.send_text_and_wait(
                         request_id=message.request_id,
                         to=message.trigger.chat_id,
                         content=text,
                         reply_to_message_id=reply_to_message_id,
-                    )
-                except asyncio.CancelledError:
-                    message.uncertain = True
-                    message.text = text
-                    await self._defer_generated_send_after_cancellation(
-                        message.trigger.account_id,
-                        message.request_id,
-                        lease_id,
-                    )
+                    ),
+                    missing_message_id_error=(
+                        "WeChat text send returned no message ID"
+                    ),
+                    mark_uncertain=mark_uncertain,
+                )
+            except (WeChatSendFailed, WeChatAPIError) as exc:
+                if not _is_definitely_unsent(exc):
                     raise
-                except WeChatSendOutcomeUnknown:
-                    message.uncertain = True
-                    message.text = text
-                    await self._store.defer_generated_send(
-                        self._connector_key,
-                        message.trigger.account_id,
-                        message.request_id,
-                        lease_id,
-                    )
-                    raise
-                except WeChatSendFailed:
+                # The connector reserves `unknown` for every path where Quote
+                # or Send may have taken effect. A definitely unsent reply can
+                # therefore be replaced by one ordinary text operation.
+                if plain_fallback_available:
+                    plain_fallback_available = False
+                    reply_to_message_id = None
+                    message.request_id = f"{message.request_id}.plain"
+                    continue
+                message.failed = True
+                message.text = text
+                raise
+            else:
+                break
+        message.id = message_id
+        message.text = text
+        message.sent = True
+
+    async def _execute_generated_send(
+        self,
+        *,
+        trigger: WeChatMessage,
+        request_id: str,
+        fingerprint: MessageFingerprint,
+        dispatch: Callable[[], Awaitable[WeChatSendOperation]],
+        missing_message_id_error: str,
+        mark_uncertain: Callable[[], None] | None = None,
+    ) -> str:
+        """Dispatch one send while settling volatile and durable provenance."""
+        with self._generated_messages.reserve(
+            trigger.chat_id,
+            fingerprint,
+        ) as reservation:
+            try:
+                lease_id = await self._store.reserve_generated_send(
+                    self._connector_key,
+                    trigger.account_id,
+                    trigger.chat_id,
+                    request_id,
+                    fingerprint.digest,
+                )
+            except Exception:
+                reservation.failed()
+                raise
+            try:
+                operation = await dispatch()
+            except asyncio.CancelledError:
+                if mark_uncertain is not None:
+                    mark_uncertain()
+                await self._defer_generated_send_after_cancellation(
+                    trigger.account_id,
+                    request_id,
+                    lease_id,
+                )
+                raise
+            except Exception as exc:
+                if _is_definitely_unsent(exc):
                     reservation.failed()
                     await self._store.fail_generated_send(
                         self._connector_key,
-                        message.trigger.account_id,
-                        message.request_id,
+                        trigger.account_id,
+                        request_id,
                         lease_id,
                     )
-                    # The connector reserves `unknown` for every path where Quote
-                    # or Send may have taken effect. A terminal `failed` reply can
-                    # therefore be replaced by one ordinary text operation.
-                    if plain_fallback_available:
-                        plain_fallback_available = False
-                        reply_to_message_id = None
-                        message.request_id = f"{message.request_id}.plain"
-                        continue
-                    message.failed = True
-                    message.text = text
-                    raise
-                except WeChatAPIError as exc:
-                    # These synchronous reply errors are contractually rejected
-                    # before operation creation or activation.
-                    if exc.code in _SAFE_PRE_ACTIVATION_CODES:
-                        reservation.failed()
-                        await self._store.fail_generated_send(
-                            self._connector_key,
-                            message.trigger.account_id,
-                            message.request_id,
-                            lease_id,
-                        )
-                        if plain_fallback_available:
-                            plain_fallback_available = False
-                            reply_to_message_id = None
-                            message.request_id = f"{message.request_id}.plain"
-                            continue
-                        message.failed = True
-                        message.text = text
-                        raise
-                    message.uncertain = True
-                    message.text = text
-                    await self._store.defer_generated_send(
-                        self._connector_key,
-                        message.trigger.account_id,
-                        message.request_id,
-                        lease_id,
-                    )
-                    raise
-                except Exception:
+                else:
                     # A transport failure can happen after the connector accepted
                     # the request. Keep the original ID/payload reserved and never
                     # replace it with an error message under that ID.
-                    message.uncertain = True
-                    message.text = text
+                    if mark_uncertain is not None:
+                        mark_uncertain()
                     await self._store.defer_generated_send(
                         self._connector_key,
-                        message.trigger.account_id,
-                        message.request_id,
+                        trigger.account_id,
+                        request_id,
                         lease_id,
                     )
-                    raise
-                if operation.message_id is None:
-                    await self._store.defer_generated_send(
-                        self._connector_key,
-                        message.trigger.account_id,
-                        message.request_id,
-                        lease_id,
-                    )
-                    raise RuntimeError("WeChat text send returned no message ID")
-                await self._store.confirm_generated_send(
+                raise
+            if operation.message_id is None:
+                await self._store.defer_generated_send(
                     self._connector_key,
-                    message.trigger.account_id,
-                    message.trigger.chat_id,
-                    message.request_id,
-                    operation.message_id,
+                    trigger.account_id,
+                    request_id,
                     lease_id,
                 )
-                reservation.confirm(operation.message_id, echo_expected=False)
-                break
-        if operation.message_id is None:
-            raise RuntimeError("WeChat text send returned no message ID")
-        message.id = operation.message_id
-        message.text = text
-        message.sent = True
+                raise RuntimeError(missing_message_id_error)
+            await self._store.confirm_generated_send(
+                self._connector_key,
+                trigger.account_id,
+                trigger.chat_id,
+                request_id,
+                operation.message_id,
+                lease_id,
+            )
+            reservation.confirm(operation.message_id, echo_expected=False)
+            return operation.message_id
 
     async def reconcile_pending(self, account_id: str) -> int:
         self._durable_indeterminate_count = None
