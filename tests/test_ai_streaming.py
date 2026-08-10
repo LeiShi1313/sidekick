@@ -641,6 +641,34 @@ async def test_responder_surfaces_an_empty_model_response() -> None:
     assert trigger.replies[0].text == "AI returned an empty response. Try again."
 
 
+@pytest.mark.asyncio
+async def test_responder_does_not_recommend_retry_after_tool_outcome_is_unclear() -> None:
+    class UnconfirmedToolOutcomeGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(
+                type="run_failed",
+                code="TOOL_OUTCOME_UNCONFIRMED",
+                message="Agent returned no final response after using a tool",
+            )
+
+    responder = make_telegram_responder(UnconfirmedToolOutcomeGateway())
+    trigger = FakeMessage("/ai send it")
+
+    result = await responder.answer(trigger, make_request("send it"))
+
+    assert result.succeeded is False
+    assert result.failure_code == "TOOL_OUTCOME_UNCONFIRMED"
+    assert trigger.replies[0].text == (
+        "AI returned no final response after using a tool. "
+        "The action may already have completed; verify before retrying."
+    )
+
+
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:
     async with asyncio.timeout(1):
         while len(answer.edits) < count:

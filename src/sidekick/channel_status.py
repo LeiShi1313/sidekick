@@ -746,6 +746,10 @@ def _run_error_message(code: str | None) -> str | None:
         "SESSION_UNAVAILABLE": "The referenced AI thread is unavailable.",
         "DELIVERY_FAILED": "The AI response could not be delivered.",
         "EMPTY_RESPONSE": "The AI run returned no usable response.",
+        "TOOL_OUTCOME_UNCONFIRMED": (
+            "The AI run returned no final response after using a tool; "
+            "the tool outcome may need verification."
+        ),
         "AGENT_ERROR": "The AI agent run failed.",
         "PREPARATION_FAILED": "The AI request could not be prepared.",
         "HANDLER_ERROR": "The adapter failed while handling the AI run.",

@@ -989,6 +989,23 @@ class AIResponder:
                             succeeded=False,
                             failure_code="EMPTY_RESPONSE",
                         )
+                    if event.code == "TOOL_OUTCOME_UNCONFIRMED":
+                        unconfirmed = (
+                            "AI returned no final response after using a tool. "
+                            "The action may already have completed; verify before "
+                            "retrying."
+                        )
+                        await self._edit_message(
+                            answer,
+                            unconfirmed,
+                            wait=True,
+                        )
+                        return AnswerResult(
+                            message=answer,
+                            text=unconfirmed,
+                            succeeded=False,
+                            failure_code="TOOL_OUTCOME_UNCONFIRMED",
+                        )
                     raise RuntimeError(event.message or "Agent run failed")
                 if event.type == "run_completed":
                     assert event.answer is not None
@@ -6210,6 +6227,7 @@ _SAFE_AI_RUN_ERROR_CODES = frozenset(
         "SESSION_UNAVAILABLE",
         "DELIVERY_FAILED",
         "EMPTY_RESPONSE",
+        "TOOL_OUTCOME_UNCONFIRMED",
         "AGENT_ERROR",
         "PREPARATION_FAILED",
         "HANDLER_ERROR",

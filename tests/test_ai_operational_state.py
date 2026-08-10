@@ -220,6 +220,31 @@ async def test_repository_persists_session_unavailable_run_error_code(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_repository_persists_unconfirmed_tool_outcome_code(tmp_path) -> None:
+    store = await AIStateRepository(tmp_path / "ai.db").connect()
+    try:
+        await store.start_ai_run(
+            run_id="run-tool-outcome-unconfirmed",
+            scope_id="qq:private:42",
+            actor_id="qq:user:42",
+            adapter_instance_id="qq-default",
+            started_at=1_800_000_000,
+        )
+        await store.finish_ai_run(
+            "run-tool-outcome-unconfirmed",
+            status="FAILED",
+            updated_at=1_800_000_001,
+            error_code="TOOL_OUTCOME_UNCONFIRMED",
+        )
+
+        state = (await store.list_channel_operational_states())[0]
+
+        assert state.last_run_error == "TOOL_OUTCOME_UNCONFIRMED"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_later_success_clears_the_channel_run_error(tmp_path) -> None:
     store = await AIStateRepository(tmp_path / "ai.db").connect()
     try:
