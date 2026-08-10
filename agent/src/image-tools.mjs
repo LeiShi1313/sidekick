@@ -196,6 +196,7 @@ export function createImageTools({
             data: encoded,
           });
           return {
+            terminate: true,
             content: [
               {
                 type: "text",

@@ -68,6 +68,7 @@ test("generates one bounded JPEG without returning bytes to the model", async ()
       },
     },
   ]);
+  assert.equal(result.terminate, true);
   assert.match(result.content[0].text, /generated and queued/i);
   assert.equal(result.details.sizeBytes, JPEG_BYTES.length);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(JPEG_BYTES.toString("base64")));

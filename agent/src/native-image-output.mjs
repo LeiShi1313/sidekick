@@ -53,6 +53,9 @@ export function createNativeImageCaptureFetch({
         return;
       }
       if (payload?.choices?.[0]?.delta?.tool_calls?.length > 0) {
+        if (imageSeen) {
+          throw new Error("Provider returned conflicting native image output");
+        }
         toolCallSeen = true;
       }
       const url = nativeImageUrl(payload);
