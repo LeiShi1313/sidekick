@@ -964,6 +964,31 @@ class WeChatConnectorClient:
         self._validate_send_identity(operation, request_id=request_id, to=target)
         return await self._wait_for_send(operation, request_id=request_id, to=target)
 
+    async def reconcile_send_and_wait(
+        self,
+        *,
+        request_id: str,
+        to: str,
+    ) -> WeChatSendOperation:
+        if REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise ValueError("WeChat request ID must be 1-128 URL-safe characters")
+        target = _canonical_wechat_id(to, "to")
+        payload = await self._request_json(
+            "GET",
+            f"/sends/{quote(request_id, safe='')}",
+        )
+        operation = WeChatSendOperation.parse(payload)
+        self._validate_send_identity(
+            operation,
+            request_id=request_id,
+            to=target,
+        )
+        return await self._wait_for_send(
+            operation,
+            request_id=request_id,
+            to=target,
+        )
+
     async def _wait_for_send(
         self,
         operation: WeChatSendOperation,

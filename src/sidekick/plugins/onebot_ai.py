@@ -322,6 +322,9 @@ class OneBotAI(metaclass=PluginMount):
         except OneBotMessageError:
             self.logger.warning("Ignoring malformed OneBot message")
             return
+        if message.self_id != self._runtime.self_id:
+            self.logger.warning("Ignoring OneBot message for another account")
+            return
         if message.scope_display_name is None:
             message.scope_display_name = self._directory.scope_name(message.chat_id)
         key = (message.chat_id, message.id)

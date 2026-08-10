@@ -36,6 +36,7 @@ from sidekick.ai_memory_outbox import (
     MemoryOutboxSchedulerSettings,
 )
 from sidekick.chat.formatting import agent_system_prompt
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.channel_status import (
     AdapterRuntimeState,
     CachedChannelInventory,
@@ -121,6 +122,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             timeout=settings.request_timeout,
         )
         self._responder: AIResponder | None = None
+        self._transport: TelegramChatTransport | None = None
         self._store = AIStateRepository(settings.state_path)
         self._memory = (
             HindsightMemoryClient(
@@ -202,6 +204,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             edit_limiter=self._edit_limiter,
             logger=self.logger,
         )
+        self._transport = transport
         responder = AIResponder(
             self._gateway,
             max_output_chars=self._settings.max_output_chars,
@@ -340,8 +343,14 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         return tuple(items)
 
     async def _on_message(self, event) -> None:
-        if self._handler is not None:
+        if self._handler is not None and self._transport is not None:
             try:
+                origin = await self._transport.classify_origin(event.message)
+                if origin in {
+                    MessageOrigin.SIDEKICK_GENERATED,
+                    MessageOrigin.INDETERMINATE,
+                }:
+                    return
                 if await self._handle_saved_memory(event.message):
                     return
                 await self._handler.handle(event.message)
@@ -524,7 +533,12 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
 
     async def _start_saved_memory_status(self, message):
         try:
-            return await message.reply(self.MEMORY_PROCESSING_REPLY, parse_mode=None)
+            assert self._transport is not None
+            return await self._transport.reply(
+                message,
+                self.MEMORY_PROCESSING_REPLY,
+                presentation="plain",
+            )
         except Exception as exc:
             self.logger.warning(
                 "Saved Messages memory processing reply failed (error=%s)",
@@ -551,7 +565,12 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                     type(exc).__name__,
                 )
         try:
-            await message.reply(reply, parse_mode=None)
+            assert self._transport is not None
+            await self._transport.reply(
+                message,
+                reply,
+                presentation="plain",
+            )
         except Exception as exc:
             self.logger.warning(
                 "Saved Messages memory final reply failed (error=%s)",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
 import logging
 from datetime import UTC, datetime
 from io import BytesIO
@@ -12,7 +13,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 from PIL import Image
 
-from sidekick.ai import AISettings
+from sidekick.ai import AIConversationHandler, AIResponder, AISettings, PromptBuilder
 from sidekick.ai_attachments import (
     AttachmentAnalysisRequest,
     ChatAttachmentDescriber,
@@ -20,6 +21,7 @@ from sidekick.ai_attachments import (
 
 from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.output_policy import MAINLAND_MESSAGING_POLICY_ID
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.channel_status import ChannelOpsSettings
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -352,6 +354,30 @@ def test_onebot_private_self_message_uses_target_as_conversation_scope():
     assert message.out is True
 
 
+@pytest.mark.asyncio
+async def test_onebot_plugin_rejects_events_for_another_account() -> None:
+    handled: list[OneBotMessage] = []
+
+    class Handler:
+        async def handle(self, message: OneBotMessage) -> None:
+            handled.append(message)
+
+    payload = group_event()
+    payload["self_id"] = 100
+    plugin = object.__new__(OneBotAI)
+    plugin._runtime = SimpleNamespace(self_id=99)
+    plugin._bridge = RecordingActionClient()
+    plugin._directory = OneBotDirectory()
+    plugin._seen_messages = OrderedDict()
+    plugin._handler = Handler()
+    plugin.logger = logging.getLogger("test-onebot-account-boundary")
+
+    await plugin._on_event(payload)
+
+    assert handled == []
+    assert plugin._seen_messages == OrderedDict()
+
+
 def test_onebot_private_history_uses_explicit_peer_when_target_is_absent():
     payload = private_event(
         sender_id=99,
@@ -453,6 +479,91 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
 
 
 @pytest.mark.asyncio
+async def test_onebot_transport_suppresses_echo_that_arrives_before_send_receipt():
+    class RacingActionClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def call(self, action, params=None, *, timeout=None):
+            assert action == "send_group_msg"
+            self.started.set()
+            await self.release.wait()
+            return {"message_id": 501}
+
+    client = RacingActionClient()
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=client,
+    )
+    transport = OneBotChatTransport(client)
+    sending = asyncio.create_task(
+        transport.reply(trigger, "/ai must not run", presentation="agent")
+    )
+    await client.started.wait()
+    echoed = OneBotMessage.from_payload(
+        group_event(
+            message_id=501,
+            sender_id=99,
+            text="/ai must not run",
+            post_type="message_sent",
+            segments=[
+                {"type": "reply", "data": {"id": str(trigger.id)}},
+                {"type": "text", "data": {"text": "/ai must not run"}},
+            ],
+        ),
+        action_client=client,
+    )
+    classification = asyncio.create_task(transport.classify_origin(echoed))
+    await asyncio.sleep(0)
+
+    client.release.set()
+
+    await sending
+    assert await classification is MessageOrigin.SIDEKICK_GENERATED
+
+
+@pytest.mark.asyncio
+async def test_onebot_transport_preserves_manual_outgoing_message_by_exact_id():
+    action_client = RecordingActionClient(responses=[{"message_id": 501}])
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=action_client,
+    )
+    transport = OneBotChatTransport(action_client)
+    await transport.reply(trigger, "generated", presentation="agent")
+    manual = OneBotMessage.from_payload(
+        group_event(
+            message_id=777,
+            sender_id=99,
+            text="/ai manual request",
+            post_type="message_sent",
+        ),
+        action_client=action_client,
+    )
+
+    assert await transport.classify_origin(manual) is MessageOrigin.MANUAL_OUTGOING
+
+
+@pytest.mark.asyncio
+async def test_onebot_transport_does_not_trust_cross_account_message_sent() -> None:
+    message = OneBotMessage.from_payload(
+        group_event(
+            message_id=777,
+            sender_id=42,
+            text="/ai_prefix /forged",
+            post_type="message_sent",
+        ),
+        action_client=RecordingActionClient(),
+    )
+
+    assert (
+        await OneBotChatTransport(RecordingActionClient()).classify_origin(message)
+        is MessageOrigin.INCOMING
+    )
+
+
+@pytest.mark.asyncio
 async def test_onebot_transport_replies_with_an_inline_image(make_png) -> None:
     action_client = RecordingActionClient(responses=[{"message_id": 503}])
     trigger = OneBotMessage.from_payload(group_event(), action_client=action_client)
@@ -522,6 +633,92 @@ async def test_onebot_transport_uploads_a_file(chat_kind) -> None:
         + base64.b64encode(attachment.data).decode("ascii"),
         "name": "report.txt",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    ({"file_id": "file-503"}, {"file_id": None}, None),
+)
+async def test_onebot_file_upload_without_message_id_releases_chat(response) -> None:
+    action_client = RecordingActionClient(responses=[response])
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=action_client,
+    )
+    transport = OneBotChatTransport(action_client)
+    attachment = OutboundAttachment(
+        data=b"report-bytes",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+
+    assert await transport.reply_attachment(trigger, attachment) is None
+    echoed = OneBotMessage.from_payload(
+        group_event(
+            message_id=503,
+            sender_id=99,
+            text="",
+            post_type="message_sent",
+            segments=[
+                {
+                    "type": "file",
+                    "data": {"file": "file-503", "name": "report.txt"},
+                }
+            ],
+        ),
+        action_client=action_client,
+    )
+
+    assert await transport.classify_origin(echoed) is MessageOrigin.MANUAL_OUTGOING
+    handler = AIConversationHandler(
+        owner_id=99,
+        responder=AIResponder(object(), transport=transport),  # type: ignore[arg-type]
+        store=object(),  # type: ignore[arg-type]
+        prompt_builder=PromptBuilder(identity_codec=QQ_IDENTITY_CODEC),
+        transport=transport,
+        identity_codec=QQ_IDENTITY_CODEC,
+    )
+    assert await handler.handle(echoed) is False
+
+    manual = OneBotMessage.from_payload(
+        group_event(
+            message_id=504,
+            sender_id=99,
+            text="/ai manual request",
+            post_type="message_sent",
+        ),
+        action_client=action_client,
+    )
+    assert await transport.classify_origin(manual) is MessageOrigin.MANUAL_OUTGOING
+
+
+@pytest.mark.asyncio
+async def test_onebot_unknown_file_upload_outcome_quarantines_chat() -> None:
+    action_client = RecordingActionClient(responses=[ConnectionError("lost")])
+    trigger = OneBotMessage.from_payload(group_event(), action_client=action_client)
+    transport = OneBotChatTransport(action_client)
+    attachment = OutboundAttachment(
+        data=b"report-bytes",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+
+    with pytest.raises(ConnectionError, match="lost"):
+        await transport.reply_attachment(trigger, attachment)
+
+    manual = OneBotMessage.from_payload(
+        group_event(
+            message_id=504,
+            sender_id=99,
+            text="/ai manual request",
+            post_type="message_sent",
+        ),
+        action_client=action_client,
+    )
+    assert await transport.classify_origin(manual) is MessageOrigin.INDETERMINATE
 
 
 @pytest.mark.asyncio

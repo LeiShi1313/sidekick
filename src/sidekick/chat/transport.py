@@ -5,6 +5,12 @@ from typing import Any, Literal, Protocol
 
 from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.identity import ExternalId
+from sidekick.chat.provenance import (
+    GeneratedMessageTracker,
+    MessageOrigin,
+    message_fingerprint,
+    observed_message_fingerprint,
+)
 
 
 ChatPresentation = Literal["plain", "agent"]
@@ -43,13 +49,18 @@ class ChatTransport(Protocol):
 
     async def delete(self, message: Any) -> None: ...
 
-    def is_outgoing(self, message: Any) -> bool: ...
+    async def classify_origin(self, message: Any) -> MessageOrigin:
+        """Attest origin; MANUAL_OUTGOING must mean authenticated local input."""
+        ...
 
     def is_group(self, message: Any) -> bool: ...
 
 
 class ObjectChatTransport:
     """Adapter for SDK message objects exposing reply/edit/delete methods."""
+
+    def __init__(self) -> None:
+        self._generated_messages = GeneratedMessageTracker()
 
     async def get_reply(self, message: Any) -> Any | None:
         operation = getattr(message, "get_reply_message", None)
@@ -65,7 +76,18 @@ class ObjectChatTransport:
         operation = getattr(message, "reply", None)
         if not callable(operation):
             raise RuntimeError("Chat transport cannot reply to this message")
-        return await operation(text)
+        fingerprint = message_fingerprint(
+            text=text,
+            reply_to_message_id=message.id,
+            has_attachment=False,
+        )
+        with self._generated_messages.reserve(
+            message.chat_id,
+            fingerprint,
+        ) as reservation:
+            sent = await operation(text)
+            reservation.confirm(sent.id)
+            return sent
 
     async def reply_attachment(
         self,
@@ -78,10 +100,24 @@ class ObjectChatTransport:
         upload = BytesIO(attachment.data)
         upload.name = attachment.filename
         try:
-            return await operation(
-                file=upload,
-                force_document=attachment.display_as == "file",
+            fingerprint = message_fingerprint(
+                text=None,
+                reply_to_message_id=message.id,
+                has_attachment=True,
             )
+            with self._generated_messages.reserve(
+                message.chat_id,
+                fingerprint,
+            ) as reservation:
+                sent = await operation(
+                    file=upload,
+                    force_document=attachment.display_as == "file",
+                )
+                if sent is not None:
+                    reservation.confirm(sent.id)
+                else:
+                    reservation.uncertain()
+                return sent
         finally:
             upload.close()
 
@@ -104,11 +140,19 @@ class ObjectChatTransport:
         if callable(operation):
             await operation()
 
-    def is_outgoing(self, message: Any) -> bool:
+    async def classify_origin(self, message: Any) -> MessageOrigin:
         outgoing = getattr(message, "is_outgoing", None)
         if outgoing is None:
             outgoing = getattr(message, "out", False)
-        return bool(outgoing)
+        self_id = getattr(message, "self_id", None)
+        if self_id is not None and getattr(message, "sender_id", None) != self_id:
+            outgoing = False
+        return await self._generated_messages.classify(
+            chat_id=message.chat_id,
+            message_id=message.id,
+            outgoing=bool(outgoing),
+            fingerprint=observed_message_fingerprint(message),
+        )
 
     def is_group(self, message: Any) -> bool:
         group = getattr(message, "is_group", None)

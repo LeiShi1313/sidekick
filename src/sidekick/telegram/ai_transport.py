@@ -18,6 +18,12 @@ from sidekick.chat.formatting import (
     has_streamable_markdown_content,
     sanitize_rich_markdown,
 )
+from sidekick.chat.provenance import (
+    GeneratedMessageTracker,
+    MessageOrigin,
+    message_fingerprint,
+    observed_message_fingerprint,
+)
 from sidekick.chat.transport import ChatPresentation, SentMessage
 
 
@@ -144,6 +150,7 @@ class TelegramChatTransport:
         self._sleep = sleep or asyncio.sleep
         self._logger = logger
         self._update_states: dict[int, _TelegramUpdateState] = {}
+        self._generated_messages = GeneratedMessageTracker()
         self._edit_limiter = edit_limiter or TelegramEditLimiter(
             edit_cadence,
             clock=clock,
@@ -165,7 +172,20 @@ class TelegramChatTransport:
         operation = getattr(message, "reply", None)
         if not callable(operation):
             raise RuntimeError("Telegram message cannot be replied to")
-        return await operation(text, parse_mode=None)
+        fingerprint = message_fingerprint(
+            text=text,
+            reply_to_message_id=message.id,
+            has_attachment=False,
+        )
+        with self._generated_messages.reserve(
+            message.chat_id,
+            fingerprint,
+        ) as reservation:
+            sent = await operation(text, parse_mode=None)
+            # Telethon consumes the RPC-returned update and does not dispatch a
+            # second NewMessage event for this same-client send.
+            reservation.confirm(sent.id, echo_expected=False)
+            return sent
 
     async def reply_attachment(
         self,
@@ -178,10 +198,24 @@ class TelegramChatTransport:
         upload = BytesIO(attachment.data)
         upload.name = attachment.filename
         try:
-            return await operation(
-                file=upload,
-                force_document=attachment.display_as == "file",
+            fingerprint = message_fingerprint(
+                text=None,
+                reply_to_message_id=message.id,
+                has_attachment=True,
             )
+            with self._generated_messages.reserve(
+                message.chat_id,
+                fingerprint,
+            ) as reservation:
+                sent = await operation(
+                    file=upload,
+                    force_document=attachment.display_as == "file",
+                )
+                if sent is not None:
+                    reservation.confirm(sent.id, echo_expected=False)
+                else:
+                    reservation.uncertain()
+                return sent
         finally:
             upload.close()
 
@@ -249,8 +283,13 @@ class TelegramChatTransport:
         if callable(operation):
             await operation()
 
-    def is_outgoing(self, message: Any) -> bool:
-        return bool(getattr(message, "out", False))
+    async def classify_origin(self, message: Any) -> MessageOrigin:
+        return await self._generated_messages.classify(
+            chat_id=message.chat_id,
+            message_id=message.id,
+            outgoing=bool(getattr(message, "out", False)),
+            fingerprint=observed_message_fingerprint(message),
+        )
 
     def is_group(self, message: Any) -> bool:
         return bool(getattr(message, "is_group", False))
