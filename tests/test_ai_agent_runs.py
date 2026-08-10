@@ -506,6 +506,12 @@ async def test_reply_to_active_request_reports_that_ai_is_still_working():
         )
         assert len(gateway.requests) == 1
 
+        outgoing_echo = FakeMessage("Generated answer", reply_to=trigger)
+        outgoing_echo.out = True
+        assert await handler.handle(outgoing_echo) is False
+        assert outgoing_echo.replies == []
+        assert len(gateway.requests) == 1
+
         other_chat = FakeMessage(
             "Are you still working?",
             chat_id=-1002,
