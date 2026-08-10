@@ -39,6 +39,11 @@ test("pseudonymizes platform actor identifiers with a stable keyed alias", () =>
     redactSensitiveText("Post by telegram:channel:998877", options),
     /telegram:channel:998877/,
   );
+  const bridgeActorId =
+    "telegram:matrix-bridge:6332621450%3A-1001%3A0123456789abcdef0123456789abcdef";
+  const bridged = redactSensitiveText(`Post by ${bridgeActorId}`, options);
+  assert.match(bridged, /actor_[a-f0-9]{16}/);
+  assert.equal(bridged.includes(bridgeActorId), false);
 });
 
 const DOCUMENTATION_IPV4 = "203.0.113.42";

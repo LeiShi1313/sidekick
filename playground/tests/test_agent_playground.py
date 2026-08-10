@@ -281,11 +281,24 @@ async def dependencies(
                     },
                     "memory": {
                         "enabled": True,
-                        "primaryBankId": None,
+                        "primaryBankId": "workspace:engineering",
                         "route": "cross_bank_queried",
                         "initialRecall": {
                             "status": "completed",
-                            "queries": [],
+                            "queries": ["Current request: Who owns deployment?"],
+                            "memories": [
+                                {
+                                    "id": "memory-1",
+                                    "text": "Alice owns deployment.",
+                                    "type": "world",
+                                    "entities": ["chat:user:alice"],
+                                    "occurredStart": None,
+                                    "occurredEnd": None,
+                                    "mentionedAt": "2026-07-13T12:00:00Z",
+                                    "documentId": "conversation:7",
+                                    "chunkId": "chunk-7",
+                                }
+                            ],
                             "queryCount": 1,
                             "memoryCount": 1,
                             "eventSequence": 3,
@@ -377,6 +390,21 @@ async def dependencies(
                         "type": "memory.context",
                         "data": {
                             "memoryEnabled": True,
+                            "primaryBankId": "workspace:engineering",
+                            "queries": ["Current request: Who owns deployment?"],
+                            "memories": [
+                                {
+                                    "id": "memory-1",
+                                    "text": "Alice owns deployment.",
+                                    "type": "world",
+                                    "entities": ["chat:user:alice"],
+                                    "occurredStart": None,
+                                    "occurredEnd": None,
+                                    "mentionedAt": "2026-07-13T12:00:00Z",
+                                    "documentId": "conversation:7",
+                                    "chunkId": "chunk-7",
+                                }
+                            ],
                             "queryCount": 1,
                             "memoryCount": 1,
                             "recall": {"status": "completed"},
@@ -789,6 +817,21 @@ async def test_session_history_and_run_audits_are_proxied_without_exposing_token
         assert audit["events"][1]["data"]["durationMs"] == 42
         assert audit["summary"]["memory"]["route"] == "cross_bank_queried"
         assert audit["summary"]["memory"]["initialRecall"]["status"] == "completed"
+        assert audit["summary"]["memory"]["primaryBankId"] == "workspace:engineering"
+        assert audit["summary"]["memory"]["initialRecall"]["queries"] == [
+            "Current request: Who owns deployment?"
+        ]
+        assert audit["summary"]["memory"]["initialRecall"]["memories"][0] == {
+            "id": "memory-1",
+            "text": "Alice owns deployment.",
+            "type": "world",
+            "entities": ["chat:user:alice"],
+            "occurredStart": None,
+            "occurredEnd": None,
+            "mentionedAt": "2026-07-13T12:00:00Z",
+            "documentId": "conversation:7",
+            "chunkId": "chunk-7",
+        }
         assert audit["summary"]["tools"][0]["name"] == "memory_reflect"
         assert received["session_queries"] == [{"limit": "20", "q": "deploy"}]
         assert received["audit_queries"] == [{"limit": "10", "sessionId": "session-1"}]
@@ -900,6 +943,8 @@ async def test_playground_rejects_invalid_input_and_untrusted_hosts():
                 assert "content omitted" in script
                 assert "function renderAuditDiagnosis" in script
                 assert "Decision trail" in script
+                assert "Loaded memories" in script
+                assert "Recall queries" in script
                 assert "Inspect event metadata" in script
                 assert "current_bank_only" in script
 
@@ -980,7 +1025,11 @@ def test_playground_accepts_wechat_memory_snapshot_source_ids():
     event = {
         "type": "memory_snapshot",
         "primaryBankId": bank_id,
-        "queries": ["What happened today?"],
+        "queries": [
+            "What happened today?",
+            "What happened today? Identity anchors: Alice",
+            "Requester personalization context for Alice",
+        ],
         "memories": [
             {
                 "id": "d94960ea-e1a2-4739-8435-4fca079e8870",
@@ -996,6 +1045,7 @@ def test_playground_accepts_wechat_memory_snapshot_source_ids():
 
     assert parsed["memories"][0]["documentId"] == document_id
     assert parsed["memories"][0]["chunkId"] == chunk_id
+    assert len(parsed["queries"]) == 3
 
 
 def test_run_audit_requires_a_bounded_diagnostic_summary():

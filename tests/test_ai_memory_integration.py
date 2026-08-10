@@ -86,6 +86,7 @@ class FakeMessage:
         date=None,
         file=None,
         is_human=True,
+        is_group=False,
         out=False,
         entities=(),
     ):
@@ -98,6 +99,7 @@ class FakeMessage:
         self.date = date or datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
         self.file = file
         self.is_human = is_human
+        self.is_group = is_group
         self.out = out
         self.entities = entities
         self._reply_to = reply_to
@@ -148,6 +150,7 @@ class FailingGateway(FakeGateway):
 class FakeStore:
     def __init__(self, allowed=()):
         self.allowed = set(allowed)
+        self.open_chats = set()
         self.bank_grants = {}
         self.markers = {}
         self.last_request = {}
@@ -220,6 +223,15 @@ class FakeStore:
     async def deny_user(self, actor_id):
         self.allowed.discard(actor_id)
         self.bank_grants.pop(actor_id, None)
+
+    async def is_chat_access_open(self, scope_id):
+        return scope_id in self.open_chats
+
+    async def set_chat_access_open(self, scope_id, enabled):
+        if enabled:
+            self.open_chats.add(scope_id)
+        else:
+            self.open_chats.discard(scope_id)
 
     async def grant_bank(self, actor_id, bank_id):
         if actor_id not in self.allowed:
@@ -719,12 +731,15 @@ async def test_matrix_bridge_identity_is_a_memory_source_with_an_alias_id():
 
 
 @pytest.mark.asyncio
-async def test_matrix_bridge_ai_command_uses_alias_for_prompt_and_memory():
+async def test_matrix_bridge_ai_command_separates_entity_from_access_principal(
+    tmp_path,
+):
     bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
     trigger = FakeMessage(
         "SteamedFish: /ai can I use CaiBao?",
         sender_id=6332621450,
         is_human=False,
+        is_group=True,
         entities=(
             telegram_types.MessageEntityBold(offset=0, length=11),
             telegram_types.MessageEntityBotCommand(offset=13, length=3),
@@ -732,8 +747,13 @@ async def test_matrix_bridge_ai_command_uses_alias_for_prompt_and_memory():
     )
     attribution = bridge_resolver.resolve(trigger)
     assert attribution is not None
-    store = FakeStore(allowed={attribution.actor_id})
-    store.bank_grants[attribution.actor_id] = {"telegram:chat:-9999"}
+    principal_id = TELEGRAM_IDENTITY_CODEC.actor_id(6332621450)
+    store = await AIStateRepository(tmp_path / "state.db").connect()
+    await store.allow_user(principal_id)
+    assert await store.grant_bank(principal_id, "telegram:chat:-9999") is True
+    await store.set_chat_access_open("telegram:chat:-1001", True)
+    with pytest.raises(ValueError, match="canonical actor"):
+        await store.grant_bank(attribution.actor_id, "telegram:chat:-9999")
     memory = FakeMemory()
     gateway = FakeGateway(["yes"])
     handler = make_handler(
@@ -746,21 +766,121 @@ async def test_matrix_bridge_ai_command_uses_alias_for_prompt_and_memory():
         ),
     )
 
-    assert await handler.handle(trigger) is True
+    try:
+        assert await handler.handle(trigger) is True
 
-    request = gateway.requests[0]
-    assert request.prompt == "can I use CaiBao?"
-    assert request.identity.requester.identity == attribution.actor_id
-    assert request.identity.requester.label == "SteamedFish"
-    assert request.memory is not None
-    assert request.memory.primary_bank_id == "telegram:chat:-1001"
-    assert request.memory.granted_bank_ids == ()
-    marker = next(iter(store.markers.values()))
-    assert marker.requester_id == attribution.actor_id
-    retained_event = memory.retain_calls[0]["episode"].events[0]
-    assert retained_event.actor_id == attribution.actor_id
-    assert retained_event.actor_display_name == "SteamedFish"
-    assert retained_event.text == "can I use CaiBao?"
+        request = gateway.requests[0]
+        assert request.prompt == "can I use CaiBao?"
+        assert request.identity.requester.identity == attribution.actor_id
+        assert request.identity.requester.label == "SteamedFish"
+        assert request.memory is not None
+        assert request.memory.primary_bank_id == "telegram:chat:-1001"
+        assert request.memory.granted_bank_ids == ()
+        assert await store.get_last_request_at(
+            "telegram:chat:-1001",
+            principal_id,
+        ) is not None
+        marker = await store.get_turn_for_message("telegram:chat:-1001", trigger.id)
+        assert marker is not None
+        assert marker.requester_id == attribution.actor_id
+        retained_event = memory.retain_calls[0]["episode"].events[0]
+        assert retained_event.actor_id == attribution.actor_id
+        assert retained_event.actor_display_name == "SteamedFish"
+        assert retained_event.text == "can I use CaiBao?"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_matrix_bridge_does_not_inherit_bridge_bot_whitelist(tmp_path):
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    trigger = FakeMessage(
+        "SteamedFish: /ai restricted",
+        sender_id=6332621450,
+        is_human=False,
+        is_group=True,
+        entities=(
+            telegram_types.MessageEntityBold(offset=0, length=11),
+            telegram_types.MessageEntityBotCommand(offset=13, length=3),
+        ),
+    )
+    store = await AIStateRepository(tmp_path / "state.db").connect()
+    await store.allow_user(TELEGRAM_IDENTITY_CODEC.actor_id(6332621450))
+    gateway = FakeGateway(["must not run"])
+    handler = make_handler(
+        gateway,
+        None,
+        store=store,
+        attribution_resolver=bridge_resolver,
+    )
+    try:
+        assert await handler.handle(trigger) is False
+        assert gateway.requests == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_matrix_bridge_cannot_cancel_another_room_bridge_request():
+    class BlockingGateway:
+        def __init__(self):
+            self.requests = []
+            self.cancelled = []
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]:
+            self.requests.append(request)
+            self.started.set()
+            await self.release.wait()
+            yield AgentEvent(type="run_started", session_id="session-bridge")
+            yield AgentEvent(type="text_delta", delta="done", reset=True)
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-bridge",
+                entry_id="entry-bridge",
+                answer="done",
+            )
+
+        async def cancel(self, run_id: str) -> bool:
+            self.cancelled.append(run_id)
+            return True
+
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    store = FakeStore()
+    store.open_chats.update({"telegram:chat:-1001", "telegram:chat:-2002"})
+    gateway = BlockingGateway()
+    handler = make_handler(
+        gateway,
+        None,
+        store=store,
+        attribution_resolver=bridge_resolver,
+    )
+    trigger = FakeMessage(
+        "SteamedFish: /ai wait",
+        sender_id=6332621450,
+        chat_id=-1001,
+        is_human=False,
+        is_group=True,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+    running = asyncio.create_task(handler.handle(trigger))
+    await gateway.started.wait()
+    cancel = FakeMessage(
+        "Other: /ai_cancel",
+        sender_id=6332621450,
+        chat_id=-2002,
+        is_human=False,
+        is_group=True,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=5),),
+    )
+    try:
+        assert await handler.handle(cancel) is False
+        assert gateway.cancelled == []
+        assert cancel.replies == []
+    finally:
+        gateway.release.set()
+        assert await running is True
 
 
 @pytest.mark.asyncio
@@ -770,6 +890,7 @@ async def test_matrix_bridge_uses_the_group_ai_command_for_prompt_and_memory():
         "SteamedFish: /Ask can I use CaiBao?",
         sender_id=6332621450,
         is_human=False,
+        is_group=True,
         entities=(
             telegram_types.MessageEntityBold(offset=0, length=11),
             telegram_types.MessageEntityBotCommand(offset=13, length=4),
@@ -777,7 +898,8 @@ async def test_matrix_bridge_uses_the_group_ai_command_for_prompt_and_memory():
     )
     attribution = bridge_resolver.resolve(trigger)
     assert attribution is not None
-    store = FakeStore(allowed={attribution.actor_id})
+    store = FakeStore()
+    store.open_chats.add("telegram:chat:-1001")
     await store.set_ai_command_prefix("telegram:chat:-1001", "/ask")
     memory = FakeMemory()
     gateway = FakeGateway(["yes"])
@@ -878,6 +1000,7 @@ async def test_manual_memory_uses_the_prefix_recorded_before_group_change():
 async def test_matrix_bridge_reply_continues_with_the_cleaned_message_text():
     bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
     store = FakeStore()
+    store.open_chats.add("telegram:chat:-1001")
     gateway = FakeGateway(["first answer", "second answer"])
     handler = make_handler(
         gateway,
@@ -894,11 +1017,11 @@ async def test_matrix_bridge_reply_continues_with_the_cleaned_message_text():
         "SteamedFish: follow up",
         sender_id=6332621450,
         reply_to=root.replies[0],
+        is_group=True,
         entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
     )
     attribution = bridge_resolver.resolve(bridge_reply)
     assert attribution is not None
-    store.allowed.add(attribution.actor_id)
 
     assert await handler.handle(bridge_reply) is True
 

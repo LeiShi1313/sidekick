@@ -4128,16 +4128,18 @@ class AIConversationHandler:
     async def handle(self, message: ReplyTarget) -> bool:
         if message.sender_id is None or message.chat_id is None:
             return False
-        actor_id = self._prompt_builder.message_actor_id(message)
-        if actor_id is None:
+        requester_actor_id = self._prompt_builder.message_actor_id(message)
+        if requester_actor_id is None:
             return False
+        principal_actor_id = self._identity_codec.actor_id(message.sender_id)
         message_text = self._prompt_builder.message_text(message)
         scope_id = self._identity_codec.scope_id(message.chat_id)
         ai_prefix = DEFAULT_AI_COMMAND_PREFIX
         if message_text is not None and message_text.startswith("/"):
             ai_prefix = await self._ai_command_prefix_for(scope_id)
         command = parse_chat_command(message_text, ai_prefix=ai_prefix)
-        is_owner = actor_id == self._owner_actor_id
+        is_owner = principal_actor_id == self._owner_actor_id
+        allow_individual_access = requester_actor_id == principal_actor_id
         is_owner_control = is_owner or self._transport.is_outgoing(message)
         if command is not None and not isinstance(command, AIAskCommand):
             await self._mark_memory_excluded(scope_id, message.id, "ai-control")
@@ -4248,14 +4250,18 @@ class AIConversationHandler:
             return await self._handle_bank_grant(message, command)
 
         if isinstance(command, AICancelCommand):
+            # Proxy aliases are attribution entities, not authenticated principals.
+            if not allow_individual_access:
+                return False
             if not await self._has_ai_access(
                 message,
                 scope_id=scope_id,
-                actor_id=actor_id,
+                actor_id=principal_actor_id,
                 is_owner=is_owner,
+                allow_individual=allow_individual_access,
             ):
                 return False
-            return await self._handle_cancel(message, actor_id)
+            return await self._handle_cancel(message, principal_actor_id)
 
         ai_trigger = command if isinstance(command, AIAskCommand) else None
         if command is not None and ai_trigger is None:
@@ -4266,8 +4272,9 @@ class AIConversationHandler:
         if not await self._has_ai_access(
             message,
             scope_id=scope_id,
-            actor_id=actor_id,
+            actor_id=principal_actor_id,
             is_owner=is_owner,
+            allow_individual=allow_individual_access,
         ):
             return False
         if (
@@ -4351,7 +4358,7 @@ class AIConversationHandler:
 
         acquired = await self._rate_limiter.acquire(
             scope_id=scope_id,
-            actor_id=actor_id,
+            actor_id=principal_actor_id,
             is_owner=is_owner,
         )
         if not acquired:
@@ -4371,7 +4378,7 @@ class AIConversationHandler:
         await self._record_ai_run_start(
             run_id=run_id,
             scope_id=scope_id,
-            actor_id=actor_id,
+            actor_id=principal_actor_id,
         )
         active_request_key = (scope_id, message.id)
         self._active_request_runs[active_request_key] = run_id
@@ -4470,7 +4477,7 @@ class AIConversationHandler:
                 ),
             )
             await self._record_ai_run_running(run_id)
-            self._active_runs[actor_id] = run_id
+            self._active_runs[principal_actor_id] = run_id
             result = await self._responder.answer(message, request)
             if result.succeeded:
                 terminal_status = "COMPLETED"
@@ -4499,8 +4506,8 @@ class AIConversationHandler:
                     answer_message.id,
                     kind,
                 )
-            if self._active_runs.get(actor_id) == run_id:
-                self._active_runs.pop(actor_id, None)
+            if self._active_runs.get(principal_actor_id) == run_id:
+                self._active_runs.pop(principal_actor_id, None)
             if self._active_request_runs.get(active_request_key) == run_id:
                 self._active_request_runs.pop(active_request_key, None)
             if result.succeeded:
@@ -4513,7 +4520,7 @@ class AIConversationHandler:
                             answer_message_id=answer_message.id,
                             trigger_message_id=message.id,
                             command_prefix=ai_prefix,
-                            requester_id=actor_id,
+                            requester_id=requester_actor_id,
                             parent_answer_message_id=parent_answer_id,
                             agent_session_id=result.session_id,
                             agent_entry_id=result.entry_id,
@@ -4521,7 +4528,7 @@ class AIConversationHandler:
                     )
                 await self._rate_limiter.release(
                     scope_id=scope_id,
-                    actor_id=actor_id,
+                    actor_id=principal_actor_id,
                     is_owner=is_owner,
                 )
                 rate_released = True
@@ -4586,14 +4593,14 @@ class AIConversationHandler:
                     session_id=terminal_session_id,
                     error_code=terminal_error_code,
                 )
-            if self._active_runs.get(actor_id) == run_id:
-                self._active_runs.pop(actor_id, None)
+            if self._active_runs.get(principal_actor_id) == run_id:
+                self._active_runs.pop(principal_actor_id, None)
             if self._active_request_runs.get(active_request_key) == run_id:
                 self._active_request_runs.pop(active_request_key, None)
             if not rate_released:
                 await self._rate_limiter.release(
                     scope_id=scope_id,
-                    actor_id=actor_id,
+                    actor_id=principal_actor_id,
                     is_owner=is_owner,
                 )
 
@@ -4960,8 +4967,11 @@ class AIConversationHandler:
         scope_id: str,
         actor_id: str,
         is_owner: bool,
+        allow_individual: bool,
     ) -> bool:
-        if is_owner or await self._store.is_allowed(actor_id):
+        if is_owner or (
+            allow_individual and await self._store.is_allowed(actor_id)
+        ):
             return True
         if not self._transport.is_group(message):
             return False

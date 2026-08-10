@@ -12,6 +12,8 @@ const MAX_CONTEXT_CHARS = 4_000;
 const MAX_MEMORY_ITEMS = 50;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_DIRECTORY_CONTEXT_CHARS = 4_000;
+const MAX_PERSONALIZATION_MEMORY_ITEMS = 5;
+const PERSONALIZATION_MAX_TOKENS = 750;
 
 export const CROSS_BANK_MEMORY_POLICY =
   "The current primary memory bank is the default scope. " +
@@ -58,20 +60,39 @@ export function buildMemoryQueries({ prompt, context, memory, identity }) {
     }
   }
   const unanchored = bounded(sections.join("\n"), MAX_QUERY_CHARS);
+  const queries = [unanchored];
   const anchors = identity?.anchors ?? [];
-  if (anchors.length === 0) return [unanchored];
-  const labels = anchors.map(({ id, label }) =>
-    label ? `${oneLine(label, 256)} (${oneLine(id, 256)})` : oneLine(id, 256),
-  );
-  const anchorSection = bounded(
-    `Identity anchors for resolving references: ${labels.join(", ")}`,
-    MAX_ANCHOR_CHARS,
-  );
-  const anchored = `${bounded(
-    unanchored,
-    MAX_QUERY_CHARS - anchorSection.length - 1,
-  )}\n${anchorSection}`;
-  return anchored === unanchored ? [unanchored] : [unanchored, anchored];
+  if (anchors.length > 0) {
+    const labels = anchors.map(({ id, label }) =>
+      label ? `${oneLine(label, 256)} (${oneLine(id, 256)})` : oneLine(id, 256),
+    );
+    const anchorSection = bounded(
+      `Identity anchors for resolving references: ${labels.join(", ")}`,
+      MAX_ANCHOR_CHARS,
+    );
+    const anchored = `${bounded(
+      unanchored,
+      MAX_QUERY_CHARS - anchorSection.length - 1,
+    )}\n${anchorSection}`;
+    if (anchored !== unanchored) queries.push(anchored);
+  }
+  const requester = identity?.requester;
+  if (requester?.id) {
+    const requesterLabel = requester.label
+      ? `${oneLine(requester.label, 256)} (${oneLine(requester.id, 256)})`
+      : oneLine(requester.id, 256);
+    const personalizationPrefix =
+      "Requester personalization context for the current answer.\n" +
+      `Current requester: ${requesterLabel}\n` +
+      "Recall only low-stakes preferences, skills, ongoing plans, decisions, commitments, established context, or communication preferences about this requester that would materially improve the answer. " +
+      "Exclude sensitive, speculative, insulting, or unrelated details, and keep third-party claims attributed.\n" +
+      "Current request:\n";
+    queries.push(
+      personalizationPrefix +
+        bounded(prompt.trim(), MAX_QUERY_CHARS - personalizationPrefix.length),
+    );
+  }
+  return queries;
 }
 
 function optionalString(value, key) {
@@ -126,13 +147,14 @@ export async function recallMemories({
   variant,
   operation = "recall",
   toolCallId = null,
+  maxTokens = 2_000,
 }) {
   const bank = encodeURIComponent(scopeId);
   const url = `${baseUrl.replace(/\/$/, "")}/v1/default/banks/${bank}/memories/recall`;
   const body = {
     query,
     budget: "mid",
-    max_tokens: 2_000,
+    max_tokens: maxTokens,
     types: ["world", "experience", "observation"],
     include: {
       entities: { max_tokens: 500 },
@@ -482,6 +504,9 @@ export async function retrieveMemoryContext({
     throw new Error("Memory API credential is unavailable");
   }
   const queries = buildMemoryQueries({ prompt, context, memory, identity });
+  const personalizationIndex = identity?.requester?.id
+    ? queries.length - 1
+    : -1;
   const [settled, directorySettled] = await Promise.all([
     Promise.allSettled(
       queries.map((query, index) =>
@@ -493,8 +518,25 @@ export async function retrieveMemoryContext({
           timeoutMs,
           fetchImpl,
           observe,
-          variant: index === 0 ? "unanchored" : "anchored",
-        }),
+          variant:
+            index === 0
+              ? "unanchored"
+              : index === personalizationIndex
+                ? "requester_personalization"
+                : "anchored",
+          maxTokens:
+            index === personalizationIndex
+              ? PERSONALIZATION_MAX_TOKENS
+              : 2_000,
+        }).then((memories) =>
+          index === personalizationIndex
+            ? memories
+                .filter((item) =>
+                  item.entities.includes(identity.requester.id),
+                )
+                .slice(0, MAX_PERSONALIZATION_MEMORY_ITEMS)
+            : memories,
+        ),
       ),
     ),
     Promise.allSettled([

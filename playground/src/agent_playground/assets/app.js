@@ -330,6 +330,22 @@ function renderInspector() {
   renderTools();
 }
 
+function memoryItem(memory) {
+  const item = node("section", null, "memory-item");
+  item.append(node("div", memory.type || "memory", "memory-type"));
+  item.append(node("p", memory.text, "memory-text"));
+  const metadata = [
+    ...(memory.entities || []),
+    memory.occurredStart,
+    memory.mentionedAt,
+    memory.documentId,
+    memory.chunkId,
+  ].filter(Boolean).join(" · ");
+  if (metadata) item.append(node("div", metadata, "memory-meta"));
+  item.append(node("code", memory.id, "memory-id"));
+  return item;
+}
+
 function renderMemory() {
   const panel = document.querySelector("#inspector-memory");
   if (!state.memory) {
@@ -352,17 +368,7 @@ function renderMemory() {
     blocks.push(node("p", "No matching memories.", "empty-inspector"));
   }
   for (const memory of memories) {
-    const item = node("section", null, "memory-item");
-    item.append(node("div", memory.type || "memory", "memory-type"));
-    item.append(node("p", memory.text, "memory-text"));
-    const metadata = [
-      ...(memory.entities || []),
-      memory.occurredStart,
-      memory.documentId,
-    ].filter(Boolean).join(" · ");
-    if (metadata) item.append(node("div", metadata, "memory-meta"));
-    item.append(node("code", memory.id, "memory-id"));
-    blocks.push(item);
+    blocks.push(memoryItem(memory));
   }
   panel.replaceChildren(...blocks);
 }
@@ -1256,6 +1262,34 @@ function renderAuditDiagnosis(summary, audit) {
       status: initial.status,
       eventSequence: initial.eventSequence,
     });
+  }
+
+  if (summary.memory.route !== "off" && initial) {
+    const querySection = node("section", null, "trace-section");
+    querySection.append(node("h3", "Recall queries"));
+    if (initial.queries.length === 0) {
+      querySection.append(node("p", "Query details were not recorded.", "trace-empty"));
+    } else {
+      const queries = node("ol", null, "trace-memory-queries");
+      for (const query of initial.queries) {
+        const item = node("li");
+        item.append(node("pre", query, "trace-memory-query"));
+        queries.append(item);
+      }
+      querySection.append(queries);
+    }
+    diagnosis.append(querySection);
+
+    const memorySection = node("section", null, "trace-section");
+    memorySection.append(node("h3", "Loaded memories"));
+    if (initial.memories.length === 0) {
+      memorySection.append(node("p", "No memories were loaded.", "trace-empty"));
+    } else {
+      const memories = node("div", null, "trace-memories");
+      for (const memory of initial.memories) memories.append(memoryItem(memory));
+      memorySection.append(memories);
+    }
+    diagnosis.append(memorySection);
   }
   const directory = summary.memory.directory;
   if (summary.memory.route !== "off" && directory) {

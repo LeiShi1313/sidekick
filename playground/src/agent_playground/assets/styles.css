@@ -168,6 +168,9 @@ textarea:focus, select:focus, input:focus, button:focus-visible { outline: 2px s
 .trace-route.cross_bank_attempted, .trace-route.cross_bank_failed { color: #8f1d14; }
 .trace-section { margin-top: 13px; }
 .trace-section h3, .raw-events-header h3 { margin: 0; color: #59666b; font-size: 10px; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
+.trace-memory-queries { display: grid; gap: 6px; margin: 7px 0 0; padding-left: 20px; }
+.trace-memory-query { margin: 0; padding: 7px 8px; border-left: 3px solid #7d8b90; background: #fff; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; line-height: 1.45; }
+.trace-memories { margin-top: 5px; }
 .trace-steps { display: grid; gap: 5px; margin: 7px 0 0; padding: 0; list-style: none; }
 .trace-step { width: 100%; display: grid; gap: 3px; border: 1px solid #cbd3d5; border-left: 3px solid #526b82; border-radius: 3px; padding: 7px 8px; text-align: left; color: #354247; background: #fff; }
 .trace-step:hover { background: #edf3f3; }

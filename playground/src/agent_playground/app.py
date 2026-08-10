@@ -855,14 +855,18 @@ def _parse_run_summary(
                 not isinstance(queries, list)
                 or len(queries) > 32
                 or any(
-                    not isinstance(query, str) or len(query) > 2_000
+                    not isinstance(query, str) or not 1 <= len(query) <= 8_000
                     for query in queries
                 )
             ):
                 fail()
+            memories = initial_recall.get("memories")
+            if not isinstance(memories, list) or len(memories) > 50:
+                fail()
             parsed_initial_recall = {
                 "status": recall_status,
                 "queries": queries,
+                "memories": [_parse_snapshot_memory(item) for item in memories],
                 "queryCount": count(initial_recall.get("queryCount"), 5_000),
                 "memoryCount": count(initial_recall.get("memoryCount"), 5_000),
                 "eventSequence": event_sequence(initial_recall.get("eventSequence")),
@@ -1098,7 +1102,7 @@ def _parse_pi_event(raw: bytes) -> dict[str, Any]:
             not isinstance(primary_bank_id, str)
             or not _BANK_RE.fullmatch(primary_bank_id)
             or not isinstance(queries, list)
-            or len(queries) > 2
+            or len(queries) > 32
             or not all(
                 isinstance(query, str) and 1 <= len(query) <= 8_000 for query in queries
             )

@@ -711,6 +711,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       queries: [
         "Current request: What did Richard say?\nReference context:\nA telecom discussion.",
         "Current request: What did Richard say?\nReference context:\nA telecom discussion.\nIdentity anchors for resolving references: Alice (chat:user:alice)",
+        "Requester personalization context for the current answer.\nCurrent requester: Alice (chat:user:alice)\nRecall only low-stakes preferences, skills, ongoing plans, decisions, commitments, established context, or communication preferences about this requester that would materially improve the answer. Exclude sensitive, speculative, insulting, or unrelated details, and keep third-party claims attributed.\nCurrent request:\nWhat did Richard say?",
       ],
       memories: [
         {
@@ -732,7 +733,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       },
     });
     assert.equal(events.at(-1).answer, "Richard favors lower prices.");
-    assert.equal(recalls.length, 3);
+    assert.equal(recalls.length, 4);
     assert(recalls.some(({ body }) => body.query.includes("Identity anchors")));
     assert(
       recalls
@@ -1823,9 +1824,22 @@ test("records a correlated run audit with memory, model, and tool details", asyn
     const memoryContext = audit.events.find(
       (event) => event.type === "memory.context",
     );
+    assert.equal(memoryContext.data.primaryBankId, "workspace:engineering");
+    assert.equal(memoryContext.data.queries.length, 3);
+    assert.match(memoryContext.data.queries[2], /Requester personalization context/);
+    assert.equal(memoryContext.data.memories[0].text, "Alice owns deployment.");
     assert.equal(memoryContext.data.recall.status, "completed");
     assert.equal(memoryContext.data.memoryCount, 1);
     assert.equal(audit.summary.memory.initialRecall.status, "completed");
+    assert.equal(audit.summary.memory.primaryBankId, "workspace:engineering");
+    assert.deepEqual(
+      audit.summary.memory.initialRecall.queries,
+      memoryContext.data.queries,
+    );
+    assert.deepEqual(
+      audit.summary.memory.initialRecall.memories,
+      memoryContext.data.memories,
+    );
     const modelInput = audit.events.find((event) => event.type === "model.input");
     assert(modelInput.data.promptChars > requestEvent.data.promptChars);
     assert.equal(modelInput.data.model.id, "test-model");
@@ -1842,7 +1856,7 @@ test("records a correlated run audit with memory, model, and tool details", asyn
     assert.equal(completed.data.answerChars, result.answer.length);
     assert.doesNotMatch(
       JSON.stringify(audit),
-      /test-key|Who owns deployment|Alice owns deployment|workspace:engineering|6 \* 7/,
+      /test-key/,
     );
   } finally {
     await app.close();
