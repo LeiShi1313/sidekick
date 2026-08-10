@@ -4331,6 +4331,8 @@ class AIConversationHandler:
             if parent_answer_id is None:
                 return False
             if (scope_id, parent_answer_id) in self._active_request_runs:
+                if self._transport.is_outgoing(message):
+                    return False
                 await self._reply_memory_excluded(
                     message,
                     "AI is still working. Please wait for the answer.",
