@@ -1127,19 +1127,6 @@ export class PiEngine {
               })),
             }),
           );
-          if (nativeImageOutput) {
-            queue.push({ type: "attachment", ...nativeImageOutput.artifact });
-            await record("image.output.accepted", {
-              source: "model_native",
-              mimeType: nativeImageOutput.artifact.mimeType,
-              sizeBytes: nativeImageOutput.sizeBytes,
-            });
-          } else if (nativeImageIgnored) {
-            await record("image.output.ignored", {
-              source: "model_native",
-              reason: "generated_attachment_already_present",
-            });
-          }
           let lastAssistant = [...session.messages]
             .reverse()
             .find((message) => message.role === "assistant");
@@ -1193,6 +1180,19 @@ export class PiEngine {
               message: failed.message,
             });
           } else {
+            if (nativeImageOutput) {
+              queue.push({ type: "attachment", ...nativeImageOutput.artifact });
+              await record("image.output.accepted", {
+                source: "model_native",
+                mimeType: nativeImageOutput.artifact.mimeType,
+                sizeBytes: nativeImageOutput.sizeBytes,
+              });
+            } else if (nativeImageIgnored) {
+              await record("image.output.ignored", {
+                source: "model_native",
+                reason: "generated_attachment_already_present",
+              });
+            }
             const rawAnswer = redactSensitiveText(
               finalAnswer || extractText(lastAssistant),
               privacyOptions,

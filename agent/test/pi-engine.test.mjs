@@ -1097,6 +1097,80 @@ test("does not retry invalid native image output", async () => {
   }
 });
 
+test("does not publish a native image from a conflicting model response", async () => {
+  const encoded = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture(
+    (_body, response) => {
+      writeSse(response, [
+        {
+          id: "chatcmpl-conflicting-native-image",
+          model: "test-model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                images: [
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: `data:image/jpeg;base64,${encoded}`,
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "chatcmpl-conflicting-native-image",
+          model: "test-model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call-conflicting-image",
+                    type: "function",
+                    function: {
+                      name: "image_generate",
+                      arguments: '{"prompt":"A duplicate"}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+      ]);
+    },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+    },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("39393939-3939-4939-8939-393939393939", {
+        prompt: "Generate a new logo",
+      }),
+    );
+
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
+    assert.equal(events.some((event) => event.type === "attachment"), false);
+    assert.equal(events.at(-1).type, "run_failed");
+    assert.equal(events.at(-1).code, "PROVIDER_ERROR");
+  } finally {
+    await app.close();
+  }
+});
+
 test("retries an empty model response once and can select a tool", async () => {
   const app = await fixture((body, response, requestNumber) => {
     if (requestNumber === 1) {
