@@ -21,6 +21,10 @@ class OneBotActionError(RuntimeError):
         super().__init__(f"{action} failed ({retcode}): {message}")
 
 
+class OneBotNotConnectedError(ConnectionError):
+    """The action was rejected locally before any WebSocket dispatch."""
+
+
 class OneBotReverseWebSocket:
     def __init__(
         self,
@@ -126,7 +130,7 @@ class OneBotReverseWebSocket:
             raise ValueError("OneBot action must be a non-empty token")
         connection = self._connection
         if connection is None or connection.closed:
-            raise ConnectionError("NapCat is not connected")
+            raise OneBotNotConnectedError("NapCat is not connected")
         echo = uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._pending[echo] = (future, action)

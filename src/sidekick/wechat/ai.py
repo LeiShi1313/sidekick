@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any, Protocol
+import time
+from typing import Any, Callable, Protocol
 from urllib.parse import quote, unquote
 
 from sidekick.ai import MemoryScopeTarget, MessageIdentity, MentionedUser, ReplyTarget
@@ -39,7 +41,7 @@ from sidekick.wechat.store import (
 )
 
 
-_SAFE_PLAIN_FALLBACK_CODES = frozenset(
+_SAFE_PRE_ACTIVATION_CODES = frozenset(
     {"REPLY_UNSUPPORTED", "SEND_NOT_READY", "SEND_UNAVAILABLE"}
 )
 
@@ -151,7 +153,7 @@ class WeChatMessageSender(Protocol):
         *,
         request_id: str,
         to: str,
-    ) -> WeChatSendOperation: ...
+    ) -> WeChatSendOperation | None: ...
 
 
 class WeChatImageDownloader(Protocol):
@@ -271,6 +273,10 @@ class WeChatSentMessage:
 
 class WeChatChatTransport:
     RECONCILIATION_CONCURRENCY = 8
+    RECONCILIATION_BATCH_SIZE = 32
+    RECONCILIATION_RETRY_BASE_SECONDS = 2.0
+    RECONCILIATION_RETRY_MAX_SECONDS = 300.0
+    RECONCILIATION_LOG_INTERVAL_SECONDS = 60.0
 
     def __init__(
         self,
@@ -280,13 +286,30 @@ class WeChatChatTransport:
         *,
         native_reply_ready: bool,
         logger: Any | None = None,
+        clock: Callable[[], float] = time.time,
     ):
         self._client = client
         self._store = store
         self._connector_key = connector_key
         self._native_reply_ready = native_reply_ready
         self._logger = logger
+        self._clock = clock
         self._generated_messages = GeneratedMessageTracker()
+        self._durable_indeterminate_count: int | None = None
+        self._reconciliation_accounts: set[str] = set()
+        self._reconciliation_initialization_lock = asyncio.Lock()
+        self._deferred_reconciliation_errors: Counter[str] = Counter()
+        self._next_reconciliation_log_at = 0.0
+
+    @property
+    def indeterminate_outbound_count(self) -> int | None:
+        in_memory_count = self._generated_messages.indeterminate_count
+        if self._durable_indeterminate_count is None:
+            return in_memory_count or None
+        return max(
+            in_memory_count,
+            self._durable_indeterminate_count,
+        )
 
     async def draft_reply(self, message: Any) -> WeChatSentMessage:
         trigger = self._trigger(message)
@@ -386,6 +409,21 @@ class WeChatChatTransport:
                     to=trigger.chat_id,
                     attachment=attachment,
                 )
+            except asyncio.CancelledError:
+                await self._defer_generated_send_after_cancellation(
+                    trigger.account_id,
+                    request_id,
+                    lease_id,
+                )
+                raise
+            except WeChatSendOutcomeUnknown:
+                await self._store.defer_generated_send(
+                    self._connector_key,
+                    trigger.account_id,
+                    request_id,
+                    lease_id,
+                )
+                raise
             except WeChatSendFailed:
                 reservation.failed()
                 await self._store.fail_generated_send(
@@ -403,9 +441,39 @@ class WeChatChatTransport:
                     expected_attempt=attempt,
                 )
                 raise
+            except WeChatAPIError as exc:
+                if exc.code in _SAFE_PRE_ACTIVATION_CODES:
+                    reservation.failed()
+                    await self._store.fail_generated_send(
+                        self._connector_key,
+                        trigger.account_id,
+                        request_id,
+                        lease_id,
+                    )
+                else:
+                    await self._store.defer_generated_send(
+                        self._connector_key,
+                        trigger.account_id,
+                        request_id,
+                        lease_id,
+                    )
+                raise
+            except Exception:
+                await self._store.defer_generated_send(
+                    self._connector_key,
+                    trigger.account_id,
+                    request_id,
+                    lease_id,
+                )
+                raise
             if operation.message_id is None:
+                await self._store.defer_generated_send(
+                    self._connector_key,
+                    trigger.account_id,
+                    request_id,
+                    lease_id,
+                )
                 raise RuntimeError("WeChat attachment send returned no message ID")
-            reservation.confirm(operation.message_id, echo_expected=False)
             await self._store.confirm_generated_send(
                 self._connector_key,
                 trigger.account_id,
@@ -413,6 +481,7 @@ class WeChatChatTransport:
                 request_id,
                 operation.message_id,
             )
+            reservation.confirm(operation.message_id, echo_expected=False)
         return WeChatSentMessage(
             id=operation.message_id,
             text=None,
@@ -524,9 +593,24 @@ class WeChatChatTransport:
                         content=text,
                         reply_to_message_id=reply_to_message_id,
                     )
+                except asyncio.CancelledError:
+                    message.uncertain = True
+                    message.text = text
+                    await self._defer_generated_send_after_cancellation(
+                        message.trigger.account_id,
+                        message.request_id,
+                        lease_id,
+                    )
+                    raise
                 except WeChatSendOutcomeUnknown:
                     message.uncertain = True
                     message.text = text
+                    await self._store.defer_generated_send(
+                        self._connector_key,
+                        message.trigger.account_id,
+                        message.request_id,
+                        lease_id,
+                    )
                     raise
                 except WeChatSendFailed:
                     reservation.failed()
@@ -550,10 +634,7 @@ class WeChatChatTransport:
                 except WeChatAPIError as exc:
                     # These synchronous reply errors are contractually rejected
                     # before operation creation or activation.
-                    if (
-                        plain_fallback_available
-                        and exc.code in _SAFE_PLAIN_FALLBACK_CODES
-                    ):
+                    if exc.code in _SAFE_PRE_ACTIVATION_CODES:
                         reservation.failed()
                         await self._store.fail_generated_send(
                             self._connector_key,
@@ -561,12 +642,22 @@ class WeChatChatTransport:
                             message.request_id,
                             lease_id,
                         )
-                        plain_fallback_available = False
-                        reply_to_message_id = None
-                        message.request_id = f"{message.request_id}.plain"
-                        continue
+                        if plain_fallback_available:
+                            plain_fallback_available = False
+                            reply_to_message_id = None
+                            message.request_id = f"{message.request_id}.plain"
+                            continue
+                        message.failed = True
+                        message.text = text
+                        raise
                     message.uncertain = True
                     message.text = text
+                    await self._store.defer_generated_send(
+                        self._connector_key,
+                        message.trigger.account_id,
+                        message.request_id,
+                        lease_id,
+                    )
                     raise
                 except Exception:
                     # A transport failure can happen after the connector accepted
@@ -574,10 +665,21 @@ class WeChatChatTransport:
                     # replace it with an error message under that ID.
                     message.uncertain = True
                     message.text = text
+                    await self._store.defer_generated_send(
+                        self._connector_key,
+                        message.trigger.account_id,
+                        message.request_id,
+                        lease_id,
+                    )
                     raise
                 if operation.message_id is None:
+                    await self._store.defer_generated_send(
+                        self._connector_key,
+                        message.trigger.account_id,
+                        message.request_id,
+                        lease_id,
+                    )
                     raise RuntimeError("WeChat text send returned no message ID")
-                reservation.confirm(operation.message_id, echo_expected=False)
                 await self._store.confirm_generated_send(
                     self._connector_key,
                     message.trigger.account_id,
@@ -585,6 +687,7 @@ class WeChatChatTransport:
                     message.request_id,
                     operation.message_id,
                 )
+                reservation.confirm(operation.message_id, echo_expected=False)
                 break
         if operation.message_id is None:
             raise RuntimeError("WeChat text send returned no message ID")
@@ -593,25 +696,45 @@ class WeChatChatTransport:
         message.sent = True
 
     async def reconcile_pending(self, account_id: str) -> int:
-        reservations = await self._store.list_generated_send_reservations(
+        self._durable_indeterminate_count = None
+        await self._initialize_reconciliation(account_id)
+        reservations = await self._store.list_due_generated_send_reservations(
             self._connector_key,
             account_id,
+            now=self._clock(),
+            limit=self.RECONCILIATION_BATCH_SIZE,
         )
-        await self._reconcile_reservations(account_id, reservations)
-        return len(
-            await self._store.list_generated_send_reservations(
+        deferred = await self._reconcile_reservations(account_id, reservations)
+        if deferred:
+            self._log_reconciliation_deferred(deferred)
+        self._durable_indeterminate_count = (
+            await self._store.count_generated_send_reservations(
                 self._connector_key,
                 account_id,
             )
         )
+        return self._durable_indeterminate_count
+
+    async def _initialize_reconciliation(self, account_id: str) -> None:
+        if account_id in self._reconciliation_accounts:
+            return
+        async with self._reconciliation_initialization_lock:
+            if account_id in self._reconciliation_accounts:
+                return
+            await self._store.recover_generated_send_leases(
+                self._connector_key,
+                account_id,
+            )
+            self._reconciliation_accounts.add(account_id)
 
     async def _reconcile_reservations(
         self,
         account_id: str,
         reservations: tuple[WeChatGeneratedSendReservation, ...],
-    ) -> None:
+    ) -> tuple[str, ...]:
+        deferred: list[str] = []
         for offset in range(0, len(reservations), self.RECONCILIATION_CONCURRENCY):
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(
                     self._reconcile_reservation(account_id, reservation)
                     for reservation in reservations[
@@ -619,17 +742,39 @@ class WeChatChatTransport:
                     ]
                 )
             )
+            deferred.extend(result for result in results if result is not None)
+        return tuple(deferred)
 
     async def _reconcile_reservation(
         self,
         account_id: str,
         reservation: WeChatGeneratedSendReservation,
-    ) -> None:
+    ) -> str | None:
+        reconciliation_lease = (
+            await self._store.claim_generated_send_reconciliation(
+                self._connector_key,
+                account_id,
+                reservation.request_id,
+            )
+        )
+        if reconciliation_lease is None:
+            return None
         try:
             operation = await self._client.reconcile_send_and_wait(
                 request_id=reservation.request_id,
                 to=reservation.chat_id,
             )
+            if operation is None:
+                await self._store.fail_generated_send(
+                    self._connector_key,
+                    account_id,
+                    reservation.request_id,
+                )
+                self._generated_messages.clear_uncertain(
+                    reservation.chat_id,
+                    MessageFingerprint(reservation.fingerprint),
+                )
+                return None
             if operation.message_id is None:
                 raise RuntimeError(
                     "WeChat generated-send reconciliation returned no message ID"
@@ -645,7 +790,13 @@ class WeChatChatTransport:
                 reservation.chat_id,
                 MessageFingerprint(reservation.fingerprint),
             )
+            return None
         except asyncio.CancelledError:
+            await self._defer_generated_send_after_cancellation(
+                account_id,
+                reservation.request_id,
+                reconciliation_lease,
+            )
             raise
         except WeChatSendFailed:
             try:
@@ -659,16 +810,100 @@ class WeChatChatTransport:
                     MessageFingerprint(reservation.fingerprint),
                 )
             except Exception as exc:
-                self._log_reconciliation_deferred(exc)
+                return await self._defer_reconciliation(
+                    account_id,
+                    reservation,
+                    reconciliation_lease,
+                    exc,
+                )
+            return None
         except Exception as exc:
-            self._log_reconciliation_deferred(exc)
-
-    def _log_reconciliation_deferred(self, exc: Exception) -> None:
-        if self._logger is not None:
-            self._logger.warning(
-                "WeChat generated-send reconciliation deferred (%s)",
-                type(exc).__name__,
+            return await self._defer_reconciliation(
+                account_id,
+                reservation,
+                reconciliation_lease,
+                exc,
             )
+
+    async def _defer_reconciliation(
+        self,
+        account_id: str,
+        reservation: WeChatGeneratedSendReservation,
+        reconciliation_lease: str,
+        exc: Exception,
+    ) -> str:
+        next_attempt_at = self._clock() + self._reconciliation_delay(reservation)
+        try:
+            await self._store.defer_generated_send_reconciliation(
+                self._connector_key,
+                account_id,
+                reservation.request_id,
+                reconciliation_lease,
+                next_attempt_at=next_attempt_at,
+            )
+        except Exception as state_error:
+            return f"{type(exc).__name__}/{type(state_error).__name__}"
+        return type(exc).__name__
+
+    async def _defer_generated_send_after_cancellation(
+        self,
+        account_id: str,
+        request_id: str,
+        lease_id: str,
+    ) -> None:
+        try:
+            await self._store.defer_generated_send(
+                self._connector_key,
+                account_id,
+                request_id,
+                lease_id,
+            )
+        except Exception as exc:
+            if self._logger is not None:
+                self._logger.warning(
+                    "WeChat cancelled-send lease cleanup deferred (%s)",
+                    type(exc).__name__,
+                )
+
+    def _reconciliation_delay(
+        self,
+        reservation: WeChatGeneratedSendReservation,
+    ) -> float:
+        jitter_bucket = int.from_bytes(
+            sha256(reservation.request_id.encode("utf-8")).digest()[:2],
+            "big",
+        )
+        jitter = (jitter_bucket / 65_535) * 0.25
+        delay = self.RECONCILIATION_RETRY_BASE_SECONDS * (
+            2 ** min(reservation.reconciliation_attempts, 16)
+        )
+        return min(
+            self.RECONCILIATION_RETRY_MAX_SECONDS,
+            delay * (1 + jitter),
+        )
+
+    def _log_reconciliation_deferred(self, errors: tuple[str, ...]) -> None:
+        if self._logger is None:
+            return
+        self._deferred_reconciliation_errors.update(errors)
+        now = self._clock()
+        if now < self._next_reconciliation_log_at:
+            return
+        summary = ", ".join(
+            f"{name}={count}"
+            for name, count in sorted(
+                self._deferred_reconciliation_errors.items()
+            )
+        )
+        self._logger.warning(
+            "WeChat generated-send reconciliation deferred (%d; %s)",
+            self._deferred_reconciliation_errors.total(),
+            summary,
+        )
+        self._deferred_reconciliation_errors.clear()
+        self._next_reconciliation_log_at = (
+            now + self.RECONCILIATION_LOG_INTERVAL_SECONDS
+        )
 
     def _native_reply_target(self, trigger: WeChatMessage) -> str | None:
         if not self._native_reply_ready:

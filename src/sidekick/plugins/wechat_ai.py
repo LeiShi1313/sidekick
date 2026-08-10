@@ -156,6 +156,11 @@ class WeChatAI(metaclass=PluginMount):
         self._adapter_status = AdapterRuntimeState(
             id=self._ops_settings.instance_id,
             platform="wechat",
+            indeterminate_outbound_probe=lambda: (
+                self._channel_runtime.transport.indeterminate_outbound_count
+                if self._channel_runtime is not None
+                else None
+            ),
         )
         self._ops_server = ChannelOpsServer(
             snapshot_service=ChannelSnapshotService(

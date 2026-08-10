@@ -66,6 +66,68 @@ class PausingWeChatStateRepository(WeChatStateRepository):
         )
 
 
+@pytest.mark.asyncio
+async def test_wechat_store_upgrades_existing_generated_send_queue(tmp_path) -> None:
+    state_path = tmp_path / "wechat.db"
+    connection = sqlite3.connect(state_path)
+    connection.executescript(
+        """
+        CREATE TABLE wechat_generated_send_reservations (
+            connector_key TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+            created_at REAL NOT NULL,
+            PRIMARY KEY (connector_key, account_id, request_id)
+        );
+        CREATE TABLE wechat_generated_send_leases (
+            connector_key TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            lease_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (connector_key, account_id, request_id, lease_id)
+        );
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO wechat_generated_send_reservations (
+            connector_key, account_id, request_id, chat_id,
+            fingerprint, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (CONNECTOR_KEY, ACCOUNT_ID, "request-existing", GROUP_ID, b"x" * 32, 1.0),
+    )
+    connection.execute(
+        """
+        INSERT INTO wechat_generated_send_leases (
+            connector_key, account_id, request_id, lease_id, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (CONNECTOR_KEY, ACCOUNT_ID, "request-existing", "stale-lease", 1.0),
+    )
+    connection.commit()
+    connection.close()
+
+    store = await WeChatStateRepository(state_path).connect()
+    try:
+        await store.recover_generated_send_leases(CONNECTOR_KEY, ACCOUNT_ID)
+        reservations = await store.list_due_generated_send_reservations(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            now=1.0,
+            limit=1,
+        )
+
+        assert len(reservations) == 1
+        assert reservations[0].request_id == "request-existing"
+        assert reservations[0].reconciliation_attempts == 0
+    finally:
+        await store.close()
+
+
 def connector_message(
     message_id: str,
     content: str,

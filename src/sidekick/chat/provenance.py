@@ -198,6 +198,10 @@ class GeneratedMessageTracker:
             tuple[ExternalId, MessageFingerprint], float
         ] = OrderedDict()
 
+    @property
+    def indeterminate_count(self) -> int:
+        return len(self._uncertain)
+
     def reserve(
         self,
         chat_id: ExternalId,

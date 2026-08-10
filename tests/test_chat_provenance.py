@@ -347,3 +347,17 @@ async def test_confirmation_without_expected_echo_releases_send_capacity() -> No
         )
         is MessageOrigin.SIDEKICK_GENERATED
     )
+
+
+@pytest.mark.asyncio
+async def test_tracker_reports_indeterminate_outbound_count() -> None:
+    tracker = GeneratedMessageTracker()
+    first = tracker.reserve(7, GENERATED)
+    second = tracker.reserve(8, MANUAL)
+
+    first.uncertain()
+    second.failed()
+
+    assert tracker.indeterminate_count == 1
+    tracker.clear_uncertain(7)
+    assert tracker.indeterminate_count == 0

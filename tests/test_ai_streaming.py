@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
-from telethon.errors import FloodWaitError
+from telethon.errors import BadRequestError, FloodWaitError, ServerError
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
@@ -270,6 +270,74 @@ async def test_telegram_confirmations_do_not_accumulate_without_echoes() -> None
     await transport.reply(message, "second", presentation="plain")
 
     assert len(message.replies) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection",
+    (
+        ValueError("invalid local send"),
+        BadRequestError(None, "SEND_REJECTED"),
+    ),
+)
+async def test_telegram_proven_send_rejection_does_not_quarantine_chat(
+    rejection,
+) -> None:
+    class RejectingMessage:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, text, **kwargs):
+            raise rejection
+
+    transport = TelegramChatTransport()
+    with pytest.raises(type(rejection)):
+        await transport.reply(
+            RejectingMessage(),
+            "not sent",
+            presentation="plain",
+        )
+
+    manual = SimpleNamespace(
+        id=101,
+        chat_id=7,
+        raw_text="/ai manual request",
+        reply_to_msg_id=None,
+        out=True,
+        file=None,
+    )
+    assert await transport.classify_origin(manual) is MessageOrigin.MANUAL_OUTGOING
+
+
+@pytest.mark.asyncio
+async def test_telegram_ambiguous_server_failure_keeps_chat_quarantined() -> None:
+    class FailingMessage:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, text, **kwargs):
+            raise ServerError(None, "SERVER_ERROR")
+
+    transport = TelegramChatTransport()
+    with pytest.raises(ServerError):
+        await transport.reply(
+            FailingMessage(),
+            "possibly sent",
+            presentation="plain",
+        )
+
+    possible_echo = SimpleNamespace(
+        id=101,
+        chat_id=7,
+        raw_text="possibly sent",
+        reply_to_msg_id=1,
+        out=True,
+        file=None,
+    )
+    assert (
+        await transport.classify_origin(possible_echo)
+        is MessageOrigin.INDETERMINATE
+    )
 
 
 @pytest.mark.asyncio

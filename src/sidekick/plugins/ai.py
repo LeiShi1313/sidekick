@@ -143,6 +143,11 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             id=self._ops_settings.instance_id,
             platform="telegram",
             connected_probe=self.client.is_connected,
+            indeterminate_outbound_probe=lambda: (
+                self._transport.indeterminate_outbound_count
+                if self._transport is not None
+                else None
+            ),
         )
         self._telegram_inventory = CachedChannelInventory(
             self._load_channel_inventory,

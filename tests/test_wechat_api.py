@@ -1214,6 +1214,29 @@ async def test_wechat_client_reconciles_an_existing_send_by_request_id() -> None
 
 
 @pytest.mark.asyncio
+async def test_wechat_client_treats_missing_send_as_proven_not_admitted() -> None:
+    async def get_send(_request: web.Request) -> web.Response:
+        return json_response(
+            {"error": {"code": "NOT_FOUND", "message": "Send not found"}},
+            status=404,
+        )
+
+    app = web.Application()
+    app.router.add_get("/sends/{request_id}", get_send)
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(str(server.make_url("/")))
+        try:
+            operation = await client.reconcile_send_and_wait(
+                request_id="sidekick.wechat.not-admitted-1",
+                to="filehelper",
+            )
+        finally:
+            await client.close()
+
+    assert operation is None
+
+
+@pytest.mark.asyncio
 async def test_wechat_client_replays_events_after_opaque_cursor() -> None:
     observed_after: list[str] = []
 

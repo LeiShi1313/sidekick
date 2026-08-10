@@ -127,6 +127,7 @@ class OneBotAI(metaclass=PluginMount):
         )
         self._directory = OneBotDirectory()
         self._handler: AIConversationHandler | None = None
+        self._transport: OneBotChatTransport | None = None
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_scheduler: ContinuousMemoryScheduler | None = None
         self._memory_outbox_scheduler: MemoryOutboxScheduler | None = None
@@ -136,6 +137,11 @@ class OneBotAI(metaclass=PluginMount):
             platform="qq",
             account_id=str(self._runtime.self_id),
             connected_probe=lambda: self._bridge.connected,
+            indeterminate_outbound_probe=lambda: (
+                self._transport.indeterminate_outbound_count
+                if self._transport is not None
+                else None
+            ),
         )
         self._ops_server = ChannelOpsServer(
             snapshot_service=ChannelSnapshotService(
@@ -199,6 +205,7 @@ class OneBotAI(metaclass=PluginMount):
     async def _setup(self) -> None:
         output_policy = MainlandMessagingOutputPolicy.from_env()
         transport = OneBotChatTransport(self._bridge, logger=self.logger)
+        self._transport = transport
         responder = AIResponder(
             self._gateway,
             max_output_chars=self._settings.max_output_chars,

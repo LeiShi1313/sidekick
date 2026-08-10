@@ -26,7 +26,7 @@ from sidekick.chat.provenance import (
 )
 from sidekick.chat.transport import ChatPresentation, SentMessage
 from sidekick.channel_status import ChannelInventoryItem
-from sidekick.onebot.client import OneBotActionError
+from sidekick.onebot.client import OneBotActionError, OneBotNotConnectedError
 from sidekick.onebot.message import (
     OneBotActionClient,
     OneBotMessage,
@@ -173,6 +173,10 @@ class OneBotChatTransport:
         self._logger = logger
         self._generated_messages = GeneratedMessageTracker()
 
+    @property
+    def indeterminate_outbound_count(self) -> int:
+        return self._generated_messages.indeterminate_count
+
     async def get_reply(self, message: Any) -> OneBotMessage | None:
         reply_id = getattr(message, "reply_to_msg_id", None)
         if not isinstance(reply_id, int):
@@ -261,7 +265,7 @@ class OneBotChatTransport:
                     },
                     timeout=120,
                 )
-            except OneBotActionError:
+            except (OneBotActionError, OneBotNotConnectedError):
                 reservation.failed()
                 raise
             # NapCat awaits delivery but these file-only actions expose no
@@ -372,7 +376,7 @@ class OneBotChatTransport:
                     response = await self._client.call(action, params)
                 else:
                     response = await self._client.call(action, params, timeout=timeout)
-            except OneBotActionError:
+            except (OneBotActionError, OneBotNotConnectedError):
                 reservation.failed()
                 raise
             if not isinstance(response, dict):
@@ -380,7 +384,10 @@ class OneBotChatTransport:
             message_id = response.get("message_id")
             if isinstance(message_id, bool) or not isinstance(message_id, int):
                 raise RuntimeError("OneBot send response has no message ID")
-            reservation.confirm(message_id)
+            # NapCat's reportSelfMessage option defaults to false, so a
+            # successful action receipt is terminal for tracker capacity. A
+            # rare self-echo is still recognized by the observed-ID tombstone.
+            reservation.confirm(message_id, echo_expected=False)
             return message_id
 
     def _log(self, level: str, message: str, *args: Any) -> None:

@@ -21,7 +21,7 @@ from sidekick.ai_attachments import (
 
 from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.output_policy import MAINLAND_MESSAGING_POLICY_ID
-from sidekick.chat.provenance import MessageOrigin
+from sidekick.chat.provenance import GeneratedMessageTracker, MessageOrigin
 from sidekick.channel_status import ChannelOpsSettings
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -521,6 +521,48 @@ async def test_onebot_transport_suppresses_echo_that_arrives_before_send_receipt
 
     await sending
     assert await classification is MessageOrigin.SIDEKICK_GENERATED
+
+
+@pytest.mark.asyncio
+async def test_onebot_confirmations_do_not_accumulate_when_self_echoes_are_off():
+    action_client = RecordingActionClient(
+        responses=[{"message_id": 501}, {"message_id": 502}]
+    )
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=action_client,
+    )
+    transport = OneBotChatTransport(action_client)
+    transport._generated_messages = GeneratedMessageTracker(max_confirmed=1)
+
+    await transport.reply(trigger, "first", presentation="plain")
+    await transport.reply(trigger, "second", presentation="plain")
+
+    assert len(action_client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_onebot_disconnected_send_does_not_quarantine_manual_messages():
+    bridge = OneBotReverseWebSocket(token="secret", self_id=99)
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=bridge,
+    )
+    transport = OneBotChatTransport(bridge)
+
+    with pytest.raises(ConnectionError, match="NapCat is not connected"):
+        await transport.reply(trigger, "not dispatched", presentation="plain")
+
+    manual = OneBotMessage.from_payload(
+        group_event(
+            message_id=777,
+            sender_id=99,
+            text="/ai manual request",
+            post_type="message_sent",
+        ),
+        action_client=bridge,
+    )
+    assert await transport.classify_origin(manual) is MessageOrigin.MANUAL_OUTGOING
 
 
 @pytest.mark.asyncio

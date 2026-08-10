@@ -7,7 +7,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import (
+    BadRequestError,
+    FloodError,
+    FloodWaitError,
+    ForbiddenError,
+    MessageNotModifiedError,
+    NotFoundError,
+    UnauthorizedError,
+)
 from telethon.extensions import markdown as telegram_markdown
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
@@ -38,6 +46,14 @@ _TELEGRAM_MARKDOWN_DELIMITERS = {
 }
 
 _COLLAPSE_AFTER_CHARS = 700
+_TELEGRAM_SEND_REJECTIONS = (
+    ValueError,
+    BadRequestError,
+    FloodError,
+    ForbiddenError,
+    NotFoundError,
+    UnauthorizedError,
+)
 _COLLAPSE_AFTER_NEWLINES = 10
 
 
@@ -158,6 +174,10 @@ class TelegramChatTransport:
             logger=logger,
         )
 
+    @property
+    def indeterminate_outbound_count(self) -> int:
+        return self._generated_messages.indeterminate_count
+
     async def get_reply(self, message: Any) -> Any | None:
         operation = getattr(message, "get_reply_message", None)
         return await operation() if callable(operation) else None
@@ -181,7 +201,11 @@ class TelegramChatTransport:
             message.chat_id,
             fingerprint,
         ) as reservation:
-            sent = await operation(text, parse_mode=None)
+            try:
+                sent = await operation(text, parse_mode=None)
+            except _TELEGRAM_SEND_REJECTIONS:
+                reservation.failed()
+                raise
             # Telethon consumes the RPC-returned update and does not dispatch a
             # second NewMessage event for this same-client send.
             reservation.confirm(sent.id, echo_expected=False)
@@ -207,10 +231,14 @@ class TelegramChatTransport:
                 message.chat_id,
                 fingerprint,
             ) as reservation:
-                sent = await operation(
-                    file=upload,
-                    force_document=attachment.display_as == "file",
-                )
+                try:
+                    sent = await operation(
+                        file=upload,
+                        force_document=attachment.display_as == "file",
+                    )
+                except _TELEGRAM_SEND_REJECTIONS:
+                    reservation.failed()
+                    raise
                 if sent is not None:
                     reservation.confirm(sent.id, echo_expected=False)
                 else:

@@ -660,6 +660,94 @@ async def test_wechat_transport_falls_back_after_safe_quote_rejection(
     ]
 
 
+@pytest.mark.parametrize(
+    ("status", "code"),
+    (
+        (422, "REPLY_UNSUPPORTED"),
+        (503, "SEND_NOT_READY"),
+        (501, "SEND_UNAVAILABLE"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_wechat_safe_plain_rejection_releases_generated_send(
+    tmp_path,
+    status,
+    code,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    transport = WeChatChatTransport(
+        RecordingConnectorClient(
+            (WeChatAPIError(status, code, "rejected before activation"),)
+        ),
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    manual = WeChatMessage(
+        connector_key=CONNECTOR_KEY,
+        account_id=ACCOUNT_ID,
+        memory_cursor=12,
+        id="7158246912028861545",
+        chat_id=GROUP_ID,
+        raw_text="/ai manual request",
+        content_redacted=False,
+        sender_id=ACCOUNT_ID,
+        reply_to_msg_id=None,
+        date=trigger.date,
+        out=True,
+        self_id=ACCOUNT_ID,
+        message_type="text",
+        chat_type="group",
+        sender_display_name="Sidekick",
+        scope_display_name="Example group",
+        source="wechat+localdb",
+        sequence=None,
+    )
+    try:
+        with pytest.raises(WeChatAPIError) as raised:
+            await transport.reply(trigger, "Not sent.", presentation="plain")
+
+        assert raised.value.code == code
+        assert await store.list_generated_send_reservations(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+        ) == ()
+        assert await transport.classify_origin(manual) is MessageOrigin.MANUAL_OUTGOING
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_safe_plain_fallback_rejection_releases_both_attempts(
+    tmp_path,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient(
+        (
+            WeChatAPIError(422, "REPLY_UNSUPPORTED", "quote not activated"),
+            WeChatAPIError(503, "SEND_NOT_READY", "plain send not activated"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=True,
+    )
+    try:
+        with pytest.raises(WeChatAPIError) as raised:
+            await transport.reply(trigger, "Not sent.", presentation="plain")
+
+        assert raised.value.code == "SEND_NOT_READY"
+        assert len(client.calls) == 2
+        assert await store.list_generated_send_reservations(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+        ) == ()
+    finally:
+        await store.close()
+
+
 @pytest.mark.asyncio
 async def test_wechat_transport_does_not_fallback_after_quote_outcome_unknown(
     tmp_path,
@@ -774,6 +862,93 @@ async def test_wechat_unknown_send_is_quarantined_without_blocking_ingress(
 
 
 @pytest.mark.asyncio
+async def test_wechat_unknown_send_detaches_completed_caller_lease(tmp_path) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+    operation = WeChatSendOperation(
+        request_id="placeholder",
+        status="unknown",
+        message_id=None,
+        error_code="SEND_OUTCOME_UNKNOWN",
+        to=GROUP_ID,
+    )
+    transport = WeChatChatTransport(
+        RecordingConnectorClient(
+            tuple(
+                WeChatSendOutcomeUnknown(operation, "outcome unknown")
+                for _ in range(2)
+            )
+        ),
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(WeChatSendOutcomeUnknown):
+                await transport.reply(trigger, "Possibly sent.", presentation="plain")
+
+        cursor = await store._require_connection().execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM wechat_generated_send_leases
+            WHERE connector_key = ? AND account_id = ?
+            """,
+            (CONNECTOR_KEY, ACCOUNT_ID),
+        )
+        row = await cursor.fetchone()
+        assert row is not None and int(row["count"]) == 0
+        assert len(
+            await store.list_generated_send_reservations(
+                CONNECTOR_KEY,
+                ACCOUNT_ID,
+            )
+        ) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_send_cancellation_is_not_masked_by_lease_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, trigger = await bootstrap_store(tmp_path / "wechat.db")
+
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def send_text_and_wait(self, **kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    client = BlockingClient()
+    transport = WeChatChatTransport(
+        client,  # type: ignore[arg-type]
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    sending = asyncio.create_task(
+        transport.reply(trigger, "Possibly sent.", presentation="plain")
+    )
+    try:
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+
+        async def cleanup_failed(*args, **kwargs) -> None:
+            raise RuntimeError("cleanup unavailable")
+
+        monkeypatch.setattr(store, "defer_generated_send", cleanup_failed)
+        sending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+    finally:
+        if not sending.done():
+            sending.cancel()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_wechat_quarantined_manual_message_is_released_after_send_failure(
     tmp_path,
 ) -> None:
@@ -843,6 +1018,45 @@ async def test_wechat_quarantined_manual_message_is_released_after_send_failure(
         )
     finally:
         await restarted_store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_missing_reconciled_send_releases_durable_quarantine(
+    tmp_path,
+) -> None:
+    store, _ = await bootstrap_store(tmp_path / "wechat.db")
+    fingerprint = message_fingerprint(
+        text="not admitted",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    lease_id = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "not-admitted-request",
+        fingerprint,
+    )
+    await store.defer_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "not-admitted-request",
+        lease_id,
+    )
+    transport = WeChatChatTransport(
+        RecordingConnectorClient((None,)),
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    try:
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 0
+        assert await store.list_generated_send_reservations(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+        ) == ()
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -1064,6 +1278,236 @@ async def test_wechat_reconciliation_has_bounded_concurrency(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wechat_reconciliation_backoff_persists_across_restart(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    store, _ = await bootstrap_store(state_path)
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    lease_id = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-backoff",
+        fingerprint,
+    )
+    await store.defer_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "request-backoff",
+        lease_id,
+    )
+    now = [1_000.0]
+    first_client = RecordingConnectorClient((ConnectionError("offline"),))
+    first = WeChatChatTransport(
+        first_client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        clock=lambda: now[0],
+    )
+    try:
+        assert await first.reconcile_pending(ACCOUNT_ID) == 1
+        assert await first.reconcile_pending(ACCOUNT_ID) == 1
+        assert len(first_client.reconcile_calls) == 1
+    finally:
+        await store.close()
+
+    restarted_store = await WeChatStateRepository(state_path).connect()
+    restarted_client = RecordingConnectorClient(
+        (submitted(request_id="request-backoff"),)
+    )
+    restarted = WeChatChatTransport(
+        restarted_client,
+        restarted_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        clock=lambda: now[0],
+    )
+    try:
+        assert await restarted.reconcile_pending(ACCOUNT_ID) == 1
+        assert restarted_client.reconcile_calls == []
+
+        now[0] += 3
+        assert await restarted.reconcile_pending(ACCOUNT_ID) == 0
+        assert len(restarted_client.reconcile_calls) == 1
+    finally:
+        await restarted_store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_reconciliation_bounds_each_cycle_and_aggregates_logging(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, _ = await bootstrap_store(tmp_path / "wechat.db")
+    monkeypatch.setattr(WeChatChatTransport, "RECONCILIATION_BATCH_SIZE", 2)
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    for index in range(3):
+        lease_id = await store.reserve_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            GROUP_ID,
+            f"request-batch-{index}",
+            fingerprint,
+        )
+        await store.defer_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            f"request-batch-{index}",
+            lease_id,
+        )
+
+    class RecordingLogger:
+        def __init__(self) -> None:
+            self.warnings: list[tuple[object, ...]] = []
+
+        def warning(self, *args: object) -> None:
+            self.warnings.append(args)
+
+    logger = RecordingLogger()
+    client = RecordingConnectorClient(
+        (
+            ConnectionError("offline-a"),
+            ConnectionError("offline-b"),
+            ConnectionError("offline-c"),
+        )
+    )
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        logger=logger,
+        clock=lambda: 1_000.0,
+    )
+    try:
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 3
+        assert len(client.reconcile_calls) == 2
+        assert len(logger.warnings) == 1
+
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 3
+        assert len(client.reconcile_calls) == 3
+        assert len(logger.warnings) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_reconciliation_skips_active_send_callers(tmp_path) -> None:
+    store, _ = await bootstrap_store(tmp_path / "wechat.db")
+    client = RecordingConnectorClient(())
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+        clock=lambda: 1_000.0,
+    )
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    try:
+        # The first cycle recovers only leases inherited from an older
+        # transport. A lease created afterward belongs to a live caller.
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 0
+        lease_id = await store.reserve_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            GROUP_ID,
+            "request-active",
+            fingerprint,
+        )
+
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 1
+        assert client.reconcile_calls == []
+
+        await store.defer_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            "request-active",
+            lease_id,
+        )
+        client.responses.append(submitted(request_id="request-active"))
+        assert await transport.reconcile_pending(ACCOUNT_ID) == 0
+        assert len(client.reconcile_calls) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_active_reconciliation_blocks_request_adoption(tmp_path) -> None:
+    state_path = tmp_path / "wechat.db"
+    store, _ = await bootstrap_store(state_path)
+    adopter = await WeChatStateRepository(state_path).connect()
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    lease_id = await store.reserve_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        GROUP_ID,
+        "request-reconciling",
+        fingerprint,
+    )
+    await store.defer_generated_send(
+        CONNECTOR_KEY,
+        ACCOUNT_ID,
+        "request-reconciling",
+        lease_id,
+    )
+
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def reconcile_send_and_wait(self, *, request_id, to):
+            self.started.set()
+            await self.release.wait()
+            return submitted(request_id=request_id)
+
+    client = BlockingClient()
+    transport = WeChatChatTransport(
+        client,  # type: ignore[arg-type]
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    reconciling = asyncio.create_task(transport.reconcile_pending(ACCOUNT_ID))
+    try:
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        with pytest.raises(RuntimeError, match="being reconciled"):
+            await adopter.reserve_generated_send(
+                CONNECTOR_KEY,
+                ACCOUNT_ID,
+                GROUP_ID,
+                "request-reconciling",
+                fingerprint,
+            )
+        client.release.set()
+        assert await asyncio.wait_for(reconciling, timeout=1) == 0
+    finally:
+        client.release.set()
+        if not reconciling.done():
+            reconciling.cancel()
+        await adopter.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_generated_send_capacity_is_atomic_across_store_connections(
     tmp_path,
     monkeypatch,
@@ -1104,6 +1548,60 @@ async def test_generated_send_capacity_is_atomic_across_store_connections(
                 ACCOUNT_ID,
             )
         ) == 1
+    finally:
+        await second.close()
+        await first.close()
+
+
+@pytest.mark.asyncio
+async def test_generated_send_active_callers_are_bounded_across_connections(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    first, _ = await bootstrap_store(state_path)
+    second = await WeChatStateRepository(state_path).connect()
+    monkeypatch.setattr(
+        wechat_store_module,
+        "_MAX_GENERATED_SEND_LEASES_PER_REQUEST",
+        1,
+    )
+    fingerprint = message_fingerprint(
+        text="generated",
+        reply_to_message_id=None,
+        has_attachment=False,
+    ).digest
+    try:
+        results = await asyncio.gather(
+            first.reserve_generated_send(
+                CONNECTOR_KEY,
+                ACCOUNT_ID,
+                GROUP_ID,
+                "same-request",
+                fingerprint,
+            ),
+            second.reserve_generated_send(
+                CONNECTOR_KEY,
+                ACCOUNT_ID,
+                GROUP_ID,
+                "same-request",
+                fingerprint,
+            ),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(result, str) for result in results) == 1
+        assert sum(isinstance(result, RuntimeError) for result in results) == 1
+        cursor = await first._require_connection().execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM wechat_generated_send_leases
+            WHERE connector_key = ? AND account_id = ? AND request_id = ?
+            """,
+            (CONNECTOR_KEY, ACCOUNT_ID, "same-request"),
+        )
+        row = await cursor.fetchone()
+        assert row is not None and int(row["count"]) == 1
     finally:
         await second.close()
         await first.close()

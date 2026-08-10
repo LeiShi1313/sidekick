@@ -104,6 +104,7 @@ async def test_snapshot_merges_live_inventory_with_nested_operational_state() ->
         account_id="wxid@example.com",
         connected=True,
         observed_at=1_800_000_000,
+        indeterminate_outbound_probe=lambda: 3,
     )
 
     async def inventory() -> tuple[ChannelInventoryItem, ...]:
@@ -125,6 +126,7 @@ async def test_snapshot_merges_live_inventory_with_nested_operational_state() ->
     ).snapshot()
 
     assert snapshot["adapter"]["accountId"] == "wxid@example.com"
+    assert snapshot["adapter"]["indeterminateOutboundCount"] == 3
     assert adapter.observed_at is not None and adapter.observed_at >= before
     assert len(snapshot["items"]) == 1
     row = snapshot["items"][0]
@@ -224,6 +226,7 @@ async def test_ops_routes_require_the_dedicated_channel_bearer_token() -> None:
                     "platform": "qq",
                     "accountId": "42",
                     "connected": True,
+                    "indeterminateOutboundCount": None,
                 },
                 "items": [],
             }

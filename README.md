@@ -125,6 +125,29 @@ same bounded history window as the adapter bootstrap.
 Optional connector bearer tokens are configured independently with
 `SIDEKICK_WECHAT_HOST_TOKEN` and `SIDEKICK_WECHAT_PEER_TOKEN`.
 
+### Generated-send rollout safety
+
+The authenticated channel `/health` and `/v1/channels` responses expose
+`adapter.indeterminateOutboundCount`. A non-zero value means a send may have
+reached the native chat without a trustworthy receipt, so outgoing controls in
+the affected chat remain fail-closed; `null` means the adapter cannot yet prove
+the count. WeChat reconciles these sends from the connector's idempotency
+ledger with bounded, persisted backoff. Telegram and
+OneBot retain genuinely ambiguous sends in memory for deliberate operator
+review; inspect the native chat and allow delayed events to arrive before
+restarting either adapter, because restart clears that in-memory quarantine.
+
+For a provenance-aware release, quiesce new AI commands and let the existing
+adapter run for at least the connector's 30-second send-settlement window.
+Then update one worker at a time, verify its authenticated health reports zero
+indeterminate outbound sends, and smoke-test one text response and one
+attachment response without a repeated command. Do not roll a WeChat worker
+back to a build that predates durable generated-send provenance while the
+count is non-zero: the older build cannot read the reconciliation ledger and
+could treat a delayed generated echo as a manual command. Keep the new worker
+running until reconciliation reaches zero, then quiesce for the same settlement
+window before rollback.
+
 ## Containers
 
 The stack is deliberately split by ownership so each layer can run on its own:
