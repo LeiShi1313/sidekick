@@ -6,7 +6,7 @@ export const IMAGE_TOOL_NAME = "image_generate";
 const MAX_GENERATED_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_BASE64_CHARS =
   Math.ceil(MAX_GENERATED_IMAGE_BYTES / 3) * 4;
-const MAX_GENERATED_IMAGE_RESPONSE_BYTES =
+export const MAX_GENERATED_IMAGE_RESPONSE_BYTES =
   MAX_GENERATED_IMAGE_BASE64_CHARS + 64 * 1024;
 
 
@@ -69,7 +69,7 @@ export function createImageGenerationGate() {
 }
 
 
-function decodeGeneratedImage(value) {
+export function decodeGeneratedImage(value) {
   if (
     typeof value !== "string" ||
     value.length < 8 ||
@@ -114,6 +114,16 @@ function decodeGeneratedImage(value) {
 }
 
 
+export function decodeGeneratedImageDataUrl(value) {
+  if (typeof value !== "string") return null;
+  const match = /^data:(image\/(?:jpeg|png));base64,(.+)$/.exec(value);
+  if (!match) return null;
+  const image = decodeGeneratedImage(match[2]);
+  if (!image || image.mimeType !== match[1]) return null;
+  return { ...image, encoded: match[2] };
+}
+
+
 export function createImageTools({
   client,
   model,
@@ -132,7 +142,7 @@ export function createImageTools({
       description:
         "Generate one original image from a detailed text prompt when the user asks to create, draw, or render an image. The host delivers the image directly to the chat. This tool creates new images; it does not search for existing images or edit an input image.",
       promptSnippet:
-        "Use image_generate when the user asks for an original image. Call it at most once in this request, then briefly tell the user the generated image is attached.",
+        "Image creation is host-controlled. When the user asks for an original image, always call image_generate exactly once. Never return image bytes or an image URL directly. After the tool succeeds, briefly tell the user the generated image is attached.",
       parameters: Type.Object({
         prompt: Type.String({
           minLength: 1,

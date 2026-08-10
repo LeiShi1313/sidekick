@@ -102,6 +102,46 @@ function sendEmptyText(response) {
   ]);
 }
 
+function sendNativeImage(response, dataUrl) {
+  writeSse(response, [
+    {
+      id: "chatcmpl-native-image",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    },
+    {
+      id: "chatcmpl-native-image",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            images: [
+              {
+                type: "image_url",
+                index: 0,
+                image_url: { url: dataUrl },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    },
+    {
+      id: "chatcmpl-native-image",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ]);
+}
+
 function sendTextChunks(response, chunks) {
   writeSse(response, [
     {
@@ -845,6 +885,65 @@ test("streams generated image bytes without persisting them", async () => {
     const audit = await app.engine.getRunAudit(runId);
     assert.doesNotMatch(rawSession, new RegExp(encoded));
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
+test("streams a provider-native image without retrying or persisting bytes", async () => {
+  const imageBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]);
+  const encoded = imageBytes.toString("base64");
+  const app = await fixture(
+    (_body, response) => {
+      sendNativeImage(response, `data:image/jpeg;base64,${encoded}`);
+    },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+    },
+  );
+  try {
+    const runId = "47474747-4747-4747-8747-474747474747";
+    const events = await collect(
+      app.engine,
+      request(runId, { prompt: "Generate a fox and cat in Xiamen" }),
+    );
+
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
+    assert.deepEqual(
+      events.find((event) => event.type === "attachment"),
+      {
+        type: "attachment",
+        filename: "generated-image.jpg",
+        mimeType: "image/jpeg",
+        displayAs: "image",
+        data: encoded,
+      },
+    );
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "");
+
+    const sessionFiles = (await readdir(app.engine.config.sessionDir)).filter(
+      (name) => name.endsWith(".jsonl"),
+    );
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    const audit = await app.engine.getRunAudit(runId);
+    assert.doesNotMatch(rawSession, new RegExp(encoded));
+    assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+    assert.ok(
+      audit.events.some(
+        (event) =>
+          event.type === "image.output.accepted" &&
+          event.data.source === "model_native" &&
+          event.data.mimeType === "image/jpeg" &&
+          event.data.sizeBytes === imageBytes.length,
+      ),
+    );
   } finally {
     await app.close();
   }

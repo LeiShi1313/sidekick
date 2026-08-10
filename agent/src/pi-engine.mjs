@@ -1,4 +1,5 @@
 import { chmod, mkdir } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import {
   DefaultResourceLoader,
@@ -12,6 +13,7 @@ import {
   InMemoryCredentialStore,
   InMemoryModelsStore,
 } from "@earendil-works/pi-ai";
+import { streamSimple as streamOpenAICompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import { complete } from "@earendil-works/pi-ai/compat";
 import OpenAI from "openai";
 import { Type } from "typebox";
@@ -26,6 +28,7 @@ import {
 import { retrieveMemoryContext } from "./memory-context.mjs";
 import { createMemoryTools, MEMORY_TOOL_NAMES } from "./memory-tools.mjs";
 import { isModelId } from "./model-id.mjs";
+import { createNativeImageCaptureFetch } from "./native-image-output.mjs";
 import {
   SensitiveTextStream,
   collectSensitiveLiterals,
@@ -470,6 +473,7 @@ export class PiEngine {
     this.codeTool = createCodeTool();
     this.imageGenerationGate =
       config.imageGenerationGate ?? createImageGenerationGate();
+    this.nativeImageReceiver = new AsyncLocalStorage();
     this.imageClient =
       config.imageClient ??
       (config.imageModel
@@ -948,6 +952,8 @@ export class PiEngine {
       let textStream = new SensitiveTextStream(privacyOptions);
       let finalAnswer = "";
       let hasGeneratedAttachment = false;
+      let nativeImageOutput = null;
+      let nativeImageIgnored = false;
       let toolExecutionStarted = false;
       let turnNumber = 0;
       let turnStartedAt = null;
@@ -1037,6 +1043,11 @@ export class PiEngine {
           if (!event.isError && artifact) {
             hasGeneratedAttachment = true;
             queue.push({ type: "attachment", ...artifact });
+            void record("image.output.accepted", {
+              source: IMAGE_TOOL_NAME,
+              mimeType: artifact.mimeType,
+              sizeBytes: event.result?.details?.sizeBytes ?? null,
+            });
           }
         } else if (event.type === "turn_end") {
           emitText(textStream.flush());
@@ -1092,32 +1103,61 @@ export class PiEngine {
         runId: request.runId,
         sessionId: session.sessionId,
       });
+      const receiveNativeImage = (output) => {
+        if (!toolNames.includes(IMAGE_TOOL_NAME)) {
+          throw new Error("Provider returned unsupported native image output");
+        }
+        if (hasGeneratedAttachment) {
+          nativeImageIgnored = true;
+          return;
+        }
+        nativeImageOutput = output;
+        hasGeneratedAttachment = true;
+      };
       const task = (async () => {
         try {
-          await session.prompt(preparedPrompt, {
-            expandPromptTemplates: false,
-            source: "rpc",
-            images: request.images?.map((image) => ({
-              type: "image",
-              data: image.data.toString("base64"),
-              mimeType: image.mimeType,
-            })),
-          });
+          await this.nativeImageReceiver.run(receiveNativeImage, () =>
+            session.prompt(preparedPrompt, {
+              expandPromptTemplates: false,
+              source: "rpc",
+              images: request.images?.map((image) => ({
+                type: "image",
+                data: image.data.toString("base64"),
+                mimeType: image.mimeType,
+              })),
+            }),
+          );
+          if (nativeImageOutput) {
+            queue.push({ type: "attachment", ...nativeImageOutput.artifact });
+            await record("image.output.accepted", {
+              source: "model_native",
+              mimeType: nativeImageOutput.artifact.mimeType,
+              sizeBytes: nativeImageOutput.sizeBytes,
+            });
+          } else if (nativeImageIgnored) {
+            await record("image.output.ignored", {
+              source: "model_native",
+              reason: "generated_attachment_already_present",
+            });
+          }
           let lastAssistant = [...session.messages]
             .reverse()
             .find((message) => message.role === "assistant");
           if (
             lastAssistant?.stopReason === "stop" &&
             !toolExecutionStarted &&
+            !hasGeneratedAttachment &&
             !extractText(lastAssistant).trim()
           ) {
-            await session.sendCustomMessage(
-              {
-                customType: "empty-response-retry",
-                content: EMPTY_RESPONSE_RETRY_PROMPT,
-                display: false,
-              },
-              { triggerTurn: true },
+            await this.nativeImageReceiver.run(receiveNativeImage, () =>
+              session.sendCustomMessage(
+                {
+                  customType: "empty-response-retry",
+                  content: EMPTY_RESPONSE_RETRY_PROMPT,
+                  display: false,
+                },
+                { triggerTurn: true },
+              ),
             );
             lastAssistant = [...session.messages]
               .reverse()
@@ -1372,6 +1412,22 @@ export class PiEngine {
         baseUrl: model.baseUrl,
         apiKey: this.config.apiKey,
         api: model.api,
+        streamSimple: (runtimeModel, context, options) =>
+          streamOpenAICompletions(runtimeModel, context, {
+            ...options,
+            fetch: createNativeImageCaptureFetch({
+              fetchImpl: options?.fetch ?? globalThis.fetch,
+              onImage: (output) => {
+                const receiver = this.nativeImageReceiver.getStore();
+                if (!receiver) {
+                  throw new Error(
+                    "Provider returned uncorrelated native image output",
+                  );
+                }
+                receiver(output);
+              },
+            }),
+          }),
         models: [
           {
             id: model.id,
