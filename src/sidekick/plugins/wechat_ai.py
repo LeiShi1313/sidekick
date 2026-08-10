@@ -110,6 +110,7 @@ class WeChatRuntimeSettings:
 @dataclass(frozen=True, slots=True)
 class _WeChatChannelRuntime:
     handler: AIConversationHandler
+    transport: WeChatChatTransport
     identity_codec: IdentityCodec
     memory_ingestor: ChatMemoryIngestor | None
     dream_scheduler: DreamScheduler | None
@@ -120,6 +121,8 @@ class _WeChatChannelRuntime:
 class WeChatAI(metaclass=PluginMount):
     command_group = "wechat"
     command_name = "ai"
+    RECONCILIATION_ACTIVE_DELAY = 2.0
+    RECONCILIATION_IDLE_DELAY = 30.0
 
     def __init__(self, log_level: str = "info"):
         self._runtime = WeChatRuntimeSettings.from_env()
@@ -149,9 +152,15 @@ class WeChatAI(metaclass=PluginMount):
             else None
         )
         self._channel_runtime: _WeChatChannelRuntime | None = None
+        self._generated_send_reconciliation_task: asyncio.Task[None] | None = None
         self._adapter_status = AdapterRuntimeState(
             id=self._ops_settings.instance_id,
             platform="wechat",
+            indeterminate_outbound_probe=lambda: (
+                self._channel_runtime.transport.indeterminate_outbound_count
+                if self._channel_runtime is not None
+                else None
+            ),
         )
         self._ops_server = ChannelOpsServer(
             snapshot_service=ChannelSnapshotService(
@@ -180,9 +189,13 @@ class WeChatAI(metaclass=PluginMount):
                 loop.add_signal_handler(stop_signal, stop.set)
             except NotImplementedError:
                 pass
-        await self._wechat_store.connect()
-        await self._ai_store.connect()
+        await self._wechat_store.acquire_adapter_ownership()
         try:
+            await self._wechat_store.connect()
+            await self._wechat_store.recover_generated_send_leases(
+                self._client.base_url
+            )
+            await self._ai_store.connect()
             try:
                 account_id = await self._wechat_store.get_account_id(
                     self._client.base_url
@@ -362,6 +375,7 @@ class WeChatAI(metaclass=PluginMount):
         )
         return _WeChatChannelRuntime(
             handler=handler,
+            transport=transport,
             identity_codec=identity_codec,
             memory_ingestor=memory_ingestor,
             dream_scheduler=dream_scheduler,
@@ -398,9 +412,30 @@ class WeChatAI(metaclass=PluginMount):
             runtime.dream_scheduler.start()
         if runtime.outbox_scheduler is not None:
             runtime.outbox_scheduler.start()
+        self._generated_send_reconciliation_task = asyncio.create_task(
+            self._reconcile_generated_sends(
+                runtime.transport,
+                bootstrap.session.self_id,
+            ),
+            name="wechat-generated-send-reconciliation",
+        )
+        await asyncio.sleep(0)
         return runtime.handler
 
     async def _close_channel_runtime(self) -> None:
+        reconciliation = getattr(
+            self,
+            "_generated_send_reconciliation_task",
+            None,
+        )
+        self._generated_send_reconciliation_task = None
+        if reconciliation is not None:
+            if not reconciliation.done():
+                reconciliation.cancel()
+            try:
+                await reconciliation
+            except asyncio.CancelledError:
+                pass
         runtime = self._channel_runtime
         self._channel_runtime = None
         if runtime is None:
@@ -411,6 +446,28 @@ class WeChatAI(metaclass=PluginMount):
             await runtime.dream_scheduler.close()
         if runtime.outbox_scheduler is not None:
             await runtime.outbox_scheduler.close()
+
+    async def _reconcile_generated_sends(
+        self,
+        transport: WeChatChatTransport,
+        account_id: str,
+    ) -> None:
+        while True:
+            try:
+                remaining = await transport.reconcile_pending(account_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "WeChat generated-send reconciliation deferred (%s)",
+                    type(exc).__name__,
+                )
+                remaining = 1
+            await asyncio.sleep(
+                self.RECONCILIATION_ACTIVE_DELAY
+                if remaining
+                else self.RECONCILIATION_IDLE_DELAY
+            )
 
 
 async def _wait_or_stop(stop: asyncio.Event, delay: float) -> None:

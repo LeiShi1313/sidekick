@@ -69,6 +69,7 @@ from sidekick.chat.identity import (
     NamespacedIdentityCodec,
 )
 from sidekick.chat.output_policy import OutputPolicy
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.chat.transport import ChatTransport, ObjectChatTransport, SentMessage
 from sidekick.channel_status import (
     ACTIVE_AI_RUN_STATUSES,
@@ -987,6 +988,23 @@ class AIResponder:
                             text=empty,
                             succeeded=False,
                             failure_code="EMPTY_RESPONSE",
+                        )
+                    if event.code == "TOOL_OUTCOME_UNCONFIRMED":
+                        unconfirmed = (
+                            "AI returned no final response after using a tool. "
+                            "The action may already have completed; verify before "
+                            "retrying."
+                        )
+                        await self._edit_message(
+                            answer,
+                            unconfirmed,
+                            wait=True,
+                        )
+                        return AnswerResult(
+                            message=answer,
+                            text=unconfirmed,
+                            succeeded=False,
+                            failure_code="TOOL_OUTCOME_UNCONFIRMED",
                         )
                     raise RuntimeError(event.message or "Agent run failed")
                 if event.type == "run_completed":
@@ -4168,6 +4186,15 @@ class AIConversationHandler:
     async def handle(self, message: ReplyTarget) -> bool:
         if message.sender_id is None or message.chat_id is None:
             return False
+        origin = await self._transport.classify_origin(message)
+        if origin is MessageOrigin.SIDEKICK_GENERATED:
+            return False
+        if origin is MessageOrigin.INDETERMINATE:
+            if self._logger is not None:
+                self._logger.warning(
+                    "Ignoring outgoing message with indeterminate local provenance"
+                )
+            return False
         requester_actor_id = self._prompt_builder.message_actor_id(message)
         if requester_actor_id is None:
             return False
@@ -4180,7 +4207,10 @@ class AIConversationHandler:
         command = parse_chat_command(message_text, ai_prefix=ai_prefix)
         is_owner = principal_actor_id == self._owner_actor_id
         allow_individual_access = requester_actor_id == principal_actor_id
-        is_owner_control = is_owner or self._transport.is_outgoing(message)
+        # MANUAL_OUTGOING is an adapter-attested local action. Telegram may
+        # legitimately attribute such a post to a channel rather than the
+        # account's user identity.
+        is_owner_control = is_owner or origin is MessageOrigin.MANUAL_OUTGOING
         if command is not None and not isinstance(command, AIAskCommand):
             await self._mark_memory_excluded(scope_id, message.id, "ai-control")
         if isinstance(command, MemoryRememberCommand):
@@ -4371,8 +4401,6 @@ class AIConversationHandler:
             if parent_answer_id is None:
                 return False
             if (scope_id, parent_answer_id) in self._active_request_runs:
-                if self._transport.is_outgoing(message):
-                    return False
                 await self._reply_memory_excluded(
                     message,
                     "AI is still working. Please wait for the answer.",
@@ -6199,6 +6227,7 @@ _SAFE_AI_RUN_ERROR_CODES = frozenset(
         "SESSION_UNAVAILABLE",
         "DELIVERY_FAILED",
         "EMPTY_RESPONSE",
+        "TOOL_OUTCOME_UNCONFIRMED",
         "AGENT_ERROR",
         "PREPARATION_FAILED",
         "HANDLER_ERROR",

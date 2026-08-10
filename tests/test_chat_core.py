@@ -49,6 +49,7 @@ from sidekick.chat.commands import (
     parse_chat_command,
 )
 from sidekick.chat.identity import NamespacedIdentityCodec
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.chat.transport import ChatPresentation, ObjectChatTransport
 
 
@@ -326,6 +327,8 @@ def test_outbound_attachment_is_one_bounded_safe_named_payload(make_png) -> None
 async def test_object_transport_replies_with_a_named_file() -> None:
     class Message:
         def __init__(self) -> None:
+            self.id = 1
+            self.chat_id = 7
             self.observed: tuple[str, bytes, bool] | None = None
 
         async def reply(self, *args, **kwargs):
@@ -351,6 +354,42 @@ async def test_object_transport_replies_with_a_named_file() -> None:
     assert isinstance(result, FakeSentMessage)
     assert result.id == 100
     assert message.observed == ("report.txt", b"report", True)
+
+
+@pytest.mark.asyncio
+async def test_object_transport_quarantines_attachment_without_receipt() -> None:
+    class Message:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, *args, **kwargs):
+            return None
+
+    transport = ObjectChatTransport()
+    attachment = OutboundAttachment(
+        data=b"report",
+        filename="report.txt",
+        mime_type="text/plain",
+        display_as="file",
+    )
+
+    assert await transport.reply_attachment(Message(), attachment) is None
+    echo = type(
+        "Echo",
+        (),
+        {
+            "id": 100,
+            "chat_id": 7,
+            "text": None,
+            "reply_to_msg_id": 1,
+            "is_outgoing": True,
+            "file": object(),
+        },
+    )()
+    assert (
+        await transport.classify_origin(echo)
+        is MessageOrigin.INDETERMINATE
+    )
 
 
 @pytest.mark.asyncio
@@ -547,8 +586,8 @@ class FakeTransport:
     async def delete(self, message):
         self.deleted.append(message)
 
-    def is_outgoing(self, message):
-        return False
+    async def classify_origin(self, message):
+        return MessageOrigin.INCOMING
 
 
 @pytest.mark.asyncio

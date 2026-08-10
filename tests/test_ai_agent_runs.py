@@ -507,6 +507,7 @@ async def test_reply_to_active_request_reports_that_ai_is_still_working():
         assert len(gateway.requests) == 1
 
         outgoing_echo = FakeMessage("Generated answer", reply_to=trigger)
+        outgoing_echo.id = trigger.replies[0].id
         outgoing_echo.out = True
         assert await handler.handle(outgoing_echo) is False
         assert outgoing_echo.replies == []
@@ -526,3 +527,71 @@ async def test_reply_to_active_request_reports_that_ai_is_still_working():
     late_follow_up = FakeMessage("Still working?", reply_to=trigger)
     assert await handler.handle(late_follow_up) is False
     assert late_follow_up.replies == []
+
+
+@pytest.mark.asyncio
+async def test_generated_command_echo_is_rejected_but_manual_outgoing_is_preserved():
+    gateway = FakeAgentGateway(["/ai must not run", "manual answer"])
+    transport = TelegramChatTransport(edit_cadence=0)
+    handler = AIConversationHandler(
+        owner_id=10,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            identity_codec=TELEGRAM_IDENTITY_CODEC,
+        ),
+        transport=transport,
+        identity_codec=TELEGRAM_IDENTITY_CODEC,
+    )
+    trigger = FakeMessage("/ai first")
+
+    assert await handler.handle(trigger) is True
+    generated_answer = trigger.replies[0]
+    echoed = FakeMessage("/ai must not run")
+    echoed.id = generated_answer.id
+    echoed.out = True
+
+    assert await handler.handle(echoed) is False
+    assert len(gateway.requests) == 1
+
+    manual = FakeMessage("/ai manual request")
+    manual.out = True
+
+    assert await handler.handle(manual) is True
+    assert len(gateway.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_generated_owner_control_cannot_change_channel_configuration():
+    gateway = FakeAgentGateway(["/ai_prefix /ask"])
+    store = FakeStore()
+    transport = TelegramChatTransport(edit_cadence=0)
+    handler = AIConversationHandler(
+        owner_id=10,
+        responder=AIResponder(gateway, transport=transport),
+        store=store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            identity_codec=TELEGRAM_IDENTITY_CODEC,
+        ),
+        transport=transport,
+        identity_codec=TELEGRAM_IDENTITY_CODEC,
+    )
+    trigger = FakeMessage("/ai produce a command")
+    assert await handler.handle(trigger) is True
+    generated_answer = trigger.replies[0]
+    echoed = FakeMessage("/ai_prefix /ask")
+    echoed.id = generated_answer.id
+    echoed.out = True
+    echoed.is_group = True
+
+    assert await handler.handle(echoed) is False
+    scope_id = TELEGRAM_IDENTITY_CODEC.scope_id(echoed.chat_id)
+    assert await store.get_ai_command_prefix(scope_id) is None
+
+    manual = FakeMessage("/ai_prefix /ask")
+    manual.out = True
+    manual.is_group = True
+    assert await handler.handle(manual) is True
+    assert await store.get_ai_command_prefix(scope_id) == "/ask"

@@ -1179,6 +1179,64 @@ async def test_wechat_client_never_retries_unknown_send_under_a_new_id() -> None
 
 
 @pytest.mark.asyncio
+async def test_wechat_client_reconciles_an_existing_send_by_request_id() -> None:
+    reads = 0
+
+    async def get_send(request: web.Request) -> web.Response:
+        nonlocal reads
+        reads += 1
+        assert request.match_info["request_id"] == "sidekick.wechat.unknown-1"
+        return json_response(
+            {
+                "requestId": "sidekick.wechat.unknown-1",
+                "status": "submitted",
+                "messageId": "7158246912028861544",
+                "to": "filehelper",
+                "messageType": "text",
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/sends/{request_id}", get_send)
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(str(server.make_url("/")))
+        try:
+            operation = await client.reconcile_send_and_wait(
+                request_id="sidekick.wechat.unknown-1",
+                to="filehelper",
+            )
+        finally:
+            await client.close()
+
+    assert operation.status == "submitted"
+    assert operation.message_id == "7158246912028861544"
+    assert reads == 1
+
+
+@pytest.mark.asyncio
+async def test_wechat_client_treats_missing_send_as_proven_not_admitted() -> None:
+    async def get_send(_request: web.Request) -> web.Response:
+        return json_response(
+            {"error": {"code": "NOT_FOUND", "message": "Send not found"}},
+            status=404,
+        )
+
+    app = web.Application()
+    app.router.add_get("/sends/{request_id}", get_send)
+    async with TestServer(app) as server:
+        client = WeChatConnectorClient(str(server.make_url("/")))
+        try:
+            operation = await client.reconcile_send_and_wait(
+                request_id="sidekick.wechat.not-admitted-1",
+                to="filehelper",
+            )
+        finally:
+            await client.close()
+
+    assert operation is None
+
+
+@pytest.mark.asyncio
 async def test_wechat_client_replays_events_after_opaque_cursor() -> None:
     observed_after: list[str] = []
 

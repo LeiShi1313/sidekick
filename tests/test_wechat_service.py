@@ -7,11 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from sidekick.ai import AISettings, AIStateRepository
+from sidekick.chat.provenance import MessageOrigin, message_fingerprint
 from sidekick.chat.output_policy import MAINLAND_MESSAGING_POLICY_ID
 from sidekick.channel_status import ChannelOpsSettings
 from sidekick.plugins.base import command_registry
 from sidekick.plugins.wechat_ai import WeChatAI, WeChatRuntimeSettings
-from sidekick.wechat.ai import WeChatQuotedImageDescriber
+from sidekick.wechat.ai import WeChatChatTransport, WeChatQuotedImageDescriber
 from sidekick.wechat.api import (
     WeChatCapabilities,
     WeChatChat,
@@ -52,6 +53,58 @@ def test_wechat_runtime_settings_and_cli_command(monkeypatch, tmp_path) -> None:
     assert settings.state_path == state_path
     assert settings.reconnect_delay == 1.5
     assert command_registry.as_fire_commands()["wechat"]["ai"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_wechat_adapter_fails_before_opening_ai_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "wechat.db"
+    owner = await WeChatStateRepository(state_path).connect()
+    await owner.acquire_adapter_ownership()
+
+    class RecordingAIStore:
+        def __init__(self) -> None:
+            self.connect_calls = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+
+        async def close(self) -> None:
+            pass
+
+    class AsyncCloser:
+        async def close(self) -> None:
+            pass
+
+    class AdapterStatus:
+        def update(self, **_values) -> None:
+            pass
+
+    ai_store = RecordingAIStore()
+    plugin = object.__new__(WeChatAI)
+    plugin._wechat_store = WeChatStateRepository(state_path)
+    plugin._ai_store = ai_store
+    plugin._client = SimpleNamespace(
+        base_url=CONNECTOR_KEY,
+        close=AsyncCloser().close,
+    )
+    plugin._gateway = AsyncCloser()
+    plugin._memory = None
+    plugin._ops_server = AsyncCloser()
+    plugin._adapter_status = AdapterStatus()
+    plugin._channel_runtime = None
+    plugin._generated_send_reconciliation_task = None
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "add_signal_handler", lambda *_args: None)
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            await plugin._run()
+        assert ai_store.connect_calls == 0
+        assert plugin._wechat_store._connection is None
+    finally:
+        await owner.close()
 
 
 def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
@@ -118,6 +171,10 @@ async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
         async def close(self) -> None:
             calls.append(f"close:{self.name}")
 
+    class Transport:
+        async def reconcile_pending(self, account_id: str) -> None:
+            calls.append(f"reconcile:{account_id}")
+
     old = SimpleNamespace(
         continuous_scheduler=Scheduler("old-continuous"),
         dream_scheduler=Scheduler("old-dream"),
@@ -126,6 +183,7 @@ async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
     new_handler = object()
     new = SimpleNamespace(
         handler=new_handler,
+        transport=Transport(),
         continuous_scheduler=Scheduler("new-continuous"),
         dream_scheduler=Scheduler("new-dream"),
         outbox_scheduler=Scheduler("new-outbox"),
@@ -134,7 +192,9 @@ async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
     plugin._channel_runtime = old
     plugin._build_channel_runtime = lambda _bootstrap: new
 
-    handler = await plugin._activate_channel_runtime(object())
+    handler = await plugin._activate_channel_runtime(
+        SimpleNamespace(session=SimpleNamespace(self_id="wxid_self"))
+    )
     await plugin._close_channel_runtime()
 
     assert handler is new_handler
@@ -145,10 +205,48 @@ async def test_wechat_channel_runtime_restarts_memory_schedulers() -> None:
         "start:new-continuous",
         "start:new-dream",
         "start:new-outbox",
+        "reconcile:wxid_self",
         "close:new-continuous",
         "close:new-dream",
         "close:new-outbox",
     ]
+
+
+@pytest.mark.asyncio
+async def test_wechat_channel_activation_does_not_wait_for_reconciliation() -> None:
+    reconcile_started = asyncio.Event()
+    reconcile_cancelled = asyncio.Event()
+
+    class Transport:
+        async def reconcile_pending(self, _account_id: str) -> None:
+            reconcile_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                reconcile_cancelled.set()
+
+    runtime = SimpleNamespace(
+        handler=object(),
+        transport=Transport(),
+        continuous_scheduler=None,
+        dream_scheduler=None,
+        outbox_scheduler=None,
+    )
+    plugin = object.__new__(WeChatAI)
+    plugin._channel_runtime = None
+    plugin._build_channel_runtime = lambda _bootstrap: runtime
+
+    handler = await asyncio.wait_for(
+        plugin._activate_channel_runtime(
+            SimpleNamespace(session=SimpleNamespace(self_id="wxid_self"))
+        ),
+        timeout=0.1,
+    )
+    await asyncio.wait_for(reconcile_started.wait(), timeout=0.1)
+    await plugin._close_channel_runtime()
+
+    assert handler is runtime.handler
+    assert reconcile_cancelled.is_set()
 
 
 class FakeConnectorClient:
@@ -270,6 +368,7 @@ def message_event(
     message_type: str = "text",
     content_redacted: bool = False,
     sender_id: str | None = ACCOUNT_ID,
+    direction: str = "out",
     shared_chat_history: dict[str, object] | None = None,
 ) -> WeChatEvent:
     payload = {
@@ -278,7 +377,7 @@ def message_event(
         "event": "message",
         "id": message_id,
         "chatId": CHAT_ID,
-        "direction": "out",
+        "direction": direction,
         "messageType": message_type,
         "content": content,
         "timestamp": 1_783_772_734,
@@ -755,6 +854,71 @@ async def test_wechat_event_pump_handles_each_message_once_and_then_acks(tmp_pat
         assert replay_result == "reconnect"
         assert len(handler.messages) == 1
         assert await store.get_cursor(CONNECTOR_KEY) == "12"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_unknown_send_does_not_block_event_ingress(tmp_path) -> None:
+    events = tuple(
+        message_event(
+            cursor=str(cursor),
+            message_id=f"41596676209820408{cursor}",
+            content=f"/ai outgoing {cursor}",
+        )
+        for cursor in range(11, 19)
+    ) + (
+        message_event(
+            cursor="19",
+            message_id="4159667620982040819",
+            content="/ai incoming",
+            sender_id="wxid_alice",
+            direction="in",
+        ),
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    client = FakeConnectorClient(events)
+    origins: list[MessageOrigin] = []
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+        await store.reserve_generated_send(
+            CONNECTOR_KEY,
+            ACCOUNT_ID,
+            CHAT_ID,
+            "request-with-unknown-outcome",
+            message_fingerprint(
+                text="generated",
+                reply_to_message_id=None,
+                has_attachment=False,
+            ).digest,
+        )
+        transport = WeChatChatTransport(
+            client,  # type: ignore[arg-type]
+            store,
+            CONNECTOR_KEY,
+            native_reply_ready=False,
+        )
+
+        class ClassifyingHandler:
+            async def handle(self, message):
+                origins.append(await transport.classify_origin(message))
+                return True
+
+        result = await asyncio.wait_for(
+            WeChatEventPump(
+                client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+            ).run(ClassifyingHandler(), asyncio.Event()),
+            timeout=0.5,
+        )
+
+        assert result == "reconnect"
+        assert origins == [MessageOrigin.INDETERMINATE] * 8 + [
+            MessageOrigin.INCOMING
+        ]
+        assert await store.get_cursor(CONNECTOR_KEY) == "19"
     finally:
         await store.close()
 

@@ -114,16 +114,60 @@ Hindsight; that memory must be revised or removed through the memory service.
 The root Compose stack declares `wechat-host-ai` and `wechat-peer-ai`. Each
 worker joins only its matching bridge network, uses its own WeChat projection
 and AI state databases, and shares the existing Pi agent and Hindsight services.
-Start or update both workers without recreating the Telegram or OneBot adapters:
+Start or update them one at a time without recreating the Telegram or OneBot
+adapters, completing the rollout gates below before advancing:
 
 ```bash
-docker compose up -d --build wechat-host-ai wechat-peer-ai
+docker compose up -d --build wechat-host-ai
+# Complete the generated-send rollout gates, then:
+docker compose up -d --build wechat-peer-ai
 ```
 
 The Compose healthcheck applies the same live capability gates and parses the
 same bounded history window as the adapter bootstrap.
 Optional connector bearer tokens are configured independently with
 `SIDEKICK_WECHAT_HOST_TOKEN` and `SIDEKICK_WECHAT_PEER_TOKEN`.
+
+### Generated-send rollout safety
+
+The authenticated channel `/health` and `/v1/channels` responses expose
+`adapter.indeterminateOutboundCount`. A non-zero value means a send may have
+reached the native chat without a trustworthy receipt, so outgoing controls in
+the affected chat remain fail-closed; `null` means the adapter cannot yet prove
+the count. WeChat reconciles these sends from the connector's idempotency
+ledger with bounded, persisted backoff. Telegram and OneBot retain genuinely
+ambiguous sends in memory for deliberate operator review. The exposed value is
+aggregate, so use adapter logs and active-run context to identify the affected
+native chat. Do not restart either adapter while the value is non-zero; restart
+clears that in-memory quarantine.
+
+The first upgrade from a build without durable provenance needs a separate
+pre-upgrade audit. The new counter has no record of ambiguous sends created by
+the old build, and a zero after startup cannot prove that none exist. Before
+stopping an old worker, quiesce new AI commands, verify that it has no active
+runs, and wait 30 seconds for ordinary connector polling to finish. Audit the
+old adapter and connector logs since the last clean start for terminal-unknown
+or other post-admission send failures. Resolve every recorded request ID through
+the connector send journal: proceed only when each is definitely failed or its
+stable message ID and outbound event have been observed. If the audit is
+incomplete or any operation remains unknown, keep the worker and affected chat
+quarantined and do not treat the new worker's zero as a release gate.
+
+After that first audit, update one provenance-aware worker at a time. WeChat
+startup takes exclusive ownership of its state database, so a duplicate worker
+must fail startup instead of overlapping. Verify authenticated health reports a
+connector-wide zero, then smoke-test one text response and one attachment
+response without a repeated command. Re-check that the value is zero after the
+smoke tests before advancing to the next worker. Do not roll a WeChat worker
+back to a build that predates durable generated-send provenance while the value
+is non-zero or `null`: the older build cannot read the reconciliation ledger
+and could treat a delayed generated echo as a manual command. Keep the new
+worker running until reconciliation reaches zero, then quiesce and repeat the
+active-run and send-journal audit before rollback.
+
+Mount each WeChat state database through its whole parent directory or a named
+volume so SQLite WAL and ownership sidecars share the same filesystem identity.
+Hard-linked databases and file-only bind mounts are unsupported.
 
 ## Containers
 

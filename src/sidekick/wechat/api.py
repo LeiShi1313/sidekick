@@ -964,6 +964,38 @@ class WeChatConnectorClient:
         self._validate_send_identity(operation, request_id=request_id, to=target)
         return await self._wait_for_send(operation, request_id=request_id, to=target)
 
+    async def reconcile_send_and_wait(
+        self,
+        *,
+        request_id: str,
+        to: str,
+    ) -> WeChatSendOperation | None:
+        if REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise ValueError("WeChat request ID must be 1-128 URL-safe characters")
+        target = _canonical_wechat_id(to, "to")
+        try:
+            payload = await self._request_json(
+                "GET",
+                f"/sends/{quote(request_id, safe='')}",
+            )
+        except WeChatAPIError as exc:
+            # Connector contract: this lookup is authoritative. NOT_FOUND means
+            # no operation was admitted under the idempotency key.
+            if exc.status == 404 and exc.code == "NOT_FOUND":
+                return None
+            raise
+        operation = WeChatSendOperation.parse(payload)
+        self._validate_send_identity(
+            operation,
+            request_id=request_id,
+            to=target,
+        )
+        return await self._wait_for_send(
+            operation,
+            request_id=request_id,
+            to=target,
+        )
+
     async def _wait_for_send(
         self,
         operation: WeChatSendOperation,

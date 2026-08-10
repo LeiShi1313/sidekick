@@ -18,9 +18,15 @@ from sidekick.ai import (
 from sidekick.chat.attachments import OutboundAttachment
 from sidekick.chat.formatting import markdown_to_plain_text
 from sidekick.chat.identity import ExternalId, IdentityCodec
+from sidekick.chat.provenance import (
+    GeneratedMessageTracker,
+    MessageOrigin,
+    message_fingerprint,
+    observed_message_fingerprint,
+)
 from sidekick.chat.transport import ChatPresentation, SentMessage
 from sidekick.channel_status import ChannelInventoryItem
-from sidekick.onebot.client import OneBotActionError
+from sidekick.onebot.client import OneBotActionError, OneBotNotConnectedError
 from sidekick.onebot.message import (
     OneBotActionClient,
     OneBotMessage,
@@ -165,6 +171,11 @@ class OneBotChatTransport:
     def __init__(self, client: OneBotActionClient, *, logger: Any | None = None):
         self._client = client
         self._logger = logger
+        self._generated_messages = GeneratedMessageTracker()
+
+    @property
+    def indeterminate_outbound_count(self) -> int:
+        return self._generated_messages.indeterminate_count
 
     async def get_reply(self, message: Any) -> OneBotMessage | None:
         reply_id = getattr(message, "reply_to_msg_id", None)
@@ -235,15 +246,32 @@ class OneBotChatTransport:
         else:
             action = "upload_private_file"
             target = {"user_id": str(abs(message.chat_id))}
-        await self._client.call(
-            action,
-            {
-                **target,
-                "file": encoded,
-                "name": attachment.filename,
-            },
-            timeout=120,
+        fingerprint = message_fingerprint(
+            text=None,
+            reply_to_message_id=None,
+            has_attachment=True,
         )
+        with self._generated_messages.reserve(
+            message.chat_id,
+            fingerprint,
+        ) as reservation:
+            try:
+                await self._client.call(
+                    action,
+                    {
+                        **target,
+                        "file": encoded,
+                        "name": attachment.filename,
+                    },
+                    timeout=120,
+                )
+            except (OneBotActionError, OneBotNotConnectedError):
+                reservation.failed()
+                raise
+            # NapCat awaits delivery but these file-only actions expose no
+            # message ID. Their possible echo has neither command text nor a
+            # reply trigger, so the successful action is terminal for provenance.
+            reservation.complete_without_message_id()
 
     async def update(
         self,
@@ -283,8 +311,17 @@ class OneBotChatTransport:
                 {"message_id": str(message_id)},
             )
 
-    def is_outgoing(self, message: Any) -> bool:
-        return bool(getattr(message, "is_outgoing", getattr(message, "out", False)))
+    async def classify_origin(self, message: Any) -> MessageOrigin:
+        return await self._generated_messages.classify(
+            chat_id=message.chat_id,
+            message_id=message.id,
+            outgoing=bool(
+                getattr(message, "is_outgoing", getattr(message, "out", False))
+            )
+            and getattr(message, "sender_id", None)
+            == getattr(message, "self_id", None),
+            fingerprint=observed_message_fingerprint(message),
+        )
 
     def is_group(self, message: Any) -> bool:
         return getattr(message, "message_type", None) == "group"
@@ -317,16 +354,41 @@ class OneBotChatTransport:
         else:
             action = "send_private_msg"
             params = {"user_id": str(abs(trigger.chat_id)), "message": message}
-        if timeout is None:
-            response = await self._client.call(action, params)
-        else:
-            response = await self._client.call(action, params, timeout=timeout)
-        if not isinstance(response, dict):
-            raise RuntimeError("OneBot send response is malformed")
-        message_id = response.get("message_id")
-        if isinstance(message_id, bool) or not isinstance(message_id, int):
-            raise RuntimeError("OneBot send response has no message ID")
-        return message_id
+        text = "".join(
+            str(segment["data"].get("text", segment["data"].get("content", "")))
+            for segment in message
+            if segment["type"] in {"text", "markdown"}
+        )
+        fingerprint = message_fingerprint(
+            text=text,
+            reply_to_message_id=trigger.id,
+            has_attachment=any(
+                segment["type"] not in {"reply", "text", "markdown"}
+                for segment in message
+            ),
+        )
+        with self._generated_messages.reserve(
+            trigger.chat_id,
+            fingerprint,
+        ) as reservation:
+            try:
+                if timeout is None:
+                    response = await self._client.call(action, params)
+                else:
+                    response = await self._client.call(action, params, timeout=timeout)
+            except (OneBotActionError, OneBotNotConnectedError):
+                reservation.failed()
+                raise
+            if not isinstance(response, dict):
+                raise RuntimeError("OneBot send response is malformed")
+            message_id = response.get("message_id")
+            if isinstance(message_id, bool) or not isinstance(message_id, int):
+                raise RuntimeError("OneBot send response has no message ID")
+            # NapCat's reportSelfMessage option defaults to false, so a
+            # successful action receipt is terminal for tracker capacity. A
+            # rare self-echo is still recognized by the observed-ID tombstone.
+            reservation.confirm(message_id, echo_expected=False)
+            return message_id
 
     def _log(self, level: str, message: str, *args: Any) -> None:
         operation = getattr(self._logger, level, None)

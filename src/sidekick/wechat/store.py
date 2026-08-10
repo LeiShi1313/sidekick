@@ -4,10 +4,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+import fcntl
 from functools import wraps
+import os
 from pathlib import Path
 import time
-from typing import Concatenate, ParamSpec, TypeVar
+from typing import Concatenate, Literal, ParamSpec, TypeVar
+from uuid import uuid4
 
 import aiosqlite
 
@@ -28,6 +31,8 @@ from sidekick.wechat.message import WeChatMessage
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_MAX_PENDING_GENERATED_SENDS = 4_096
+_MAX_GENERATED_SEND_LEASES_PER_REQUEST = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +41,14 @@ class WeChatStoredChat:
     chat_type: str
     display_name: str | None
     last_observed_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatGeneratedSendReservation:
+    request_id: str
+    chat_id: str
+    fingerprint: bytes
+    reconciliation_attempts: int = 0
 
 
 def _serialized(
@@ -60,20 +73,69 @@ def _serialized(
     return locked
 
 
+async def _rollback_quietly(connection: aiosqlite.Connection) -> None:
+    try:
+        await asyncio.shield(connection.rollback())
+    except BaseException:
+        pass
+
+
+async def _release_generated_send_lease(
+    connection: aiosqlite.Connection,
+    connector_key: str,
+    account_id: str,
+    request_id: str,
+    lease_id: str,
+) -> None:
+    async def cleanup() -> None:
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ?
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_reservations
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wechat_generated_send_leases
+                      WHERE connector_key = ? AND account_id = ?
+                        AND request_id = ?
+                  )
+                """,
+                (
+                    connector_key,
+                    account_id,
+                    request_id,
+                    connector_key,
+                    account_id,
+                    request_id,
+                ),
+            )
+            await connection.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(connection)
+
+    await asyncio.shield(cleanup())
+
+
 class WeChatStateRepository:
     def __init__(self, path: Path):
-        self.path = Path(path)
+        self.path = Path(path).resolve(strict=False)
         self._connection: aiosqlite.Connection | None = None
+        self._adapter_lock_fd: int | None = None
         # aiosqlite serializes statements, not multi-statement transactions.
         # Readers share this lock so they cannot observe an in-progress refresh.
         self._access_lock = asyncio.Lock()
 
     @_serialized
     async def connect(self) -> WeChatStateRepository:
-        parent_existed = self.path.parent.exists()
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not parent_existed:
-            self.path.parent.chmod(0o700)
+        self._ensure_parent_directory()
         connection = await aiosqlite.connect(self.path)
         connection.row_factory = aiosqlite.Row
         await connection.execute("PRAGMA journal_mode=WAL")
@@ -152,6 +214,48 @@ class WeChatStateRepository:
                 processed_at REAL NOT NULL,
                 PRIMARY KEY (connector_key, account_id, chat_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS wechat_generated_send_reservations (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+                created_at REAL NOT NULL,
+                reconciliation_attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK (reconciliation_attempts >= 0),
+                next_reconciliation_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (connector_key, account_id, request_id)
+            );
+            CREATE INDEX IF NOT EXISTS wechat_generated_sends_by_candidate
+            ON wechat_generated_send_reservations (
+                connector_key, account_id, chat_id, fingerprint
+            );
+            CREATE TABLE IF NOT EXISTS wechat_generated_send_leases (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                lease_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'send'
+                    CHECK (kind IN ('send', 'reconcile')),
+                created_at REAL NOT NULL,
+                PRIMARY KEY (
+                    connector_key, account_id, request_id, lease_id
+                )
+            );
+            CREATE INDEX IF NOT EXISTS wechat_generated_send_leases_by_request
+            ON wechat_generated_send_leases (
+                connector_key, account_id, request_id
+            );
+            CREATE TABLE IF NOT EXISTS wechat_generated_messages (
+                connector_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                confirmed_at REAL NOT NULL,
+                PRIMARY KEY (
+                    connector_key, account_id, chat_id, message_id
+                )
+            );
             CREATE TABLE IF NOT EXISTS wechat_attachment_send_attempts (
                 connector_key TEXT NOT NULL,
                 account_id TEXT NOT NULL,
@@ -189,6 +293,39 @@ class WeChatStateRepository:
             await connection.execute(
                 "ALTER TABLE wechat_messages ADD COLUMN media_id TEXT"
             )
+        generated_send_columns = {
+            str(row["name"])
+            async for row in await connection.execute(
+                "PRAGMA table_info(wechat_generated_send_reservations)"
+            )
+        }
+        if "reconciliation_attempts" not in generated_send_columns:
+            await connection.execute(
+                """
+                ALTER TABLE wechat_generated_send_reservations
+                ADD COLUMN reconciliation_attempts INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        if "next_reconciliation_at" not in generated_send_columns:
+            await connection.execute(
+                """
+                ALTER TABLE wechat_generated_send_reservations
+                ADD COLUMN next_reconciliation_at REAL NOT NULL DEFAULT 0
+                """
+            )
+        generated_send_lease_columns = {
+            str(row["name"])
+            async for row in await connection.execute(
+                "PRAGMA table_info(wechat_generated_send_leases)"
+            )
+        }
+        if "kind" not in generated_send_lease_columns:
+            await connection.execute(
+                """
+                ALTER TABLE wechat_generated_send_leases
+                ADD COLUMN kind TEXT NOT NULL DEFAULT 'send'
+                """
+            )
         await connection.execute(
             "UPDATE wechat_messages SET memory_order = local_order "
             "WHERE memory_order IS NULL"
@@ -198,6 +335,14 @@ class WeChatStateRepository:
             CREATE INDEX IF NOT EXISTS wechat_messages_by_chat_memory_order
             ON wechat_messages (
                 connector_key, account_id, chat_id, memory_order
+            )
+            """
+        )
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS wechat_generated_sends_due
+            ON wechat_generated_send_reservations (
+                connector_key, account_id, next_reconciliation_at, created_at
             )
             """
         )
@@ -226,6 +371,56 @@ class WeChatStateRepository:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
+        self._release_adapter_ownership()
+
+    @_serialized
+    async def acquire_adapter_ownership(self) -> None:
+        """Exclusively own adapter mutations for this state database."""
+        if self._adapter_lock_fd is not None:
+            raise RuntimeError("WeChat adapter ownership is already held")
+        self._ensure_parent_directory()
+        if self.path.exists():
+            if not self.path.is_file():
+                raise RuntimeError("WeChat state path must be a regular file")
+            if self.path.stat().st_nlink != 1:
+                raise RuntimeError(
+                    "WeChat state databases must not be hard-linked"
+                )
+        lock_path = self.path.with_name(f"{self.path.name}.adapter.lock")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RuntimeError(
+                f"WeChat adapter is already active for {self.path}"
+            ) from exc
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._adapter_lock_fd = descriptor
+
+    def _release_adapter_ownership(self) -> None:
+        descriptor = self._adapter_lock_fd
+        if descriptor is None:
+            return
+        self._adapter_lock_fd = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def _ensure_parent_directory(self) -> None:
+        parent_existed = self.path.parent.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not parent_existed:
+            self.path.parent.chmod(0o700)
 
     @_serialized
     async def bootstrap(
@@ -664,6 +859,511 @@ class WeChatStateRepository:
             (connector_key, account_id, chat_id, message_id, time.time()),
         )
         await connection.commit()
+
+    @_serialized
+    async def reserve_generated_send(
+        self,
+        connector_key: str,
+        account_id: str,
+        chat_id: str,
+        request_id: str,
+        fingerprint: bytes,
+    ) -> str:
+        if not isinstance(fingerprint, bytes) or len(fingerprint) != 32:
+            raise ValueError("WeChat generated-send fingerprint is invalid")
+        connection = self._require_connection()
+        lease_id = uuid4().hex
+        lease_inserted = False
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                SELECT chat_id, fingerprint
+                FROM wechat_generated_send_reservations
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                """,
+                (connector_key, account_id, request_id),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None:
+                if (
+                    str(existing["chat_id"]) != chat_id
+                    or bytes(existing["fingerprint"]) != fingerprint
+                ):
+                    raise RuntimeError(
+                        "WeChat generated-send request ID was reused for another payload"
+                    )
+            else:
+                cursor = await connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM wechat_generated_send_reservations
+                    WHERE connector_key = ? AND account_id = ?
+                    """,
+                    (connector_key, account_id),
+                )
+                row = await cursor.fetchone()
+                if (
+                    row is not None
+                    and int(row["count"]) >= _MAX_PENDING_GENERATED_SENDS
+                ):
+                    raise RuntimeError(
+                        "WeChat generated-send reservation capacity reached"
+                    )
+                await connection.execute(
+                    """
+                    INSERT INTO wechat_generated_send_reservations (
+                        connector_key, account_id, request_id, chat_id,
+                        fingerprint, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        connector_key,
+                        account_id,
+                        request_id,
+                        chat_id,
+                        fingerprint,
+                        time.time(),
+                    ),
+                )
+            cursor = await connection.execute(
+                """
+                SELECT 1
+                FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                  AND kind = 'reconcile'
+                LIMIT 1
+                """,
+                (connector_key, account_id, request_id),
+            )
+            if await cursor.fetchone() is not None:
+                raise RuntimeError("WeChat generated send is being reconciled")
+            cursor = await connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                  AND kind = 'send'
+                """,
+                (connector_key, account_id, request_id),
+            )
+            row = await cursor.fetchone()
+            if (
+                row is not None
+                and int(row["count"]) >= _MAX_GENERATED_SEND_LEASES_PER_REQUEST
+            ):
+                raise RuntimeError(
+                    "WeChat generated-send active caller capacity reached"
+                )
+            await connection.execute(
+                """
+                INSERT INTO wechat_generated_send_leases (
+                    connector_key, account_id, request_id,
+                    lease_id, kind, created_at
+                ) VALUES (?, ?, ?, ?, 'send', ?)
+                """,
+                (
+                    connector_key,
+                    account_id,
+                    request_id,
+                    lease_id,
+                    time.time(),
+                ),
+            )
+            lease_inserted = True
+            await connection.commit()
+            return lease_id
+        except BaseException:
+            await _rollback_quietly(connection)
+            if lease_inserted:
+                await _release_generated_send_lease(
+                    connection,
+                    connector_key,
+                    account_id,
+                    request_id,
+                    lease_id,
+                )
+            raise
+
+    @_serialized
+    async def defer_generated_send(
+        self,
+        connector_key: str,
+        account_id: str,
+        request_id: str,
+        lease_id: str,
+    ) -> None:
+        """Detach a completed caller while retaining its unknown send."""
+        connection = self._require_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ?
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            await connection.commit()
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
+
+    @_serialized
+    async def recover_generated_send_leases(
+        self,
+        connector_key: str,
+    ) -> None:
+        """Release stale leases after exclusive adapter startup."""
+        if self._adapter_lock_fd is None:
+            raise RuntimeError(
+                "WeChat generated-send recovery requires adapter ownership"
+            )
+        connection = self._require_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ?
+                """,
+                (connector_key,),
+            )
+            await connection.commit()
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
+
+    @_serialized
+    async def claim_generated_send_reconciliation(
+        self,
+        connector_key: str,
+        account_id: str,
+        request_id: str,
+    ) -> str | None:
+        connection = self._require_connection()
+        lease_id = uuid4().hex
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                INSERT INTO wechat_generated_send_leases (
+                    connector_key, account_id, request_id,
+                    lease_id, kind, created_at
+                )
+                SELECT connector_key, account_id, request_id,
+                       ?, 'reconcile', ?
+                FROM wechat_generated_send_reservations AS reservations
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wechat_generated_send_leases AS leases
+                      WHERE leases.connector_key = reservations.connector_key
+                        AND leases.account_id = reservations.account_id
+                        AND leases.request_id = reservations.request_id
+                  )
+                """,
+                (lease_id, time.time(), connector_key, account_id, request_id),
+            )
+            claimed = cursor.rowcount == 1
+            await connection.commit()
+            return lease_id if claimed else None
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
+
+    @_serialized
+    async def fail_generated_send(
+        self,
+        connector_key: str,
+        account_id: str,
+        request_id: str,
+        lease_id: str,
+    ) -> bool:
+        connection = self._require_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ?
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            owned = cursor.rowcount == 1
+            if owned:
+                await connection.execute(
+                    """
+                    DELETE FROM wechat_generated_send_reservations
+                    WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM wechat_generated_send_leases
+                          WHERE connector_key = ? AND account_id = ?
+                            AND request_id = ?
+                      )
+                    """,
+                    (
+                        connector_key,
+                        account_id,
+                        request_id,
+                        connector_key,
+                        account_id,
+                        request_id,
+                    ),
+                )
+            await connection.commit()
+            return owned
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
+
+    @_serialized
+    async def confirm_generated_send(
+        self,
+        connector_key: str,
+        account_id: str,
+        chat_id: str,
+        request_id: str,
+        message_id: str,
+        lease_id: str,
+    ) -> bool:
+        connection = self._require_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                SELECT 1
+                FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ?
+                LIMIT 1
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            if await cursor.fetchone() is None:
+                await connection.commit()
+                return False
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO wechat_processed_messages (
+                    connector_key, account_id, chat_id, message_id, processed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (connector_key, account_id, chat_id, message_id, time.time()),
+            )
+            await connection.execute(
+                """
+                INSERT OR IGNORE INTO wechat_generated_messages (
+                    connector_key, account_id, chat_id, message_id, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (connector_key, account_id, chat_id, message_id, time.time()),
+            )
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                """,
+                (connector_key, account_id, request_id),
+            )
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_reservations
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                """,
+                (connector_key, account_id, request_id),
+            )
+            await connection.commit()
+            return True
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
+
+    @_serialized
+    async def generated_message_provenance(
+        self,
+        message: WeChatMessage,
+    ) -> Literal["confirmed", "candidate"] | None:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM wechat_generated_messages
+                    WHERE connector_key = ? AND account_id = ?
+                      AND chat_id = ? AND message_id = ?
+                ) THEN 'confirmed'
+                WHEN EXISTS (
+                    SELECT 1 FROM wechat_generated_send_reservations
+                    WHERE connector_key = ? AND account_id = ?
+                      AND chat_id = ?
+                ) THEN 'candidate'
+                ELSE NULL
+            END AS provenance
+            """,
+            (
+                message.connector_key,
+                message.account_id,
+                message.chat_id,
+                message.id,
+                message.connector_key,
+                message.account_id,
+                message.chat_id,
+            ),
+        )
+        row = await cursor.fetchone()
+        provenance = row["provenance"] if row is not None else None
+        if provenance in {"confirmed", "candidate"}:
+            return provenance
+        return None
+
+    @_serialized
+    async def list_generated_send_reservations(
+        self,
+        connector_key: str,
+        account_id: str,
+    ) -> tuple[WeChatGeneratedSendReservation, ...]:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT request_id, chat_id, fingerprint, reconciliation_attempts
+            FROM wechat_generated_send_reservations
+            WHERE connector_key = ? AND account_id = ?
+            ORDER BY created_at, request_id
+            """,
+            (connector_key, account_id),
+        )
+        return tuple(
+            WeChatGeneratedSendReservation(
+                request_id=str(row["request_id"]),
+                chat_id=str(row["chat_id"]),
+                fingerprint=bytes(row["fingerprint"]),
+                reconciliation_attempts=int(row["reconciliation_attempts"]),
+            )
+            for row in await cursor.fetchall()
+        )
+
+    @_serialized
+    async def list_due_generated_send_reservations(
+        self,
+        connector_key: str,
+        account_id: str,
+        *,
+        now: float,
+        limit: int,
+    ) -> tuple[WeChatGeneratedSendReservation, ...]:
+        if limit < 1:
+            raise ValueError("WeChat reconciliation limit must be positive")
+        cursor = await self._require_connection().execute(
+            """
+            SELECT request_id, chat_id, fingerprint, reconciliation_attempts
+            FROM wechat_generated_send_reservations AS reservations
+            WHERE connector_key = ? AND account_id = ?
+              AND next_reconciliation_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM wechat_generated_send_leases AS leases
+                  WHERE leases.connector_key = reservations.connector_key
+                    AND leases.account_id = reservations.account_id
+                    AND leases.request_id = reservations.request_id
+              )
+            ORDER BY next_reconciliation_at, created_at, request_id
+            LIMIT ?
+            """,
+            (connector_key, account_id, now, limit),
+        )
+        return tuple(
+            WeChatGeneratedSendReservation(
+                request_id=str(row["request_id"]),
+                chat_id=str(row["chat_id"]),
+                fingerprint=bytes(row["fingerprint"]),
+                reconciliation_attempts=int(row["reconciliation_attempts"]),
+            )
+            for row in await cursor.fetchall()
+        )
+
+    @_serialized
+    async def defer_generated_send_reconciliation(
+        self,
+        connector_key: str,
+        account_id: str,
+        request_id: str,
+        lease_id: str,
+        *,
+        next_attempt_at: float,
+    ) -> bool:
+        connection = self._require_connection()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                UPDATE wechat_generated_send_reservations
+                SET reconciliation_attempts = reconciliation_attempts + 1,
+                    next_reconciliation_at = ?
+                WHERE connector_key = ? AND account_id = ? AND request_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM wechat_generated_send_leases
+                      WHERE connector_key = ? AND account_id = ?
+                        AND request_id = ? AND lease_id = ?
+                        AND kind = 'reconcile'
+                  )
+                """,
+                (
+                    next_attempt_at,
+                    connector_key,
+                    account_id,
+                    request_id,
+                    connector_key,
+                    account_id,
+                    request_id,
+                    lease_id,
+                ),
+            )
+            owned = cursor.rowcount == 1
+            await connection.execute(
+                """
+                DELETE FROM wechat_generated_send_leases
+                WHERE connector_key = ? AND account_id = ?
+                  AND request_id = ? AND lease_id = ? AND kind = 'reconcile'
+                """,
+                (connector_key, account_id, request_id, lease_id),
+            )
+            await connection.commit()
+            return owned
+        except BaseException:
+            await _rollback_quietly(connection)
+            raise
+
+    @_serialized
+    async def count_generated_send_reservations(
+        self,
+        connector_key: str,
+        account_id: str,
+    ) -> int:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM wechat_generated_send_reservations
+            WHERE connector_key = ? AND account_id = ?
+            """,
+            (connector_key, account_id),
+        )
+        row = await cursor.fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    @_serialized
+    async def count_connector_generated_send_reservations(
+        self,
+        connector_key: str,
+    ) -> int:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM wechat_generated_send_reservations
+            WHERE connector_key = ?
+            """,
+            (connector_key,),
+        )
+        row = await cursor.fetchone()
+        return int(row["count"]) if row is not None else 0
 
     @_serialized
     async def get_attachment_send_attempt(

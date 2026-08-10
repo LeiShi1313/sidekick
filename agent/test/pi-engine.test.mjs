@@ -1014,8 +1014,8 @@ test("does not retry an empty response after a tool starts", async () => {
     assert.equal(app.provider.requests.length, 2);
     assert.deepEqual(events.at(-1), {
       type: "run_failed",
-      code: "EMPTY_RESPONSE",
-      message: "Agent returned an empty response",
+      code: "TOOL_OUTCOME_UNCONFIRMED",
+      message: "Agent returned no final response after using a tool",
     });
   } finally {
     await app.close();

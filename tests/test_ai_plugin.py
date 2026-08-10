@@ -7,6 +7,7 @@ from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
 from sidekick.ai import MemoryScopeTarget
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.plugins.ai import (
     TelegramAI,
     _parse_telegram_message_link,
@@ -238,13 +239,40 @@ class RecordingEditLimiter:
         return True
 
 
-def make_plugin(*, handler, store, client, owner_id=10, edit_limiter=None):
+class FakePluginTransport:
+    def __init__(self, generated_ids=()) -> None:
+        self.generated_ids = set(generated_ids)
+
+    async def classify_origin(self, message):
+        if message.id in self.generated_ids:
+            return MessageOrigin.SIDEKICK_GENERATED
+        return (
+            MessageOrigin.MANUAL_OUTGOING
+            if bool(getattr(message, "out", False))
+            else MessageOrigin.INCOMING
+        )
+
+    async def reply(self, message, text, *, presentation):
+        assert presentation == "plain"
+        return await message.reply(text, parse_mode=None)
+
+
+def make_plugin(
+    *,
+    handler,
+    store,
+    client,
+    owner_id=10,
+    edit_limiter=None,
+    transport=None,
+):
     plugin = TelegramAI.__new__(TelegramAI)
     plugin._handler = handler
     plugin._store = store
     plugin._owner_id = owner_id
     plugin._saved_memory_lock = asyncio.Lock()
     plugin._edit_limiter = edit_limiter or RecordingEditLimiter()
+    plugin._transport = transport or FakePluginTransport()
     plugin._continuous_memory_scheduler = None
     plugin.service = SimpleNamespace(client=client)
     plugin.logger = RecordingLogger()
@@ -441,6 +469,7 @@ async def test_ai_plugin_logs_message_handler_failures():
     plugin = TelegramAI.__new__(TelegramAI)
     plugin._handler = FailingHandler()
     plugin._owner_id = 10
+    plugin._transport = FakePluginTransport()
     plugin.logger = RecordingLogger()
     event = SimpleNamespace(
         message=SimpleNamespace(chat_id=-1001, id=42),
@@ -454,6 +483,32 @@ async def test_ai_plugin_logs_message_handler_failures():
             ("RuntimeError",),
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_generated_saved_message_link_is_rejected_before_memory_ingestion():
+    source_peer = telegram_types.PeerChannel(1001)
+    source_message = SimpleNamespace(chat_id=-1001001, id=42)
+    saved_message = FakeSavedMessage(
+        forwarded=False,
+        text="https://t.me/public_group/42",
+    )
+    handler = RecordingHandler()
+    store = FakeStateRepository()
+    client = FakeTelegramClient(source_message, input_peer=source_peer)
+    plugin = make_plugin(
+        handler=handler,
+        store=store,
+        client=client,
+        transport=FakePluginTransport({saved_message.id}),
+    )
+
+    await plugin._on_message(SimpleNamespace(message=saved_message))
+
+    assert client.get_input_entity_calls == []
+    assert client.get_messages_calls == []
+    assert handler.memory_targets == []
+    assert store.records == []
 
 
 @pytest.mark.asyncio

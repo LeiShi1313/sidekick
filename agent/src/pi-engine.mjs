@@ -1160,9 +1160,14 @@ export class PiEngine {
             const answer = rawAnswer.trim() ? rawAnswer : "";
             const entryId = sessionManager.getLeafId();
             if (!answer && !hasGeneratedAttachment) {
+              const toolOutcomeUnconfirmed = toolExecutionStarted;
               const failed = {
-                code: "EMPTY_RESPONSE",
-                message: "Agent returned an empty response",
+                code: toolOutcomeUnconfirmed
+                  ? "TOOL_OUTCOME_UNCONFIRMED"
+                  : "EMPTY_RESPONSE",
+                message: toolOutcomeUnconfirmed
+                  ? "Agent returned no final response after using a tool"
+                  : "Agent returned an empty response",
                 sessionId: session.sessionId,
               };
               terminalRecorded = true;

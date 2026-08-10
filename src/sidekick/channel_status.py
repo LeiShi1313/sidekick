@@ -230,6 +230,7 @@ class AdapterRuntimeState:
     connected: bool = False
     observed_at: float | None = None
     connected_probe: Callable[[], bool] | None = None
+    indeterminate_outbound_probe: Callable[[], int | None] | None = None
 
     def update(
         self,
@@ -251,6 +252,19 @@ class AdapterRuntimeState:
             return bool(self.connected_probe())
         except Exception:
             return self.connected
+
+    def indeterminate_outbound_count(self) -> int | None:
+        if self.indeterminate_outbound_probe is None:
+            return None
+        try:
+            count = self.indeterminate_outbound_probe()
+        except Exception:
+            return None
+        if count is None:
+            return None
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        return count
 
 
 class ChannelSnapshotService:
@@ -294,6 +308,9 @@ class ChannelSnapshotService:
             "platform": self._adapter.platform,
             "accountId": self._adapter.account_id,
             "connected": self._adapter.is_connected(),
+            "indeterminateOutboundCount": (
+                self._adapter.indeterminate_outbound_count()
+            ),
             "observedAt": _timestamp(self._adapter.observed_at),
         }
         if inventory_error is not None:
@@ -522,6 +539,9 @@ class ChannelOpsServer:
                     "platform": adapter.platform,
                     "accountId": adapter.account_id,
                     "connected": adapter.is_connected(),
+                    "indeterminateOutboundCount": (
+                        adapter.indeterminate_outbound_count()
+                    ),
                     "observedAt": _timestamp(adapter.observed_at),
                 },
             }
@@ -746,6 +766,10 @@ def _run_error_message(code: str | None) -> str | None:
         "SESSION_UNAVAILABLE": "The referenced AI thread is unavailable.",
         "DELIVERY_FAILED": "The AI response could not be delivered.",
         "EMPTY_RESPONSE": "The AI run returned no usable response.",
+        "TOOL_OUTCOME_UNCONFIRMED": (
+            "The AI run returned no final response after using a tool; "
+            "the tool outcome may need verification."
+        ),
         "AGENT_ERROR": "The AI agent run failed.",
         "PREPARATION_FAILED": "The AI request could not be prepared.",
         "HANDLER_ERROR": "The adapter failed while handling the AI run.",

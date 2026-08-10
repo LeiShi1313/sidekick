@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
-from telethon.errors import FloodWaitError
+from telethon.errors import BadRequestError, FloodWaitError, ServerError
 from telethon.tl import functions as telegram_functions
 from telethon.tl import types as telegram_types
 
@@ -34,6 +34,7 @@ from sidekick.chat.output_policy import (
     MAINLAND_MESSAGING_REFUSAL,
     MainlandMessagingOutputPolicy,
 )
+from sidekick.chat.provenance import GeneratedMessageTracker, MessageOrigin
 from sidekick.plugins.base import command_registry
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 from sidekick.telegram.ai_transport import (
@@ -195,6 +196,8 @@ async def test_telegram_transport_replies_with_one_attachment(
 ) -> None:
     class AttachmentMessage:
         def __init__(self) -> None:
+            self.id = 1
+            self.chat_id = 7
             self.observed = None
 
         async def reply(self, *args, **kwargs):
@@ -226,6 +229,155 @@ async def test_telegram_transport_replies_with_one_attachment(
         "data": attachment.data,
         "force_document": force_document,
     }
+
+
+@pytest.mark.asyncio
+async def test_telegram_transport_quarantines_attachment_without_receipt() -> None:
+    class AttachmentMessage:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, *args, **kwargs):
+            return None
+
+    transport = TelegramChatTransport()
+    attachment = OutboundAttachment(
+        data=b"attachment-bytes",
+        filename="answer.bin",
+        mime_type="application/octet-stream",
+        display_as="file",
+    )
+
+    assert await transport.reply_attachment(AttachmentMessage(), attachment) is None
+    echo = SimpleNamespace(
+        id=100,
+        chat_id=7,
+        raw_text="",
+        reply_to_msg_id=1,
+        out=True,
+        file=object(),
+    )
+    assert await transport.classify_origin(echo) is MessageOrigin.INDETERMINATE
+
+
+@pytest.mark.asyncio
+async def test_telegram_confirmations_do_not_accumulate_without_echoes() -> None:
+    transport = TelegramChatTransport()
+    transport._generated_messages = GeneratedMessageTracker(max_confirmed=1)
+    message = FakeMessage("trigger")
+
+    await transport.reply(message, "first", presentation="plain")
+    await transport.reply(message, "second", presentation="plain")
+
+    assert len(message.replies) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection",
+    (
+        ValueError("invalid local send"),
+        BadRequestError(None, "SEND_REJECTED"),
+    ),
+)
+async def test_telegram_proven_send_rejection_does_not_quarantine_chat(
+    rejection,
+) -> None:
+    class RejectingMessage:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, text, **kwargs):
+            raise rejection
+
+    transport = TelegramChatTransport()
+    with pytest.raises(type(rejection)):
+        await transport.reply(
+            RejectingMessage(),
+            "not sent",
+            presentation="plain",
+        )
+
+    manual = SimpleNamespace(
+        id=101,
+        chat_id=7,
+        raw_text="/ai manual request",
+        reply_to_msg_id=None,
+        out=True,
+        file=None,
+    )
+    assert await transport.classify_origin(manual) is MessageOrigin.MANUAL_OUTGOING
+
+
+@pytest.mark.asyncio
+async def test_telegram_ambiguous_server_failure_keeps_chat_quarantined() -> None:
+    class FailingMessage:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, text, **kwargs):
+            raise ServerError(None, "SERVER_ERROR")
+
+    transport = TelegramChatTransport()
+    with pytest.raises(ServerError):
+        await transport.reply(
+            FailingMessage(),
+            "possibly sent",
+            presentation="plain",
+        )
+
+    possible_echo = SimpleNamespace(
+        id=101,
+        chat_id=7,
+        raw_text="possibly sent",
+        reply_to_msg_id=1,
+        out=True,
+        file=None,
+    )
+    assert (
+        await transport.classify_origin(possible_echo)
+        is MessageOrigin.INDETERMINATE
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_pre_receipt_echo_uses_exact_id_not_fingerprint() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class RacingMessage:
+        id = 1
+        chat_id = 7
+
+        async def reply(self, text, **kwargs):
+            started.set()
+            await release.wait()
+            return SimpleNamespace(id=100, text=text)
+
+    transport = TelegramChatTransport()
+    sending = asyncio.create_task(
+        transport.reply(
+            RacingMessage(),
+            "/ai must not run",
+            presentation="plain",
+        )
+    )
+    await started.wait()
+    echoed = SimpleNamespace(
+        id=100,
+        chat_id=7,
+        raw_text="/ai must not run",
+        reply_to_msg_id=None,
+        out=True,
+        file=None,
+    )
+    classification = asyncio.create_task(transport.classify_origin(echoed))
+    await asyncio.sleep(0)
+
+    assert not classification.done()
+    release.set()
+    await sending
+    assert await classification is MessageOrigin.SIDEKICK_GENERATED
 
 
 @pytest.mark.asyncio
@@ -555,6 +707,34 @@ async def test_responder_surfaces_an_empty_model_response() -> None:
     assert result.succeeded is False
     assert result.failure_code == "EMPTY_RESPONSE"
     assert trigger.replies[0].text == "AI returned an empty response. Try again."
+
+
+@pytest.mark.asyncio
+async def test_responder_does_not_recommend_retry_after_tool_outcome_is_unclear() -> None:
+    class UnconfirmedToolOutcomeGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(
+                type="run_failed",
+                code="TOOL_OUTCOME_UNCONFIRMED",
+                message="Agent returned no final response after using a tool",
+            )
+
+    responder = make_telegram_responder(UnconfirmedToolOutcomeGateway())
+    trigger = FakeMessage("/ai send it")
+
+    result = await responder.answer(trigger, make_request("send it"))
+
+    assert result.succeeded is False
+    assert result.failure_code == "TOOL_OUTCOME_UNCONFIRMED"
+    assert trigger.replies[0].text == (
+        "AI returned no final response after using a tool. "
+        "The action may already have completed; verify before retrying."
+    )
 
 
 async def wait_for_edit_count(answer: FakeAnswer, count: int) -> None:
