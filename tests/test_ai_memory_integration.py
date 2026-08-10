@@ -703,8 +703,19 @@ def test_matrix_bridge_resolver_ignores_unconfigured_and_malformed_senders():
             entities=(),
         )
     )
+    bold_gap = resolver.resolve(
+        FakeMessage(
+            "@fangliding:matrix.org: /ai hello",
+            sender_id=6332621450,
+            entities=(
+                telegram_types.MessageEntityBold(offset=0, length=11),
+                telegram_types.MessageEntityBold(offset=12, length=10),
+            ),
+        )
+    )
     assert unconfigured is None
     assert malformed is None
+    assert bold_gap is None
 
 
 @pytest.mark.asyncio
@@ -731,18 +742,22 @@ async def test_matrix_bridge_identity_is_a_memory_source_with_an_alias_id():
 
 
 @pytest.mark.asyncio
-async def test_matrix_bridge_ai_command_separates_entity_from_access_principal(
+async def test_fragmented_matrix_mxid_triggers_ai_with_separate_access_principal(
     tmp_path,
 ):
     bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
     trigger = FakeMessage(
-        "SteamedFish: /ai can I use CaiBao?",
+        "@fangliding:matrix.org: /ai can I use CaiBao?",
         sender_id=6332621450,
         is_human=False,
         is_group=True,
         entities=(
+            telegram_types.MessageEntityMention(offset=0, length=11),
             telegram_types.MessageEntityBold(offset=0, length=11),
-            telegram_types.MessageEntityBotCommand(offset=13, length=3),
+            telegram_types.MessageEntityBold(offset=11, length=1),
+            telegram_types.MessageEntityUrl(offset=12, length=10),
+            telegram_types.MessageEntityBold(offset=12, length=10),
+            telegram_types.MessageEntityBotCommand(offset=24, length=3),
         ),
     )
     attribution = bridge_resolver.resolve(trigger)
@@ -772,7 +787,7 @@ async def test_matrix_bridge_ai_command_separates_entity_from_access_principal(
         request = gateway.requests[0]
         assert request.prompt == "can I use CaiBao?"
         assert request.identity.requester.identity == attribution.actor_id
-        assert request.identity.requester.label == "SteamedFish"
+        assert request.identity.requester.label == "@fangliding:matrix.org"
         assert request.memory is not None
         assert request.memory.primary_bank_id == "telegram:chat:-1001"
         assert request.memory.granted_bank_ids == ()
@@ -785,7 +800,7 @@ async def test_matrix_bridge_ai_command_separates_entity_from_access_principal(
         assert marker.requester_id == attribution.actor_id
         retained_event = memory.retain_calls[0]["episode"].events[0]
         assert retained_event.actor_id == attribution.actor_id
-        assert retained_event.actor_display_name == "SteamedFish"
+        assert retained_event.actor_display_name == "@fangliding:matrix.org"
         assert retained_event.text == "can I use CaiBao?"
     finally:
         await store.close()
