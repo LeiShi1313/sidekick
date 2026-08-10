@@ -87,6 +87,7 @@ def _parse_matrix_bridge_envelope(
     if not isinstance(raw_text, str) or not raw_text:
         return None
     surrogate_text = telegram_helpers.add_surrogate(raw_text)
+    bold_spans: list[tuple[int, int]] = []
     for entity in getattr(message, "entities", None) or ():
         if not isinstance(entity, telegram_types.MessageEntityBold):
             continue
@@ -98,13 +99,28 @@ def _parse_matrix_bridge_envelope(
             or isinstance(length, bool)
             or not isinstance(length, int)
             or length <= 0
+            or start < 0
         ):
             continue
         end = start + length
-        if start not in {0, 2} or end > len(surrogate_text):
+        if end > len(surrogate_text):
             continue
-        prefix = surrogate_text[:start]
-        suffix = surrogate_text[end:]
+        bold_spans.append((start, end))
+
+    bold_spans.sort()
+    for envelope_start in (0, 2):
+        envelope_end = envelope_start
+        for span_start, span_end in bold_spans:
+            if span_start < envelope_start:
+                continue
+            if span_start > envelope_end:
+                break
+            envelope_end = max(envelope_end, span_end)
+        if envelope_end == envelope_start:
+            continue
+
+        prefix = surrogate_text[:envelope_start]
+        suffix = surrogate_text[envelope_end:]
         if prefix == "" and suffix.startswith(": "):
             body = suffix[2:]
         elif prefix == "* " and suffix.startswith(" "):
@@ -113,7 +129,9 @@ def _parse_matrix_bridge_envelope(
             continue
         display_name = unicodedata.normalize(
             "NFC",
-            telegram_helpers.del_surrogate(surrogate_text[start:end]),
+            telegram_helpers.del_surrogate(
+                surrogate_text[envelope_start:envelope_end]
+            ),
         ).strip()
         if (
             not display_name
