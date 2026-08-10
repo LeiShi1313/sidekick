@@ -29,6 +29,11 @@ from sidekick.chat.commands import (
     parse_chat_command,
 )
 from sidekick.chat.attachments import OutboundAttachment
+from sidekick.chat.output_policy import (
+    MAINLAND_MESSAGING_POLICY_ID,
+    MAINLAND_MESSAGING_REFUSAL,
+    MainlandMessagingOutputPolicy,
+)
 from sidekick.plugins.base import command_registry
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 from sidekick.telegram.ai_transport import (
@@ -224,7 +229,9 @@ async def test_telegram_transport_replies_with_one_attachment(
 
 
 @pytest.mark.asyncio
-async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
+async def test_responder_policy_preserves_safe_generated_attachment_delivery(
+    make_jpeg,
+) -> None:
     attachment = OutboundAttachment(
         data=make_jpeg(),
         filename="generated-image.jpg",
@@ -266,7 +273,11 @@ async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
 
     trigger = FakeMessage("/ai generate an image")
     transport = AttachmentTransport()
-    responder = AIResponder(AttachmentGateway(), transport=transport)
+    responder = AIResponder(
+        AttachmentGateway(),
+        transport=transport,
+        output_policy=MainlandMessagingOutputPolicy(),
+    )
 
     result = await responder.answer(trigger, make_request("generate an image"))
 
@@ -274,6 +285,81 @@ async def test_responder_delivers_one_generated_attachment(make_jpeg) -> None:
     assert result.text == "Here is the generated image."
     assert result.attachment_message is transport.attachment_answer
     assert transport.attachments == [(trigger, attachment)]
+
+
+@pytest.mark.asyncio
+async def test_responder_blocks_guarded_text_before_any_dynamic_delivery(
+    make_jpeg,
+) -> None:
+    attachment = OutboundAttachment(
+        data=make_jpeg(),
+        filename="generated-image.jpg",
+        mime_type="image/jpeg",
+        display_as="image",
+    )
+
+    class GuardedGateway(FakeGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-1",
+            )
+            yield AgentEvent(type="text_delta", delta="restricted-", reset=True)
+            yield AgentEvent(type="attachment", attachment=attachment)
+            yield AgentEvent(type="text_delta", delta="example")
+            yield AgentEvent(
+                type="run_completed",
+                session_id="session-1",
+                entry_id="entry-1",
+                answer="restricted-example",
+            )
+
+    class RecordingLogger:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, message, *args):
+            self.warnings.append((message, args))
+
+    trigger = FakeMessage("/ai unsafe output")
+    logger = RecordingLogger()
+    responder = AIResponder(
+        GuardedGateway(),
+        output_policy=MainlandMessagingOutputPolicy(("restricted-example",)),
+        logger=logger,
+    )
+
+    result = await responder.answer(trigger, make_request("unsafe output"))
+
+    assert result.succeeded is False
+    assert result.failure_code == "OUTPUT_BLOCKED"
+    assert result.session_id == "session-1"
+    assert result.entry_id == "entry-1"
+    assert result.text == MAINLAND_MESSAGING_REFUSAL
+    assert len(trigger.replies) == 1
+    assert trigger.replies[0].initial_text == "Thinking..."
+    assert trigger.replies[0].edits == [MAINLAND_MESSAGING_REFUSAL]
+    assert "restricted" not in trigger.replies[0].text
+    assert logger.warnings == [
+        ("AI output blocked by policy (%s)", (MAINLAND_MESSAGING_POLICY_ID,))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responder_marks_the_policy_self_refusal_as_blocked() -> None:
+    trigger = FakeMessage("/ai restricted request")
+    responder = AIResponder(
+        FakeGateway((MAINLAND_MESSAGING_REFUSAL,)),
+        output_policy=MainlandMessagingOutputPolicy(),
+    )
+
+    result = await responder.answer(trigger, make_request("restricted request"))
+
+    assert result.succeeded is False
+    assert result.failure_code == "OUTPUT_BLOCKED"
+    assert result.text == MAINLAND_MESSAGING_REFUSAL
+    assert trigger.replies[0].edits == [MAINLAND_MESSAGING_REFUSAL]
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from sidekick.ai_memory_outbox import (
     MemoryOutboxSchedulerSettings,
 )
 from sidekick.chat.formatting import agent_system_prompt
+from sidekick.chat.output_policy import MainlandMessagingOutputPolicy
 from sidekick.channel_status import (
     AdapterRuntimeState,
     ChannelOpsServer,
@@ -196,11 +197,13 @@ class OneBotAI(metaclass=PluginMount):
             await self._store.close()
 
     async def _setup(self) -> None:
+        output_policy = MainlandMessagingOutputPolicy.from_env()
         transport = OneBotChatTransport(self._bridge, logger=self.logger)
         responder = AIResponder(
             self._gateway,
             max_output_chars=self._settings.max_output_chars,
             transport=transport,
+            output_policy=output_policy,
             logger=self.logger,
         )
         await self._store.connect()
@@ -209,7 +212,9 @@ class OneBotAI(metaclass=PluginMount):
             directory=self._directory,
         )
         prompt_builder = PromptBuilder(
-            system_prompt=agent_system_prompt(self._settings.system_prompt),
+            system_prompt=output_policy.apply_to_system_prompt(
+                agent_system_prompt(self._settings.system_prompt)
+            ),
             max_context_messages=self._settings.max_context_messages,
             max_context_chars=self._settings.max_context_chars,
             attachment_describer=ChatAttachmentDescriber(

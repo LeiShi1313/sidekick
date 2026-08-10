@@ -68,6 +68,7 @@ from sidekick.chat.identity import (
     IdentityCodec,
     NamespacedIdentityCodec,
 )
+from sidekick.chat.output_policy import OutputPolicy
 from sidekick.chat.transport import ChatTransport, ObjectChatTransport, SentMessage
 from sidekick.channel_status import (
     ACTIVE_AI_RUN_STATUSES,
@@ -876,12 +877,14 @@ class AIResponder:
         max_output_chars: int = 3_900,
         initial_status: str | None = "Thinking...",
         transport: ChatTransport | None = None,
+        output_policy: OutputPolicy | None = None,
         logger: Any | None = None,
     ):
         self._gateway = gateway
         self._transport = transport or ObjectChatTransport()
         self._max_output_chars = max(4, max_output_chars)
         self._initial_status = initial_status
+        self._output_policy = output_policy
         self._logger = logger
 
     async def answer(
@@ -909,7 +912,7 @@ class AIResponder:
                     session_id = event.session_id
                     continue
                 if event.type == "tool_snapshot":
-                    if event.summary:
+                    if event.summary and self._output_policy is None:
                         await self._edit_message(
                             answer,
                             event.summary,
@@ -926,8 +929,9 @@ class AIResponder:
                 if event.type == "text_delta":
                     assert event.delta is not None
                     text = event.delta if event.reset else text + event.delta
-                    visible = self._truncate(text)
-                    await self._edit_formatted(answer, visible, wait=False)
+                    if self._output_policy is None:
+                        visible = self._truncate(text)
+                        await self._edit_formatted(answer, visible, wait=False)
                     continue
                 if event.type == "run_failed":
                     if event.code == "CANCELLED":
@@ -997,6 +1001,22 @@ class AIResponder:
                 (text or attachment is not None) and session_id and entry_id
             )
             final_text = self._truncate(text) if text else ""
+            blocked_reply = (
+                self._output_policy.blocked_reply(final_text, attachment)
+                if self._output_policy is not None
+                else None
+            )
+            if blocked_reply is not None:
+                await self._edit_message(answer, blocked_reply, wait=True)
+                self._log_output_blocked()
+                return AnswerResult(
+                    message=answer,
+                    text=blocked_reply,
+                    succeeded=False,
+                    session_id=session_id,
+                    entry_id=entry_id,
+                    failure_code="OUTPUT_BLOCKED",
+                )
             if text:
                 if not await self._edit_formatted(answer, final_text, wait=True):
                     final_text = "AI returned an empty response."
@@ -1156,6 +1176,13 @@ class AIResponder:
             self._logger.error(
                 "AI agent request failed (%s)",
                 type(exc).__name__,
+            )
+
+    def _log_output_blocked(self) -> None:
+        if self._logger is not None and self._output_policy is not None:
+            self._logger.warning(
+                "AI output blocked by policy (%s)",
+                self._output_policy.policy_id,
             )
 
 

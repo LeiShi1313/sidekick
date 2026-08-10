@@ -35,6 +35,7 @@ from sidekick.ai_memory_outbox import (
 )
 from sidekick.chat.identity import IdentityCodec
 from sidekick.chat.formatting import agent_system_prompt
+from sidekick.chat.output_policy import MainlandMessagingOutputPolicy
 from sidekick.channel_status import (
     AdapterRuntimeState,
     ChannelInventoryItem,
@@ -244,6 +245,7 @@ class WeChatAI(metaclass=PluginMount):
         self,
         bootstrap: WeChatBootstrap,
     ) -> _WeChatChannelRuntime:
+        output_policy = MainlandMessagingOutputPolicy.from_env()
         identity_codec = WeChatIdentityCodec(
             account_id=bootstrap.session.self_id,
         )
@@ -263,10 +265,13 @@ class WeChatAI(metaclass=PluginMount):
             max_output_chars=self._settings.max_output_chars,
             initial_status=None,
             transport=transport,
+            output_policy=output_policy,
             logger=self.logger,
         )
         prompt_builder = PromptBuilder(
-            system_prompt=agent_system_prompt(self._settings.system_prompt),
+            system_prompt=output_policy.apply_to_system_prompt(
+                agent_system_prompt(self._settings.system_prompt)
+            ),
             max_context_messages=self._settings.max_context_messages,
             max_context_chars=self._settings.max_context_chars,
             quoted_attachment_describer=WeChatQuotedImageDescriber(
