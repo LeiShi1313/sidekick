@@ -67,7 +67,7 @@ function directoryResult(bankId, name, text = `${name} is a knowledge source.`) 
   };
 }
 
-test("builds chat-agnostic unanchored and identity-anchored recall queries", () => {
+test("builds topical, identity-anchored, and requester-personalization queries", () => {
   const queries = buildMemoryQueries({
     prompt: "What did Richard say?",
     context: [
@@ -79,12 +79,16 @@ test("builds chat-agnostic unanchored and identity-anchored recall queries", () 
     memory: memoryTarget(),
   });
 
-  assert.equal(queries.length, 2);
+  assert.equal(queries.length, 3);
   assert.match(queries[0], /What did Richard say/);
   assert.match(queries[0], /Earlier conversation/);
   assert.doesNotMatch(queries[0], /person:alice/);
   assert.match(queries[1], /Identity anchors/);
   assert.match(queries[1], /Alice \(person:alice\)/);
+  assert.match(queries[2], /Requester personalization context/);
+  assert.match(queries[2], /Current requester: Alice \(chat:user:alice\)/);
+  assert.match(queries[2], /What did Richard say/);
+  assert.doesNotMatch(queries[2], /person:alice/);
 });
 
 test("preserves identity anchors when reference context fills the query budget", () => {
@@ -97,9 +101,11 @@ test("preserves identity anchors when reference context fills the query budget",
     memory: memoryTarget(),
   });
 
-  assert.equal(queries.length, 2);
+  assert.equal(queries.length, 3);
   assert(queries[1].length <= 8_000);
   assert.match(queries[1], /Alice \(person:alice\)$/);
+  assert(queries[2].length <= 8_000);
+  assert.match(queries[2], /chat:user:alice/);
 });
 
 test("recalls query variants concurrently and merges their evidence by rank", async () => {
@@ -116,9 +122,29 @@ test("recalls query variants concurrently and merges their evidence by rank", as
     peak = Math.max(peak, active);
     await new Promise((resolve) => setTimeout(resolve, 5));
     active -= 1;
+    const personalization = options.body.includes(
+      "Requester personalization context",
+    );
     const anchored = options.body.includes("Identity anchors");
     return response(
-      anchored
+      personalization
+        ? [
+            {
+              id: "personal-1",
+              text: "Alice prefers concise explanations.",
+              type: "observation",
+              entities: ["chat:user:alice"],
+              document_id: "conversation:personal",
+              chunk_id: "chunk-personal",
+            },
+            {
+              id: "other-person",
+              text: "Bob prefers long explanations.",
+              type: "world",
+              entities: ["chat:user:bob"],
+            },
+          ]
+        : anchored
         ? [
             {
               id: "anchor-1",
@@ -155,8 +181,8 @@ test("recalls query variants concurrently and merges their evidence by rank", as
     fetchImpl,
   });
 
-  assert.equal(calls.length, 3);
-  assert.equal(peak, 3);
+  assert.equal(calls.length, 4);
+  assert.equal(peak, 4);
   assert(calls.every(({ authorization }) => authorization === `Bearer ${MEMORY_TOKEN}`));
   assert(
     calls
@@ -169,10 +195,16 @@ test("recalls query variants concurrently and merges their evidence by rank", as
   );
   assert.deepEqual(
     result.memories.map((item) => item.id),
-    ["named-1", "anchor-1", "shared"],
+    ["named-1", "anchor-1", "personal-1", "shared"],
   );
   assert.match(result.context, /Richard favors lower telecom prices/);
   assert.match(result.context, /Alice is also known as Rocket/);
+  assert.match(result.context, /Alice prefers concise explanations/);
+  assert.doesNotMatch(result.context, /Bob prefers long explanations/);
+  const personalizationCall = calls.find(({ body }) =>
+    body.query.includes("Requester personalization context"),
+  );
+  assert.equal(personalizationCall.body.max_tokens, 750);
   assert.deepEqual(result.access, {
     primaryBankId: "workspace:engineering",
     references: [
@@ -187,6 +219,12 @@ test("recalls query variants concurrently and merges their evidence by rank", as
         memoryId: "anchor-1",
         documentId: "conversation:9",
         chunkId: "chunk-9",
+      },
+      {
+        bankId: "workspace:engineering",
+        memoryId: "personal-1",
+        documentId: "conversation:personal",
+        chunkId: "chunk-personal",
       },
       {
         bankId: "workspace:engineering",
@@ -247,9 +285,9 @@ test("keeps the surviving recall variant when the other one fails", async () => 
   assert.match(result.context, /Rocket is Alice/);
   assert.deepEqual(result.recall, {
     status: "partial",
-    attemptedCount: 2,
+    attemptedCount: 3,
     completedCount: 1,
-    failedCount: 1,
+    failedCount: 2,
   });
 });
 
@@ -304,9 +342,9 @@ test("disables memory tools when every initial recall attempt fails", async () =
   assert.equal(result.access, null);
   assert.deepEqual(result.recall, {
     status: "failed",
-    attemptedCount: 2,
+    attemptedCount: 3,
     completedCount: 0,
-    failedCount: 2,
+    failedCount: 3,
   });
 });
 
@@ -321,8 +359,8 @@ test("keeps reflection available after a successful empty recall", async () => {
 
   assert.deepEqual(result.recall, {
     status: "completed",
-    attemptedCount: 1,
-    completedCount: 1,
+    attemptedCount: 2,
+    completedCount: 2,
     failedCount: 0,
   });
   assert.deepEqual(result.access, {
@@ -362,7 +400,11 @@ test("observes the complete initial recall HTTP exchange", async () => {
     observe: async (event) => observed.push(event),
   });
 
-  const recallEvents = observed.filter((event) => event.data.operation === "recall");
+  const recallEvents = observed.filter(
+    (event) =>
+      event.data.operation === "recall" &&
+      event.data.variant === "unanchored",
+  );
   assert.deepEqual(recallEvents.map((event) => event.type), [
     "memory.http.request",
     "memory.http.response",

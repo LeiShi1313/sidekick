@@ -711,6 +711,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       queries: [
         "Current request: What did Richard say?\nReference context:\nA telecom discussion.",
         "Current request: What did Richard say?\nReference context:\nA telecom discussion.\nIdentity anchors for resolving references: Alice (chat:user:alice)",
+        "Requester personalization context for the current answer.\nCurrent requester: Alice (chat:user:alice)\nRecall only low-stakes preferences, skills, ongoing plans, decisions, commitments, established context, or communication preferences about this requester that would materially improve the answer. Exclude sensitive, speculative, insulting, or unrelated details, and keep third-party claims attributed.\nCurrent request:\nWhat did Richard say?",
       ],
       memories: [
         {
@@ -732,7 +733,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       },
     });
     assert.equal(events.at(-1).answer, "Richard favors lower prices.");
-    assert.equal(recalls.length, 3);
+    assert.equal(recalls.length, 4);
     assert(recalls.some(({ body }) => body.query.includes("Identity anchors")));
     assert(
       recalls
