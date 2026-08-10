@@ -305,8 +305,32 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
       memory: { primaryBankId: "telegram:chat:-1001" },
     });
     await audit.record("memory.context", {
-      queries: ["2026-07-23 dog bro"],
-      memories: [{ id: "memory-1" }, { id: "memory-2" }],
+      primaryBankId: "telegram:chat:-1001",
+      queries: [
+        "2026-07-23 dog bro",
+        "Requester personalization context for chat:user:alice",
+      ],
+      memories: [
+        {
+          id: "memory-1",
+          text: "Dog bro appeared in the room today.",
+          type: "observation",
+          entities: ["chat:user:alice"],
+          occurredStart: "2026-07-23",
+          occurredEnd: null,
+          mentionedAt: "2026-07-23T10:30:00Z",
+          documentId: "conversation:7",
+          chunkId: "chunk-7",
+        },
+      ],
+      recall: {
+        status: "completed",
+        attemptedCount: 2,
+        completedCount: 2,
+        failedCount: 0,
+      },
+      renderedContext: "PRIVATE_DUPLICATE_RENDERED_CONTEXT",
+      access: { token: "PRIVATE_MEMORY_ACCESS_TOKEN" },
     });
     await audit.record("memory.http.request", {
       operation: "directory.recall",
@@ -385,13 +409,29 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
     });
     assert.deepEqual(summary.memory, {
       enabled: true,
-      primaryBankId: null,
+      primaryBankId: "telegram:chat:-1001",
       route: "current_bank_only",
       initialRecall: {
-        status: "unknown",
-        queries: [],
-        queryCount: 1,
-        memoryCount: 2,
+        status: "completed",
+        queries: [
+          "2026-07-23 dog bro",
+          "Requester personalization context for chat:user:alice",
+        ],
+        memories: [
+          {
+            id: "memory-1",
+            text: "Dog bro appeared in the room today.",
+            type: "observation",
+            entities: ["chat:user:alice"],
+            occurredStart: "2026-07-23",
+            occurredEnd: null,
+            mentionedAt: "2026-07-23T10:30:00Z",
+            documentId: "conversation:7",
+            chunkId: "chunk-7",
+          },
+        ],
+        queryCount: 2,
+        memoryCount: 1,
         eventSequence: 2,
       },
       directory: {
@@ -414,6 +454,23 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
     ]);
     assert.deepEqual(summary.warnings, []);
     assert.equal(summary.failure, null);
+    const detail = await app.store.get(RUN_ID);
+    const memoryEvent = detail.events.find(
+      (event) => event.type === "memory.context",
+    );
+    assert.equal(memoryEvent.data.primaryBankId, "telegram:chat:-1001");
+    assert.deepEqual(memoryEvent.data.queries, summary.memory.initialRecall.queries);
+    assert.deepEqual(memoryEvent.data.memories, summary.memory.initialRecall.memories);
+    assert.deepEqual(memoryEvent.data.recall, {
+      status: "completed",
+      attemptedCount: 2,
+      completedCount: 2,
+      failedCount: 0,
+    });
+    assert.doesNotMatch(
+      JSON.stringify(detail),
+      /PRIVATE_DUPLICATE_RENDERED_CONTEXT|PRIVATE_MEMORY_ACCESS_TOKEN/,
+    );
   } finally {
     await app.close();
   }

@@ -20,6 +20,8 @@ const MAX_STRING_CHARS = 1024 * 1024;
 const MAX_ARRAY_ITEMS = 5_000;
 const MAX_OBJECT_KEYS = 1_000;
 const MAX_DEPTH = 16;
+const MAX_MEMORY_QUERIES = 32;
+const MAX_RECALLED_MEMORIES = 50;
 const CURRENT_AUDIT_VERSION = 2;
 
 function safeString(value, max = 1_000) {
@@ -91,6 +93,53 @@ function memoryHttpMetadata(type, data) {
   };
 }
 
+function recalledMemoryMetadata(value) {
+  const memory = objectValue(value);
+  const id = safeString(memory.id, 256);
+  const text = safeString(memory.text, 16_000);
+  if (!id || !text) return null;
+  return {
+    id,
+    text,
+    type: safeString(memory.type, 16_000),
+    entities: (Array.isArray(memory.entities) ? memory.entities : [])
+      .map((entity) => safeString(entity, 256))
+      .filter((entity) => entity !== null)
+      .slice(0, 100),
+    occurredStart: safeString(memory.occurredStart, 16_000),
+    occurredEnd: safeString(memory.occurredEnd, 16_000),
+    mentionedAt: safeString(memory.mentionedAt, 16_000),
+    documentId: safeString(memory.documentId, 512),
+    chunkId: safeString(memory.chunkId, 512),
+  };
+}
+
+function memoryContextMetadata(value) {
+  const data = objectValue(value);
+  const recall = objectValue(data.recall);
+  return {
+    memoryEnabled:
+      data.memoryEnabled === true || data.primaryBankId != null,
+    primaryBankId: safeString(data.primaryBankId, 512),
+    queries: (Array.isArray(data.queries) ? data.queries : [])
+      .map((query) => safeString(query, 8_000))
+      .filter((query) => query !== null && query.length > 0)
+      .slice(0, MAX_MEMORY_QUERIES),
+    memories: (Array.isArray(data.memories) ? data.memories : [])
+      .map(recalledMemoryMetadata)
+      .filter((memory) => memory !== null)
+      .slice(0, MAX_RECALLED_MEMORIES),
+    queryCount: suppliedCount(data, "queryCount", "queries"),
+    memoryCount: suppliedCount(data, "memoryCount", "memories"),
+    recall: {
+      status: safeString(recall.status, 64),
+      attemptedCount: safeInteger(recall.attemptedCount),
+      completedCount: safeInteger(recall.completedCount),
+      failedCount: safeInteger(recall.failedCount),
+    },
+  };
+}
+
 export function minimizeAuditData(type, value = {}) {
   const data = objectValue(value);
   switch (type) {
@@ -110,15 +159,7 @@ export function minimizeAuditData(type, value = {}) {
         includeMemorySnapshot: data.includeMemorySnapshot === true,
       };
     case "memory.context":
-      return {
-        memoryEnabled:
-          data.memoryEnabled === true || data.primaryBankId != null,
-        queryCount: suppliedCount(data, "queryCount", "queries"),
-        memoryCount: suppliedCount(data, "memoryCount", "memories"),
-        recall: {
-          status: safeString(objectValue(data.recall).status, 64),
-        },
-      };
+      return memoryContextMetadata(data);
     case "memory.directory.policy":
       return {
         requesterOwner:
@@ -606,7 +647,7 @@ function summarize(events) {
   const opened = objectValue(openedEvent?.data);
   const completed = objectValue(completedEvent?.data);
   const failed = objectValue(failedEvent?.data);
-  const context = objectValue(contextEvent?.data);
+  const context = memoryContextMetadata(contextEvent?.data);
   const directory = objectValue(directoryEvent?.data);
   const capabilityData = objectValue(capabilityEvent?.data);
   const model = objectValue(objectValue(modelEvent?.data).model);
@@ -669,12 +710,16 @@ function summarize(events) {
       : null,
     memory: {
       enabled: memoryEnabled,
-      primaryBankId: null,
-      route: memoryRoute(memoryEnabled ? "enabled" : null, tools),
+      primaryBankId: context.primaryBankId,
+      route: memoryRoute(
+        memoryEnabled ? context.primaryBankId ?? "enabled" : null,
+        tools,
+      ),
       initialRecall: contextEvent
         ? {
             status: initialRecallStatus(context, events),
-            queries: [],
+            queries: context.queries,
+            memories: context.memories,
             queryCount: safeInteger(context.queryCount) ?? 0,
             memoryCount: safeInteger(context.memoryCount) ?? 0,
             eventSequence: contextEvent.sequence,

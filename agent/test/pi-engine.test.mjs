@@ -1824,9 +1824,22 @@ test("records a correlated run audit with memory, model, and tool details", asyn
     const memoryContext = audit.events.find(
       (event) => event.type === "memory.context",
     );
+    assert.equal(memoryContext.data.primaryBankId, "workspace:engineering");
+    assert.equal(memoryContext.data.queries.length, 3);
+    assert.match(memoryContext.data.queries[2], /Requester personalization context/);
+    assert.equal(memoryContext.data.memories[0].text, "Alice owns deployment.");
     assert.equal(memoryContext.data.recall.status, "completed");
     assert.equal(memoryContext.data.memoryCount, 1);
     assert.equal(audit.summary.memory.initialRecall.status, "completed");
+    assert.equal(audit.summary.memory.primaryBankId, "workspace:engineering");
+    assert.deepEqual(
+      audit.summary.memory.initialRecall.queries,
+      memoryContext.data.queries,
+    );
+    assert.deepEqual(
+      audit.summary.memory.initialRecall.memories,
+      memoryContext.data.memories,
+    );
     const modelInput = audit.events.find((event) => event.type === "model.input");
     assert(modelInput.data.promptChars > requestEvent.data.promptChars);
     assert.equal(modelInput.data.model.id, "test-model");
@@ -1843,7 +1856,7 @@ test("records a correlated run audit with memory, model, and tool details", asyn
     assert.equal(completed.data.answerChars, result.answer.length);
     assert.doesNotMatch(
       JSON.stringify(audit),
-      /test-key|Who owns deployment|Alice owns deployment|workspace:engineering|6 \* 7/,
+      /test-key/,
     );
   } finally {
     await app.close();
