@@ -306,6 +306,7 @@ class PlaygroundData:
                         "label": "Playground owner",
                     }
                 ],
+                "requesterCanCustomize": True,
             },
             "origin": {
                 "scopeId": "playground:owner",

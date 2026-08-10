@@ -12,8 +12,6 @@ const MAX_CONTEXT_CHARS = 4_000;
 const MAX_MEMORY_ITEMS = 50;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_DIRECTORY_CONTEXT_CHARS = 4_000;
-const MAX_PERSONALIZATION_MEMORY_ITEMS = 5;
-const PERSONALIZATION_MAX_TOKENS = 750;
 
 export const CROSS_BANK_MEMORY_POLICY =
   "The current primary memory bank is the default scope. " +
@@ -75,22 +73,6 @@ export function buildMemoryQueries({ prompt, context, memory, identity }) {
       MAX_QUERY_CHARS - anchorSection.length - 1,
     )}\n${anchorSection}`;
     if (anchored !== unanchored) queries.push(anchored);
-  }
-  const requester = identity?.requester;
-  if (requester?.id) {
-    const requesterLabel = requester.label
-      ? `${oneLine(requester.label, 256)} (${oneLine(requester.id, 256)})`
-      : oneLine(requester.id, 256);
-    const personalizationPrefix =
-      "Requester personalization context for the current answer.\n" +
-      `Current requester: ${requesterLabel}\n` +
-      "Recall only low-stakes preferences, skills, ongoing plans, decisions, commitments, established context, or communication preferences about this requester that would materially improve the answer. " +
-      "Exclude sensitive, speculative, insulting, or unrelated details, and keep third-party claims attributed.\n" +
-      "Current request:\n";
-    queries.push(
-      personalizationPrefix +
-        bounded(prompt.trim(), MAX_QUERY_CHARS - personalizationPrefix.length),
-    );
   }
   return queries;
 }
@@ -504,9 +486,6 @@ export async function retrieveMemoryContext({
     throw new Error("Memory API credential is unavailable");
   }
   const queries = buildMemoryQueries({ prompt, context, memory, identity });
-  const personalizationIndex = identity?.requester?.id
-    ? queries.length - 1
-    : -1;
   const [settled, directorySettled] = await Promise.all([
     Promise.allSettled(
       queries.map((query, index) =>
@@ -518,25 +497,9 @@ export async function retrieveMemoryContext({
           timeoutMs,
           fetchImpl,
           observe,
-          variant:
-            index === 0
-              ? "unanchored"
-              : index === personalizationIndex
-                ? "requester_personalization"
-                : "anchored",
-          maxTokens:
-            index === personalizationIndex
-              ? PERSONALIZATION_MAX_TOKENS
-              : 2_000,
-        }).then((memories) =>
-          index === personalizationIndex
-            ? memories
-                .filter((item) =>
-                  item.entities.includes(identity.requester.id),
-                )
-                .slice(0, MAX_PERSONALIZATION_MEMORY_ITEMS)
-            : memories,
-        ),
+          variant: index === 0 ? "unanchored" : "anchored",
+          maxTokens: 2_000,
+        }),
       ),
     ),
     Promise.allSettled([

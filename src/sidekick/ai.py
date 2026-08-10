@@ -139,6 +139,7 @@ class AgentParticipantAccess:
 class AgentRequestIdentity:
     requester: AgentIdentityAnchor
     anchors: tuple[AgentIdentityAnchor, ...] = ()
+    requester_can_customize: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +290,7 @@ class PiAgentGateway:
                     {"id": anchor.identity, "label": anchor.label}
                     for anchor in request.identity.anchors
                 ],
+                "requesterCanCustomize": request.identity.requester_can_customize,
             },
             "origin": {
                 "scopeId": request.origin.scope_id,
@@ -5534,9 +5536,10 @@ class AIConversationHandler:
         current_mentions: tuple[MentionedUser, ...],
         observations: list[HumanObservation],
     ) -> AgentRequestIdentity:
+        principal_actor_id = self._identity_codec.actor_id(requester_id)
         requester_actor_id = (
             requester_identity.subject_id
-            or self._identity_codec.actor_id(requester_id)
+            or principal_actor_id
         )
         anchor_identities: dict[str, str | None] = {
             requester_actor_id: requester_identity.subject_display_name
@@ -5572,6 +5575,10 @@ class AIConversationHandler:
                 label=requester_identity.subject_display_name,
             ),
             anchors=anchors,
+            requester_can_customize=(
+                requester_identity.is_human
+                and requester_actor_id == principal_actor_id
+            ),
         )
 
     async def _build_agent_memory_target(

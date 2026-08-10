@@ -1042,6 +1042,7 @@ async def test_request_identity_is_present_when_memory_is_disabled():
     request = gateway.requests[0]
     assert request.memory is None
     assert request.identity.requester.identity == "qq:user:42"
+    assert request.identity.requester_can_customize is True
     assert [anchor.identity for anchor in request.identity.anchors] == [
         "qq:user:42"
     ]

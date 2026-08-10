@@ -694,6 +694,7 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
                     "label": "Playground owner",
                 }
             ],
+            "requesterCanCustomize": True,
         }
         assert pi_request["origin"] == {
             "scopeId": "playground:owner",

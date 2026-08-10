@@ -117,6 +117,7 @@ function recalledMemoryMetadata(value) {
 function memoryContextMetadata(value) {
   const data = objectValue(value);
   const recall = objectValue(data.recall);
+  const requesterMemory = objectValue(data.requesterMemory);
   return {
     memoryEnabled:
       data.memoryEnabled === true || data.primaryBankId != null,
@@ -129,6 +130,19 @@ function memoryContextMetadata(value) {
       .map(recalledMemoryMetadata)
       .filter((memory) => memory !== null)
       .slice(0, MAX_RECALLED_MEMORIES),
+    customizations: (Array.isArray(data.customizations)
+      ? data.customizations
+      : [])
+      .map((customization) => safeString(customization, 2_000))
+      .filter((customization) => customization !== null)
+      .slice(0, 1),
+    requesterMemory: {
+      customizationStatus: safeString(
+        requesterMemory.customizationStatus,
+        64,
+      ),
+      evidenceStatus: safeString(requesterMemory.evidenceStatus, 64),
+    },
     queryCount: suppliedCount(data, "queryCount", "queries"),
     memoryCount: suppliedCount(data, "memoryCount", "memories"),
     recall: {
@@ -238,12 +252,18 @@ export function minimizeAuditData(type, value = {}) {
       };
     case "tool.completed": {
       const details = resultDetails(data);
+      const saved = data.saved ?? details.saved;
+      const cleared = data.cleared ?? details.cleared;
+      const conflict = data.conflict ?? details.conflict;
       return {
         turn: safeInteger(data.turn),
         toolCallId: safeString(data.toolCallId, 256),
         toolName: safeString(data.toolName, 128),
         isError: data.isError === true,
         unavailable: data.unavailable === true || details.unavailable === true,
+        ...(typeof saved === "boolean" ? { saved } : {}),
+        ...(typeof cleared === "boolean" ? { cleared } : {}),
+        ...(typeof conflict === "boolean" ? { conflict } : {}),
         durationMs: safeInteger(data.durationMs),
         sourceHandle: safeSourceHandle(
           data.sourceHandle ?? details.sourceHandle ?? objectValue(data.args).reference,
