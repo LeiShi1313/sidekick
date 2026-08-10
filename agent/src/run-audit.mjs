@@ -250,6 +250,17 @@ export function minimizeAuditData(type, value = {}) {
         ),
       };
     }
+    case "image.output.accepted":
+      return {
+        source: safeString(data.source, 64),
+        mimeType: safeString(data.mimeType, 64),
+        sizeBytes: safeInteger(data.sizeBytes),
+      };
+    case "image.output.ignored":
+      return {
+        source: safeString(data.source, 64),
+        reason: safeString(data.reason, 128),
+      };
     case "memory.access.warning":
       return {
         unavailableBankCount:

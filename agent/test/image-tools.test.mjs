@@ -42,6 +42,8 @@ function fixture(result = { data: [{ b64_json: JPEG_BYTES.toString("base64") }] 
 test("generates one bounded JPEG without returning bytes to the model", async () => {
   const app = fixture();
 
+  assert.match(app.tool.promptSnippet, /host delivers.*ends the turn/i);
+
   const result = await app.tool.execute("call-image-1", {
     prompt: "A fox and Devon Rex cat visiting Xiamen",
   });
@@ -68,6 +70,7 @@ test("generates one bounded JPEG without returning bytes to the model", async ()
       },
     },
   ]);
+  assert.equal(result.terminate, true);
   assert.match(result.content[0].text, /generated and queued/i);
   assert.equal(result.details.sizeBytes, JPEG_BYTES.length);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(JPEG_BYTES.toString("base64")));

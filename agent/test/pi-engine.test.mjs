@@ -102,6 +102,46 @@ function sendEmptyText(response) {
   ]);
 }
 
+function sendNativeImage(response, dataUrl) {
+  writeSse(response, [
+    {
+      id: "chatcmpl-native-image",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    },
+    {
+      id: "chatcmpl-native-image",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            images: [
+              {
+                type: "image_url",
+                index: 0,
+                image_url: { url: dataUrl },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    },
+    {
+      id: "chatcmpl-native-image",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ]);
+}
+
 function sendTextChunks(response, chunks) {
   writeSse(response, [
     {
@@ -786,7 +826,7 @@ test("owner and delegated runs receive the same restricted tools", () => {
   assert.deepEqual(toolNamesForPolicy("none", false, false, true), []);
 });
 
-test("streams generated image bytes without persisting them", async () => {
+test("terminates after streaming generated image bytes without persisting them", async () => {
   const imageBytes = Buffer.from([
     0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
   ]);
@@ -801,18 +841,12 @@ test("streams generated image bytes without persisting them", async () => {
     },
   };
   const app = await fixture(
-    (body, response, requestNumber) => {
-      if (requestNumber === 1) {
-        sendToolCall(response, {
-          id: "call-image-1",
-          name: "image_generate",
-          args: { prompt: "A fox and cat visiting Xiamen" },
-        });
-        return;
-      }
-      assert.equal(body.messages.at(-1)?.role, "tool");
-      assert.doesNotMatch(JSON.stringify(body.messages), new RegExp(encoded));
-      sendText(response, "Here is the generated image.");
+    (_body, response) => {
+      sendToolCall(response, {
+        id: "call-image-1",
+        name: "image_generate",
+        args: { prompt: "A fox and cat visiting Xiamen" },
+      });
     },
     { imageModel: "gpt-image-2", imageClient },
   );
@@ -824,6 +858,7 @@ test("streams generated image bytes without persisting them", async () => {
     );
 
     assert.equal(imageCalls.length, 1);
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
     const attachment = events.find((event) => event.type === "attachment");
     assert.deepEqual(attachment, {
       type: "attachment",
@@ -833,7 +868,7 @@ test("streams generated image bytes without persisting them", async () => {
       data: encoded,
     });
     assert.equal(events.at(-1).type, "run_completed");
-    assert.equal(events.at(-1).answer, "Here is the generated image.");
+    assert.equal(events.at(-1).answer, "");
 
     const sessionFiles = (await readdir(app.engine.config.sessionDir)).filter(
       (name) => name.endsWith(".jsonl"),
@@ -850,85 +885,287 @@ test("streams generated image bytes without persisting them", async () => {
   }
 });
 
-test("completes a generated image when the model returns no caption", async () => {
-  const imageBytes = Buffer.from([
+test("continues a session after a terminal image tool result", async () => {
+  const encoded = Buffer.from([
     0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
-  ]);
-  const encoded = imageBytes.toString("base64");
-  const imageClient = {
-    images: {
-      async generate() {
-        return { data: [{ b64_json: encoded }] };
-      },
-    },
-  };
+  ]).toString("base64");
   const app = await fixture(
     (_body, response, requestNumber) => {
       if (requestNumber === 1) {
         sendToolCall(response, {
-          id: "call-image-empty-caption",
+          id: "call-image-before-continuation",
           name: "image_generate",
           args: { prompt: "A new logo" },
         });
         return;
       }
-      sendEmptyText(response);
+      sendText(response, "The follow-up still works.");
     },
-    { imageModel: "gpt-image-2", imageClient },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: {
+        images: { generate: async () => ({ data: [{ b64_json: encoded }] }) },
+      },
+    },
   );
   try {
-    const runId = "49494949-4949-4949-8949-494949494949";
-    const events = await collect(
+    const first = await collect(
       app.engine,
-      request(runId, { prompt: "Generate a new logo" }),
+      request("43434343-4343-4343-8343-434343434343", {
+        prompt: "Generate a new logo",
+      }),
+    );
+    const completed = first.at(-1);
+    const second = await collect(
+      app.engine,
+      request("42424242-4242-4242-8242-424242424242", {
+        sessionId: completed.sessionId,
+        parentEntryId: completed.entryId,
+        prompt: "Now answer a follow-up question",
+      }),
     );
 
-    assert.ok(events.some((event) => event.type === "attachment"));
-    assert.equal(events.at(-1).type, "run_completed");
-    assert.equal(events.at(-1).answer, "");
-    assert.equal((await app.engine.getRunAudit(runId)).summary.status, "completed");
+    assert.equal(app.provider.requests.length, 2);
+    assert.equal(second.at(-1).type, "run_completed");
+    assert.equal(second.at(-1).answer, "The follow-up still works.");
   } finally {
     await app.close();
   }
 });
 
-test("normalizes a whitespace-only image caption to empty", async () => {
+test("streams a provider-native image without retrying or persisting bytes", async () => {
   const imageBytes = Buffer.from([
     0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
   ]);
   const encoded = imageBytes.toString("base64");
-  const imageClient = {
-    images: {
-      async generate() {
-        return { data: [{ b64_json: encoded }] };
-      },
-    },
-  };
   const app = await fixture(
-    (_body, response, requestNumber) => {
-      if (requestNumber === 1) {
-        sendToolCall(response, {
-          id: "call-image-whitespace-caption",
-          name: "image_generate",
-          args: { prompt: "A new logo" },
-        });
-        return;
-      }
-      sendText(response, " \n\t");
+    (_body, response) => {
+      sendNativeImage(response, `data:image/jpeg;base64,${encoded}`);
     },
-    { imageModel: "gpt-image-2", imageClient },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+    },
   );
+  try {
+    const runId = "47474747-4747-4747-8747-474747474747";
+    const events = await collect(
+      app.engine,
+      request(runId, { prompt: "Generate a fox and cat in Xiamen" }),
+    );
+
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
+    assert.deepEqual(
+      events.find((event) => event.type === "attachment"),
+      {
+        type: "attachment",
+        filename: "generated-image.jpg",
+        mimeType: "image/jpeg",
+        displayAs: "image",
+        data: encoded,
+      },
+    );
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "");
+
+    const sessionFiles = (await readdir(app.engine.config.sessionDir)).filter(
+      (name) => name.endsWith(".jsonl"),
+    );
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    const audit = await app.engine.getRunAudit(runId);
+    assert.doesNotMatch(rawSession, new RegExp(encoded));
+    assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+    assert.ok(
+      audit.events.some(
+        (event) =>
+          event.type === "image.output.accepted" &&
+          event.data.source === "model_native" &&
+          event.data.mimeType === "image/jpeg" &&
+          event.data.sizeBytes === imageBytes.length,
+      ),
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("keeps concurrent native image outputs correlated to their runs", async () => {
+  const firstImage = Buffer.from([
+    0xff, 0xd8, 0xff, 0x01, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const secondImage = Buffer.from([
+    0xff, 0xd8, 0xff, 0x02, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture(
+    (body, response) => {
+      const encoded = JSON.stringify(body).includes("first native image")
+        ? firstImage
+        : secondImage;
+      sendNativeImage(response, `data:image/jpeg;base64,${encoded}`);
+    },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+    },
+  );
+  try {
+    const [first, second] = await Promise.all([
+      collect(
+        app.engine,
+        request("41414141-4141-4141-8141-414141414141", {
+          prompt: "Generate the first native image",
+        }),
+      ),
+      collect(
+        app.engine,
+        request("40404040-4040-4040-8040-404040404040", {
+          prompt: "Generate the second native image",
+        }),
+      ),
+    ]);
+
+    assert.equal(
+      first.find((event) => event.type === "attachment").data,
+      firstImage,
+    );
+    assert.equal(
+      second.find((event) => event.type === "attachment").data,
+      secondImage,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("rejects native image output when image generation is unavailable", async () => {
+  const encoded = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture((_body, response) => {
+    sendNativeImage(response, `data:image/jpeg;base64,${encoded}`);
+  });
   try {
     const events = await collect(
       app.engine,
-      request("51515151-5151-4151-8151-515151515151", {
+      request("45454545-4545-4545-8545-454545454545", {
         prompt: "Generate a new logo",
       }),
     );
 
-    assert.ok(events.some((event) => event.type === "attachment"));
-    assert.equal(events.at(-1).type, "run_completed");
-    assert.equal(events.at(-1).answer, "");
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
+    assert.equal(events.some((event) => event.type === "attachment"), false);
+    assert.deepEqual(events.at(-1), {
+      type: "run_failed",
+      code: "PROVIDER_ERROR",
+      message: "Agent provider request failed",
+    });
+  } finally {
+    await app.close();
+  }
+});
+
+test("does not retry invalid native image output", async () => {
+  const encodedJpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture(
+    (_body, response) => {
+      sendNativeImage(response, `data:image/png;base64,${encodedJpeg}`);
+    },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+    },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("44444444-4444-4444-8444-444444444444", {
+        prompt: "Generate a new logo",
+      }),
+    );
+
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
+    assert.equal(events.some((event) => event.type === "attachment"), false);
+    assert.equal(events.at(-1).type, "run_failed");
+    assert.equal(events.at(-1).code, "PROVIDER_ERROR");
+  } finally {
+    await app.close();
+  }
+});
+
+test("does not publish a native image from a conflicting model response", async () => {
+  const encoded = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture(
+    (_body, response) => {
+      writeSse(response, [
+        {
+          id: "chatcmpl-conflicting-native-image",
+          model: "test-model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                images: [
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: `data:image/jpeg;base64,${encoded}`,
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "chatcmpl-conflicting-native-image",
+          model: "test-model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call-conflicting-image",
+                    type: "function",
+                    function: {
+                      name: "image_generate",
+                      arguments: '{"prompt":"A duplicate"}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+      ]);
+    },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+    },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("39393939-3939-4939-8939-393939393939", {
+        prompt: "Generate a new logo",
+      }),
+    );
+
+    assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
+    assert.equal(events.some((event) => event.type === "attachment"), false);
+    assert.equal(events.at(-1).type, "run_failed");
+    assert.equal(events.at(-1).code, "PROVIDER_ERROR");
   } finally {
     await app.close();
   }
