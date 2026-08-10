@@ -207,7 +207,7 @@ export function pseudonymizeActorIdentities(value, key, scope) {
   const text = String(value ?? "");
   requirePseudonymContext(key, scope);
   return text.replace(HOST_ID_TOKEN_RE, (identity) => {
-    if (!/:(?:user|channel):/.test(identity)) {
+    if (!/:(?:user|channel|matrix-bridge):/.test(identity)) {
       return identity;
     }
     return pseudonymizeIdentity(identity, key, scope);

@@ -17,6 +17,8 @@ const MAX_PARTICIPANTS = 16;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const BANK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$/;
+const TELEGRAM_MATRIX_BRIDGE_ACTOR_RE =
+  /^telegram:matrix-bridge:[1-9][0-9]*%3A-?[0-9]+%3A[a-f0-9]{32}$/;
 const MIME_RE = /^[a-z0-9][a-z0-9.+-]{0,63}\/[a-z0-9][a-z0-9.+-]{0,127}$/;
 const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const CLIENT_CAPABILITIES = new Set([
@@ -76,7 +78,11 @@ function boundedBankIds(value) {
 }
 
 function isHostIdentity(value) {
-  return isBankId(value) && /:(?:user|channel):/.test(value);
+  return (
+    isBankId(value) &&
+    (/:(?:user|channel):/.test(value) ||
+      TELEGRAM_MATRIX_BRIDGE_ACTOR_RE.test(value))
+  );
 }
 
 function listOptions(url, kind) {

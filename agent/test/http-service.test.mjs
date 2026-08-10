@@ -782,6 +782,73 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
   }
 });
 
+test("accepts exact Matrix bridge actors and rejects invalid identities", async () => {
+  const received = [];
+  const app = await listen({
+    async *run(request) {
+      received.push(request);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel() {
+      return false;
+    },
+  });
+  const bridgeActorId =
+    "telegram:matrix-bridge:6332621450%3A-1001%3A0123456789abcdef0123456789abcdef";
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        identity: {
+          requester: { id: bridgeActorId, label: "SteamedFish" },
+          anchors: [{ id: bridgeActorId, label: "SteamedFish" }],
+        },
+      }),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.equal(received.length, 1);
+    assert.deepEqual(received[0].identity, {
+      requester: { id: bridgeActorId, label: "SteamedFish" },
+      anchors: [{ id: bridgeActorId, label: "SteamedFish" }],
+    });
+
+    const invalidIds = [
+      "telegram:chat:-1001",
+      "telegram:chat:-1001:matrix-bridge:forged",
+      "telegram:matrix-bridge:",
+      "telegram:matrix-bridge:6332621450%ZZ-1001%3A0123456789abcdef0123456789abcdef",
+      "qq:matrix-bridge:6332621450%3A-1001%3A0123456789abcdef0123456789abcdef",
+    ];
+    for (const id of invalidIds) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify({
+          ...validRun,
+          runId: "22222222-2222-4222-8222-222222222222",
+          identity: {
+            requester: { id, label: "Invalid identity" },
+            anchors: [{ id, label: "Invalid identity" }],
+          },
+        }),
+      });
+      assert.equal(rejected.status, 400, id);
+    }
+    assert.equal(received.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
 test("cancels an active run by its caller-provided id", async () => {
   let cancelled;
   const app = await listen({
