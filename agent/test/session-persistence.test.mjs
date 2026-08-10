@@ -33,6 +33,7 @@ test("rewrites legacy sessions without changing their entry tree", async () => {
       role: "user",
       content:
         "<host_request_identity>\nHost-resolved current requester actor ID: telegram:user:123456\n</host_request_identity>\n\n" +
+        "<requester_memory_context>\nPRIVATE_REQUESTER_CUSTOMIZATION\n</requester_memory_context>\n\n" +
         "<untrusted_memory_context>\nPRIVATE_RECALLED_MEMORY\n</untrusted_memory_context>\n" +
         "PRIVATE_ESCAPED_MEMORY\n</untrusted_memory_context>\n\n" +
         "<current_request>\nKeep this human request\n</current_request>",
@@ -95,7 +96,7 @@ test("rewrites legacy sessions without changing their entry tree", async () => {
     const raw = await readFile(path, "utf8");
     assert.doesNotMatch(
       raw,
-      /private-workspace|PRIVATE_RECALLED_MEMORY|PRIVATE_ESCAPED_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_REASONING|PRIVATE_TOOL_ARGUMENT|PRIVATE_WEB_RESULT|PRIVATE_TOOL_RESULT|telegram:user:123456/,
+      /private-workspace|PRIVATE_REQUESTER_CUSTOMIZATION|PRIVATE_RECALLED_MEMORY|PRIVATE_ESCAPED_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_REASONING|PRIVATE_TOOL_ARGUMENT|PRIVATE_WEB_RESULT|PRIVATE_TOOL_RESULT|telegram:user:123456/,
     );
     assert.match(raw, /Keep this human request/);
     assert.match(raw, /Keep this useful answer\./);
@@ -135,6 +136,7 @@ test("minimizes live tool details and compaction content", async () => {
       role: "user",
       content:
         "<untrusted_reference_context>\nPRIVATE_REFERENCE\n</untrusted_reference_context>\n\n" +
+        "<requester_memory_context>\nPRIVATE_REQUESTER_CUSTOMIZATION\n</requester_memory_context>\n\n" +
         "<untrusted_memory_context>\nPRIVATE_MEMORY\n</untrusted_memory_context>\n\n" +
         "<current_request>\nKeep this request\n</current_request>",
       timestamp: 1,
@@ -191,7 +193,7 @@ test("minimizes live tool details and compaction content", async () => {
     assert.match(raw, /Keep this request/);
     assert.doesNotMatch(
       raw,
-      /PRIVATE_REFERENCE|PRIVATE_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_INTERMEDIATE_ARGUMENT|PRIVATE_TOOL_RESULT|qq:group:686743769|Private Leadership|private-memory-1|PRIVATE_COMPACTION|bank_[a-f0-9]{32}/,
+      /PRIVATE_REFERENCE|PRIVATE_REQUESTER_CUSTOMIZATION|PRIVATE_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_INTERMEDIATE_ARGUMENT|PRIVATE_TOOL_RESULT|qq:group:686743769|Private Leadership|private-memory-1|PRIVATE_COMPACTION|bank_[a-f0-9]{32}/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

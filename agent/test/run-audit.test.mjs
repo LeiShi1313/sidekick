@@ -173,6 +173,45 @@ test("persists only allowlisted operational audit metadata", async () => {
   }
 });
 
+test("records requester-memory outcomes without tool arguments or content", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("tool.completed", {
+      toolCallId: "call-requester-memory",
+      toolName: "memory_update_requester",
+      args: { customization: "PRIVATE_CUSTOMIZATION_ARGUMENT" },
+      result: {
+        content: "PRIVATE_CUSTOMIZATION_RESULT",
+        details: { saved: true, cleared: false, conflict: false },
+      },
+      isError: false,
+      durationMs: 7,
+    });
+    await audit.flush();
+
+    const result = await app.store.get(RUN_ID);
+    assert.deepEqual(result.events[0].data, {
+      turn: null,
+      toolCallId: "call-requester-memory",
+      toolName: "memory_update_requester",
+      isError: false,
+      unavailable: false,
+      saved: true,
+      cleared: false,
+      conflict: false,
+      durationMs: 7,
+      sourceHandle: null,
+    });
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /PRIVATE_CUSTOMIZATION_ARGUMENT|PRIVATE_CUSTOMIZATION_RESULT/,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
 test("rewrites legacy audit payloads through the current allowlist", async () => {
   const app = await fixture();
   try {
@@ -329,7 +368,13 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
         completedCount: 2,
         failedCount: 0,
       },
+      customizations: ["Call me Captain."],
+      requesterMemory: {
+        customizationStatus: "available",
+        evidenceStatus: "completed",
+      },
       renderedContext: "PRIVATE_DUPLICATE_RENDERED_CONTEXT",
+      renderedRequesterContext: "PRIVATE_REQUESTER_RENDERED_CONTEXT",
       access: { token: "PRIVATE_MEMORY_ACCESS_TOKEN" },
     });
     await audit.record("memory.http.request", {
@@ -467,9 +512,14 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
       completedCount: 2,
       failedCount: 0,
     });
+    assert.deepEqual(memoryEvent.data.customizations, ["Call me Captain."]);
+    assert.deepEqual(memoryEvent.data.requesterMemory, {
+      customizationStatus: "available",
+      evidenceStatus: "completed",
+    });
     assert.doesNotMatch(
       JSON.stringify(detail),
-      /PRIVATE_DUPLICATE_RENDERED_CONTEXT|PRIVATE_MEMORY_ACCESS_TOKEN/,
+      /PRIVATE_DUPLICATE_RENDERED_CONTEXT|PRIVATE_REQUESTER_RENDERED_CONTEXT|PRIVATE_MEMORY_ACCESS_TOKEN/,
     );
   } finally {
     await app.close();

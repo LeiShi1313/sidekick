@@ -72,6 +72,7 @@ def run_request(
                     label="Alice",
                 ),
             ),
+            requester_can_customize=True,
         ),
         model=model,
         images=images,
@@ -149,6 +150,7 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
         "identity": {
             "requester": {"id": "telegram:user:40", "label": "Alice"},
             "anchors": [{"id": "telegram:user:40", "label": "Alice"}],
+            "requesterCanCustomize": True,
         },
         "model": "gpt-5.4-mini",
         "origin": {

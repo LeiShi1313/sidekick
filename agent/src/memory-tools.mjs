@@ -10,14 +10,6 @@ import {
   renderRecalledMemories,
 } from "./memory-context.mjs";
 
-export const MEMORY_TOOL_NAMES = Object.freeze([
-  "memory_reflect",
-  "memory_get_sources",
-  "memory_query_current",
-  "memory_query_source",
-  "memory_find_sources",
-]);
-
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_REFLECT_CHARS = 6_000;
 const MAX_SOURCE_CHARS = 6_000;

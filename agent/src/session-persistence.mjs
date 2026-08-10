@@ -194,6 +194,7 @@ export function hardenSessionPersistence(manager, getState = () => ({})) {
 
 const OMITTED_CONTEXT_BLOCKS = new Set([
   "host_access_advisory",
+  "requester_memory_context",
   "untrusted_memory_context",
   "untrusted_reference_context",
 ]);

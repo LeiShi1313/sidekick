@@ -16,6 +16,7 @@ const validRun = {
   identity: {
     requester: { id: "telegram:user:40", label: "Alice" },
     anchors: [{ id: "telegram:user:40", label: "Alice" }],
+    requesterCanCustomize: true,
   },
   origin: {
     scopeId: "telegram:chat:-1001",
@@ -816,7 +817,25 @@ test("accepts exact Matrix bridge actors and rejects invalid identities", async 
     assert.deepEqual(received[0].identity, {
       requester: { id: bridgeActorId, label: "SteamedFish" },
       anchors: [{ id: bridgeActorId, label: "SteamedFish" }],
+      requesterCanCustomize: false,
     });
+
+    const writableBridge = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        identity: {
+          requester: { id: bridgeActorId, label: "SteamedFish" },
+          anchors: [{ id: bridgeActorId, label: "SteamedFish" }],
+          requesterCanCustomize: true,
+        },
+      }),
+    });
+    assert.equal(writableBridge.status, 400);
 
     const invalidIds = [
       "telegram:chat:-1001",

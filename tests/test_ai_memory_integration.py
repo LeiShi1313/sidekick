@@ -788,6 +788,7 @@ async def test_fragmented_matrix_mxid_triggers_ai_with_separate_access_principal
         assert request.prompt == "can I use CaiBao?"
         assert request.identity.requester.identity == attribution.actor_id
         assert request.identity.requester.label == "@fangliding:matrix.org"
+        assert request.identity.requester_can_customize is False
         assert request.memory is not None
         assert request.memory.primary_bank_id == "telegram:chat:-1001"
         assert request.memory.granted_bank_ids == ()
@@ -1065,6 +1066,36 @@ async def test_unconfigured_bot_with_a_bridge_shaped_message_is_ignored():
 
     assert await handler.handle(trigger) is False
     assert gateway.requests == []
+
+
+@pytest.mark.asyncio
+async def test_unparseable_configured_bridge_bot_cannot_customize_requester_memory():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+    gateway = FakeGateway(["ok"])
+    store = FakeStore()
+    store.open_chats.add("telegram:chat:-1001")
+    handler = make_handler(
+        gateway,
+        None,
+        store=store,
+        attribution_resolver=bridge_resolver,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+    )
+    trigger = FakeMessage(
+        "/ai remember my answer style",
+        sender_id=6332621450,
+        is_human=False,
+        is_group=True,
+        entities=(telegram_types.MessageEntityBotCommand(offset=0, length=3),),
+    )
+
+    assert await handler.handle(trigger) is True
+
+    request = gateway.requests[0]
+    assert request.identity.requester.identity == "telegram:user:6332621450"
+    assert request.identity.requester_can_customize is False
 
 
 @pytest.mark.asyncio
