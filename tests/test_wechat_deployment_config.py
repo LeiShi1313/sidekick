@@ -42,6 +42,7 @@ def render_compose() -> dict[str, object]:
         "SIDEKICK_WECHAT_PEER_PI_TOKEN": "wechat-peer-pi-token-that-is-long-enough",
         "SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough",
         "MEMORY_API_TOKEN": "memory-api-token-that-is-long-enough",
+        "SIDEKICK_MAINLAND_BLOCKED_TERMS": '["restricted-example"]',
     }
     completed = subprocess.run(
         [
@@ -75,6 +76,20 @@ def test_telegram_worker_receives_matrix_bridge_bot_ids() -> None:
         ]
         == "6332621450,7000000000"
     )
+
+
+@pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
+def test_compose_scopes_mainland_blocked_terms_to_wechat_and_qq() -> None:
+    services = render_compose()["services"]
+
+    assert services["onebot-ai"]["environment"][
+        "SIDEKICK_MAINLAND_BLOCKED_TERMS"
+    ] == '["restricted-example"]'
+    for service_name in ("wechat-host-ai", "wechat-peer-ai"):
+        assert services[service_name]["environment"][
+            "SIDEKICK_MAINLAND_BLOCKED_TERMS"
+        ] == '["restricted-example"]'
+    assert "SIDEKICK_MAINLAND_BLOCKED_TERMS" not in services["ai"]["environment"]
 
 
 @pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")

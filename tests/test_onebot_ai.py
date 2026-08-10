@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from datetime import UTC, datetime
 from io import BytesIO
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
 from PIL import Image
 
+from sidekick.ai import AISettings
 from sidekick.ai_attachments import (
     AttachmentAnalysisRequest,
     ChatAttachmentDescriber,
 )
 
 from sidekick.chat.attachments import OutboundAttachment
+from sidekick.chat.output_policy import MAINLAND_MESSAGING_POLICY_ID
+from sidekick.channel_status import ChannelOpsSettings
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
     OneBotChatTransport,
@@ -33,6 +38,7 @@ from sidekick.onebot.message import (
     OneBotMessage,
     OneBotMessageError,
 )
+from sidekick.plugins.onebot_ai import OneBotAI
 
 
 class RecordingActionClient:
@@ -57,6 +63,48 @@ class RecordingAttachmentGateway:
     async def describe_attachment(self, request: AttachmentAnalysisRequest) -> str:
         self.requests.append(request)
         return "A red image."
+
+
+@pytest.mark.asyncio
+async def test_onebot_runtime_applies_mainland_output_policy(tmp_path) -> None:
+    class SetupStore:
+        async def connect(self):
+            return self
+
+    class SetupBridge:
+        def set_event_handler(self, handler):
+            self.event_handler = handler
+
+    plugin = object.__new__(OneBotAI)
+    plugin._runtime = SimpleNamespace(self_id=99)
+    plugin._settings = AISettings(
+        agent_url="http://agent.invalid",
+        agent_token="test-agent-token-that-is-long-enough",
+        state_path=tmp_path / "ai.db",
+    )
+    plugin._ops_settings = ChannelOpsSettings(
+        instance_id="qq-test",
+        token="channel-ops-token-that-is-long-enough",
+    )
+    plugin._gateway = object()
+    plugin._store = SetupStore()
+    plugin._memory = None
+    plugin._bridge = SetupBridge()
+    plugin._directory = OneBotDirectory()
+    plugin._dream_scheduler = None
+    plugin._continuous_scheduler = None
+    plugin._memory_outbox_scheduler = None
+    plugin.logger = logging.getLogger("test-onebot-output-policy")
+
+    await plugin._setup()
+
+    assert MAINLAND_MESSAGING_POLICY_ID in (
+        plugin._handler._prompt_builder.system_prompt
+    )
+    assert (
+        plugin._handler._responder._output_policy.policy_id
+        == MAINLAND_MESSAGING_POLICY_ID
+    )
 
 
 def group_event(

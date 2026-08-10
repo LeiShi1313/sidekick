@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from sidekick.ai import AISettings, AIStateRepository
+from sidekick.chat.output_policy import MAINLAND_MESSAGING_POLICY_ID
 from sidekick.channel_status import ChannelOpsSettings
 from sidekick.plugins.base import command_registry
 from sidekick.plugins.wechat_ai import WeChatAI, WeChatRuntimeSettings
@@ -94,6 +95,13 @@ def test_wechat_channel_runtime_wires_account_scoped_memory(tmp_path) -> None:
         WeChatQuotedImageDescriber,
     )
     assert runtime.handler._transport._native_reply_ready is True
+    assert MAINLAND_MESSAGING_POLICY_ID in (
+        runtime.handler._prompt_builder.system_prompt
+    )
+    assert (
+        runtime.handler._responder._output_policy.policy_id
+        == MAINLAND_MESSAGING_POLICY_ID
+    )
 
 
 @pytest.mark.asyncio

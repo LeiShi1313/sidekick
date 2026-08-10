@@ -59,6 +59,17 @@ non-canonical alias scoped to that bridge and Telegram chat. The alias can be
 retained in the room memory bank, but it cannot receive private-bank grants or
 merge across rooms.
 
+WeChat and OneBot/QQ AI responses receive the mandatory
+`mainland-messaging-v1` output policy; Telegram does not. The policy asks the
+model to audit its complete response before delivery, and guarded responses are
+buffered until the run completes. `SIDEKICK_MAINLAND_BLOCKED_TERMS` can add a
+JSON array of literal substrings that must never be sent, for example
+`["restricted-example"]`. Matching is case-insensitive after Unicode and
+visible Markdown normalization, and a match is replaced with a fixed neutral
+reply without preserving an AI continuation. This first version checks final
+text and attachment filenames; it does not inspect image pixels or arbitrary
+file contents.
+
 The WeChat adapter reads `SIDEKICK_WECHAT_URL` (default
 `http://127.0.0.1:18188`) and the optional `SIDEKICK_WECHAT_TOKEN`. It requires
 the connector's complete/current chat snapshot, durable event replay,

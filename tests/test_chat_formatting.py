@@ -4,6 +4,7 @@ from sidekick.chat.formatting import (
     markdown_to_plain_text,
     sanitize_rich_markdown,
 )
+from sidekick.chat.output_policy import MAINLAND_MESSAGING_POLICY_ID
 
 
 def test_agent_prompt_requests_one_portable_content_only_format():
@@ -20,6 +21,7 @@ def test_agent_prompt_requests_one_portable_content_only_format():
     assert "Never discuss formatting rules or decisions" in prompt
     assert "Telegram" not in prompt
     assert "QQ" not in prompt
+    assert MAINLAND_MESSAGING_POLICY_ID not in prompt
 
 
 def test_markdown_to_plain_text_preserves_content_and_link_destinations():
