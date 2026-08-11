@@ -709,8 +709,9 @@ test("regenerates requester customization for each participant in a shared sessi
       requesterMemoryTags({
         bankId,
         requesterId,
+        source: "requester",
         identityAliasKey: IDENTITY_ALIAS_KEY,
-      })[1],
+      })[2],
       requesterId,
     ]),
   );
@@ -754,6 +755,7 @@ test("regenerates requester customization for each participant in a shared sessi
                       tags: requesterMemoryTags({
                         bankId,
                         requesterId,
+                        source: "requester",
                         identityAliasKey: IDENTITY_ALIAS_KEY,
                       }),
                     },
@@ -825,6 +827,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
                   tags: requesterMemoryTags({
                     bankId: "workspace:engineering",
                     requesterId: "chat:user:alice",
+                    source: "requester",
                     identityAliasKey: IDENTITY_ALIAS_KEY,
                   }),
                 },
@@ -943,7 +946,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       },
     });
     assert.equal(events.at(-1).answer, "Richard favors lower prices.");
-    assert.equal(recalls.length, 5);
+    assert.equal(recalls.length, 6);
     assert(
       recalls.some(({ body }) => body?.query.includes("Identity anchors")),
     );

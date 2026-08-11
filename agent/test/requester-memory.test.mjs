@@ -32,6 +32,7 @@ function directive(overrides = {}) {
     tags: requesterMemoryTags({
       bankId: BANK_ID,
       requesterId: REQUESTER_ID,
+      source: "requester",
       identityAliasKey: IDENTITY_ALIAS_KEY,
     }),
     created_at: "2026-08-10T12:00:00Z",
@@ -64,25 +65,195 @@ test("derives opaque requester tags from both bank and canonical actor", () => {
   const tags = requesterMemoryTags({
     bankId: BANK_ID,
     requesterId: REQUESTER_ID,
+    source: "requester",
     identityAliasKey: IDENTITY_ALIAS_KEY,
   });
   const otherActor = requesterMemoryTags({
     bankId: BANK_ID,
     requesterId: "telegram:user:2",
+    source: "requester",
     identityAliasKey: IDENTITY_ALIAS_KEY,
   });
   const otherBank = requesterMemoryTags({
     bankId: "telegram:chat:-2002",
     requesterId: REQUESTER_ID,
+    source: "requester",
     identityAliasKey: IDENTITY_ALIAS_KEY,
   });
 
-  assert.equal(tags.length, 2);
-  assert.match(tags[0], /^sidekick:requester-customization:v1$/);
-  assert.match(tags[1], /^sidekick:requester:[a-f0-9]{32}$/);
+  assert.equal(tags.length, 3);
+  assert.match(tags[0], /^sidekick:requester-customization:v2$/);
+  assert.equal(tags[1], "sidekick:customization-source:requester");
+  assert.match(tags[2], /^sidekick:requester:[a-f0-9]{32}$/);
   assert.equal(tags.join(" ").includes(REQUESTER_ID), false);
   assert.notDeepEqual(tags, otherActor);
   assert.notDeepEqual(tags, otherBank);
+});
+
+test("derives isolated v2 tags for requester and owner customization", () => {
+  const requesterTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: REQUESTER_ID,
+    source: "requester",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const ownerTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: REQUESTER_ID,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+
+  assert.deepEqual(requesterTags.slice(0, 2), [
+    "sidekick:requester-customization:v2",
+    "sidekick:customization-source:requester",
+  ]);
+  assert.deepEqual(ownerTags.slice(0, 2), [
+    "sidekick:requester-customization:v2",
+    "sidekick:customization-source:owner",
+  ]);
+  assert.match(requesterTags[2], /^sidekick:requester:[a-f0-9]{32}$/);
+  assert.equal(requesterTags[2], ownerTags[2]);
+  assert.notDeepEqual(requesterTags, ownerTags);
+});
+
+test("loads requester customization above owner defaults without mixing storage", async () => {
+  const requesterTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: REQUESTER_ID,
+    source: "requester",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const ownerTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: REQUESTER_ID,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const directiveReads = [];
+  const store = createStore(async (url) => {
+    if (url.includes("/directives?")) {
+      const tags = new URL(url).searchParams.getAll("tags");
+      directiveReads.push(tags);
+      if (tags.includes("sidekick:customization-source:requester")) {
+        return jsonResponse({
+          items: [
+            directive({
+              content: "Keep answers concise.",
+              tags: requesterTags,
+            }),
+          ],
+        });
+      }
+      if (tags.includes("sidekick:customization-source:owner")) {
+        return jsonResponse({
+          items: [
+            directive({
+              id: "22222222-2222-4222-8222-222222222222",
+              content: "Use headings by default.",
+              tags: ownerTags,
+            }),
+          ],
+        });
+      }
+      throw new Error(`unexpected customization tags ${tags.join(",")}`);
+    }
+    return jsonResponse({ results: [] });
+  });
+
+  const result = await retrieve(store);
+
+  assert.deepEqual(result.customizations, [
+    "Keep answers concise.",
+    "Use headings by default.",
+  ]);
+  assert.equal(directiveReads.length, 2);
+  assert.match(
+    result.context,
+    /requester customization overrides conflicting owner-provided defaults/i,
+  );
+  assert.match(result.context, /Keep answers concise/);
+  assert.match(result.context, /Use headings by default/);
+});
+
+test("renders both complete customization documents before lower-priority evidence", async () => {
+  const requesterContent = `REQUESTER_START ${"r".repeat(1_850)} REQUESTER_END`;
+  const ownerContent = `OWNER_START ${"o".repeat(1_850)} OWNER_END`;
+  const store = createStore(async (url) => {
+    if (url.includes("/directives?")) {
+      const tags = new URL(url).searchParams.getAll("tags");
+      const source = tags.includes("sidekick:customization-source:requester")
+        ? "requester"
+        : "owner";
+      return jsonResponse({
+        items: [
+          directive({
+            id:
+              source === "requester"
+                ? "11111111-1111-4111-8111-111111111111"
+                : "22222222-2222-4222-8222-222222222222",
+            content: source === "requester" ? requesterContent : ownerContent,
+            tags: requesterMemoryTags({
+              bankId: BANK_ID,
+              requesterId: REQUESTER_ID,
+              source,
+              identityAliasKey: IDENTITY_ALIAS_KEY,
+            }),
+          }),
+        ],
+      });
+    }
+    return jsonResponse({ results: [] });
+  });
+
+  const result = await retrieve(store);
+
+  assert.match(result.context, /REQUESTER_END/);
+  assert.match(result.context, /OWNER_END/);
+});
+
+test("owner target retrieval reads only owner-authored defaults", async () => {
+  const requesterTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: TARGET_ID,
+    source: "requester",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const ownerTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: TARGET_ID,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const directiveReads = [];
+  const store = createStore(async (url) => {
+    if (url.includes("/directives?")) {
+      const tags = new URL(url).searchParams.getAll("tags");
+      directiveReads.push(tags);
+      return jsonResponse({
+        items: tags.includes("sidekick:customization-source:owner")
+          ? [directive({ content: "Use owner headings.", tags: ownerTags })]
+          : [
+              directive({
+                content: "PRIVATE_REQUESTER_PREFERENCE",
+                tags: requesterTags,
+              }),
+            ],
+      });
+    }
+    return jsonResponse({ results: [] });
+  });
+
+  const targets = await store.retrieveTargets({
+    bankId: BANK_ID,
+    requesterIsOwner: true,
+    targets: [{ handle: "reply_author", id: TARGET_ID, label: "Bob" }],
+  });
+
+  assert.equal(directiveReads.length, 1);
+  assert(directiveReads[0].includes("sidekick:customization-source:owner"));
+  assert.deepEqual(targets[0].customizations, ["Use owner headings."]);
+  assert.doesNotMatch(JSON.stringify(targets), /PRIVATE_REQUESTER_PREFERENCE/);
 });
 
 test("loads only the exact requester directive and exact requester evidence", async () => {
@@ -140,20 +311,25 @@ test("loads only the exact requester directive and exact requester evidence", as
   assert.match(result.context, /Inferred requester context/i);
   assert.match(result.context, /Alice enjoys compact technical examples/);
   assert.match(result.context, /current request overrides/i);
-  assert.match(result.context, /saved customization overrides conflicting inferred/i);
+  assert.match(result.context, /owner-provided defaults override conflicting inferred/i);
   assert.match(result.context, /system.*safety.*tool/i);
   assert.doesNotMatch(result.context, /Global directive|Another requester|Bob enjoys/);
   assert.equal(result.customization.status, "available");
   assert.equal(result.evidenceRecall.status, "completed");
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 
-  const directiveCall = calls.find(({ url }) => url.includes("/directives?"));
+  const directiveCall = calls.find(({ url }) =>
+    new URL(url).searchParams
+      .getAll("tags")
+      .includes("sidekick:customization-source:requester"),
+  );
   const directiveUrl = new URL(directiveCall.url);
   assert.deepEqual(
     directiveUrl.searchParams.getAll("tags"),
     requesterMemoryTags({
       bankId: BANK_ID,
       requesterId: REQUESTER_ID,
+      source: "requester",
       identityAliasKey: IDENTITY_ALIAS_KEY,
     }),
   );
@@ -287,6 +463,7 @@ test("sets one host-bound customization document and preserves exact tags", asyn
     tags: requesterMemoryTags({
       bankId: BANK_ID,
       requesterId: REQUESTER_ID,
+      source: "requester",
       identityAliasKey: IDENTITY_ALIAS_KEY,
     }),
   });
@@ -607,11 +784,13 @@ test("lets an owner update one host-bound participant customization", async () =
   const requesterTags = requesterMemoryTags({
     bankId: BANK_ID,
     requesterId: REQUESTER_ID,
+    source: "requester",
     identityAliasKey: IDENTITY_ALIAS_KEY,
   });
   const targetTags = requesterMemoryTags({
     bankId: BANK_ID,
     requesterId: TARGET_ID,
+    source: "owner",
     identityAliasKey: IDENTITY_ALIAS_KEY,
   });
   let targetItems = [
@@ -748,23 +927,36 @@ test("shares one mutation budget across requester and participant tools", async 
 });
 
 test("paginates directive reads before deciding exact requester state", async () => {
-  const offsets = [];
+  const offsets = { requester: [], owner: [] };
   const unrelated = Array.from({ length: 100 }, (_, index) => ({
     id: `unrelated-${index}`,
     tags: [],
   }));
   const store = createStore(async (url) => {
     if (url.includes("/directives?")) {
-      const offset = Number(new URL(url).searchParams.get("offset"));
-      offsets.push(offset);
-      return jsonResponse({ items: offset === 0 ? unrelated : [directive()] });
+      const query = new URL(url).searchParams;
+      const source = query
+        .getAll("tags")
+        .find((tag) => tag.startsWith("sidekick:customization-source:"))
+        ?.split(":")
+        .at(-1);
+      const offset = Number(query.get("offset"));
+      offsets[source].push(offset);
+      return jsonResponse({
+        items:
+          source === "requester"
+            ? offset === 0
+              ? unrelated
+              : [directive()]
+            : [],
+      });
     }
     return jsonResponse({ results: [] });
   });
 
   const state = await retrieve(store);
 
-  assert.deepEqual(offsets, [0, 100]);
+  assert.deepEqual(offsets, { requester: [0, 100], owner: [0] });
   assert.deepEqual(state.customizations, [directive().content]);
   assert.equal(state.customization.status, "available");
 });
@@ -778,7 +970,12 @@ test("fails closed when directive pagination exceeds its bounded scan", async ()
   const store = createStore(async (url) => {
     if (url.includes("/directives?")) {
       directiveReads += 1;
-      return jsonResponse({ items: unrelated });
+      const tags = new URL(url).searchParams.getAll("tags");
+      return jsonResponse({
+        items: tags.includes("sidekick:customization-source:requester")
+          ? unrelated
+          : [],
+      });
     }
     return jsonResponse({ results: [] });
   });
@@ -787,7 +984,7 @@ test("fails closed when directive pagination exceeds its bounded scan", async ()
     prompt: "Remember my answer style: concise.",
   });
 
-  assert.equal(directiveReads, 10);
+  assert.equal(directiveReads, 11);
   assert.equal(state.customization.status, "unavailable");
   assert.deepEqual(store.createTools(state), []);
 });
