@@ -1,4 +1,5 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
+import { toFile } from "openai";
 import { Type } from "typebox";
 
 
@@ -128,6 +129,7 @@ export function createImageTools({
   client,
   model,
   onArtifact,
+  referenceImages = [],
   tryAcquire = () => () => {},
 }) {
   if (!client || !model) return [];
@@ -140,9 +142,9 @@ export function createImageTools({
       name: IMAGE_TOOL_NAME,
       label: "Generate image",
       description:
-        "Generate one original image from a detailed text prompt when the user asks to create, draw, or render an image. The host delivers the image directly to the chat. This tool creates new images; it does not search for existing images or edit an input image.",
+        "Generate one image from a detailed text prompt when the user asks to create, draw, render, or transform an image. When the user supplies an image, the host uses it as a reference for the new image. The host delivers the result directly to the chat. This tool does not search for existing images.",
       promptSnippet:
-        "Image creation is host-controlled. When the user asks for an original image, always call image_generate exactly once. Never return image bytes or an image URL directly. After success, the host delivers the image and ends the turn; no follow-up response is needed.",
+        "Image creation is host-controlled. When the user asks to create an image, including from a supplied reference image, always call image_generate exactly once. Never return image bytes or an image URL directly. After success, the host delivers the image and ends the turn; no follow-up response is needed.",
       parameters: Type.Object({
         prompt: Type.String({
           minLength: 1,
@@ -162,18 +164,30 @@ export function createImageTools({
         try {
           let response;
           try {
-            response = await client.images.generate(
-              {
-                model,
-                prompt,
-                n: 1,
-                size: "1024x1024",
-                quality: "medium",
-                output_format: "jpeg",
-                output_compression: 85,
-              },
-              { signal },
-            );
+            const imageRequest = {
+              model,
+              prompt,
+              n: 1,
+              size: "1024x1024",
+              quality: "medium",
+              output_format: "jpeg",
+              output_compression: 85,
+            };
+            if (referenceImages.length > 0) {
+              const uploads = await Promise.all(
+                referenceImages.map((image, index) =>
+                  toFile(image.data, `reference-image-${index + 1}.jpg`, {
+                    type: image.mimeType,
+                  }),
+                ),
+              );
+              response = await client.images.edit(
+                { ...imageRequest, image: uploads },
+                { signal },
+              );
+            } else {
+              response = await client.images.generate(imageRequest, { signal });
+            }
           } catch (error) {
             if (signal?.aborted) throw error;
             if (error?.code === "moderation_blocked") {
