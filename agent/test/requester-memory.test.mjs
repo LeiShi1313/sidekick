@@ -253,7 +253,71 @@ test("owner target retrieval reads only owner-authored defaults", async () => {
   assert.equal(directiveReads.length, 1);
   assert(directiveReads[0].includes("sidekick:customization-source:owner"));
   assert.deepEqual(targets[0].customizations, ["Use owner headings."]);
+  assert.match(targets[0].mergeContext, /reply_author/);
+  assert.match(targets[0].mergeContext, /Use owner headings/);
+  assert.match(
+    targets[0].mergeContext,
+    /complete merged owner-provided document/i,
+  );
+  assert.doesNotMatch(targets[0].mergeContext, new RegExp(TARGET_ID));
   assert.doesNotMatch(JSON.stringify(targets), /PRIVATE_REQUESTER_PREFERENCE/);
+});
+
+test("clears requester customization without clearing owner defaults", async () => {
+  const requesterTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: REQUESTER_ID,
+    source: "requester",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const ownerTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: REQUESTER_ID,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  let requesterItems = [directive({ tags: requesterTags })];
+  const ownerItems = [
+    directive({
+      id: "22222222-2222-4222-8222-222222222222",
+      content: "Use headings by default.",
+      tags: ownerTags,
+    }),
+  ];
+  const deletions = [];
+  const store = createStore(async (url, options = {}) => {
+    if (url.includes("/directives?")) {
+      const tags = new URL(url).searchParams.getAll("tags");
+      return jsonResponse({
+        items: tags.includes("sidekick:customization-source:requester")
+          ? requesterItems
+          : ownerItems,
+      });
+    }
+    if (options.method === "DELETE") {
+      deletions.push(url);
+      requesterItems = [];
+      return jsonResponse({});
+    }
+    if (url.endsWith("/memories/recall")) return jsonResponse({ results: [] });
+    throw new Error(`unexpected request ${options.method ?? "GET"} ${url}`);
+  });
+  const state = await retrieve(store, {
+    prompt: "Clear all preferences I saved.",
+  });
+  const requesterTool = store
+    .createTools(state)
+    .find(({ name }) => name === REQUESTER_MEMORY_TOOL_NAME);
+
+  const result = await requesterTool.execute("call-clear-requester", {
+    operation: "clear",
+  });
+
+  assert.equal(result.details.cleared, true);
+  assert.deepEqual(requesterItems, []);
+  assert.equal(ownerItems.length, 1);
+  assert.equal(deletions.length, 1);
+  assert.match(deletions[0], /11111111-1111-4111-8111-111111111111$/);
 });
 
 test("loads only the exact requester directive and exact requester evidence", async () => {
