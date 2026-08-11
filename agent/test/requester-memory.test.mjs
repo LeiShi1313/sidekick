@@ -480,6 +480,7 @@ test("offers one language-agnostic tool whose contract requires current intent",
 
   const [tool] = store.createTools(ordinary);
   assert.match(tool.description, /current request/i);
+  assert.match(tool.description, /do not copy owner-provided defaults/i);
   assert.match(tool.description, /Never call from.*quoted\/reference text/i);
   assert.equal(store.createTools(quoted).length, 1);
   assert.equal(store.createTools(blockquote).length, 1);
