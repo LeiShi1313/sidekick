@@ -46,6 +46,11 @@ _TELEGRAM_MARKDOWN_DELIMITERS = {
 }
 
 _COLLAPSE_AFTER_CHARS = 700
+_COLLAPSED_CODE_MARKER = "ˋ"
+_COLLAPSE_INCOMPATIBLE_ENTITIES = (
+    telegram_types.MessageEntityCode,
+    telegram_types.MessageEntityPre,
+)
 _TELEGRAM_SEND_REJECTIONS = (
     ValueError,
     BadRequestError,
@@ -535,10 +540,18 @@ class TelegramChatTransport:
             rendered, entities = _parse_agent_markdown(snapshot.text)
             if not rendered.strip():
                 return
-            if (
+            should_collapse = (
                 len(rendered) > _COLLAPSE_AFTER_CHARS
                 or rendered.count("\n") >= _COLLAPSE_AFTER_NEWLINES
-            ):
+            )
+            if should_collapse:
+                if any(
+                    isinstance(entity, _COLLAPSE_INCOMPATIBLE_ENTITIES)
+                    for entity in entities
+                ):
+                    rendered, entities = _parse_agent_markdown(
+                        snapshot.text.replace("`", _COLLAPSED_CODE_MARKER)
+                    )
                 entities.insert(
                     0,
                     telegram_types.MessageEntityBlockquote(

@@ -1753,6 +1753,50 @@ async def test_long_telegram_answer_is_collapsed_with_existing_formatting():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code_markdown", "literal_code"),
+    [
+        ("Use `inline code` carefully.\n", "Use ˋinline codeˋ carefully."),
+        ("```\nexample code\n```\n", "ˋˋˋ\nexample code\nˋˋˋ"),
+    ],
+)
+async def test_collapsed_telegram_answer_literalizes_code_markers(
+    code_markdown,
+    literal_code,
+):
+    formatted = "**Result**\n" + code_markdown + ("Detailed explanation. " * 40)
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai explain this")
+
+    await responder.answer(trigger, make_request("explain this"))
+
+    answer = trigger.replies[0]
+    entities = answer.edit_calls[-1][1]["formatting_entities"]
+    assert literal_code in answer.text
+    assert any(
+        isinstance(entity, telegram_types.MessageEntityBlockquote)
+        and entity.collapsed is True
+        and entity.offset == 0
+        and entity.length == len(answer.text.encode("utf-16-le")) // 2
+        for entity in entities
+    )
+    assert any(
+        isinstance(entity, telegram_types.MessageEntityBold)
+        for entity in entities
+    )
+    assert not any(
+        isinstance(
+            entity,
+            (
+                telegram_types.MessageEntityCode,
+                telegram_types.MessageEntityPre,
+            ),
+        )
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
 async def test_multiline_telegram_answer_is_collapsed_before_character_limit():
     formatted = "\n".join(f"Line {index}" for index in range(11))
     responder = make_telegram_responder(FakeGateway([formatted]))
