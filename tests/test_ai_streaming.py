@@ -1753,6 +1753,60 @@ async def test_long_telegram_answer_is_collapsed_with_existing_formatting():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("formatted", "nested_entity_type"),
+    [
+        (
+            "Use `inline code` carefully. " + ("Detailed explanation. " * 40),
+            telegram_types.MessageEntityCode,
+        ),
+        (
+            "```\nexample code\n```\n" + ("Detailed explanation. " * 40),
+            telegram_types.MessageEntityPre,
+        ),
+    ],
+)
+async def test_long_telegram_answer_with_code_is_not_collapsed(
+    formatted,
+    nested_entity_type,
+):
+    responder = make_telegram_responder(FakeGateway([formatted]))
+    trigger = FakeMessage("/ai explain this")
+
+    await responder.answer(trigger, make_request("explain this"))
+
+    entities = trigger.replies[0].edit_calls[-1][1]["formatting_entities"]
+    assert any(isinstance(entity, nested_entity_type) for entity in entities)
+    assert not any(
+        isinstance(entity, telegram_types.MessageEntityBlockquote)
+        for entity in entities
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_telegram_blockquote_is_not_wrapped_in_another(
+    monkeypatch,
+):
+    rendered = "Detailed explanation. " * 40
+    existing_quote = telegram_types.MessageEntityBlockquote(
+        offset=0,
+        length=len(rendered),
+        collapsed=False,
+    )
+    monkeypatch.setattr(
+        "sidekick.telegram.ai_transport._parse_agent_markdown",
+        lambda _: (rendered, [existing_quote]),
+    )
+    responder = make_telegram_responder(FakeGateway([rendered]))
+    trigger = FakeMessage("/ai explain this")
+
+    await responder.answer(trigger, make_request("explain this"))
+
+    entities = trigger.replies[0].edit_calls[-1][1]["formatting_entities"]
+    assert entities == [existing_quote]
+
+
+@pytest.mark.asyncio
 async def test_multiline_telegram_answer_is_collapsed_before_character_limit():
     formatted = "\n".join(f"Line {index}" for index in range(11))
     responder = make_telegram_responder(FakeGateway([formatted]))
