@@ -735,6 +735,31 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     await acceptedLegacyMemory.text();
     assert.deepEqual(received.memory, memory);
 
+    const legacyOwnerMemory = {
+      ...legacyMemory,
+      requesterIsOwner: true,
+      grantedBankIds: [],
+    };
+    const acceptedLegacyOwnerMemory = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        runId: "17171717-1717-4717-8717-171717171717",
+        toolPolicy: "none",
+        memory: legacyOwnerMemory,
+      }),
+    });
+    assert.equal(acceptedLegacyOwnerMemory.status, 200);
+    await acceptedLegacyOwnerMemory.text();
+    assert.deepEqual(received.memory, {
+      ...legacyOwnerMemory,
+      customizationTargets: [],
+    });
+
     const ownerMemory = {
       ...memory,
       requesterIsOwner: true,
