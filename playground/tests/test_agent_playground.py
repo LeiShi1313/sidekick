@@ -681,6 +681,7 @@ async def test_agent_run_accepts_proxy_origin_and_streams_pi_events():
             "primaryBankId": "chat:engineering",
             "requesterIsOwner": True,
             "grantedBankIds": [],
+            "customizationTargets": [],
             "participants": [],
         }
         assert pi_request["identity"] == {
