@@ -610,7 +610,11 @@ function principalAllowsRun(principal, run) {
     principal.scopePrefix !== null &&
     (run.identity.anchors.some(
       ({ id }) => !id.startsWith(principal.scopePrefix),
-    ) || !run.identity.requester.id.startsWith(principal.scopePrefix))
+    ) ||
+      !run.identity.requester.id.startsWith(principal.scopePrefix) ||
+      run.memory?.customizationTargets.some(
+        ({ id }) => !id.startsWith(principal.scopePrefix),
+      ))
   ) {
     return false;
   }

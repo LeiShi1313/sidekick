@@ -357,6 +357,32 @@ test("restricts a WeChat credential to its exact connector account", async () =>
     assert.equal(own.status, 200);
     await own.text();
 
+    const crossAccountTargetRequest = requestFor(
+      "wxid_host",
+      "32323232-3232-4232-8232-323232323232",
+    );
+    crossAccountTargetRequest.toolPolicy = "owner";
+    crossAccountTargetRequest.identity.requesterCanCustomize = true;
+    crossAccountTargetRequest.memory = {
+      primaryBankId: crossAccountTargetRequest.origin.scopeId,
+      requesterIsOwner: true,
+      grantedBankIds: [],
+      customizationTargets: [
+        {
+          handle: "reply_author",
+          id: "wechat:account:wxid_peer:user:bob",
+          label: "Bob",
+        },
+      ],
+      participants: [],
+    };
+    const crossAccountTarget = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(crossAccountTargetRequest),
+    });
+    assert.equal(crossAccountTarget.status, 403);
+
     const peer = await fetch(`${app.baseUrl}/v1/runs`, {
       method: "POST",
       headers,
