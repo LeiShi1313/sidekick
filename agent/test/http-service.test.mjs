@@ -715,6 +715,34 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     await acceptedOwnerTarget.text();
     assert.deepEqual(received.memory, ownerMemory);
 
+    for (const invalidOwnerRequest of [
+      {
+        ...validRun,
+        runId: "14141414-1414-4414-8414-141414141414",
+        memory: ownerMemory,
+      },
+      {
+        ...validRun,
+        runId: "15151515-1515-4515-8515-151515151515",
+        toolPolicy: "owner",
+        identity: {
+          ...validRun.identity,
+          requesterCanCustomize: false,
+        },
+        memory: ownerMemory,
+      },
+    ]) {
+      const rejectedOwnerAuthority = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify(invalidOwnerRequest),
+      });
+      assert.equal(rejectedOwnerAuthority.status, 400);
+    }
+
     for (const invalidMemory of [
       {
         ...memory,

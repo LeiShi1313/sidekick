@@ -336,6 +336,8 @@ export function validateRunRequest(value) {
     if (
       typeof supplied.requesterIsOwner !== "boolean" ||
       grantedBankIds === null ||
+      (supplied.requesterIsOwner &&
+        (value.toolPolicy !== "owner" || !identity.requesterCanCustomize)) ||
       (supplied.requesterIsOwner && grantedBankIds.length > 0) ||
       (!supplied.requesterIsOwner && supplied.customizationTargets.length > 0)
     ) {

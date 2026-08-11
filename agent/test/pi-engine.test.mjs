@@ -1054,6 +1054,20 @@ test("exposes participant customization only to an owner with a host target", as
         memory: memoryTarget({ customizationTargets }),
       }),
     );
+    await collect(
+      app.engine,
+      request("55555555-5555-4555-8555-555555555555", {
+        memory: memoryTarget({ requesterIsOwner: true, customizationTargets }),
+      }),
+    );
+    await collect(
+      app.engine,
+      request("56565656-5656-4656-8656-565656565656", {
+        toolPolicy: "owner",
+        identity: requestIdentity("chat:user:alice", "Alice", false),
+        memory: memoryTarget({ requesterIsOwner: true, customizationTargets }),
+      }),
+    );
   } finally {
     await app.close();
   }
