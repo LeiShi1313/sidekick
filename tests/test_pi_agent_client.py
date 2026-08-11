@@ -163,6 +163,7 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
             "primaryBankId": "telegram:chat:-1001",
             "requesterIsOwner": False,
             "grantedBankIds": ["qq:group:686743769"],
+            "customizationTargets": [],
             "participants": [
                 {
                     "id": "telegram:user:41",
