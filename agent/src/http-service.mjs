@@ -19,6 +19,8 @@ const MAX_ATTACHMENT_TEXT_CHARS = 50_000;
 const MAX_MEMORY_ANCHORS = 64;
 const MAX_BANK_GRANTS = 64;
 const MAX_PARTICIPANTS = 16;
+const CUSTOMIZATION_TARGET_HANDLE_RE =
+  /^(?:reply_author|direct_chat_participant|mention_[1-9][0-9]*)$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const MIME_RE = /^[a-z0-9][a-z0-9.+-]{0,63}\/[a-z0-9][a-z0-9.+-]{0,127}$/;
@@ -312,6 +314,7 @@ export function validateRunRequest(value) {
           "primaryBankId",
           "requesterIsOwner",
           "grantedBankIds",
+          "customizationTargets",
           "participants",
           "query",
         ]),
@@ -322,6 +325,8 @@ export function validateRunRequest(value) {
         supplied.query === null ||
         isBoundedString(supplied.query, 1, 8_000)
       ) ||
+      !Array.isArray(supplied.customizationTargets) ||
+      supplied.customizationTargets.length > MAX_PARTICIPANTS ||
       !Array.isArray(supplied.participants) ||
       supplied.participants.length > MAX_PARTICIPANTS
     ) {
@@ -331,9 +336,41 @@ export function validateRunRequest(value) {
     if (
       typeof supplied.requesterIsOwner !== "boolean" ||
       grantedBankIds === null ||
-      (supplied.requesterIsOwner && grantedBankIds.length > 0)
+      (supplied.requesterIsOwner && grantedBankIds.length > 0) ||
+      (!supplied.requesterIsOwner && supplied.customizationTargets.length > 0)
     ) {
       return null;
+    }
+    const customizationTargets = [];
+    const customizationTargetHandles = new Set();
+    const customizationTargetIds = new Set();
+    for (const target of supplied.customizationTargets) {
+      if (
+        !target ||
+        typeof target !== "object" ||
+        Array.isArray(target) ||
+        !hasOnlyKeys(target, new Set(["handle", "id", "label"])) ||
+        !isBoundedString(target.handle, 1, 64) ||
+        !CUSTOMIZATION_TARGET_HANDLE_RE.test(target.handle) ||
+        customizationTargetHandles.has(target.handle) ||
+        !isRequesterCustomizationPrincipal(target.id) ||
+        target.id === identity.requester.id ||
+        customizationTargetIds.has(target.id) ||
+        !(
+          target.label === null ||
+          target.label === undefined ||
+          isBoundedString(target.label, 1, 256)
+        )
+      ) {
+        return null;
+      }
+      customizationTargetHandles.add(target.handle);
+      customizationTargetIds.add(target.id);
+      customizationTargets.push({
+        handle: target.handle,
+        id: target.id,
+        label: target.label ?? null,
+      });
     }
     const participants = [];
     const participantIds = new Set();
@@ -373,6 +410,7 @@ export function validateRunRequest(value) {
       primaryBankId: supplied.primaryBankId,
       requesterIsOwner: supplied.requesterIsOwner,
       grantedBankIds,
+      customizationTargets,
       participants,
       ...(supplied.query ? { query: supplied.query } : {}),
     };

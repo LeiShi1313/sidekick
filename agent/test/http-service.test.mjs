@@ -656,6 +656,7 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     primaryBankId: "telegram:chat:-1001",
     requesterIsOwner: false,
     grantedBankIds: ["qq:group:686743769"],
+    customizationTargets: [],
     participants: [
       {
         id: "telegram:user:41",
@@ -684,6 +685,82 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     await accepted.text();
     assert.deepEqual(received.memory, memory);
     assert.equal(received.includeMemorySnapshot, true);
+
+    const ownerMemory = {
+      ...memory,
+      requesterIsOwner: true,
+      grantedBankIds: [],
+      customizationTargets: [
+        {
+          handle: "reply_author",
+          id: "telegram:user:41",
+          label: "Bob",
+        },
+      ],
+    };
+    const acceptedOwnerTarget = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        runId: "12121212-1212-4212-8212-121212121212",
+        toolPolicy: "owner",
+        memory: ownerMemory,
+      }),
+    });
+    assert.equal(acceptedOwnerTarget.status, 200);
+    await acceptedOwnerTarget.text();
+    assert.deepEqual(received.memory, ownerMemory);
+
+    for (const invalidMemory of [
+      {
+        ...memory,
+        customizationTargets: ownerMemory.customizationTargets,
+      },
+      {
+        ...ownerMemory,
+        customizationTargets: [
+          {
+            handle: "telegram:user:41",
+            id: "telegram:user:41",
+            label: "Bob",
+          },
+        ],
+      },
+      {
+        ...ownerMemory,
+        customizationTargets: [
+          {
+            handle: "reply_author",
+            id: validRun.identity.requester.id,
+            label: "Alice",
+          },
+        ],
+      },
+      {
+        primaryBankId: memory.primaryBankId,
+        requesterIsOwner: false,
+        grantedBankIds: memory.grantedBankIds,
+        participants: memory.participants,
+      },
+    ]) {
+      const rejectedTarget = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify({
+          ...validRun,
+          runId: "13131313-1313-4313-8313-131313131313",
+          memory: invalidMemory,
+        }),
+      });
+      assert.equal(rejectedTarget.status, 400);
+    }
 
     const rejectedSnapshotFlag = await fetch(`${app.baseUrl}/v1/runs`, {
       method: "POST",
