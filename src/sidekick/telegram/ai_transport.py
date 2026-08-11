@@ -535,7 +535,18 @@ class TelegramChatTransport:
             rendered, entities = _parse_agent_markdown(snapshot.text)
             if not rendered.strip():
                 return
-            if (
+            can_auto_collapse = not any(
+                isinstance(
+                    entity,
+                    (
+                        telegram_types.MessageEntityBlockquote,
+                        telegram_types.MessageEntityCode,
+                        telegram_types.MessageEntityPre,
+                    ),
+                )
+                for entity in entities
+            )
+            if can_auto_collapse and (
                 len(rendered) > _COLLAPSE_AFTER_CHARS
                 or rendered.count("\n") >= _COLLAPSE_AFTER_NEWLINES
             ):
