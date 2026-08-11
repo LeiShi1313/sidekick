@@ -712,6 +712,29 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     assert.deepEqual(received.memory, memory);
     assert.equal(received.includeMemorySnapshot, true);
 
+    const legacyMemory = {
+      primaryBankId: memory.primaryBankId,
+      requesterIsOwner: memory.requesterIsOwner,
+      grantedBankIds: memory.grantedBankIds,
+      participants: memory.participants,
+      query: memory.query,
+    };
+    const acceptedLegacyMemory = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        runId: "16161616-1616-4616-8616-161616161616",
+        memory: legacyMemory,
+      }),
+    });
+    assert.equal(acceptedLegacyMemory.status, 200);
+    await acceptedLegacyMemory.text();
+    assert.deepEqual(received.memory, memory);
+
     const ownerMemory = {
       ...memory,
       requesterIsOwner: true,
@@ -772,6 +795,10 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     for (const invalidMemory of [
       {
         ...memory,
+        customizationTargets: null,
+      },
+      {
+        ...memory,
         customizationTargets: ownerMemory.customizationTargets,
       },
       {
@@ -793,12 +820,6 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
             label: "Alice",
           },
         ],
-      },
-      {
-        primaryBankId: memory.primaryBankId,
-        requesterIsOwner: false,
-        grantedBankIds: memory.grantedBankIds,
-        participants: memory.participants,
       },
     ]) {
       const rejectedTarget = await fetch(`${app.baseUrl}/v1/runs`, {

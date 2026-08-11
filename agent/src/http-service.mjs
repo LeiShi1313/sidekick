@@ -304,6 +304,10 @@ export function validateRunRequest(value) {
   let memory;
   if (value.memory !== undefined) {
     const supplied = value.memory;
+    const suppliedCustomizationTargets =
+      supplied?.customizationTargets === undefined
+        ? []
+        : supplied.customizationTargets;
     if (
       !supplied ||
       typeof supplied !== "object" ||
@@ -325,8 +329,8 @@ export function validateRunRequest(value) {
         supplied.query === null ||
         isBoundedString(supplied.query, 1, 8_000)
       ) ||
-      !Array.isArray(supplied.customizationTargets) ||
-      supplied.customizationTargets.length > MAX_PARTICIPANTS ||
+      !Array.isArray(suppliedCustomizationTargets) ||
+      suppliedCustomizationTargets.length > MAX_PARTICIPANTS ||
       !Array.isArray(supplied.participants) ||
       supplied.participants.length > MAX_PARTICIPANTS
     ) {
@@ -339,14 +343,14 @@ export function validateRunRequest(value) {
       (supplied.requesterIsOwner &&
         (value.toolPolicy !== "owner" || !identity.requesterCanCustomize)) ||
       (supplied.requesterIsOwner && grantedBankIds.length > 0) ||
-      (!supplied.requesterIsOwner && supplied.customizationTargets.length > 0)
+      (!supplied.requesterIsOwner && suppliedCustomizationTargets.length > 0)
     ) {
       return null;
     }
     const customizationTargets = [];
     const customizationTargetHandles = new Set();
     const customizationTargetIds = new Set();
-    for (const target of supplied.customizationTargets) {
+    for (const target of suppliedCustomizationTargets) {
       if (
         !target ||
         typeof target !== "object" ||

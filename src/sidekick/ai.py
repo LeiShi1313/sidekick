@@ -316,18 +316,10 @@ class PiAgentGateway:
                 for image in request.images
             ]
         if request.memory is not None:
-            payload["memory"] = {
+            memory = {
                 "primaryBankId": request.memory.primary_bank_id,
                 "requesterIsOwner": request.memory.requester_is_owner,
                 "grantedBankIds": list(request.memory.granted_bank_ids),
-                "customizationTargets": [
-                    {
-                        "handle": target.handle,
-                        "id": target.identity,
-                        "label": target.label,
-                    }
-                    for target in request.memory.customization_targets
-                ],
                 "participants": [
                     {
                         "id": participant.identity,
@@ -338,6 +330,16 @@ class PiAgentGateway:
                     for participant in request.memory.participants
                 ],
             }
+            if request.memory.customization_targets:
+                memory["customizationTargets"] = [
+                    {
+                        "handle": target.handle,
+                        "id": target.identity,
+                        "label": target.label,
+                    }
+                    for target in request.memory.customization_targets
+                ]
+            payload["memory"] = memory
             if request.memory.query:
                 payload["memory"]["query"] = request.memory.query
         session = self._get_session()

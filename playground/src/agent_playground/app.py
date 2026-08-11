@@ -318,7 +318,6 @@ class PlaygroundData:
                 "primaryBankId": bank_id,
                 "requesterIsOwner": True,
                 "grantedBankIds": [],
-                "customizationTargets": [],
                 "participants": [],
             }
             pi_request["includeMemorySnapshot"] = True
