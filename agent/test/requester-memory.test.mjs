@@ -177,8 +177,8 @@ test("loads requester customization above owner defaults without mixing storage"
 });
 
 test("renders both complete customization documents before lower-priority evidence", async () => {
-  const requesterContent = `REQUESTER_START ${"r".repeat(1_850)} REQUESTER_END`;
-  const ownerContent = `OWNER_START ${"o".repeat(1_850)} OWNER_END`;
+  const requesterContent = `REQUESTER_START ${"&".repeat(1_900)} REQUESTER_END`;
+  const ownerContent = `OWNER_START ${"&".repeat(1_900)} OWNER_END`;
   const store = createStore(async (url) => {
     if (url.includes("/directives?")) {
       const tags = new URL(url).searchParams.getAll("tags");
@@ -203,13 +203,50 @@ test("renders both complete customization documents before lower-priority eviden
         ],
       });
     }
-    return jsonResponse({ results: [] });
+    return jsonResponse({
+      results: [
+        {
+          id: "memory-long-evidence",
+          text: `EVIDENCE_START ${"&".repeat(1_900)} EVIDENCE_END`,
+          type: "observation",
+          entities: [REQUESTER_ID],
+        },
+      ],
+    });
   });
 
   const result = await retrieve(store);
 
   assert.match(result.context, /REQUESTER_END/);
   assert.match(result.context, /OWNER_END/);
+  assert.match(result.context, /EVIDENCE_START/);
+  assert.doesNotMatch(result.context, /EVIDENCE_END/);
+});
+
+test("renders a complete escaped owner document in target merge context", async () => {
+  const ownerContent = `OWNER_START ${"&".repeat(1_900)} OWNER_END`;
+  const ownerTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: TARGET_ID,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const store = createStore(async (url) =>
+    jsonResponse({
+      items: url.includes("/directives?")
+        ? [directive({ content: ownerContent, tags: ownerTags })]
+        : [],
+    }),
+  );
+
+  const [target] = await store.retrieveTargets({
+    bankId: BANK_ID,
+    requesterIsOwner: true,
+    targets: [{ handle: "reply_author", id: TARGET_ID, label: "Bob" }],
+  });
+
+  assert.match(target.mergeContext, /OWNER_START/);
+  assert.match(target.mergeContext, /OWNER_END/);
 });
 
 test("owner target retrieval reads only owner-authored defaults", async () => {
@@ -928,6 +965,86 @@ test("lets an owner update one host-bound participant customization", async () =
     tags: targetTags,
   });
   assert.notDeepEqual(targetTags, requesterTags);
+});
+
+test("clears owner defaults without clearing target requester customization", async () => {
+  const requesterDirectiveId = "33333333-3333-4333-8333-333333333333";
+  const ownerDirectiveId = "22222222-2222-4222-8222-222222222222";
+  const targetRequesterTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: TARGET_ID,
+    source: "requester",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const targetOwnerTags = requesterMemoryTags({
+    bankId: BANK_ID,
+    requesterId: TARGET_ID,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  let targetRequesterItems = [
+    directive({
+      id: requesterDirectiveId,
+      content: "Keep my answers detailed.",
+      tags: targetRequesterTags,
+    }),
+  ];
+  let targetOwnerItems = [
+    directive({
+      id: ownerDirectiveId,
+      content: "Use headings by default.",
+      tags: targetOwnerTags,
+    }),
+  ];
+  const deletions = [];
+  const store = createStore(async (url, options = {}) => {
+    if (url.includes("/directives?")) {
+      const tags = new URL(url).searchParams.getAll("tags");
+      const hasExactTags = (expected) =>
+        tags.length === expected.length &&
+        expected.every((tag) => tags.includes(tag));
+      let items = [];
+      if (hasExactTags(targetRequesterTags)) items = targetRequesterItems;
+      if (hasExactTags(targetOwnerTags)) items = targetOwnerItems;
+      return jsonResponse({ items });
+    }
+    if (options.method === "DELETE") {
+      deletions.push(url);
+      if (url.endsWith(requesterDirectiveId)) {
+        targetRequesterItems = [];
+      } else if (url.endsWith(ownerDirectiveId)) {
+        targetOwnerItems = [];
+      }
+      return jsonResponse({});
+    }
+    if (url.endsWith("/memories/recall")) return jsonResponse({ results: [] });
+    throw new Error(`unexpected request ${options.method ?? "GET"} ${url}`);
+  });
+  const requesterMemory = await retrieve(store, {
+    prompt: "Clear the answer defaults I set for the reply author.",
+  });
+  const customizationTargets = await store.retrieveTargets({
+    bankId: BANK_ID,
+    requesterIsOwner: true,
+    targets: [{ handle: "reply_author", id: TARGET_ID, label: "Bob" }],
+  });
+  const tool = store
+    .createTools(requesterMemory, {
+      requesterIsOwner: true,
+      customizationTargets,
+    })
+    .find(({ name }) => name === PARTICIPANT_MEMORY_TOOL_NAME);
+
+  const result = await tool.execute("call-clear-owner-defaults", {
+    target: "reply_author",
+    operation: "clear",
+  });
+
+  assert.equal(result.details.cleared, true);
+  assert.equal(targetRequesterItems.length, 1);
+  assert.deepEqual(targetOwnerItems, []);
+  assert.equal(deletions.length, 1);
+  assert.match(deletions[0], /22222222-2222-4222-8222-222222222222$/);
 });
 
 test("does not issue participant customization without owner attestation", async () => {
