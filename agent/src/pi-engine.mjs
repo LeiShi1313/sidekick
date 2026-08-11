@@ -167,6 +167,7 @@ function disabledRequesterMemory() {
     evidence: [],
     context: "",
     customization: { status: "disabled" },
+    ownerCustomization: { status: "disabled" },
     evidenceRecall: {
       status: "disabled",
       attemptedCount: 0,
@@ -927,6 +928,12 @@ export class PiEngine {
         recalled.access,
         requesterMemory.references,
       );
+      const renderedRequesterContext = [
+        requesterMemory.context,
+        ...customizationTargets.map(({ mergeContext }) => mergeContext),
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       await record("memory.context", {
         primaryBankId: request.memory?.primaryBankId ?? null,
         queries: memoryQueries,
@@ -935,10 +942,11 @@ export class PiEngine {
         customizations: requesterMemory.customizations,
         requesterMemory: {
           customizationStatus: requesterMemory.customization.status,
+          ownerCustomizationStatus: requesterMemory.ownerCustomization.status,
           evidenceStatus: requesterMemory.evidenceRecall.status,
         },
         renderedContext: recalled.context,
-        renderedRequesterContext: requesterMemory.context,
+        renderedRequesterContext,
         renderedDirectoryContext: recalled.directoryContext,
         access: memoryAccess,
       });
@@ -967,6 +975,7 @@ export class PiEngine {
             customizations: requesterMemory.customizations,
             evidence: requesterMemory.evidence,
             customizationStatus: requesterMemory.customization.status,
+            ownerCustomizationStatus: requesterMemory.ownerCustomization.status,
             evidenceStatus: requesterMemory.evidenceRecall.status,
           },
           directory: recalled.directory,
@@ -976,8 +985,8 @@ export class PiEngine {
         .filter(Boolean)
         .join("\n\n");
       const enrichedContexts = [
-        ...(requesterMemory.context
-          ? [{ kind: "requester", text: requesterMemory.context }]
+        ...(renderedRequesterContext
+          ? [{ kind: "requester", text: renderedRequesterContext }]
           : []),
         ...(memoryContext
           ? [

@@ -135,10 +135,14 @@ function memoryContextMetadata(value) {
       : [])
       .map((customization) => safeString(customization, 2_000))
       .filter((customization) => customization !== null)
-      .slice(0, 1),
+      .slice(0, 2),
     requesterMemory: {
       customizationStatus: safeString(
         requesterMemory.customizationStatus,
+        64,
+      ),
+      ownerCustomizationStatus: safeString(
+        requesterMemory.ownerCustomizationStatus,
         64,
       ),
       evidenceStatus: safeString(requesterMemory.evidenceStatus, 64),

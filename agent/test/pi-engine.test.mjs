@@ -709,8 +709,9 @@ test("regenerates requester customization for each participant in a shared sessi
       requesterMemoryTags({
         bankId,
         requesterId,
+        source: "requester",
         identityAliasKey: IDENTITY_ALIAS_KEY,
-      })[1],
+      })[2],
       requesterId,
     ]),
   );
@@ -754,6 +755,7 @@ test("regenerates requester customization for each participant in a shared sessi
                       tags: requesterMemoryTags({
                         bankId,
                         requesterId,
+                        source: "requester",
                         identityAliasKey: IDENTITY_ALIAS_KEY,
                       }),
                     },
@@ -825,6 +827,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
                   tags: requesterMemoryTags({
                     bankId: "workspace:engineering",
                     requesterId: "chat:user:alice",
+                    source: "requester",
                     identityAliasKey: IDENTITY_ALIAS_KEY,
                   }),
                 },
@@ -934,6 +937,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
           },
         ],
         customizationStatus: "available",
+        ownerCustomizationStatus: "available",
         evidenceStatus: "completed",
       },
       directory: {
@@ -943,7 +947,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       },
     });
     assert.equal(events.at(-1).answer, "Richard favors lower prices.");
-    assert.equal(recalls.length, 5);
+    assert.equal(recalls.length, 6);
     assert(
       recalls.some(({ body }) => body?.query.includes("Identity anchors")),
     );
@@ -1071,6 +1075,149 @@ test("exposes participant customization only to an owner with a host target", as
   } finally {
     await app.close();
   }
+});
+
+test("gives the owner model only prior owner defaults for a merged target update", async () => {
+  const targetId = "chat:user:bob";
+  const bankId = "workspace:engineering";
+  const targetOwnerTags = requesterMemoryTags({
+    bankId,
+    requesterId: targetId,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const targetRequesterTags = requesterMemoryTags({
+    bankId,
+    requesterId: targetId,
+    source: "requester",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const mergedContent = "OWNER_TARGET_DEFAULT. USE_CONCISE_EXAMPLES.";
+  let targetOwnerContent = "OWNER_TARGET_DEFAULT";
+  const directiveReads = [];
+  const directiveWrites = [];
+  const app = await fixture(
+    (body, response, requestNumber) => {
+      const messages = JSON.stringify(body.messages);
+      const participantTool = body.tools
+        .map((tool) => tool.function)
+        .find(({ name }) => name === "memory_update_participant");
+
+      assert(participantTool);
+      assert.match(messages, /OWNER_TARGET_DEFAULT/);
+      assert.match(messages, /complete merged owner-provided document/i);
+      assert.doesNotMatch(messages, /PRIVATE_TARGET_REQUESTER_CUSTOMIZATION/);
+      assert.match(
+        participantTool.description,
+        /preserve.*owner-provided defaults/i,
+      );
+      assert.doesNotMatch(participantTool.description, /complete replacement/i);
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-merge-owner-customization",
+          name: "memory_update_participant",
+          args: {
+            target: "reply_author",
+            operation: "set",
+            customization: mergedContent,
+          },
+        });
+        return;
+      }
+      assert.match(messages, /Participant customization was saved/);
+      sendText(response, "ack");
+    },
+    {
+      memoryUrl: "http://memory.internal:8888",
+      memoryFetch: async (url, options = {}) => {
+        if (options.method === "PATCH") {
+          const body = JSON.parse(options.body);
+          directiveWrites.push(body);
+          targetOwnerContent = body.content;
+          return new Response(
+            JSON.stringify({
+              id: "22222222-2222-4222-8222-222222222222",
+              bank_id: bankId,
+              ...body,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/directives?")) {
+          const tags = new URL(url).searchParams.getAll("tags");
+          directiveReads.push(tags);
+          const isTarget = tags.includes(targetOwnerTags[2]);
+          const source = tags[1];
+          if (isTarget && source === "sidekick:customization-source:owner") {
+            return new Response(
+              JSON.stringify({
+                items: [
+                  {
+                    id: "22222222-2222-4222-8222-222222222222",
+                    bank_id: bankId,
+                    name: "Sidekick requester customization",
+                    content: targetOwnerContent,
+                    priority: 0,
+                    is_active: true,
+                    tags: targetOwnerTags,
+                  },
+                ],
+              }),
+              { status: 200 },
+            );
+          }
+          if (isTarget && source === "sidekick:customization-source:requester") {
+            return new Response(
+              JSON.stringify({
+                items: [
+                  {
+                    id: "33333333-3333-4333-8333-333333333333",
+                    bank_id: bankId,
+                    name: "Sidekick requester customization",
+                    content: "PRIVATE_TARGET_REQUESTER_CUSTOMIZATION",
+                    priority: 0,
+                    is_active: true,
+                    tags: targetRequesterTags,
+                  },
+                ],
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({ items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      },
+    },
+  );
+  const customizationTargets = [
+    { handle: "reply_author", id: targetId, label: "Bob" },
+  ];
+  try {
+    const events = await collect(
+      app.engine,
+      request("57575757-5757-4757-8757-575757575757", {
+        prompt: "Also use concise examples when answering Bob from now on.",
+        toolPolicy: "owner",
+        memory: memoryTarget({ requesterIsOwner: true, customizationTargets }),
+      }),
+    );
+    assert.equal(events.at(-1).answer, "ack");
+  } finally {
+    await app.close();
+  }
+
+  assert.equal(
+    directiveReads.some(
+      (tags) =>
+        tags.includes(targetRequesterTags[2]) &&
+        tags.includes("sidekick:customization-source:requester"),
+    ),
+    false,
+  );
+  assert.equal(directiveWrites.length, 1);
+  assert.equal(directiveWrites[0].content, mergedContent);
+  assert.deepEqual(directiveWrites[0].tags, targetOwnerTags);
 });
 
 test("owner and delegated runs receive the same restricted tools", () => {
