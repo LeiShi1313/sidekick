@@ -82,6 +82,58 @@ test("generates one bounded JPEG without returning bytes to the model", async ()
 });
 
 
+test("generates from a host-bound reference image", async () => {
+  const calls = [];
+  const artifacts = [];
+  const client = {
+    images: {
+      async generate() {
+        assert.fail("text-only generation should not be used");
+      },
+      async edit(request) {
+        calls.push(request);
+        return { data: [{ b64_json: JPEG_BYTES.toString("base64") }] };
+      },
+    },
+  };
+  const [tool] = createImageTools({
+    client,
+    model: "gpt-image-2",
+    referenceImages: [{ mimeType: "image/jpeg", data: JPEG_BYTES }],
+    onArtifact: (toolCallId, artifact) => {
+      artifacts.push({ toolCallId, artifact });
+    },
+  });
+
+  assert.match(tool.description, /reference/i);
+  const result = await tool.execute("call-image-reference", {
+    prompt: "Connect the shoe while preserving the original design",
+  });
+
+  assert.equal(calls.length, 1);
+  const [{ image, ...request }] = calls;
+  assert.deepEqual(request, {
+    model: "gpt-image-2",
+    prompt: "Connect the shoe while preserving the original design",
+    n: 1,
+    size: "1024x1024",
+    quality: "medium",
+    output_format: "jpeg",
+    output_compression: 85,
+  });
+  const uploads = Array.isArray(image) ? image : [image];
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].name, "reference-image-1.jpg");
+  assert.equal(uploads[0].type, "image/jpeg");
+  assert.deepEqual(
+    Buffer.from(await uploads[0].arrayBuffer()),
+    JPEG_BYTES,
+  );
+  assert.equal(result.terminate, true);
+  assert.equal(artifacts.length, 1);
+});
+
+
 test("rejects malformed and oversized image responses", async () => {
   const malformed = fixture({ data: [{ b64_json: "not base64" }] });
   await assert.rejects(

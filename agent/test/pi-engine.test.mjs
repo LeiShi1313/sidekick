@@ -1110,6 +1110,65 @@ test("terminates after streaming generated image bytes without persisting them",
   }
 });
 
+test("binds a model input image to host-controlled image generation", async () => {
+  const referenceBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0x01, 0x02, 0x03, 0xff, 0xd9,
+  ]);
+  const outputBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0x04, 0x05, 0x06, 0xff, 0xd9,
+  ]);
+  const generationCalls = [];
+  const editCalls = [];
+  const imageClient = {
+    images: {
+      async generate(request) {
+        generationCalls.push(request);
+        return { data: [{ b64_json: outputBytes.toString("base64") }] };
+      },
+      async edit(request) {
+        editCalls.push(request);
+        return { data: [{ b64_json: outputBytes.toString("base64") }] };
+      },
+    },
+  };
+  const app = await fixture(
+    (_body, response) => {
+      sendToolCall(response, {
+        id: "call-image-reference",
+        name: "image_generate",
+        args: { prompt: "Connect the shoe while preserving its design" },
+      });
+    },
+    { imageModel: "gpt-image-2", imageClient },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("53535353-5353-4353-8353-535353535353", {
+        prompt: "Use the supplied image to connect the shoe",
+        images: [{ mimeType: "image/jpeg", data: referenceBytes }],
+      }),
+    );
+
+    assert.equal(generationCalls.length, 0);
+    assert.equal(editCalls.length, 1);
+    const uploads = Array.isArray(editCalls[0].image)
+      ? editCalls[0].image
+      : [editCalls[0].image];
+    assert.deepEqual(
+      Buffer.from(await uploads[0].arrayBuffer()),
+      referenceBytes,
+    );
+    assert.equal(
+      events.find((event) => event.type === "attachment").data,
+      outputBytes.toString("base64"),
+    );
+    assert.equal(events.at(-1).type, "run_completed");
+  } finally {
+    await app.close();
+  }
+});
+
 test("continues a session after a terminal image tool result", async () => {
   const encoded = Buffer.from([
     0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,

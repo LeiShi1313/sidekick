@@ -1026,6 +1026,7 @@ export class PiEngine {
       const imageTools = createImageTools({
         client: this.imageClient,
         model: this.config.imageModel,
+        referenceImages: request.images,
         onArtifact: (toolCallId, artifact) => {
           generatedArtifacts.set(toolCallId, artifact);
         },
