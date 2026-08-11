@@ -357,6 +357,32 @@ test("restricts a WeChat credential to its exact connector account", async () =>
     assert.equal(own.status, 200);
     await own.text();
 
+    const crossAccountTargetRequest = requestFor(
+      "wxid_host",
+      "32323232-3232-4232-8232-323232323232",
+    );
+    crossAccountTargetRequest.toolPolicy = "owner";
+    crossAccountTargetRequest.identity.requesterCanCustomize = true;
+    crossAccountTargetRequest.memory = {
+      primaryBankId: crossAccountTargetRequest.origin.scopeId,
+      requesterIsOwner: true,
+      grantedBankIds: [],
+      customizationTargets: [
+        {
+          handle: "reply_author",
+          id: "wechat:account:wxid_peer:user:bob",
+          label: "Bob",
+        },
+      ],
+      participants: [],
+    };
+    const crossAccountTarget = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(crossAccountTargetRequest),
+    });
+    assert.equal(crossAccountTarget.status, 403);
+
     const peer = await fetch(`${app.baseUrl}/v1/runs`, {
       method: "POST",
       headers,
@@ -656,6 +682,7 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     primaryBankId: "telegram:chat:-1001",
     requesterIsOwner: false,
     grantedBankIds: ["qq:group:686743769"],
+    customizationTargets: [],
     participants: [
       {
         id: "telegram:user:41",
@@ -684,6 +711,156 @@ test("accepts a bounded memory target and rejects scope injection", async () => 
     await accepted.text();
     assert.deepEqual(received.memory, memory);
     assert.equal(received.includeMemorySnapshot, true);
+
+    const legacyMemory = {
+      primaryBankId: memory.primaryBankId,
+      requesterIsOwner: memory.requesterIsOwner,
+      grantedBankIds: memory.grantedBankIds,
+      participants: memory.participants,
+      query: memory.query,
+    };
+    const acceptedLegacyMemory = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        runId: "16161616-1616-4616-8616-161616161616",
+        memory: legacyMemory,
+      }),
+    });
+    assert.equal(acceptedLegacyMemory.status, 200);
+    await acceptedLegacyMemory.text();
+    assert.deepEqual(received.memory, memory);
+
+    const legacyOwnerMemory = {
+      ...legacyMemory,
+      requesterIsOwner: true,
+      grantedBankIds: [],
+    };
+    const acceptedLegacyOwnerMemory = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        runId: "17171717-1717-4717-8717-171717171717",
+        toolPolicy: "none",
+        memory: legacyOwnerMemory,
+      }),
+    });
+    assert.equal(acceptedLegacyOwnerMemory.status, 200);
+    await acceptedLegacyOwnerMemory.text();
+    assert.deepEqual(received.memory, {
+      ...legacyOwnerMemory,
+      customizationTargets: [],
+    });
+
+    const ownerMemory = {
+      ...memory,
+      requesterIsOwner: true,
+      grantedBankIds: [],
+      customizationTargets: [
+        {
+          handle: "reply_author",
+          id: "telegram:user:41",
+          label: "Bob",
+        },
+      ],
+    };
+    const acceptedOwnerTarget = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify({
+        ...validRun,
+        runId: "12121212-1212-4212-8212-121212121212",
+        toolPolicy: "owner",
+        memory: ownerMemory,
+      }),
+    });
+    assert.equal(acceptedOwnerTarget.status, 200);
+    await acceptedOwnerTarget.text();
+    assert.deepEqual(received.memory, ownerMemory);
+
+    for (const invalidOwnerRequest of [
+      {
+        ...validRun,
+        runId: "14141414-1414-4414-8414-141414141414",
+        memory: ownerMemory,
+      },
+      {
+        ...validRun,
+        runId: "15151515-1515-4515-8515-151515151515",
+        toolPolicy: "owner",
+        identity: {
+          ...validRun.identity,
+          requesterCanCustomize: false,
+        },
+        memory: ownerMemory,
+      },
+    ]) {
+      const rejectedOwnerAuthority = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify(invalidOwnerRequest),
+      });
+      assert.equal(rejectedOwnerAuthority.status, 400);
+    }
+
+    for (const invalidMemory of [
+      {
+        ...memory,
+        customizationTargets: null,
+      },
+      {
+        ...memory,
+        customizationTargets: ownerMemory.customizationTargets,
+      },
+      {
+        ...ownerMemory,
+        customizationTargets: [
+          {
+            handle: "telegram:user:41",
+            id: "telegram:user:41",
+            label: "Bob",
+          },
+        ],
+      },
+      {
+        ...ownerMemory,
+        customizationTargets: [
+          {
+            handle: "reply_author",
+            id: validRun.identity.requester.id,
+            label: "Alice",
+          },
+        ],
+      },
+    ]) {
+      const rejectedTarget = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify({
+          ...validRun,
+          runId: "13131313-1313-4313-8313-131313131313",
+          memory: invalidMemory,
+        }),
+      });
+      assert.equal(rejectedTarget.status, 400);
+    }
 
     const rejectedSnapshotFlag = await fetch(`${app.baseUrl}/v1/runs`, {
       method: "POST",

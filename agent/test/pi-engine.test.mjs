@@ -336,6 +336,7 @@ function memoryTarget(overrides = {}) {
     primaryBankId: "workspace:engineering",
     requesterIsOwner: false,
     grantedBankIds: [],
+    customizationTargets: [],
     participants: [],
     ...overrides,
   };
@@ -1002,6 +1003,69 @@ test("exposes requester mutation only to a host-attested requester", async () =>
           false,
         ),
         memory: memoryTarget(),
+      }),
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("exposes participant customization only to an owner with a host target", async () => {
+  const app = await fixture(
+    (body, response, requestNumber) => {
+      const tools = body.tools.map((tool) => tool.function);
+      const participantTool = tools.find(
+        ({ name }) => name === "memory_update_participant",
+      );
+      if (requestNumber === 1) {
+        assert(participantTool);
+        assert.match(JSON.stringify(participantTool.parameters), /reply_author/);
+        assert.doesNotMatch(
+          JSON.stringify(participantTool),
+          /chat:user:bob/,
+        );
+      } else {
+        assert.equal(participantTool, undefined);
+      }
+      sendText(response, "ack");
+    },
+    {
+      memoryUrl: "http://memory.internal:8888",
+      memoryFetch: async (url) =>
+        url.includes("/directives?")
+          ? new Response(JSON.stringify({ items: [] }), { status: 200 })
+          : new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    },
+  );
+  const customizationTargets = [
+    { handle: "reply_author", id: "chat:user:bob", label: "Bob" },
+  ];
+  try {
+    await collect(
+      app.engine,
+      request("53535353-5353-4353-8353-535353535353", {
+        toolPolicy: "owner",
+        memory: memoryTarget({ requesterIsOwner: true, customizationTargets }),
+      }),
+    );
+    await collect(
+      app.engine,
+      request("54545454-5454-4454-8454-545454545454", {
+        memory: memoryTarget({ customizationTargets }),
+      }),
+    );
+    await collect(
+      app.engine,
+      request("55555555-5555-4555-8555-555555555555", {
+        memory: memoryTarget({ requesterIsOwner: true, customizationTargets }),
+      }),
+    );
+    await collect(
+      app.engine,
+      request("56565656-5656-4656-8656-565656565656", {
+        toolPolicy: "owner",
+        identity: requestIdentity("chat:user:alice", "Alice", false),
+        memory: memoryTarget({ requesterIsOwner: true, customizationTargets }),
       }),
     );
   } finally {

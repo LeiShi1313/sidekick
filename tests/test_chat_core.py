@@ -22,6 +22,7 @@ from sidekick.ai import (
     AgentRunOrigin,
     AgentRunRequest,
     MemoryScopeState,
+    MentionedUser,
     PromptBuilder,
 )
 from sidekick.chat.attachments import (
@@ -589,6 +590,9 @@ class FakeTransport:
     async def classify_origin(self, message):
         return MessageOrigin.INCOMING
 
+    def is_group(self, message):
+        return bool(getattr(message, "is_group", False))
+
 
 @pytest.mark.asyncio
 async def test_responder_streams_through_transport_not_message_sdk_methods():
@@ -626,6 +630,7 @@ class MinimalMessage:
         chat_id: int = 7,
         sender_id: int = 42,
         reply_to_message_id: int | None = None,
+        is_group: bool = False,
     ):
         self.id = message_id
         self.chat_id = chat_id
@@ -633,6 +638,7 @@ class MinimalMessage:
         self.raw_text = text
         self.reply_to_msg_id = reply_to_message_id
         self.date = None
+        self.is_group = is_group
 
 
 class FakeStore:
@@ -1017,6 +1023,196 @@ async def test_memory_coordinates_follow_the_injected_chat_identity_codec():
     ] == ["qq:user:42"]
     assert store.saved[0].scope_id == "qq:group:7"
     assert store.saved[0].requester_id == "qq:user:42"
+
+
+@pytest.mark.asyncio
+async def test_owner_reply_issues_one_reply_author_customization_target():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    replied = MinimalMessage(
+        "Alice's message",
+        message_id=2,
+        sender_id=20,
+        is_group=True,
+    )
+    trigger = MinimalMessage(
+        "/ai Answer her briefly from now on",
+        message_id=3,
+        sender_id=42,
+        reply_to_message_id=replied.id,
+        is_group=True,
+    )
+    transport.reply_targets[trigger] = replied
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(transport=transport, identity_codec=codec),
+        transport=transport,
+        memory=object(),
+        identity_codec=codec,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    memory = gateway.requests[0].memory
+    assert memory is not None
+    assert [
+        (target.handle, target.identity, target.label)
+        for target in memory.customization_targets
+    ] == [("reply_author", "qq:user:20", None)]
+
+
+@pytest.mark.asyncio
+async def test_owner_exact_mentions_issue_bounded_customization_targets():
+    class Mentions:
+        async def resolve(self, _message):
+            return (
+                MentionedUser(user_id=20, display_name="Alice"),
+                MentionedUser(user_id=30, display_name="Bob"),
+            )
+
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            identity_codec=codec,
+            mention_resolver=Mentions(),
+        ),
+        transport=transport,
+        memory=object(),
+        identity_codec=codec,
+    )
+    trigger = MinimalMessage(
+        "/ai Update their answer preferences",
+        sender_id=42,
+        is_group=True,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    memory = gateway.requests[0].memory
+    assert memory is not None
+    assert [
+        (target.handle, target.identity, target.label)
+        for target in memory.customization_targets
+    ] == [
+        ("mention_1", "qq:user:20", "Alice"),
+        ("mention_2", "qq:user:30", "Bob"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_history_does_not_authorize_owner_customization_targets():
+    peer = MinimalMessage(
+        "Alice's earlier message",
+        message_id=2,
+        sender_id=20,
+        is_group=True,
+    )
+
+    class History:
+        async def fetch_recent(self, _trigger, *, before, limit):
+            assert limit == 1
+            return (peer,)
+
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            identity_codec=codec,
+            history_source=History(),
+        ),
+        transport=transport,
+        memory=object(),
+        identity_codec=codec,
+    )
+    trigger = MinimalMessage(
+        "/ai1 Update Alice's answer preference",
+        sender_id=42,
+        is_group=True,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    memory = gateway.requests[0].memory
+    assert memory is not None
+    assert memory.customization_targets == ()
+    assert any(
+        participant.identity == "qq:user:20"
+        for participant in memory.participants
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_chat_sole_peer_is_an_owner_customization_target():
+    peer = MinimalMessage(
+        "Alice's earlier message",
+        message_id=2,
+        sender_id=20,
+    )
+
+    class History:
+        async def fetch_recent(self, _trigger, *, before, limit):
+            assert limit == 1
+            return (peer,)
+
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            identity_codec=codec,
+            history_source=History(),
+        ),
+        transport=transport,
+        memory=object(),
+        identity_codec=codec,
+    )
+    trigger = MinimalMessage(
+        "/ai1 Answer them briefly from now on",
+        sender_id=42,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    memory = gateway.requests[0].memory
+    assert memory is not None
+    assert [
+        (target.handle, target.identity)
+        for target in memory.customization_targets
+    ] == [("direct_chat_participant", "qq:user:20")]
 
 
 @pytest.mark.asyncio

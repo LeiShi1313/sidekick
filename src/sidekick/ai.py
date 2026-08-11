@@ -136,6 +136,13 @@ class AgentParticipantAccess:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentCustomizationTarget:
+    handle: str
+    identity: str
+    label: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRequestIdentity:
     requester: AgentIdentityAnchor
     anchors: tuple[AgentIdentityAnchor, ...] = ()
@@ -148,6 +155,7 @@ class AgentMemoryTarget:
     requester_is_owner: bool
     granted_bank_ids: tuple[str, ...] = ()
     participants: tuple[AgentParticipantAccess, ...] = ()
+    customization_targets: tuple[AgentCustomizationTarget, ...] = ()
     query: str | None = None
 
 
@@ -308,7 +316,7 @@ class PiAgentGateway:
                 for image in request.images
             ]
         if request.memory is not None:
-            payload["memory"] = {
+            memory = {
                 "primaryBankId": request.memory.primary_bank_id,
                 "requesterIsOwner": request.memory.requester_is_owner,
                 "grantedBankIds": list(request.memory.granted_bank_ids),
@@ -322,6 +330,16 @@ class PiAgentGateway:
                     for participant in request.memory.participants
                 ],
             }
+            if request.memory.customization_targets:
+                memory["customizationTargets"] = [
+                    {
+                        "handle": target.handle,
+                        "id": target.identity,
+                        "label": target.label,
+                    }
+                    for target in request.memory.customization_targets
+                ]
+            payload["memory"] = memory
             if request.memory.query:
                 payload["memory"]["query"] = request.memory.query
         session = self._get_session()
@@ -4378,6 +4396,8 @@ class AIConversationHandler:
         anchor_observations: list[HumanObservation] = []
         retained_observations: list[HumanObservation] = []
         quoted_model_images: tuple[ModelInputImage, ...] = ()
+        loaded_context = ChatContext()
+        assistant_message_ids: frozenset[ExternalId] = frozenset()
         has_current_attachment = self._prompt_builder.has_attachment(message)
         has_quoted_attachment = False
         authored_prompt = ""
@@ -4520,10 +4540,18 @@ class AIConversationHandler:
                 current_mentions=current_mentions,
                 observations=anchor_observations,
             )
+            customization_targets = self._build_agent_customization_targets(
+                request_identity=request_identity,
+                current_mentions=current_mentions,
+                context=loaded_context,
+                assistant_message_ids=assistant_message_ids,
+                is_group=self._transport.is_group(message),
+            )
             memory_target = await self._build_agent_memory_target(
                 chat_id=message.chat_id,
                 request_identity=request_identity,
                 observations=anchor_observations,
+                customization_targets=customization_targets,
             )
             request = AgentRunRequest(
                 run_id=run_id,
@@ -5587,12 +5615,104 @@ class AIConversationHandler:
             ),
         )
 
+    def _build_agent_customization_targets(
+        self,
+        *,
+        request_identity: AgentRequestIdentity,
+        current_mentions: tuple[MentionedUser, ...],
+        context: ChatContext,
+        assistant_message_ids: frozenset[ExternalId],
+        is_group: bool,
+    ) -> tuple[AgentCustomizationTarget, ...]:
+        requester_id = request_identity.requester.identity
+        if requester_id != self._owner_actor_id:
+            return ()
+
+        targets: dict[str, AgentCustomizationTarget] = {}
+
+        def add(handle: str, identity: str, label: str | None) -> None:
+            if (
+                identity == requester_id
+                or not is_canonical_actor_id(identity)
+                or (
+                    identity not in targets
+                    and len(targets) >= MAX_AGENT_PARTICIPANTS
+                )
+            ):
+                return
+            existing = targets.get(identity)
+            if existing is None:
+                targets[identity] = AgentCustomizationTarget(
+                    handle=handle,
+                    identity=identity,
+                    label=label,
+                )
+            elif existing.label is None and label:
+                targets[identity] = AgentCustomizationTarget(
+                    handle=existing.handle,
+                    identity=identity,
+                    label=label,
+                )
+
+        replied_message_id = context.current_reply_to_message_id
+        if (
+            replied_message_id is not None
+            and replied_message_id not in assistant_message_ids
+        ):
+            replied = next(
+                (
+                    item.observation
+                    for item in context.messages
+                    if item.message_id == replied_message_id
+                ),
+                None,
+            )
+            if replied is not None and replied.identity.is_human:
+                add(
+                    "reply_author",
+                    replied.identity.subject_id
+                    or self._identity_codec.actor_id(replied.sender_id),
+                    replied.identity.subject_display_name,
+                )
+
+        for index, mention in enumerate(current_mentions, start=1):
+            add(
+                f"mention_{index}",
+                self._identity_codec.actor_id(mention.user_id),
+                mention.display_name,
+            )
+
+        if not is_group:
+            direct_peers: dict[str, str | None] = {}
+            for item in context.messages:
+                observation = item.observation
+                if (
+                    observation is None
+                    or item.message_id in assistant_message_ids
+                    or not observation.identity.is_human
+                ):
+                    continue
+                identity = (
+                    observation.identity.subject_id
+                    or self._identity_codec.actor_id(observation.sender_id)
+                )
+                if identity != requester_id and is_canonical_actor_id(identity):
+                    label = observation.identity.subject_display_name
+                    if identity not in direct_peers or label:
+                        direct_peers[identity] = label
+            if len(direct_peers) == 1:
+                identity, label = next(iter(direct_peers.items()))
+                add("direct_chat_participant", identity, label)
+
+        return tuple(targets.values())
+
     async def _build_agent_memory_target(
         self,
         *,
         chat_id: ExternalId,
         request_identity: AgentRequestIdentity,
         observations: list[HumanObservation],
+        customization_targets: tuple[AgentCustomizationTarget, ...] = (),
     ) -> AgentMemoryTarget | None:
         if self._memory is None:
             return None
@@ -5640,6 +5760,9 @@ class AIConversationHandler:
             requester_is_owner=requester_is_owner,
             granted_bank_ids=requester_grants,
             participants=tuple(participant_access),
+            customization_targets=(
+                customization_targets if requester_is_owner else ()
+            ),
         )
 
     async def _load_bank_grants(self, actor_id: str) -> tuple[str, ...]:

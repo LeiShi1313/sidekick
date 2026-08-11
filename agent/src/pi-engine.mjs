@@ -871,7 +871,11 @@ export class PiEngine {
       );
       this.#updateActiveRun(activeRun, { phase: "recalling" });
       const observeMemory = ({ type, data }) => record(type, data);
-      const [recalled, requesterMemory] = await Promise.all([
+      const requesterHasOwnerAuthority =
+        request.toolPolicy === "owner" &&
+        request.identity.requesterCanCustomize === true &&
+        request.memory?.requesterIsOwner === true;
+      const [recalled, requesterMemory, customizationTargets] = await Promise.all([
         retrieveMemoryContext({
           baseUrl: this.config.memoryUrl,
           token: this.config.memoryToken,
@@ -893,6 +897,14 @@ export class PiEngine {
               observe: observeMemory,
             })
           : Promise.resolve(disabledRequesterMemory()),
+        this.requesterMemoryStore && request.memory
+          ? this.requesterMemoryStore.retrieveTargets({
+              bankId: request.memory.primaryBankId,
+              targets: request.memory.customizationTargets,
+              requesterIsOwner: requesterHasOwnerAuthority,
+              observe: observeMemory,
+            })
+          : Promise.resolve([]),
       ]);
       if (activeRun.cancelRequested) {
         yield await cancelledEvent();
@@ -1019,6 +1031,8 @@ export class PiEngine {
       const requesterMemoryTools = this.requesterMemoryStore && request.memory
         ? this.requesterMemoryStore.createTools(requesterMemory, {
             observe: observeMemory,
+            requesterIsOwner: requesterHasOwnerAuthority,
+            customizationTargets,
           })
         : [];
       const allMemoryTools = [...memoryTools, ...requesterMemoryTools];

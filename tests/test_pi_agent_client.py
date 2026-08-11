@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
 import json
 from io import BytesIO
 
@@ -11,6 +12,7 @@ from PIL import Image
 
 from sidekick.ai import (
     AgentContext,
+    AgentCustomizationTarget,
     AgentIdentityAnchor,
     AgentMemoryTarget,
     AgentModelCatalog,
@@ -182,6 +184,60 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
     assert events[1].summary == "Calculation result: 42"
     assert events[-1].session_id == "session-1"
     assert events[-1].entry_id == "entry-1"
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_sends_nonempty_customization_targets() -> None:
+    received = None
+
+    async def runs(request: web.Request) -> web.Response:
+        nonlocal received
+        received = await request.json()
+        return web.Response(
+            text=(
+                '{"type":"run_completed","sessionId":"session-1",'
+                '"entryId":"entry-1","answer":"done"}\n'
+            ),
+            content_type="application/x-ndjson",
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
+    request = run_request(tool_policy="owner")
+    assert request.memory is not None
+    request = replace(
+        request,
+        memory=replace(
+            request.memory,
+            requester_is_owner=True,
+            granted_bank_ids=(),
+            customization_targets=(
+                AgentCustomizationTarget(
+                    handle="reply_author",
+                    identity="telegram:user:41",
+                    label="Bob",
+                ),
+            ),
+        ),
+    )
+    try:
+        async for _ in gateway.run(request):
+            pass
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert received["memory"]["customizationTargets"] == [
+        {
+            "handle": "reply_author",
+            "id": "telegram:user:41",
+            "label": "Bob",
+        }
+    ]
 
 
 @pytest.mark.asyncio
