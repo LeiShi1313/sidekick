@@ -325,11 +325,17 @@ class PiAgentGateway:
             if request.memory.query:
                 payload["memory"]["query"] = request.memory.query
         session = self._get_session()
+        run_timeout = (
+            aiohttp.ClientTimeout(total=None)
+            if request.tool_policy == "owner"
+            else self._timeout
+        )
         terminal = False
         async with session.post(
             f"{self._base_url}/v1/runs",
             json=payload,
             headers=self._headers,
+            timeout=run_timeout,
         ) as response:
             if response.status != 200:
                 raise RuntimeError(

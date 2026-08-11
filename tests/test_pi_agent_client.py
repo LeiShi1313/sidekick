@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from io import BytesIO
@@ -52,6 +53,7 @@ def run_request(
     *,
     model: str | None = None,
     images: tuple[ModelInputImage, ...] = (),
+    tool_policy: str = "delegated",
 ) -> AgentRunRequest:
     return AgentRunRequest(
         run_id="11111111-1111-4111-8111-111111111111",
@@ -60,7 +62,7 @@ def run_request(
         prompt="Calculate 6 * 7",
         context=(AgentContext(kind="reference", text="Prior conversation"),),
         system_prompt="Answer directly.",
-        tool_policy="delegated",
+        tool_policy=tool_policy,
         identity=AgentRequestIdentity(
             requester=AgentIdentityAnchor(
                 identity="telegram:user:40",
@@ -180,6 +182,40 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
     assert events[1].summary == "Calculation result: 42"
     assert events[-1].session_id == "session-1"
     assert events[-1].entry_id == "entry-1"
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_removes_only_the_owner_run_deadline() -> None:
+    async def runs(request: web.Request) -> web.Response:
+        await request.json()
+        await asyncio.sleep(0.15)
+        return web.Response(
+            text=(
+                '{"type":"run_completed","sessionId":"session-1",'
+                '"entryId":"entry-1","answer":"done"}\n'
+            ),
+            content_type="application/x-ndjson",
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=0.05
+    )
+    try:
+        owner_events = [
+            event
+            async for event in gateway.run(run_request(tool_policy="owner"))
+        ]
+        assert owner_events[-1].answer == "done"
+
+        with pytest.raises(TimeoutError):
+            async for _ in gateway.run(run_request()):
+                pass
+    finally:
+        await gateway.close()
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio
