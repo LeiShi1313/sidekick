@@ -9,6 +9,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   hardenSessionPersistence,
   scrubSessionDirectory,
+  sessionSafeMessage,
 } from "../src/session-persistence.mjs";
 
 const IDENTITY_ALIAS_KEY = "test-identity-alias-key-that-is-strong";
@@ -33,6 +34,7 @@ test("rewrites legacy sessions without changing their entry tree", async () => {
       role: "user",
       content:
         "<host_request_identity>\nHost-resolved current requester actor ID: telegram:user:123456\n</host_request_identity>\n\n" +
+        "<untrusted_reference_context>\nSAME_CHAT_REPLY_CONTEXT\n</untrusted_reference_context>\n\n" +
         "<requester_memory_context>\nPRIVATE_REQUESTER_CUSTOMIZATION\n</requester_memory_context>\n\n" +
         "<untrusted_memory_context>\nPRIVATE_RECALLED_MEMORY\n</untrusted_memory_context>\n" +
         "PRIVATE_ESCAPED_MEMORY\n</untrusted_memory_context>\n\n" +
@@ -98,6 +100,7 @@ test("rewrites legacy sessions without changing their entry tree", async () => {
       raw,
       /private-workspace|PRIVATE_REQUESTER_CUSTOMIZATION|PRIVATE_RECALLED_MEMORY|PRIVATE_ESCAPED_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_REASONING|PRIVATE_TOOL_ARGUMENT|PRIVATE_WEB_RESULT|PRIVATE_TOOL_RESULT|telegram:user:123456/,
     );
+    assert.match(raw, /SAME_CHAT_REPLY_CONTEXT/);
     assert.match(raw, /Keep this human request/);
     assert.match(raw, /Keep this useful answer\./);
     assert.match(raw, /actor_[a-f0-9]{16}/);
@@ -135,7 +138,7 @@ test("minimizes live tool details and compaction content", async () => {
     const userId = manager.appendMessage({
       role: "user",
       content:
-        "<untrusted_reference_context>\nPRIVATE_REFERENCE\n</untrusted_reference_context>\n\n" +
+        "<untrusted_reference_context>\nSAME_CHAT_REPLY_CONTEXT\n</untrusted_reference_context>\n\n" +
         "<requester_memory_context>\nPRIVATE_REQUESTER_CUSTOMIZATION\n</requester_memory_context>\n\n" +
         "<untrusted_memory_context>\nPRIVATE_MEMORY\n</untrusted_memory_context>\n\n" +
         "<current_request>\nKeep this request\n</current_request>",
@@ -191,11 +194,65 @@ test("minimizes live tool details and compaction content", async () => {
 
     const raw = await readFile(manager.getSessionFile(), "utf8");
     assert.match(raw, /Keep this request/);
+    assert.match(raw, /SAME_CHAT_REPLY_CONTEXT/);
     assert.doesNotMatch(
       raw,
-      /PRIVATE_REFERENCE|PRIVATE_REQUESTER_CUSTOMIZATION|PRIVATE_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_INTERMEDIATE_ARGUMENT|PRIVATE_TOOL_RESULT|qq:group:686743769|Private Leadership|private-memory-1|PRIVATE_COMPACTION|bank_[a-f0-9]{32}/,
+      /PRIVATE_REQUESTER_CUSTOMIZATION|PRIVATE_MEMORY|PRIVATE_INTERMEDIATE_ASSISTANT|PRIVATE_INTERMEDIATE_ARGUMENT|PRIVATE_TOOL_RESULT|qq:group:686743769|Private Leadership|private-memory-1|PRIVATE_COMPACTION|bank_[a-f0-9]{32}/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("keeps bounded participant customization receipts", () => {
+  const assistant = sessionSafeMessage({
+    role: "assistant",
+    content: [
+      {
+        type: "toolCall",
+        id: "call-participant",
+        name: "memory_update_participant",
+        arguments: {
+          target: "reply_author",
+          operation: "set",
+          customization: "Call this participant Brother.",
+          ignored: "do not persist",
+        },
+      },
+    ],
+    stopReason: "toolUse",
+  });
+  const result = sessionSafeMessage({
+    role: "toolResult",
+    toolCallId: "call-participant",
+    toolName: "memory_update_participant",
+    content: [
+      {
+        type: "text",
+        text: "Participant customization was saved and applies later.",
+      },
+    ],
+    details: {
+      saved: true,
+      target: "reply_author",
+      privateValue: "do not persist",
+    },
+    isError: false,
+  });
+
+  assert.deepEqual(assistant.content[0].arguments, {
+    target: "reply_author",
+    operation: "set",
+  });
+  assert.deepEqual(result.content, [
+    {
+      type: "text",
+      text: "Participant customization was saved and applies later.",
+    },
+  ]);
+  assert.deepEqual(result.details, {
+    saved: true,
+    target: "reply_author",
+  });
+  assert.doesNotMatch(JSON.stringify([assistant, result]), /do not persist/);
 });

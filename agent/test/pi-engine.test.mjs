@@ -700,6 +700,86 @@ test("serializes each requester identity in a shared session branch", async () =
   }
 });
 
+test("retains an owner's participant target when a third person continues", async () => {
+  const app = await fixture((_body, response) => sendText(response, "ack"));
+  const owner = { id: "chat:user:owner", label: "Owner" };
+  const target = { id: "chat:user:target", label: "Target" };
+  try {
+    const rootEvents = await collect(
+      app.engine,
+      request("21212121-2121-4121-8121-212121212121", {
+        prompt: "Call him Brother from now on.",
+        context: [
+          {
+            kind: "reference",
+            text:
+              "Current request replies to [m1].\n" +
+              "[m1 | role=human | actor_id=chat:user:target | " +
+              'actor_label="Target"]\n  Earlier message',
+          },
+        ],
+        identity: {
+          requester: owner,
+          anchors: [owner, target],
+          requesterCanCustomize: true,
+        },
+        toolPolicy: "owner",
+        memory: memoryTarget({
+          requesterIsOwner: true,
+          customizationTargets: [
+            {
+              handle: "reply_author",
+              id: target.id,
+              label: target.label,
+            },
+          ],
+        }),
+      }),
+    );
+    const rootResult = rootEvents.at(-1);
+
+    await collect(
+      app.engine,
+      request("23232323-2323-4323-8323-232323232323", {
+        sessionId: rootResult.sessionId,
+        parentEntryId: rootResult.entryId,
+        prompt: "What preference did you remember?",
+        identity: requestIdentity("chat:user:third", "Third person"),
+        memory: memoryTarget(),
+      }),
+    );
+
+    const userPrompts = app.provider.requests[1].messages
+      .filter((message) => message.role === "user")
+      .map((message) => textOf(message.content));
+    assert.equal(userPrompts.length, 2);
+    assert.match(userPrompts[0], /<untrusted_reference_context>/);
+    assert.match(userPrompts[0], /Current request replies to \[m1\]/);
+    assert.match(userPrompts[0], /<host_participant_bindings>/);
+    assert.match(userPrompts[0], /reply_author/);
+    assert.match(userPrompts[0], /Untrusted display label: Target/i);
+    assert.doesNotMatch(
+      JSON.stringify(app.provider.requests[1].messages),
+      /chat:user:(?:owner|target|third)/,
+    );
+    const targetAlias = userPrompts[0].match(
+      /reply_author[^\n]*Actor ID: (actor_[a-f0-9]{16})/i,
+    )?.[1];
+    const thirdAlias = userPrompts[1].match(
+      /Current requester actor ID: (actor_[a-f0-9]{16})/i,
+    )?.[1];
+    assert(targetAlias);
+    assert(thirdAlias);
+    assert.notEqual(targetAlias, thirdAlias);
+    assert.match(
+      userPrompts[1],
+      /never substitute the current requester for an earlier bound participant unless their actor IDs match/i,
+    );
+  } finally {
+    await app.close();
+  }
+});
+
 test("regenerates requester customization for each participant in a shared session", async () => {
   const aliceId = "chat:user:alice";
   const bobId = "chat:user:bob";
@@ -1991,7 +2071,7 @@ test("continues when a legacy session records different source access", async ()
   }
 });
 
-test("continues with only current memory capabilities and public transcript", async () => {
+test("continues with current memory capabilities and same-chat references", async () => {
   const sourceBank = "qq:group:private-source";
   const sourceBankPath = encodeURIComponent(sourceBank);
   const memoryRequests = [];
@@ -2018,9 +2098,13 @@ test("continues with only current memory capabilities and public transcript", as
       }
       if (requestNumber === 3) {
         assert.match(serialized, /Public source summary\./);
+        assert.match(
+          serialized,
+          /PRIVATE_REFERENCE_PREFIX.*PRIVATE_ESCAPED_REFERENCE/,
+        );
         assert.doesNotMatch(
           serialized,
-          /PRIVATE_REFERENCE_PREFIX|PRIVATE_ESCAPED_REFERENCE|PRIVATE_INTERMEDIATE_DRAFT|PRIVATE_SOURCE_EVIDENCE/,
+          /PRIVATE_INTERMEDIATE_DRAFT|PRIVATE_SOURCE_EVIDENCE/,
         );
         sendToolCall(response, {
           id: "call-stale-source",
@@ -2495,6 +2579,12 @@ test("persists only conversation-safe session data", async () => {
     const events = await collect(
       app.engine,
       request("70707070-7070-4070-8070-707070707070", {
+        context: [
+          {
+            kind: "reference",
+            text: "SAME_CHAT_REPLY_CONTEXT",
+          },
+        ],
         memory: memoryTarget(),
       }),
     );
@@ -2529,6 +2619,7 @@ test("persists only conversation-safe session data", async () => {
       rawSession,
       /PRIVATE_WEB_SNAPSHOT|RAW_FETCHED_PAGE_CONTENT|Search complete|ordinary search|PRIVATE_INTERNAL_REASONING|PRIVATE_RECALLED_MEMORY/,
     );
+    assert.match(rawSession, /SAME_CHAT_REPLY_CONTEXT/);
     assert.doesNotMatch(rawSession, /sidekick-pi-test-/);
     assert.match(rawSession, /"cwd":"\/workspace"/);
     assert.match(rawSession, /A safe final answer\./);

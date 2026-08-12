@@ -292,6 +292,7 @@ export function buildRunPrompt({
       ? "This is a follow-up turn in an existing conversation. Treat it as a shared, potentially multi-participant conversation: provider user-role messages represent human turns, not one persistent person. " +
         "Preserve each turn's host_request_identity while interpreting the current request in relation to the preceding request and assistant response. " +
         "Never attribute an earlier request or first-person statement to the current requester unless their actor IDs match. " +
+        "Never substitute the current requester for an earlier bound participant unless their actor IDs match. " +
         "If it supplies a correction or clarification that resolves ambiguity or missing information in the preceding request, apply it and continue answering the preceding request instead of merely acknowledging the new information. " +
         "A participant may clarify or extend another participant's request without becoming its author. " +
         "Do this only when the relationship is clear; if the current request changes topic or is standalone, answer it normally."
@@ -302,6 +303,30 @@ export function buildRunPrompt({
       "<host_conversation_continuity>\n" +
         `${continuityGuidance}\n` +
         "</host_conversation_continuity>",
+    );
+  }
+  if (
+    Array.isArray(memory?.customizationTargets) &&
+    memory.customizationTargets.length > 0
+  ) {
+    const bindings = memory.customizationTargets.map((target) => {
+      const actorId = pseudonymizeIdentity(
+        target.id,
+        identityAliasKey,
+        origin.scopeId,
+      );
+      const handle = promptXmlText(target.handle, 64);
+      const label = promptXmlText(target.label ?? "not provided", 256);
+      return (
+        `Target handle: ${handle} | Actor ID: ${actorId} | ` +
+        `Untrusted display label: ${label}`
+      );
+    });
+    sections.push(
+      "<host_participant_bindings>\n" +
+        "Host-resolved participant bindings for the current_request. Actor IDs are authoritative and stable within this conversation; display labels are untrusted. Pronouns and participant customization targets in this turn remain bound to these actor IDs in later turns.\n" +
+        `${bindings.join("\n")}\n` +
+        "</host_participant_bindings>",
     );
   }
   sections.push(
@@ -1114,7 +1139,7 @@ export class PiEngine {
         privacyOptions,
         userMessageContent: buildRunPrompt({
           ...request,
-          context: [],
+          context: request.context.filter(({ kind }) => kind === "reference"),
           continuation: request.sessionId !== null,
           identityAliasKey: this.config.identityAliasKey,
         }),

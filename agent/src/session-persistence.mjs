@@ -23,6 +23,12 @@ const MAX_SESSION_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SAFE_SUMMARY_CHARS = 12_000;
 const SESSION_BINDING_VERSION = 1;
 const PUBLIC_ASSISTANT_STOP_REASONS = new Set(["stop", "length"]);
+const MEMORY_MUTATION_TOOLS = new Set([
+  "memory_update_requester",
+  "memory_update_participant",
+]);
+const PARTICIPANT_TARGET_RE =
+  /^(?:reply_author|direct_chat_participant|mention_[1-9][0-9]*)$/;
 const hardenedManagers = new WeakSet();
 
 function secureSessionFile(manager) {
@@ -45,6 +51,55 @@ function safeCustomEntry(customType, data) {
   return { omitted: true };
 }
 
+function safeMutationArguments(part) {
+  if (!MEMORY_MUTATION_TOOLS.has(part.name)) return {};
+  const supplied = part.arguments;
+  if (!supplied || typeof supplied !== "object" || Array.isArray(supplied)) {
+    return {};
+  }
+  const result = {};
+  if (supplied.operation === "set" || supplied.operation === "clear") {
+    result.operation = supplied.operation;
+  }
+  if (
+    part.name === "memory_update_participant" &&
+    typeof supplied.target === "string" &&
+    PARTICIPANT_TARGET_RE.test(supplied.target)
+  ) {
+    result.target = supplied.target;
+  }
+  return result;
+}
+
+function safeMutationDetails(toolName, supplied) {
+  if (
+    !MEMORY_MUTATION_TOOLS.has(toolName) ||
+    !supplied ||
+    typeof supplied !== "object" ||
+    Array.isArray(supplied)
+  ) {
+    return null;
+  }
+  const result = {};
+  for (const field of ["saved", "cleared", "unavailable", "conflict"]) {
+    if (typeof supplied[field] === "boolean") result[field] = supplied[field];
+  }
+  if (
+    toolName === "memory_update_participant" &&
+    typeof supplied.target === "string" &&
+    PARTICIPANT_TARGET_RE.test(supplied.target)
+  ) {
+    result.target = supplied.target;
+  }
+  if (
+    typeof supplied.reason === "string" &&
+    /^[a-z][a-z0-9_]{0,63}$/.test(supplied.reason)
+  ) {
+    result.reason = supplied.reason;
+  }
+  return result;
+}
+
 function safeContentPart(part) {
   if (!part || typeof part !== "object") return part;
   if (part.type === "thinking") return null;
@@ -53,7 +108,7 @@ function safeContentPart(part) {
       type: "toolCall",
       id: String(part.id ?? ""),
       name: String(part.name ?? ""),
-      arguments: {},
+      arguments: safeMutationArguments(part),
     };
   }
   if (part.type === "image") {
@@ -90,8 +145,23 @@ export function sessionSafeMessage(message, state = {}) {
   } else if (copy.role === "user" && Array.isArray(copy.content)) {
     copy.content = copy.content.map(safeContentPart).filter(Boolean);
   } else if (copy.role === "toolResult") {
-    copy.content = [{ type: "text", text: OMITTED_TOOL_RESULT }];
-    delete copy.details;
+    if (MEMORY_MUTATION_TOOLS.has(copy.toolName)) {
+      copy.content = Array.isArray(copy.content)
+        ? copy.content
+            .filter((part) => part?.type === "text")
+            .map(safeContentPart)
+            .filter(Boolean)
+        : [];
+      if (copy.content.length === 0) {
+        copy.content = [{ type: "text", text: OMITTED_TOOL_RESULT }];
+      }
+      const details = safeMutationDetails(copy.toolName, copy.details);
+      if (details && Object.keys(details).length > 0) copy.details = details;
+      else delete copy.details;
+    } else {
+      copy.content = [{ type: "text", text: OMITTED_TOOL_RESULT }];
+      delete copy.details;
+    }
   }
   return copy;
 }
@@ -196,7 +266,6 @@ const OMITTED_CONTEXT_BLOCKS = new Set([
   "host_access_advisory",
   "requester_memory_context",
   "untrusted_memory_context",
-  "untrusted_reference_context",
 ]);
 
 function stripInjectedContext(value) {
