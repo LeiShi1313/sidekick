@@ -173,6 +173,25 @@ test("persists only allowlisted operational audit metadata", async () => {
   }
 });
 
+test("records the current requester owner attestation", async () => {
+  const app = await fixture();
+  try {
+    const audit = await app.store.start(RUN_ID);
+    await audit.record("memory.directory.policy", {
+      requesterIsOwner: true,
+      grantedBankIds: [],
+      participants: [],
+      allowedBankIds: null,
+    });
+    await audit.flush();
+
+    const result = await app.store.get(RUN_ID);
+    assert.equal(result.events[0].data.requesterOwner, true);
+  } finally {
+    await app.close();
+  }
+});
+
 test("records requester-memory outcomes without tool arguments or content", async () => {
   const app = await fixture();
   try {

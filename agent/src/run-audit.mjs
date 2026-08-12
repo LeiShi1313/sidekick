@@ -181,7 +181,9 @@ export function minimizeAuditData(type, value = {}) {
     case "memory.directory.policy":
       return {
         requesterOwner:
-          data.requesterOwner === true || objectValue(data.requester).owner === true,
+          data.requesterIsOwner === true ||
+          data.requesterOwner === true ||
+          objectValue(data.requester).owner === true,
         grantedBankCount: suppliedCount(
           data,
           "grantedBankCount",
