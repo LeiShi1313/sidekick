@@ -84,6 +84,7 @@ from sidekick.memory_directory import (
     DirectorySource,
     is_canonical_actor_id,
     is_canonical_bank_id,
+    is_owner_customization_target_actor_id,
 )
 
 
@@ -4546,6 +4547,7 @@ class AIConversationHandler:
                 context=loaded_context,
                 assistant_message_ids=assistant_message_ids,
                 is_group=self._transport.is_group(message),
+                scope_id=scope_id,
             )
             memory_target = await self._build_agent_memory_target(
                 chat_id=message.chat_id,
@@ -5623,6 +5625,7 @@ class AIConversationHandler:
         context: ChatContext,
         assistant_message_ids: frozenset[ExternalId],
         is_group: bool,
+        scope_id: str,
     ) -> tuple[AgentCustomizationTarget, ...]:
         requester_id = request_identity.requester.identity
         if requester_id != self._owner_actor_id:
@@ -5633,7 +5636,7 @@ class AIConversationHandler:
         def add(handle: str, identity: str, label: str | None) -> None:
             if (
                 identity == requester_id
-                or not is_canonical_actor_id(identity)
+                or not is_owner_customization_target_actor_id(identity, scope_id)
                 or (
                     identity not in targets
                     and len(targets) >= MAX_AGENT_PARTICIPANTS

@@ -6,6 +6,7 @@ import sharp from "sharp";
 import {
   isBankId,
   isHostIdentity,
+  isOwnerCustomizationTargetPrincipal,
   isRequesterCustomizationPrincipal,
 } from "./host-identity.mjs";
 import { isModelId } from "./model-id.mjs";
@@ -360,7 +361,7 @@ export function validateRunRequest(value) {
         !isBoundedString(target.handle, 1, 64) ||
         !CUSTOMIZATION_TARGET_HANDLE_RE.test(target.handle) ||
         customizationTargetHandles.has(target.handle) ||
-        !isRequesterCustomizationPrincipal(target.id) ||
+        !isOwnerCustomizationTargetPrincipal(target.id, supplied.primaryBankId) ||
         target.id === identity.requester.id ||
         customizationTargetIds.has(target.id) ||
         !(
