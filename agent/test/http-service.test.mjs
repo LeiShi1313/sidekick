@@ -1045,6 +1045,83 @@ test("accepts exact Matrix bridge actors and rejects invalid identities", async 
   }
 });
 
+test("accepts a same-chat Matrix bridge alias as an owner customization target", async () => {
+  const received = [];
+  const app = await listen({
+    async *run(request) {
+      received.push(request);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel() {
+      return false;
+    },
+  });
+  const bridgeActorId =
+    "telegram:matrix-bridge:6332621450%3A-1001%3A0123456789abcdef0123456789abcdef";
+  const ownerRequest = {
+    ...validRun,
+    runId: "24242424-2424-4424-8424-242424242424",
+    toolPolicy: "owner",
+    memory: {
+      primaryBankId: "telegram:chat:-1001",
+      requesterIsOwner: true,
+      grantedBankIds: [],
+      customizationTargets: [
+        {
+          handle: "reply_author",
+          id: bridgeActorId,
+          label: "SteamedFish",
+        },
+      ],
+      participants: [],
+    },
+  };
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify(ownerRequest),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.deepEqual(received[0].memory, ownerRequest.memory);
+
+    for (const id of [
+      "telegram:matrix-bridge:6332621450%3A-2002%3A0123456789abcdef0123456789abcdef",
+      "telegram:matrix-bridge:6332621450%ZZ-1001%3A0123456789abcdef0123456789abcdef",
+      "qq:matrix-bridge:6332621450%3A-1001%3A0123456789abcdef0123456789abcdef",
+    ]) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-agent-token-that-is-long-enough",
+        },
+        body: JSON.stringify({
+          ...ownerRequest,
+          runId: "25252525-2525-4525-8525-252525252525",
+          memory: {
+            ...ownerRequest.memory,
+            customizationTargets: [
+              {
+                ...ownerRequest.memory.customizationTargets[0],
+                id,
+              },
+            ],
+          },
+        }),
+      });
+      assert.equal(rejected.status, 400, id);
+    }
+    assert.equal(received.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
 test("cancels an active run by its caller-provided id", async () => {
   let cancelled;
   const app = await listen({

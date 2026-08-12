@@ -12,6 +12,9 @@ KNOWLEDGE_DIRECTORY_BANK_NAME = "Knowledge Directory"
 KNOWLEDGE_DIRECTORY_SCHEMA = "sidekick.knowledge-directory.v1"
 _BANK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.%-]{0,255}$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_TELEGRAM_MATRIX_BRIDGE_ACTOR_RE = re.compile(
+    r"^telegram:matrix-bridge:[1-9][0-9]*%3A(-?[0-9]+)%3A[a-f0-9]{32}$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +117,18 @@ def is_canonical_bank_id(value: str) -> bool:
 
 def is_canonical_actor_id(value: str) -> bool:
     return is_canonical_bank_id(value) and ":user:" in value
+
+
+def is_owner_customization_target_actor_id(value: str, scope_id: str) -> bool:
+    if is_canonical_actor_id(value):
+        return True
+    if not is_canonical_bank_id(scope_id) or not isinstance(value, str):
+        return False
+    bridge_actor = _TELEGRAM_MATRIX_BRIDGE_ACTOR_RE.fullmatch(value)
+    return (
+        bridge_actor is not None
+        and scope_id == f"telegram:chat:{bridge_actor.group(1)}"
+    )
 
 
 def bank_reference_tag(bank_id: str) -> str:

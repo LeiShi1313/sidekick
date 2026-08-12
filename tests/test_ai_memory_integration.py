@@ -742,6 +742,60 @@ async def test_matrix_bridge_identity_is_a_memory_source_with_an_alias_id():
 
 
 @pytest.mark.asyncio
+async def test_owner_reply_issues_matrix_bridge_alias_customization_target():
+    bridge_resolver = TelegramMatrixBridgeResolver({6332621450})
+
+    class OwnerMessage(FakeMessage):
+        async def get_sender(self):
+            return telegram_types.User(id=self.sender_id, first_name="Owner")
+
+        async def get_chat(self):
+            return telegram_types.Channel(
+                id=1001,
+                title="Engineering Group",
+                photo=telegram_types.ChatPhotoEmpty(),
+                date=None,
+            )
+
+    target = FakeMessage(
+        "SteamedFish: explain code with concise examples",
+        sender_id=6332621450,
+        is_human=False,
+        is_group=True,
+        entities=(telegram_types.MessageEntityBold(offset=0, length=11),),
+    )
+    attribution = bridge_resolver.resolve(target)
+    assert attribution is not None
+    command = OwnerMessage(
+        "/ai Use concise answers for this person from now on",
+        sender_id=10,
+        reply_to=target,
+        is_group=True,
+    )
+    gateway = FakeGateway(["ok"])
+    handler = make_handler(
+        gateway,
+        FakeMemory(),
+        attribution_resolver=bridge_resolver,
+        identity_resolver=TelegramMessageIdentityResolver(
+            bridge_resolver=bridge_resolver
+        ),
+    )
+
+    assert await handler.handle(command) is True
+
+    request = gateway.requests[0]
+    assert request.tool_policy == "owner"
+    assert request.identity.requester_can_customize is True
+    assert request.memory is not None
+    assert request.memory.requester_is_owner is True
+    assert [
+        (target.handle, target.identity, target.label)
+        for target in request.memory.customization_targets
+    ] == [("reply_author", attribution.actor_id, "SteamedFish")]
+
+
+@pytest.mark.asyncio
 async def test_fragmented_matrix_mxid_triggers_ai_with_separate_access_principal(
     tmp_path,
 ):
