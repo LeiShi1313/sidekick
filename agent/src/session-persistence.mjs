@@ -192,6 +192,14 @@ function boundedSummaryText(value, max) {
   return `${text.slice(0, start)}${marker}${text.slice(-end)}`;
 }
 
+function safeSummaryPayload(value, max) {
+  const escaped = String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+  return boundedSummaryText(escaped, max);
+}
+
 function promptBlockContent(value, name) {
   const open = `<${name}>`;
   const close = `</${name}>`;
@@ -206,7 +214,7 @@ function promptBlockContent(value, name) {
 function promptBlock(value, name, max) {
   const supplied = promptBlockContent(value, name);
   if (!supplied) return "";
-  const content = boundedSummaryText(supplied, max);
+  const content = safeSummaryPayload(supplied, max);
   return `<${name}>\n${content}\n</${name}>`;
 }
 
@@ -217,13 +225,13 @@ function safeSummaryIdentity(value) {
   )?.[1];
   if (!actor) return "";
   const suppliedLabel = content.match(/^Untrusted display label: ([^\n]*)$/m)?.[1];
-  const label = boundedSummaryText(
+  const label = safeSummaryPayload(
     suppliedLabel ?? "not provided",
     MAX_SAFE_SUMMARY_LABEL_CHARS,
   ).replaceAll("\n", " ");
   return (
     "<host_request_identity>\n" +
-    `Host-resolved requester actor ID: ${actor}\n` +
+    `Host-resolved current requester actor ID: ${actor}\n` +
     `Untrusted display label: ${label}\n` +
     "</host_request_identity>"
   );
@@ -237,7 +245,7 @@ function safeSummaryBindings(value) {
       /^Target handle: ([a-z0-9_]+) \| Actor ID: (actor_[a-f0-9]{16}) \| Untrusted display label: ([^\n]*)$/,
     );
     if (!match || !PARTICIPANT_TARGET_RE.test(match[1])) continue;
-    const label = boundedSummaryText(
+    const label = safeSummaryPayload(
       match[3],
       MAX_SAFE_SUMMARY_LABEL_CHARS,
     ).replaceAll("\n", " ");
@@ -267,7 +275,7 @@ function safeSummaryUserText(value) {
   ].filter(Boolean);
   return blocks.length > 0
     ? blocks.join("\n\n")
-    : boundedSummaryText(safe, MAX_SAFE_SUMMARY_REQUEST_CHARS);
+    : safeSummaryPayload(safe, MAX_SAFE_SUMMARY_REQUEST_CHARS);
 }
 
 function summaryRecords(manager, state) {
@@ -286,7 +294,7 @@ function summaryRecords(manager, state) {
         });
       }
     } else if (message.role === "assistant") {
-      const text = boundedSummaryText(
+      const text = safeSummaryPayload(
         messageText(message.content),
         MAX_SAFE_SUMMARY_ASSISTANT_CHARS,
       );
