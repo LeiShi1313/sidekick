@@ -270,7 +270,7 @@ async def test_trigger_in_reply_chain_labels_ancestors_as_untrusted_context():
     assert request.parent_entry_id is None
     assert request.prompt == "which database fits?"
     reply_context = next(
-        item.text for item in request.context if item.kind == "reference"
+        item.text for item in request.context if item.kind == "conversation"
     )
     assert "Untrusted chat context" in reply_context
     assert "context=reply_path" in reply_context
@@ -591,6 +591,7 @@ async def test_attachment_only_ai_trigger_gets_a_default_instruction():
     assert await handler.handle(trigger) is True
 
     assert gateway.requests[0].prompt == "Describe the attached content."
+    assert [item.kind for item in gateway.requests[0].context] == ["reference"]
     assert any(
         "whiteboard diagram" in item.text for item in gateway.requests[0].context
     )
@@ -1004,7 +1005,9 @@ async def test_reply_context_depth_and_size_are_bounded():
     await handler.handle(trigger)
 
     context = next(
-        item.text for item in gateway.requests[0].context if item.kind == "reference"
+        item.text
+        for item in gateway.requests[0].context
+        if item.kind == "conversation"
     )
     assert "newest context" in context
     assert "middle context" in context

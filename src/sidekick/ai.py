@@ -118,7 +118,7 @@ def _persisted_error_kind(value: object) -> str:
 
 @dataclass(frozen=True, slots=True)
 class AgentContext:
-    kind: Literal["reference"]
+    kind: Literal["conversation", "reference"]
     text: str
 
 
@@ -1680,7 +1680,9 @@ class PromptBuilder:
     ) -> tuple[AgentContext, ...]:
         context: list[AgentContext] = []
         if reference_context:
-            context.append(AgentContext(kind="reference", text=reference_context))
+            context.append(
+                AgentContext(kind="conversation", text=reference_context)
+            )
         if current_attachment_context:
             context.append(
                 AgentContext(

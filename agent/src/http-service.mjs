@@ -20,6 +20,7 @@ const MAX_ATTACHMENT_TEXT_CHARS = 50_000;
 const MAX_MEMORY_ANCHORS = 64;
 const MAX_BANK_GRANTS = 64;
 const MAX_PARTICIPANTS = 16;
+const CONTEXT_KINDS = new Set(["conversation", "reference"]);
 const CUSTOMIZATION_TARGET_HANDLE_RE =
   /^(?:reply_author|direct_chat_participant|mention_[1-9][0-9]*)$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -295,7 +296,7 @@ export function validateRunRequest(value) {
     if (
       !item ||
       typeof item !== "object" ||
-      item.kind !== "reference" ||
+      !CONTEXT_KINDS.has(item.kind) ||
       !isBoundedString(item.text, 1, 16_000)
     ) {
       return null;

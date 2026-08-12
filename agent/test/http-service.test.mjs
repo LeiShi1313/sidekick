@@ -145,7 +145,7 @@ test("accepts one bounded JPEG model input and rejects invalid image arrays", as
       body: JSON.stringify({
         ...validRun,
         context: Array.from({ length: 4 }, (_, index) => ({
-          kind: "reference",
+          kind: index === 0 ? "conversation" : "reference",
           text: `${index}${"x".repeat(15_999)}`,
         })),
         images: [image],

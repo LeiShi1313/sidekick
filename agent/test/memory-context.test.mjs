@@ -67,11 +67,14 @@ function directoryResult(bankId, name, text = `${name} is a knowledge source.`) 
   };
 }
 
-test("builds topical and identity-anchored primary-bank queries", () => {
+test("builds topical and identity-anchored queries from conversation context", () => {
   const queries = buildMemoryQueries({
     prompt: "What did Richard say?",
     context: [
-      { kind: "reference", text: "Earlier conversation about telecom pricing." },
+      {
+        kind: "conversation",
+        text: "Earlier conversation about telecom pricing.",
+      },
     ],
     identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
@@ -87,10 +90,10 @@ test("builds topical and identity-anchored primary-bank queries", () => {
   assert.match(queries[1], /Alice \(person:alice\)/);
 });
 
-test("preserves identity anchors when reference context fills the query budget", () => {
+test("preserves identity anchors when conversation context fills the query budget", () => {
   const queries = buildMemoryQueries({
     prompt: "Who does this refer to?",
-    context: [{ kind: "reference", text: "x".repeat(16_000) }],
+    context: [{ kind: "conversation", text: "x".repeat(16_000) }],
     identity: requestIdentity({
       anchors: [{ id: "person:alice", label: "Alice" }],
     }),

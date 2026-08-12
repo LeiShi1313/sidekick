@@ -155,6 +155,7 @@ class KeyedLock {
 function contextTag(kind) {
   if (kind === "access") return "host_access_advisory";
   if (kind === "requester") return "requester_memory_context";
+  if (kind === "conversation") return "untrusted_conversation_context";
   return kind === "memory"
     ? "untrusted_memory_context"
     : "untrusted_reference_context";
@@ -332,10 +333,16 @@ export function buildRunPrompt({
   sections.push(
     ...context.map(({ kind, text }) => {
       const tag = contextTag(kind);
-      return `<${tag}>\n${replaceModelIdentityIds(text, identityAliases)}\n</${tag}>`;
+      const content = promptXmlBlockText(
+        replaceModelIdentityIds(text, identityAliases),
+        32_000,
+      );
+      return `<${tag}>\n${content}\n</${tag}>`;
     }),
   );
-  sections.push(`<current_request>\n${prompt}\n</current_request>`);
+  sections.push(
+    `<current_request>\n${promptXmlBlockText(prompt, 16_000)}\n</current_request>`,
+  );
   return pseudonymizeActorIdentities(
     sections.join("\n\n"),
     identityAliasKey,
@@ -469,6 +476,13 @@ function boundedText(value, max = 500) {
 
 function promptXmlText(value, max) {
   return boundedText(value, max)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function promptXmlBlockText(value, max) {
+  return boundedMultilineText(value, max)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
@@ -1139,7 +1153,7 @@ export class PiEngine {
         privacyOptions,
         userMessageContent: buildRunPrompt({
           ...request,
-          context: request.context.filter(({ kind }) => kind === "reference"),
+          context: request.context.filter(({ kind }) => kind === "conversation"),
           continuation: request.sessionId !== null,
           identityAliasKey: this.config.identityAliasKey,
         }),

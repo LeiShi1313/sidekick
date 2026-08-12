@@ -50,7 +50,9 @@ export function buildMemoryQueries({ prompt, context, memory, identity }) {
   const sections = [explicit || `Current request: ${prompt.trim()}`];
   if (!explicit) {
     const references = context
-      .filter((item) => item.kind === "reference")
+      .filter((item) =>
+        new Set(["conversation", "reference"]).has(item.kind),
+      )
       .map((item) => item.text.trim())
       .filter(Boolean);
     if (references.length > 0) {
