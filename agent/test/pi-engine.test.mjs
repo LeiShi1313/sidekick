@@ -719,9 +719,86 @@ test("serializes each requester identity in a shared session branch", async () =
 });
 
 test("retains an owner's participant target when a third person continues", async () => {
-  const app = await fixture((_body, response) => sendText(response, "ack"));
   const owner = { id: "chat:user:owner", label: "Owner" };
   const target = { id: "chat:user:target", label: "Target" };
+  const bankId = "workspace:engineering";
+  const targetTags = requesterMemoryTags({
+    bankId,
+    requesterId: target.id,
+    source: "owner",
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+  const toolOnlyMarker = "TOOL_ARGUMENT_ONLY_MARKER";
+  let targetContent = "Address this participant formally.";
+  const app = await fixture(
+    (body, response, requestNumber) => {
+      const serialized = JSON.stringify(body.messages);
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-target-preference",
+          name: "memory_update_participant",
+          args: {
+            target: "reply_author",
+            operation: "set",
+            customization:
+              `${targetContent} Address this participant as Brother. ` +
+              toolOnlyMarker,
+          },
+        });
+        return;
+      }
+      if (requestNumber === 2) {
+        assert.match(serialized, /Participant customization was saved/);
+        sendText(response, "The target preference was saved.");
+        return;
+      }
+      assert.equal(requestNumber, 3);
+      assert.match(serialized, /Participant customization was saved/);
+      assert.match(serialized, /reply_author/);
+      assert.doesNotMatch(serialized, new RegExp(toolOnlyMarker));
+      assert.doesNotMatch(serialized, /chat:user:(?:owner|target|third)/);
+      sendText(response, "The earlier target remains distinct.");
+    },
+    {
+      memoryUrl: "http://memory.internal:8888",
+      memoryFetch: async (url, options = {}) => {
+        if (options.method === "PATCH") {
+          const body = JSON.parse(options.body);
+          targetContent = body.content;
+          return new Response(
+            JSON.stringify({
+              id: "24242424-2424-4242-8242-242424242424",
+              bank_id: bankId,
+              ...body,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/directives?")) {
+          const tags = new URL(url).searchParams.getAll("tags");
+          return new Response(
+            JSON.stringify({
+              items: tags.includes(targetTags[2])
+                ? [
+                    {
+                      id: "24242424-2424-4242-8242-242424242424",
+                      bank_id: bankId,
+                      name: "Sidekick requester customization",
+                      content: targetContent,
+                      priority: 0,
+                      is_active: true,
+                      tags: targetTags,
+                    },
+                  ]
+                : [],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      },
+    },
+  );
   try {
     const rootEvents = await collect(
       app.engine,
@@ -767,7 +844,8 @@ test("retains an owner's participant target when a third person continues", asyn
       }),
     );
 
-    const userPrompts = app.provider.requests[1].messages
+    const continuationMessages = app.provider.requests.at(-1).messages;
+    const userPrompts = continuationMessages
       .filter((message) => message.role === "user")
       .map((message) => textOf(message.content));
     assert.equal(userPrompts.length, 2);
@@ -777,7 +855,7 @@ test("retains an owner's participant target when a third person continues", asyn
     assert.match(userPrompts[0], /reply_author/);
     assert.match(userPrompts[0], /Untrusted display label: Target/i);
     assert.doesNotMatch(
-      JSON.stringify(app.provider.requests[1].messages),
+      JSON.stringify(continuationMessages),
       /chat:user:(?:owner|target|third)/,
     );
     const targetAlias = userPrompts[0].match(
@@ -793,6 +871,7 @@ test("retains an owner's participant target when a third person continues", asyn
       userPrompts[1],
       /never substitute the current requester for an earlier bound participant unless their actor IDs match/i,
     );
+    assert.equal(targetContent.includes(toolOnlyMarker), true);
   } finally {
     await app.close();
   }

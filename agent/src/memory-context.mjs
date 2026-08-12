@@ -12,6 +12,7 @@ const MAX_CONTEXT_CHARS = 4_000;
 const MAX_MEMORY_ITEMS = 50;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_DIRECTORY_CONTEXT_CHARS = 4_000;
+const RECALL_CONTEXT_KINDS = new Set(["conversation", "reference"]);
 
 export const CROSS_BANK_MEMORY_POLICY =
   "The current primary memory bank is the default scope. " +
@@ -50,9 +51,7 @@ export function buildMemoryQueries({ prompt, context, memory, identity }) {
   const sections = [explicit || `Current request: ${prompt.trim()}`];
   if (!explicit) {
     const references = context
-      .filter((item) =>
-        new Set(["conversation", "reference"]).has(item.kind),
-      )
+      .filter((item) => RECALL_CONTEXT_KINDS.has(item.kind))
       .map((item) => item.text.trim())
       .filter(Boolean);
     if (references.length > 0) {
