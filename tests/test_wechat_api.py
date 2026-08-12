@@ -444,6 +444,47 @@ def test_wechat_client_parses_image_media_identity() -> None:
     assert message.content_redacted is True
 
 
+def test_wechat_client_preserves_structured_link_destination() -> None:
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "link",
+        "content": "Shared article",
+        "title": "Shared article",
+        "url": "https://example.com/article?id=1&source=wechat",
+    }
+
+    message = WeChatConnectorMessage.parse(payload)
+
+    assert message.link_title == "Shared article"
+    assert message.link_url == "https://example.com/article?id=1&source=wechat"
+    assert message.display_content == (
+        "[Link] Shared article\n"
+        "https://example.com/article?id=1&source=wechat"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "javascript:alert(1)",
+        "https://user:password@example.com/article",
+        "/relative/article",
+        "https://example.com/\ud800",
+    ),
+)
+def test_wechat_client_rejects_unsafe_structured_link_destination(url: str) -> None:
+    payload = {
+        **connector_message_payload("4159667620982040828"),
+        "messageType": "link",
+        "content": "Shared article",
+        "title": "Shared article",
+        "url": url,
+    }
+
+    with pytest.raises(WeChatAPIContractError, match="link url"):
+        WeChatConnectorMessage.parse(payload)
+
+
 def test_wechat_client_parses_shared_chat_history_as_bounded_text() -> None:
     payload = {
         **connector_message_payload("4159667620982040828"),

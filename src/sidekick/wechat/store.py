@@ -1935,14 +1935,14 @@ class WeChatStateRepository:
             return (
                 query
                 + " AND ((messages.content_redacted = 0"
-                + " AND messages.message_type IN ('text', 'chat_history'))"
+                + " AND messages.message_type IN ('text', 'link', 'chat_history'))"
                 + " OR (messages.message_type = 'image'"
                 + " AND messages.media_id IS NOT NULL))"
             )
         return (
             query
             + " AND messages.content_redacted = 0"
-            + " AND messages.message_type IN ('text', 'chat_history')"
+            + " AND messages.message_type IN ('text', 'link', 'chat_history')"
         )
 
     def _require_connection(self) -> aiosqlite.Connection:

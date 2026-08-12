@@ -232,6 +232,8 @@ async def bootstrap_store(
     message_type="text",
     media_id=None,
     content_redacted=False,
+    link_title=None,
+    link_url=None,
 ):
     store = await WeChatStateRepository(path).connect()
     trigger = WeChatConnectorMessage(
@@ -247,6 +249,8 @@ async def bootstrap_store(
         source="wechat+localdb",
         sequence=None,
         media_id=media_id,
+        link_title=link_title,
+        link_url=link_url,
     )
     await store.bootstrap(
         connector_key=CONNECTOR_KEY,
@@ -2300,6 +2304,60 @@ async def test_wechat_conversation_handler_uses_quoted_message_as_context(
     assert marker is not None
     assert marker.agent_session_id == "session-1"
     assert marker.agent_entry_id == "entry-1"
+
+
+@pytest.mark.asyncio
+async def test_wechat_conversation_handler_uses_quoted_link_as_context(
+    tmp_path,
+) -> None:
+    url = "https://example.com/article?id=1&source=wechat"
+    wechat_store, target = await bootstrap_store(
+        tmp_path / "wechat.db",
+        trigger_text="Shared article",
+        direction="in",
+        message_type="link",
+        link_title="Shared article",
+        link_url=url,
+    )
+    command = await project_quoted_reply(wechat_store, reply_to=target.id)
+    ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
+    client = RecordingConnectorClient((submitted(),))
+    transport = WeChatChatTransport(
+        client,
+        wechat_store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    gateway = FinalGateway("Here is what the article says.")
+    identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
+    handler = AIConversationHandler(
+        owner_id=ACCOUNT_ID,
+        responder=AIResponder(
+            gateway,
+            initial_status=None,
+            transport=transport,
+        ),
+        store=ai_store,
+        prompt_builder=PromptBuilder(
+            transport=transport,
+            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            identity_resolver=WeChatMessageIdentityResolver(identity_codec),
+            mention_resolver=WeChatMessageMentionResolver(),
+            identity_codec=identity_codec,
+        ),
+        transport=transport,
+        identity_codec=identity_codec,
+    )
+    try:
+        handled = await handler.handle(command)
+    finally:
+        await ai_store.close()
+        await wechat_store.close()
+
+    assert handled is True
+    assert len(gateway.requests[0].context) == 1
+    assert "[Link] Shared article" in gateway.requests[0].context[0].text
+    assert url in gateway.requests[0].context[0].text
 
 
 @pytest.mark.asyncio
