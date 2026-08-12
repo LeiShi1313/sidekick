@@ -62,7 +62,7 @@ def run_request(
         session_id=None,
         parent_entry_id=None,
         prompt="Calculate 6 * 7",
-        context=(AgentContext(kind="reference", text="Prior conversation"),),
+        context=(AgentContext(kind="conversation", text="Prior conversation"),),
         system_prompt="Answer directly.",
         tool_policy=tool_policy,
         identity=AgentRequestIdentity(
@@ -148,7 +148,7 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
         "sessionId": None,
         "parentEntryId": None,
         "prompt": "Calculate 6 * 7",
-        "context": [{"kind": "reference", "text": "Prior conversation"}],
+        "context": [{"kind": "conversation", "text": "Prior conversation"}],
         "systemPrompt": "Answer directly.",
         "toolPolicy": "delegated",
         "identity": {

@@ -1342,7 +1342,7 @@ async def test_ai_request_delegates_scope_and_identity_anchors_to_agent():
 
     assert memory.recall_calls == []
     request = gateway.requests[0]
-    assert [item.kind for item in request.context] == ["reference"]
+    assert [item.kind for item in request.context] == ["conversation"]
     assert "Untrusted chat context" in request.context[0].text
     assert request.memory is not None
     assert request.memory.primary_bank_id == "telegram:chat:-1001"
