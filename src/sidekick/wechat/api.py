@@ -56,6 +56,8 @@ MAX_PROJECTED_SHARED_CHAT_HISTORY_ITEMS = 100
 MAX_SHARED_CHAT_HISTORY_BYTES = 48 * 1024
 MAX_SHARED_CHAT_HISTORY_LABEL_CHARS = 240
 MAX_SHARED_CHAT_HISTORY_CONTENT_CHARS = 4_096
+MAX_LINK_TITLE_CHARS = 4_096
+MAX_LINK_URL_BYTES = 4_096
 MAX_GROUP_MEMBER_DELTA_ROWS = 100_000
 
 
@@ -514,6 +516,8 @@ class WeChatConnectorMessage:
     sequence: str | None
     media_id: str | None = None
     shared_chat_history: WeChatSharedChatHistory | None = None
+    link_title: str | None = None
+    link_url: str | None = None
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatConnectorMessage:
@@ -541,6 +545,12 @@ class WeChatConnectorMessage:
                     "object is only valid for chat_history messages"
                 )
             shared_chat_history = None
+        if message_type == "link" and not content_redacted:
+            link_title = _optional_link_title(payload)
+            link_url = _optional_link_url(payload)
+        else:
+            link_title = None
+            link_url = None
         sequence = payload.get("seq")
         if sequence is not None:
             if (
@@ -566,12 +576,20 @@ class WeChatConnectorMessage:
             sequence=sequence_text,
             media_id=_optional_message_media_id(payload),
             shared_chat_history=shared_chat_history,
+            link_title=link_title,
+            link_url=link_url,
         )
 
     @property
     def display_content(self) -> str:
         if self.shared_chat_history is not None and not self.content_redacted:
             return self.shared_chat_history.text
+        if self.message_type == "link" and not self.content_redacted:
+            title = self.link_title or self.content
+            lines = [f"[Link] {title}" if title else "[Link]"]
+            if self.link_url is not None:
+                lines.append(self.link_url)
+            return "\n".join(lines)
         return self.content
 
 
@@ -1297,6 +1315,52 @@ def _shared_history_text(value: Any) -> str:
 def _shared_history_kind(value: Any) -> str:
     if not isinstance(value, str) or value not in SHARED_CHAT_HISTORY_KINDS:
         raise _shared_history_error("item kind is unsupported")
+    return value
+
+
+def _optional_link_title(payload: Mapping[str, Any]) -> str | None:
+    value = _optional_raw_text(payload, "title")
+    if value is None:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise WeChatAPIContractError("WeChat link title is invalid or oversized") from exc
+    if (
+        not value
+        or value.strip() != value
+        or len(value) > MAX_LINK_TITLE_CHARS
+        or any(
+            (ord(character) < 0x20 and character not in "\n\r\t")
+            or ord(character) == 0x7F
+            for character in value
+        )
+    ):
+        raise WeChatAPIContractError("WeChat link title is invalid or oversized")
+    return value
+
+
+def _optional_link_url(payload: Mapping[str, Any]) -> str | None:
+    value = _optional_raw_text(payload, "url")
+    if value is None:
+        return None
+    try:
+        encoded_size = len(value.encode("utf-8"))
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        has_credentials = parsed.username is not None or parsed.password is not None
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise WeChatAPIContractError("WeChat link url is invalid") from exc
+    if (
+        not value
+        or value.strip() != value
+        or encoded_size > MAX_LINK_URL_BYTES
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        or parsed.scheme.casefold() not in {"http", "https"}
+        or not hostname
+        or has_credentials
+    ):
+        raise WeChatAPIContractError("WeChat link url is invalid")
     return value
 
 

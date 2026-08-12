@@ -319,6 +319,8 @@ def connector_message(
     message_type: str = "text",
     content_redacted: bool = False,
     media_id: str | None = None,
+    link_title: str | None = None,
+    link_url: str | None = None,
 ) -> WeChatConnectorMessage:
     return WeChatConnectorMessage(
         id=message_id,
@@ -333,6 +335,8 @@ def connector_message(
         source="wechat+localdb",
         sequence=None,
         media_id=media_id,
+        link_title=link_title,
+        link_url=link_url,
     )
 
 
@@ -989,6 +993,57 @@ async def test_wechat_store_promotes_shared_history_enrichment_in_place(tmp_path
         assert visible is not None
         assert quoted is not None
         assert [message.id for message in memory_window] == [message_id]
+        assert await store.count_messages(CONNECTOR_KEY) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_store_promotes_link_enrichment_into_readable_context(tmp_path):
+    message_id = "5159667620982040828"
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=session(),
+            chats=chat_list(),
+            messages=WeChatMessageList(
+                messages=(
+                    connector_message(
+                        message_id,
+                        "Shared article",
+                        message_type="app",
+                    ),
+                ),
+                cursor="bootstrap-messages",
+            ),
+        )
+        correction = event(
+            {
+                "id": message_id,
+                "chatId": GROUP_ID,
+                "direction": "in",
+                "messageType": "link",
+                "senderId": "wxid_alice",
+                "content": "Shared article",
+                "title": "Shared article",
+                "url": "https://example.com/article?id=1&source=wechat",
+                "timestamp": 1_783_772_734,
+                "source": "wechat+localdb",
+            },
+            cursor="link-correction",
+        )
+
+        revised = await store.project_event(CONNECTOR_KEY, correction)
+        quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, message_id)
+
+        assert revised is not None
+        assert revised.message_type == "link"
+        assert quoted is not None
+        assert quoted.raw_text == (
+            "[Link] Shared article\n"
+            "https://example.com/article?id=1&source=wechat"
+        )
         assert await store.count_messages(CONNECTOR_KEY) == 1
     finally:
         await store.close()
