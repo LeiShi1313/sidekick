@@ -194,7 +194,7 @@ function boundedSummaryText(value, max) {
 
 function safeSummaryPayload(value, max) {
   const escaped = String(value ?? "")
-    .replaceAll("&", "&amp;")
+    .replace(/&(?!amp;|lt;|gt;)/g, "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
   return boundedSummaryText(escaped, max);
