@@ -102,7 +102,12 @@ def _serialized(
         **kwargs: _P.kwargs,
     ) -> _R:
         async with self._access_lock:
-            return await method(self, *args, **kwargs)
+            try:
+                return await method(self, *args, **kwargs)
+            except BaseException:
+                if self._connection is not None:
+                    await _rollback_quietly(self._connection)
+                raise
 
     return locked
 

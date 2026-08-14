@@ -6,13 +6,19 @@ import pytest
 
 from sidekick.wechat.api import (
     WeChatAPIError,
+    WeChatCapabilities,
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
     WeChatObservedMessage,
+    WeChatEvent,
     WeChatSession,
 )
-from sidekick.wechat.service import WeChatPendingAIWorker
+from sidekick.wechat.service import (
+    WeChatBootstrap,
+    WeChatEventPump,
+    WeChatPendingAIWorker,
+)
 from sidekick.wechat.store import WeChatStateRepository
 
 
@@ -125,6 +131,81 @@ async def enqueue(store: WeChatStateRepository, *, kind: str = "message") -> Non
         chat_id=CHAT_ID,
         message_id=MESSAGE_ID,
         kind=kind,
+    )
+
+
+def bootstrap() -> WeChatBootstrap:
+    return WeChatBootstrap(
+        session=WeChatSession(
+            status="logged_in",
+            self_id="wxid_self",
+            display_name="Sidekick",
+            hook_connected=True,
+            connection_generation=41,
+            content_redacted=False,
+            cursor="bootstrap-cursor",
+        ),
+        capabilities=WeChatCapabilities(
+            receive_text=True,
+            receive_shared_chat_history=True,
+            stable_inbound_message_ids=True,
+            send_text=True,
+            send_reply=True,
+            send_native_reply=True,
+            request_idempotency=True,
+            outbound_stable_message_id=True,
+            websocket=True,
+            cursor=True,
+            replay=True,
+            durable_cursor=True,
+            text_send_ready=True,
+            reply_send_ready=True,
+            connection_generation=41,
+            history=False,
+            inbound_image_download=True,
+            request_original_image=True,
+            fetch_observed_messages=True,
+        ),
+        chats=WeChatChatList(
+            chats=(
+                WeChatChat(
+                    id=CHAT_ID,
+                    type="group",
+                    display_name="Example group",
+                ),
+            ),
+            snapshot=WeChatChatSnapshot(
+                id="snapshot-41",
+                complete=True,
+                current=True,
+                count=1,
+                cursor="bootstrap-cursor",
+                connection_generation=41,
+            ),
+            cursor="bootstrap-cursor",
+        ),
+    )
+
+
+def message_event(
+    *,
+    cursor: str,
+    message_id: str = MESSAGE_ID,
+) -> WeChatEvent:
+    return WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": cursor,
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": message_id,
+            "chatId": CHAT_ID,
+            "direction": "in",
+            "messageType": "text",
+            "senderId": "wxid_alice",
+            "content": "/ai hello",
+            "timestamp": 1_700_000_010,
+        }
     )
 
 
@@ -284,3 +365,237 @@ async def test_cancelled_worker_marks_started_execution_unknown_instead_of_retry
         assert await store.claim_pending_ai_work(CONNECTOR_KEY) is None
     finally:
         await store.close()
+
+
+class StreamingObservedClient(FakeObservedClient):
+    def __init__(self, events, results):
+        super().__init__(results)
+        self._events = tuple(events)
+        self.after_values: list[str] = []
+        self.keep_open = asyncio.Event()
+
+    async def events(self, *, after: str):
+        self.after_values.append(after)
+        for event in self._events:
+            yield event
+        await self.keep_open.wait()
+
+    async def get_chats(self):
+        return bootstrap().chats
+
+    async def get_user(self, _user_id):
+        return None
+
+    async def get_group_members(self, _group_id):
+        raise AssertionError("group directory should not be read")
+
+
+async def wait_until(predicate) -> None:
+    for _ in range(100):
+        if await predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition was not reached")
+
+
+@pytest.mark.asyncio
+async def test_event_pump_drops_poison_but_advances_to_later_ai_command(
+    tmp_path,
+) -> None:
+    poison = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "1249405",
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": "4159667620982040800",
+            "chatId": CHAT_ID,
+            "direction": "in",
+            "messageType": "system",
+            "sharedChatHistory": {"title": "stale"},
+            "timestamp": 1_700_000_000,
+        }
+    )
+    valid = message_event(cursor="1249406")
+    client = StreamingObservedClient((poison, valid), [present_message()])
+    store = await open_store(tmp_path / "wechat.db")
+    handler = RecordingHandler()
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap(),
+            handler_concurrency=1,
+        ).run(handler, stop)
+    )
+    try:
+        await wait_until(_async_predicate(lambda: bool(handler.messages)))
+
+        assert await store.get_cursor(CONNECTOR_KEY) == "1249406"
+        assert [message.id for message in handler.messages] == [MESSAGE_ID]
+        assert await store.count_messages(CONNECTOR_KEY) == 0
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingHandler:
+        async def handle(self, _message) -> bool:
+            started.set()
+            await release.wait()
+            return True
+
+    later = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "event-12",
+            "event": "unsupported_future_event",
+            "connectionGeneration": 41,
+        }
+    )
+    client = StreamingObservedClient(
+        (message_event(cursor="event-11"), later),
+        [present_message()],
+    )
+    store = await open_store(tmp_path / "wechat.db")
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap(),
+            handler_concurrency=1,
+        ).run(BlockingHandler(), stop)
+    )
+    try:
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+        except TimeoutError as exc:
+            pending = await store.get_pending_ai_work(
+                CONNECTOR_KEY,
+                CHAT_ID,
+                MESSAGE_ID,
+            )
+            raise AssertionError(
+                f"handler did not start; pending={pending}; "
+                f"requests={client.requests}; pump_done={task.done()}"
+            ) from exc
+        await wait_until(
+            _async_predicate_from_async(
+                store.get_cursor,
+                CONNECTOR_KEY,
+                expected="event-12",
+            )
+        )
+        assert not release.is_set()
+        release.set()
+    finally:
+        release.set()
+        stop.set()
+        result = await asyncio.wait_for(task, timeout=1)
+        assert result == "stopped"
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
+    tmp_path,
+) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    emit_removal = asyncio.Event()
+
+    class BlockingHandler:
+        async def handle(self, _message) -> bool:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    removal = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "event-12",
+            "event": "message_remove",
+            "connectionGeneration": 41,
+            "status": "recalled",
+            "chatId": CHAT_ID,
+            "id": MESSAGE_ID,
+        }
+    )
+
+    class RemovalClient(StreamingObservedClient):
+        async def events(self, *, after: str):
+            self.after_values.append(after)
+            yield message_event(cursor="event-11")
+            await emit_removal.wait()
+            yield removal
+            await self.keep_open.wait()
+
+    client = RemovalClient((), [present_message(version="mv1:before-recall")])
+    store = await open_store(tmp_path / "wechat.db")
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap(),
+            handler_concurrency=1,
+        ).run(BlockingHandler(), stop)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        emit_removal.set()
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        await wait_until(
+            _async_predicate_from_async(
+                store.get_cursor,
+                CONNECTOR_KEY,
+                expected="event-12",
+            )
+        )
+
+        async def removal_finished() -> bool:
+            return await store.get_pending_ai_work(
+                CONNECTOR_KEY,
+                CHAT_ID,
+                MESSAGE_ID,
+            ) is None
+
+        await wait_until(removal_finished)
+        assert await store.get_processed_revision_status(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            MESSAGE_ID,
+            "mv1:before-recall",
+        ) == "failed_unknown"
+    finally:
+        emit_removal.set()
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        await store.close()
+
+
+def _async_predicate(predicate):
+    async def evaluate() -> bool:
+        return bool(predicate())
+
+    return evaluate
+
+
+def _async_predicate_from_async(function, *args, expected):
+    async def evaluate() -> bool:
+        return await function(*args) == expected
+
+    return evaluate

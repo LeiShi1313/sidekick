@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import aiohttp
-from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import logging
 import time
 from typing import Any, Callable, Literal, Protocol
+
+import aiohttp
 
 from sidekick.ai import ReplyTarget
 from sidekick.wechat.api import (
@@ -17,7 +17,6 @@ from sidekick.wechat.api import (
     WeChatChatList,
     WeChatEvent,
     WeChatGroupMemberList,
-    WeChatMessageList,
     WeChatObservedMessage,
     WeChatSession,
     WeChatUser,
@@ -80,6 +79,15 @@ class WeChatPendingAIWorker:
         self._not_observed_attempts = not_observed_attempts
         self._clock = clock
         self._logger = logger
+        self._active_work: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._recall_cancellations: set[asyncio.Task[Any]] = set()
+
+    def cancel_message(self, chat_id: str, message_id: str) -> None:
+        task = self._active_work.get((chat_id, message_id))
+        if task is None or task.done():
+            return
+        self._recall_cancellations.add(task)
+        task.cancel()
 
     async def process_one(self, handler: WeChatInboundHandler) -> WorkerResult:
         work = await self._store.claim_pending_ai_work(
@@ -92,6 +100,11 @@ class WeChatPendingAIWorker:
             resolved = await self._store.resolve_pending_ai_removal(work)
             return "recalled" if resolved else "stale"
 
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("WeChat pending work requires an asyncio task")
+        work_key = (work.chat_id, work.message_id)
+        self._active_work[work_key] = task
         execution_version: str | None = None
         try:
             try:
@@ -188,7 +201,13 @@ class WeChatPendingAIWorker:
                     now=self._clock(),
                 )
             await asyncio.shield(cleanup)
+            if task in self._recall_cancellations:
+                return "stale"
             raise
+        finally:
+            if self._active_work.get(work_key) is task:
+                self._active_work.pop(work_key, None)
+            self._recall_cancellations.discard(task)
 
     async def _handle_api_error(
         self,
@@ -264,8 +283,6 @@ class WeChatBootstrapClient(Protocol):
 
     async def get_chats(self) -> WeChatChatList: ...
 
-    async def get_messages(self, *, limit: int) -> WeChatMessageList: ...
-
     async def get_users(self) -> WeChatUserList: ...
 
     async def get_user(self, user_id: str) -> WeChatUser | None: ...
@@ -280,16 +297,6 @@ class WeChatBootstrap:
     session: WeChatSession
     capabilities: WeChatCapabilities
     chats: WeChatChatList
-    messages: WeChatMessageList
-
-
-@dataclass(slots=True)
-class _PendingEvent:
-    event: WeChatEvent
-    operation: asyncio.Task[WeChatMessage | None] | None = None
-    processed_persisted: bool = False
-    commit_cursor: bool = True
-    rebootstrap: bool = False
 
 
 async def bootstrap_wechat_channel(
@@ -307,19 +314,16 @@ async def bootstrap_wechat_channel(
         )
     chats = await client.get_chats()
     chats.require_current(session.connection_generation)
-    messages = await client.get_messages(limit=1_000)
     await store.bootstrap(
         connector_key=connector_key,
         session=session,
         chats=chats,
-        messages=messages,
     )
     await _hydrate_identity_directories(client, store, connector_key, chats)
     return WeChatBootstrap(
         session=session,
         capabilities=capabilities,
         chats=chats,
-        messages=messages,
     )
 
 
@@ -340,125 +344,104 @@ class WeChatEventPump:
         self._connector_key = connector_key
         self._bootstrap = bootstrap
         self._handler_concurrency = handler_concurrency
+        self._work_available = asyncio.Event()
+        self._directory_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
         self,
         handler: WeChatInboundHandler,
         stop: asyncio.Event,
     ) -> PumpResult:
+        await self._store.recover_pending_ai_work(self._connector_key)
+        worker = WeChatPendingAIWorker(
+            self._client,
+            self._store,
+            self._connector_key,
+            logger=_LOGGER,
+        )
+        worker_tasks = tuple(
+            asyncio.create_task(
+                self._run_worker(worker, handler),
+                name=f"wechat-ai-worker-{index}",
+            )
+            for index in range(self._handler_concurrency)
+        )
+        self._work_available.set()
         after = await self._store.get_cursor(self._connector_key)
         stream = self._client.events(after=after)
         iterator = stream.__aiter__()
-        pending: deque[_PendingEvent] = deque()
         next_event: asyncio.Task[WeChatEvent] | None = None
         stopped = asyncio.create_task(stop.wait())
-        stream_ended = False
         try:
             while True:
-                result = await self._ack_ready_events(pending)
-                if result is not None:
-                    return result
                 if stop.is_set():
                     return "stopped"
-                if stream_ended and not pending:
-                    return "reconnect"
-                if (
-                    next_event is None
-                    and not stream_ended
-                    and len(pending) < self._handler_concurrency
-                ):
+                if next_event is None:
                     next_event = asyncio.create_task(iterator.__anext__())
-
-                wait_for: set[asyncio.Task[object]] = {stopped}
-                if next_event is not None:
-                    wait_for.add(next_event)
-                if pending and pending[0].operation is not None:
-                    wait_for.add(pending[0].operation)
                 done, _ = await asyncio.wait(
-                    wait_for,
+                    {stopped, next_event},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stopped in done:
                     return "stopped"
-                if next_event is not None and next_event in done:
-                    try:
-                        event = next_event.result()
-                    except StopAsyncIteration:
-                        stream_ended = True
-                    else:
-                        prepared = await self._prepare_event(handler, event)
-                        pending.append(prepared)
-                        if prepared.rebootstrap:
-                            # Do not dispatch anything beyond an account/session
-                            # boundary using the old bootstrap state.
-                            stream_ended = True
-                    next_event = None
+                try:
+                    event = next_event.result()
+                except StopAsyncIteration:
+                    return "reconnect"
+                next_event = None
+                if await self._accept_event(event, worker):
+                    return "rebootstrap"
         finally:
             if next_event is not None:
                 next_event.cancel()
                 await asyncio.gather(next_event, return_exceptions=True)
-            operations = [
-                item.operation
-                for item in pending
-                if item.operation is not None and not item.operation.done()
-            ]
-            for operation in operations:
-                operation.cancel()
-            if operations:
-                await asyncio.gather(*operations, return_exceptions=True)
+            for task in worker_tasks:
+                task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            for task in self._directory_tasks:
+                task.cancel()
+            if self._directory_tasks:
+                await asyncio.gather(
+                    *self._directory_tasks,
+                    return_exceptions=True,
+                )
+            self._directory_tasks.clear()
             stopped.cancel()
             await asyncio.gather(stopped, return_exceptions=True)
             close = getattr(iterator, "aclose", None)
             if callable(close):
                 await close()
 
-    async def _prepare_event(
+    async def _accept_event(
         self,
-        handler: WeChatInboundHandler,
         event: WeChatEvent,
-    ) -> _PendingEvent:
+        worker: WeChatPendingAIWorker,
+    ) -> bool:
         generation = self._bootstrap.session.connection_generation
         if (
             event.connection_generation is not None
             and event.connection_generation != generation
         ):
-            return _PendingEvent(
-                event=event,
-                commit_cursor=event.connection_generation < generation,
-                rebootstrap=True,
-            )
+            if event.connection_generation < generation:
+                await self._store.acknowledge_event(
+                    self._connector_key,
+                    event.cursor,
+                )
+            return True
 
         if event.name == "hook_connection":
-            return _PendingEvent(
-                event=event,
-                rebootstrap=event.payload.get("status") == "disconnected",
+            await self._store.acknowledge_event(
+                self._connector_key,
+                event.cursor,
             )
+            return event.payload.get("status") == "disconnected"
 
         if event.name == "session_update":
-            return _PendingEvent(event=event, rebootstrap=True)
-
-        if event.name in {"chat", "chat_snapshot"}:
-            await self._refresh_chats(generation)
-            return _PendingEvent(event=event)
-
-        if event.name == "user_profile":
-            user_id = event.changed_user_id()
-            user = await self._client.get_user(user_id)
-            await self._store.refresh_user(self._connector_key, user_id, user)
-            return _PendingEvent(event=event)
-
-        if event.name in {
-            "group_member",
-            "group_member_snapshot",
-            "group_member_directory",
-        }:
-            group_id = event.invalidated_group_id()
-            if group_id is not None:
-                await self._refresh_group_members(
-                    group_id,
-                    replace_aliases=event.name == "group_member_directory",
-                )
-            return _PendingEvent(event=event)
+            await self._store.acknowledge_event(
+                self._connector_key,
+                event.cursor,
+            )
+            return True
 
         if event.name == "message":
             if _is_inconsistent_shared_chat_history(event):
@@ -470,84 +453,169 @@ class WeChatEventPump:
                         "wechat_message_type": event.payload.get("messageType"),
                     },
                 )
-                return _PendingEvent(event=event)
-            if event.is_senderless_unsupported_message():
-                return _PendingEvent(event=event)
-            message = await self._store.project_event(self._connector_key, event)
-            if message is None:
-                await self._refresh_chats(generation)
-                message = await self._store.project_event(self._connector_key, event)
-            if message is not None and _dispatchable(message):
-                if not await self._store.is_processed(message):
-                    return _PendingEvent(
-                        event=event,
-                        operation=asyncio.create_task(
-                            self._handle_message(handler, message)
-                        ),
-                    )
-            return _PendingEvent(event=event)
-
-        if event.name == "message_remove":
-            await self._store.project_event(self._connector_key, event)
-
-        return _PendingEvent(event=event)
-
-    async def _ack_ready_events(
-        self,
-        pending: deque[_PendingEvent],
-    ) -> Literal["rebootstrap"] | None:
-        await self._persist_out_of_order_completions(pending)
-        while pending:
-            current = pending[0]
-            operation = current.operation
-            if operation is not None and not operation.done():
-                return None
-            processed = operation.result() if operation is not None else None
-            if current.commit_cursor:
                 await self._store.acknowledge_event(
                     self._connector_key,
-                    current.event.cursor,
-                    processed_message=(
-                        None if current.processed_persisted else processed
-                    ),
+                    event.cursor,
                 )
-            pending.popleft()
-            if current.rebootstrap:
-                return "rebootstrap"
-        return None
-
-    async def _persist_out_of_order_completions(
-        self,
-        pending: deque[_PendingEvent],
-    ) -> None:
-        for current in tuple(pending)[1:]:
-            operation = current.operation
-            if (
-                operation is None
-                or not operation.done()
-                or operation.cancelled()
-                or current.processed_persisted
-                or operation.exception() is not None
-            ):
-                continue
-            message = operation.result()
-            if message is None:
-                continue
-            await self._store.mark_processed_identity(
+                return False
+            if event.is_senderless_unsupported_message():
+                await self._store.acknowledge_event(
+                    self._connector_key,
+                    event.cursor,
+                )
+                return False
+            try:
+                message = event.message()
+            except WeChatAPIContractError:
+                self._log_dropped_message(event)
+                await self._store.acknowledge_event(
+                    self._connector_key,
+                    event.cursor,
+                )
+                return False
+            await self._store.accept_pending_ai_event(
                 self._connector_key,
-                message.account_id,
-                message.chat_id,
-                message.id,
+                cursor=event.cursor,
+                chat_id=message.chat_id,
+                message_id=message.id,
+                kind="message",
             )
-            current.processed_persisted = True
+            self._work_available.set()
+            return False
+
+        if event.name == "message_remove":
+            try:
+                chat_id, message_id = event.removed_message()
+            except WeChatAPIContractError:
+                self._log_dropped_message(event)
+                await self._store.acknowledge_event(
+                    self._connector_key,
+                    event.cursor,
+                )
+                return False
+            await self._store.accept_pending_ai_event(
+                self._connector_key,
+                cursor=event.cursor,
+                chat_id=chat_id,
+                message_id=message_id,
+                kind="message_remove",
+            )
+            worker.cancel_message(chat_id, message_id)
+            self._work_available.set()
+            return False
+
+        await self._store.acknowledge_event(
+            self._connector_key,
+            event.cursor,
+        )
+        self._schedule_directory_refresh(event, generation)
+        return False
+
+    async def _run_worker(
+        self,
+        worker: WeChatPendingAIWorker,
+        handler: WeChatInboundHandler,
+    ) -> None:
+        while True:
+            processing = asyncio.create_task(worker.process_one(handler))
+            try:
+                result = await processing
+            except asyncio.CancelledError:
+                processing.cancel()
+                await asyncio.gather(processing, return_exceptions=True)
+                raise
+            except Exception as exc:
+                _LOGGER.error(
+                    "WeChat pending AI worker failed (%s)",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                result = "idle"
+            if result != "idle":
+                continue
+            self._work_available.clear()
+            next_attempt_at = await self._store.next_pending_ai_work_at(
+                self._connector_key
+            )
+            timeout = (
+                max(0.0, next_attempt_at - time.time())
+                if next_attempt_at is not None
+                else None
+            )
+            if timeout == 0:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._work_available.wait(),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                pass
+
+    def _schedule_directory_refresh(
+        self,
+        event: WeChatEvent,
+        generation: int,
+    ) -> None:
+        if event.name not in {
+            "chat",
+            "chat_snapshot",
+            "user_profile",
+            "group_member",
+            "group_member_snapshot",
+            "group_member_directory",
+        }:
+            return
+        task = asyncio.create_task(
+            self._refresh_directory_event(event, generation),
+            name=f"wechat-directory-refresh-{event.cursor}",
+        )
+        self._directory_tasks.add(task)
+        task.add_done_callback(self._directory_tasks.discard)
+
+    async def _refresh_directory_event(
+        self,
+        event: WeChatEvent,
+        generation: int,
+    ) -> None:
+        try:
+            if event.name in {"chat", "chat_snapshot"}:
+                await self._refresh_chats(generation)
+                return
+            if event.name == "user_profile":
+                user_id = event.changed_user_id()
+                user = await self._client.get_user(user_id)
+                await self._store.refresh_user(
+                    self._connector_key,
+                    user_id,
+                    user,
+                )
+                return
+            group_id = event.invalidated_group_id()
+            if group_id is not None:
+                await self._refresh_group_members(
+                    group_id,
+                    replace_aliases=event.name == "group_member_directory",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOGGER.warning(
+                "WeChat directory refresh deferred (%s; cursor=%s)",
+                type(exc).__name__,
+                event.cursor,
+            )
 
     @staticmethod
-    async def _handle_message(
-        handler: WeChatInboundHandler,
-        message: WeChatMessage,
-    ) -> WeChatMessage:
-        await handler.handle(message)
-        return message
+    def _log_dropped_message(event: WeChatEvent) -> None:
+        _LOGGER.warning(
+            "Dropped malformed WeChat message event",
+            extra={
+                "wechat_event_cursor": event.cursor,
+                "wechat_message_id": event.payload.get("id"),
+                "wechat_message_type": event.payload.get("messageType"),
+            },
+        )
 
     async def _refresh_chats(self, generation: int) -> None:
         chats = await self._client.get_chats()
