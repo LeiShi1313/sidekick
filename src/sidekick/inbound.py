@@ -34,6 +34,7 @@ class InboundWork(Protocol):
     kind: InboundWorkKind
     attempt_count: int
     last_error_code: str | None
+    attested_origin: MessageOrigin | None
     lease_id: str | None
 
 

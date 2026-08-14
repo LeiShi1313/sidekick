@@ -83,6 +83,7 @@ class WeChatPendingAIWork:
     lease_trigger_cursor: str | None
     current_version: str | None
     updated_at: float
+    attested_origin: None = None
 
 
 def _serialized(
