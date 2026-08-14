@@ -26,6 +26,11 @@ from sidekick.chat.provenance import (
 )
 from sidekick.chat.transport import ChatPresentation, SentMessage
 from sidekick.channel_status import ChannelInventoryItem
+from sidekick.inbound import (
+    InboundSourceRevision,
+    InboundSourceUnavailable,
+    InboundWork,
+)
 from sidekick.onebot.client import OneBotActionError, OneBotNotConnectedError
 from sidekick.onebot.message import (
     OneBotActionClient,
@@ -108,6 +113,87 @@ class QQIdentityCodec:
 
 
 QQ_IDENTITY_CODEC: IdentityCodec = QQIdentityCodec()
+
+
+class OneBotInboundMessageSource:
+    def __init__(
+        self,
+        client: OneBotActionClient,
+        *,
+        self_id: int,
+        directory: OneBotDirectory | None = None,
+    ) -> None:
+        if self_id <= 0:
+            raise ValueError("OneBot source account ID must be positive")
+        self._client = client
+        self._self_id = self_id
+        self._directory = directory
+
+    async def fetch(
+        self,
+        work: InboundWork,
+    ) -> InboundSourceRevision[OneBotMessage]:
+        if (
+            isinstance(work.chat_id, bool)
+            or not isinstance(work.chat_id, int)
+            or isinstance(work.message_id, bool)
+            or not isinstance(work.message_id, int)
+        ):
+            raise ValueError("OneBot work requires integer message identity")
+        try:
+            payload = await self._client.call(
+                "get_msg",
+                {"message_id": str(work.message_id)},
+            )
+        except (OneBotNotConnectedError, TimeoutError, ConnectionError) as exc:
+            raise InboundSourceUnavailable(
+                type(exc).__name__,
+                max_attempts=None,
+            ) from exc
+        except OneBotActionError as exc:
+            raise InboundSourceUnavailable(
+                f"ONEBOT_ACTION_{exc.retcode}",
+                max_attempts=1,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise InboundSourceUnavailable(
+                "ONEBOT_MESSAGE_INVALID",
+                max_attempts=1,
+            )
+        try:
+            message = OneBotMessage.from_payload(
+                payload,
+                action_client=self._client,
+                scope_display_name=(
+                    self._directory.scope_name(work.chat_id)
+                    if self._directory is not None
+                    else None
+                ),
+                private_peer_id=abs(work.chat_id) if work.chat_id < 0 else None,
+            )
+        except OneBotMessageError as exc:
+            raise InboundSourceUnavailable(
+                "ONEBOT_MESSAGE_INVALID",
+                max_attempts=1,
+            ) from exc
+        if (
+            message.self_id != self._self_id
+            or message.chat_id != work.chat_id
+            or message.id != work.message_id
+        ):
+            raise InboundSourceUnavailable(
+                "ONEBOT_MESSAGE_IDENTITY_MISMATCH",
+                max_attempts=1,
+            )
+        return InboundSourceRevision(
+            version=f"onebot:v1:{message.id}",
+            state="present",
+            payload=message,
+            attested_origin=work.attested_origin,
+        )
+
+    async def materialize(self, message: OneBotMessage) -> ReplyTarget | None:
+        return message
 
 
 class OneBotDirectory:
