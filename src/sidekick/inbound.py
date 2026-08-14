@@ -127,14 +127,23 @@ class InboundMessageSource(Protocol[_SourcePayload]):
 
 
 class InboundSourceUnavailable(Exception):
-    def __init__(self, code: str, *, max_attempts: int | None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        max_attempts: int | None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         if not code:
             raise ValueError("Inbound source error code cannot be empty")
         if max_attempts is not None and max_attempts < 1:
             raise ValueError("Inbound source attempts must be positive")
+        if retry_after_seconds is not None and retry_after_seconds < 0:
+            raise ValueError("Inbound source retry delay cannot be negative")
         super().__init__(code)
         self.code = code
         self.max_attempts = max_attempts
+        self.retry_after_seconds = retry_after_seconds
 
 
 class InboundMessageHandler(Protocol):
@@ -144,6 +153,13 @@ class InboundMessageHandler(Protocol):
         *,
         attested_origin: MessageOrigin | None = None,
     ) -> bool: ...
+
+
+def is_ai_candidate(message: ReplyTarget) -> bool:
+    text = message.raw_text
+    return (
+        isinstance(text, str) and text.strip().startswith("/")
+    ) or message.reply_to_msg_id is not None
 
 
 class InboundWorker(Protocol):
@@ -217,6 +233,7 @@ class DurableInboundWorker(Generic[_SourcePayload]):
                     work,
                     error_code=exc.code,
                     max_attempts=exc.max_attempts,
+                    retry_after_seconds=exc.retry_after_seconds,
                 )
 
             begin = await self._store.begin_pending_ai_execution(
@@ -314,6 +331,7 @@ class DurableInboundWorker(Generic[_SourcePayload]):
         *,
         error_code: str,
         max_attempts: int | None,
+        retry_after_seconds: float | None,
     ) -> InboundWorkerResult:
         now = self._clock()
         prior_attempts = (
@@ -322,7 +340,11 @@ class DurableInboundWorker(Generic[_SourcePayload]):
         status = await self._store.defer_pending_ai_work(
             work,
             error_code=error_code,
-            retry_at=now + self._retry_delay(prior_attempts),
+            retry_at=now
+            + max(
+                self._retry_delay(prior_attempts),
+                retry_after_seconds or 0,
+            ),
             max_attempts=max_attempts,
             now=now,
         )

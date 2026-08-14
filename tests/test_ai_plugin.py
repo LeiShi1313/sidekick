@@ -16,11 +16,7 @@ from sidekick.telegram.ai_identity import (
     TelegramDirectorySourceResolver,
     TelegramMemoryScopeTargetResolver,
 )
-
-
-class FailingHandler:
-    async def handle(self, message):
-        raise RuntimeError("handler failed")
+from sidekick.telegram.ai_history import TelegramInboundMessageSource
 
 
 class RecordingLogger:
@@ -91,6 +87,22 @@ class FakeStateRepository:
         self.records.append(
             (owner_id, saved_message_id, source_chat_id, source_message_id)
         )
+
+
+class FakeInboundStore:
+    def __init__(self):
+        self.accepted = []
+
+    async def accept_pending_ai_event(self, source_id, **work):
+        self.accepted.append((source_id, work))
+
+
+class FakeInboundPool:
+    def __init__(self):
+        self.notified = False
+
+    def notify(self):
+        self.notified = True
 
 
 class FakeTelegramClient:
@@ -197,6 +209,7 @@ class FakeSavedMessage:
         self.sender_id = owner_id
         self.out = True
         self.raw_text = text
+        self.reply_to_msg_id = None
         self.fwd_from = (
             SimpleNamespace(
                 saved_from_peer=source_peer,
@@ -265,6 +278,8 @@ def make_plugin(
     owner_id=10,
     edit_limiter=None,
     transport=None,
+    inbound_store=None,
+    inbound_pool=None,
 ):
     plugin = TelegramAI.__new__(TelegramAI)
     plugin._handler = handler
@@ -273,6 +288,9 @@ def make_plugin(
     plugin._saved_memory_lock = asyncio.Lock()
     plugin._edit_limiter = edit_limiter or RecordingEditLimiter()
     plugin._transport = transport or FakePluginTransport()
+    plugin._ops_settings = SimpleNamespace(instance_id="telegram-test")
+    plugin._inbound_store = inbound_store or FakeInboundStore()
+    plugin._inbound_pool = inbound_pool or FakeInboundPool()
     plugin._continuous_memory_scheduler = None
     plugin.service = SimpleNamespace(client=client)
     plugin.logger = RecordingLogger()
@@ -465,14 +483,30 @@ async def test_telegram_directory_rejects_private_and_cross_platform_sources():
 
 
 @pytest.mark.asyncio
-async def test_ai_plugin_logs_message_handler_failures():
+async def test_ai_plugin_logs_inbound_accept_failures():
+    class FailingInboundStore:
+        async def accept_pending_ai_event(self, *_args, **_kwargs):
+            raise RuntimeError("inbox failed")
+
     plugin = TelegramAI.__new__(TelegramAI)
-    plugin._handler = FailingHandler()
+    plugin._handler = object()
     plugin._owner_id = 10
     plugin._transport = FakePluginTransport()
+    plugin._ops_settings = SimpleNamespace(instance_id="telegram-test")
+    plugin._inbound_store = FailingInboundStore()
+    plugin._inbound_pool = FakeInboundPool()
+    plugin._saved_memory_lock = asyncio.Lock()
     plugin.logger = RecordingLogger()
     event = SimpleNamespace(
-        message=SimpleNamespace(chat_id=-1001, id=42),
+        message=SimpleNamespace(
+            chat_id=-1001,
+            id=42,
+            raw_text="/ai hello",
+            reply_to_msg_id=None,
+            out=False,
+            peer_id=telegram_types.PeerChannel(1001),
+            fwd_from=None,
+        ),
     )
 
     await plugin._on_message(event)
@@ -781,7 +815,8 @@ async def test_saved_messages_note_containing_link_stays_an_ordinary_message():
     await plugin._on_message(SimpleNamespace(message=saved_message))
 
     assert handler.memory_targets == []
-    assert handler.messages == [saved_message]
+    assert handler.messages == []
+    assert plugin._inbound_store.accepted == []
     assert client.get_input_entity_calls == []
     assert client.requests == []
 
@@ -919,8 +954,8 @@ async def test_unresolvable_saved_forward_is_not_treated_as_an_ai_command():
 
 
 @pytest.mark.asyncio
-async def test_ordinary_message_still_uses_ai_conversation_handler():
-    message = FakeSavedMessage(forwarded=False)
+async def test_ai_candidate_is_queued_for_conversation_handler():
+    message = FakeSavedMessage(forwarded=False, text="/ai hello")
     handler = RecordingHandler()
     store = FakeStateRepository()
     client = FakeTelegramClient(None)
@@ -929,5 +964,57 @@ async def test_ordinary_message_still_uses_ai_conversation_handler():
     await plugin._on_message(SimpleNamespace(message=message))
 
     assert handler.memory_targets == []
-    assert handler.messages == [message]
+    assert handler.messages == []
+    assert plugin._inbound_store.accepted == [
+        (
+            "telegram-test",
+            {
+                "cursor": message.id,
+                "chat_id": message.chat_id,
+                "message_id": message.id,
+                "kind": "message",
+                "attested_origin": MessageOrigin.MANUAL_OUTGOING,
+            },
+        )
+    ]
+    assert plugin._inbound_pool.notified is True
     assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_inbound_source_refetches_exact_message() -> None:
+    message = SimpleNamespace(
+        id=42,
+        chat_id=-1001,
+        raw_text="/ai hello",
+        reply_to_msg_id=None,
+        out=False,
+        file=None,
+        media=None,
+        message_type=None,
+        edit_date=None,
+    )
+
+    class ExactClient:
+        def __init__(self):
+            self.calls = []
+
+        async def get_messages(self, chat_id, *, ids):
+            self.calls.append((chat_id, ids))
+            return message
+
+    client = ExactClient()
+    source = TelegramInboundMessageSource(client)
+    work = SimpleNamespace(
+        chat_id=-1001,
+        message_id=42,
+        attested_origin=MessageOrigin.INCOMING,
+    )
+
+    revision = await source.fetch(work)
+
+    assert revision.version.startswith("telegram:v1:42:")
+    assert revision.payload is message
+    assert revision.attested_origin is MessageOrigin.INCOMING
+    assert await source.materialize(revision.payload) is message
+    assert client.calls == [(-1001, 42)]

@@ -45,6 +45,12 @@ from sidekick.channel_status import (
     ChannelOpsSettings,
     ChannelSnapshotService,
 )
+from sidekick.inbound import (
+    DurableInboundPool,
+    DurableInboundWorker,
+    is_ai_candidate,
+)
+from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.plugins.base import PluginMount
 from sidekick.telegram import TelegramCommand
 from sidekick.telegram.ai_transport import (
@@ -63,6 +69,7 @@ from sidekick.telegram.ai_identity import (
 )
 from sidekick.telegram.ai_history import (
     TelegramHistorySource,
+    TelegramInboundMessageSource,
     telegram_channel_album_document_id,
     telegram_source_retry_delay,
 )
@@ -82,6 +89,7 @@ class _SavedMemoryLinkUnavailable(RuntimeError):
 
 class TelegramAI(TelegramCommand, metaclass=PluginMount):
     command_name = "ai"
+    INBOUND_CONCURRENCY = 8
     THINKING_REPLY = "🤔 Thinking..."
     MEMORY_STORED_REACTION = "✍"
     MEMORY_FAILED_REACTION = "👎"
@@ -124,6 +132,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         self._responder: AIResponder | None = None
         self._transport: TelegramChatTransport | None = None
         self._store = AIStateRepository(settings.state_path)
+        self._inbound_store = SQLiteInboundWorkStore(settings.state_path)
         self._memory = (
             HindsightMemoryClient(
                 settings.hindsight_url,
@@ -134,6 +143,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             else None
         )
         self._handler: AIConversationHandler | None = None
+        self._inbound_pool: DurableInboundPool | None = None
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_memory_scheduler: ContinuousMemoryScheduler | None = None
         self._memory_outbox_scheduler: MemoryOutboxScheduler | None = None
@@ -180,6 +190,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             await self.service.wait_until_disconnected()
         finally:
             self._adapter_status.update(connected=False)
+            if self._inbound_pool is not None:
+                await self._inbound_pool.close()
             await self._ops_server.close()
             if self._continuous_memory_scheduler is not None:
                 await self._continuous_memory_scheduler.close()
@@ -190,6 +202,7 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             if self._memory is not None:
                 await self._memory.close()
             await self._gateway.close()
+            await self._inbound_store.close()
             await self._store.close()
             await self.service.close()
 
@@ -219,6 +232,15 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         )
         self._responder = responder
         await self._store.connect()
+        await self._inbound_store.connect()
+        await self._inbound_store.initialize_source(
+            self._ops_settings.instance_id,
+            epoch=str(owner.id),
+            initial_cursor=0,
+        )
+        await self._inbound_store.recover_pending_ai_work(
+            self._ops_settings.instance_id
+        )
         history_source = TelegramHistorySource(self.client)
         matrix_bridge_resolver = TelegramMatrixBridgeResolver(
             self.service.config.matrix_bridge_bot_ids
@@ -308,6 +330,22 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             adapter_instance_id=self._ops_settings.instance_id,
             logger=self.logger,
         )
+        inbound_source = TelegramInboundMessageSource(self.client)
+        inbound_worker = DurableInboundWorker(
+            inbound_source,
+            self._inbound_store,
+            self._ops_settings.instance_id,
+            logger=self.logger,
+        )
+        self._inbound_pool = DurableInboundPool(
+            inbound_worker,
+            self._inbound_store,
+            self._ops_settings.instance_id,
+            self._handler,
+            concurrency=self.INBOUND_CONCURRENCY,
+            logger=self.logger,
+        )
+        self._inbound_pool.start()
         self.client.add_event_handler(self._on_message, events.NewMessage())
         if self._continuous_memory_scheduler is not None:
             self._continuous_memory_scheduler.start()
@@ -348,7 +386,11 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
         return tuple(items)
 
     async def _on_message(self, event) -> None:
-        if self._handler is not None and self._transport is not None:
+        if (
+            self._handler is not None
+            and self._transport is not None
+            and self._inbound_pool is not None
+        ):
             try:
                 origin = await self._transport.classify_origin(event.message)
                 if origin in {
@@ -358,7 +400,17 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
                     return
                 if await self._handle_saved_memory(event.message):
                     return
-                await self._handler.handle(event.message)
+                if not is_ai_candidate(event.message):
+                    return
+                await self._inbound_store.accept_pending_ai_event(
+                    self._ops_settings.instance_id,
+                    cursor=event.message.id,
+                    chat_id=event.message.chat_id,
+                    message_id=event.message.id,
+                    kind="message",
+                    attested_origin=origin,
+                )
+                self._inbound_pool.notify()
             except Exception as exc:
                 self.logger.error(
                     "Telegram AI message handling failed (%s)",

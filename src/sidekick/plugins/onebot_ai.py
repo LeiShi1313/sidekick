@@ -44,7 +44,11 @@ from sidekick.channel_status import (
     ChannelOpsSettings,
     ChannelSnapshotService,
 )
-from sidekick.inbound import DurableInboundPool, DurableInboundWorker
+from sidekick.inbound import (
+    DurableInboundPool,
+    DurableInboundWorker,
+    is_ai_candidate,
+)
 from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
@@ -392,7 +396,7 @@ class OneBotAI(metaclass=PluginMount):
             MessageOrigin.INDETERMINATE,
         }:
             return
-        if not _is_ai_candidate(message):
+        if not is_ai_candidate(message):
             return
         await self._inbound_store.accept_pending_ai_event(
             self._ops_settings.instance_id,
@@ -533,7 +537,3 @@ def _positive_int(value: Any) -> int | None:
         parsed = int(value)
         return parsed if parsed > 0 else None
     return None
-
-
-def _is_ai_candidate(message: OneBotMessage) -> bool:
-    return message.raw_text.startswith("/") or message.reply_to_msg_id is not None
