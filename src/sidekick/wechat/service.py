@@ -236,6 +236,16 @@ class WeChatEventPump:
             return _PendingEvent(event=event)
 
         if event.name == "message":
+            if _is_inconsistent_shared_chat_history(event):
+                _LOGGER.warning(
+                    "Dropped inconsistent WeChat shared chat history event",
+                    extra={
+                        "wechat_event_cursor": event.cursor,
+                        "wechat_message_id": event.payload.get("id"),
+                        "wechat_message_type": event.payload.get("messageType"),
+                    },
+                )
+                return _PendingEvent(event=event)
             if event.is_senderless_unsupported_message():
                 return _PendingEvent(event=event)
             message = await self._store.project_event(self._connector_key, event)
@@ -391,4 +401,12 @@ def _dispatchable(message: WeChatMessage) -> bool:
                 and message.reply_to_msg_id is not None
             )
         )
+    )
+
+
+def _is_inconsistent_shared_chat_history(event: WeChatEvent) -> bool:
+    return (
+        event.name == "message"
+        and event.payload.get("sharedChatHistory") is not None
+        and event.payload.get("messageType") != "chat_history"
     )

@@ -14,6 +14,7 @@ from sidekick.plugins.base import command_registry
 from sidekick.plugins.wechat_ai import WeChatAI, WeChatRuntimeSettings
 from sidekick.wechat.ai import WeChatChatTransport, WeChatQuotedImageDescriber
 from sidekick.wechat.api import (
+    WeChatAPIContractError,
     WeChatCapabilities,
     WeChatChat,
     WeChatChatList,
@@ -1011,6 +1012,140 @@ async def test_wechat_event_pump_dispatches_shared_chat_history(tmp_path) -> Non
             "[Forwarded chat history]\nTeam history\nAlice: Hi"
         )
         assert await store.get_cursor(CONNECTOR_KEY) == "11"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_drops_inconsistent_shared_history_and_continues(
+    tmp_path,
+    caplog,
+) -> None:
+    invalid_message_id = "8710680267728517746"
+    next_message_id = "8710680267728517747"
+    client = FakeConnectorClient(
+        (
+            message_event(
+                cursor="1249405",
+                message_id=invalid_message_id,
+                content="你撤回了一条消息",
+                message_type="system",
+                shared_chat_history={
+                    "title": "Stale history",
+                    "itemCount": 1,
+                    "items": [
+                        {
+                            "kind": "text",
+                            "senderName": "Alice",
+                            "content": "Do not render this",
+                        },
+                    ],
+                },
+            ),
+            message_event(
+                cursor="1249406",
+                message_id=next_message_id,
+                content="/ai still works",
+            ),
+        )
+    )
+    client.messages = WeChatMessageList(
+        messages=(
+            message_event(
+                cursor="10",
+                message_id=invalid_message_id,
+                content="Authoritative history",
+                message_type="chat_history",
+                shared_chat_history={
+                    "title": "Authoritative history",
+                    "itemCount": 1,
+                    "items": [
+                        {
+                            "kind": "text",
+                            "senderName": "Alice",
+                            "content": "Keep this",
+                        },
+                    ],
+                },
+            ).message(),
+        ),
+        cursor="10",
+    )
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+
+        result = await WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap,
+        ).run(handler, asyncio.Event())
+
+        assert result == "reconnect"
+        assert [message.id for message in handler.messages] == [next_message_id]
+        authoritative = await store.get_message(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            invalid_message_id,
+        )
+        assert authoritative is not None
+        assert authoritative.message_type == "chat_history"
+        assert authoritative.raw_text == (
+            "[Forwarded chat history]\n"
+            "Authoritative history\n"
+            "Alice: Keep this"
+        )
+        assert await store.get_cursor(CONNECTOR_KEY) == "1249406"
+        dropped = [
+            record
+            for record in caplog.records
+            if record.getMessage()
+            == "Dropped inconsistent WeChat shared chat history event"
+        ]
+        assert len(dropped) == 1
+        assert dropped[0].wechat_event_cursor == "1249405"
+        assert dropped[0].wechat_message_id == invalid_message_id
+        assert dropped[0].wechat_message_type == "system"
+        assert "Do not render this" not in caplog.text
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_event_pump_does_not_drop_null_shared_history(
+    tmp_path,
+    caplog,
+) -> None:
+    payload = dict(
+        message_event(
+            cursor="11",
+            message_type="system",
+            content="你撤回了一条消息",
+        ).payload
+    )
+    payload["sharedChatHistory"] = None
+    client = FakeConnectorClient((WeChatEvent.parse(payload),))
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    handler = RecordingHandler()
+    try:
+        bootstrap = await bootstrap_wechat_channel(client, store, CONNECTOR_KEY)
+
+        with pytest.raises(WeChatAPIContractError, match="shared chat history"):
+            await WeChatEventPump(
+                client,
+                store,
+                CONNECTOR_KEY,
+                bootstrap,
+            ).run(handler, asyncio.Event())
+
+        assert handler.messages == []
+        assert await store.get_cursor(CONNECTOR_KEY) == "10"
+        assert (
+            "Dropped inconsistent WeChat shared chat history event"
+            not in caplog.text
+        )
     finally:
         await store.close()
 
