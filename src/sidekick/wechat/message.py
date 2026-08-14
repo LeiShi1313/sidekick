@@ -9,7 +9,7 @@ from typing import Any
 class WeChatMessage:
     connector_key: str
     account_id: str
-    memory_cursor: int
+    memory_cursor: int | str
     id: str
     chat_id: str
     raw_text: str

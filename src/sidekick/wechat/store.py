@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 import fcntl
 from functools import wraps
 import os
@@ -22,6 +22,7 @@ from sidekick.wechat.api import (
     WeChatEvent,
     WeChatGroupMemberList,
     WeChatMessageList,
+    WeChatObservedMessage,
     WeChatSession,
     WeChatUser,
     WeChatUserList,
@@ -1187,20 +1188,24 @@ class WeChatStateRepository:
         *,
         error_code: str,
         retry_at: float,
-        max_attempts: int,
+        max_attempts: int | None,
         now: float | None = None,
     ) -> Literal["pending", "unavailable", "stale"]:
         if work.lease_id is None or not error_code:
             raise ValueError("Claimed WeChat work and error code are required")
-        if max_attempts < 1:
+        if max_attempts is not None and max_attempts < 1:
             raise ValueError("WeChat pending work attempts must be positive")
         failed_at = time.time() if now is None else now
         if retry_at < failed_at:
             raise ValueError("WeChat pending retry cannot be scheduled in the past")
-        attempt_count = work.attempt_count + 1
-        status: Literal["pending", "unavailable"] = (
-            "unavailable" if attempt_count >= max_attempts else "pending"
+        attempt_count = (
+            work.attempt_count + 1
+            if work.last_error_code == error_code
+            else 1
         )
+        status: Literal["pending", "unavailable"] = "pending"
+        if max_attempts is not None and attempt_count >= max_attempts:
+            status = "unavailable"
         connection = self._require_connection()
         await connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1257,6 +1262,106 @@ class WeChatStateRepository:
             if row is not None and row["next_attempt_at"] is not None
             else None
         )
+
+    @_serialized
+    async def resolve_pending_ai_removal(
+        self,
+        work: WeChatPendingAIWork,
+    ) -> bool:
+        if work.lease_id is None:
+            raise ValueError("Claimed WeChat work is required")
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            deleted = await connection.execute(
+                """
+                DELETE FROM wechat_pending_ai_work
+                WHERE connector_key = ? AND chat_id = ? AND message_id = ?
+                  AND trigger_cursor = ? AND lease_id = ?
+                """,
+                (
+                    work.connector_key,
+                    work.chat_id,
+                    work.message_id,
+                    work.trigger_cursor,
+                    work.lease_id,
+                ),
+            )
+            if deleted.rowcount != 1:
+                await self._release_pending_ai_claim(work)
+            await connection.commit()
+            return deleted.rowcount == 1
+        except BaseException:
+            await connection.rollback()
+            raise
+
+    @_serialized
+    async def release_pending_ai_work(self, work: WeChatPendingAIWork) -> None:
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await self._release_pending_ai_claim(work)
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+
+    @_serialized
+    async def mark_pending_ai_execution_unknown(
+        self,
+        work: WeChatPendingAIWork,
+        *,
+        version: str,
+        now: float | None = None,
+    ) -> bool:
+        if work.lease_id is None:
+            raise ValueError("Claimed WeChat work is required")
+        failed_at = time.time() if now is None else now
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await connection.execute(
+                """
+                UPDATE wechat_processed_message_revisions
+                SET status = 'failed_unknown', finished_at = ?
+                WHERE connector_key = ? AND chat_id = ? AND message_id = ?
+                  AND version = ? AND status = 'running'
+                """,
+                (
+                    failed_at,
+                    work.connector_key,
+                    work.chat_id,
+                    work.message_id,
+                    version,
+                ),
+            )
+            updated = await connection.execute(
+                """
+                UPDATE wechat_pending_ai_work
+                SET status = 'failed_unknown',
+                    last_error_code = 'EXECUTION_OUTCOME_UNKNOWN',
+                    lease_id = NULL, lease_trigger_cursor = NULL,
+                    current_version = ?, updated_at = ?
+                WHERE connector_key = ? AND chat_id = ? AND message_id = ?
+                  AND trigger_cursor = ? AND lease_id = ?
+                """,
+                (
+                    version,
+                    failed_at,
+                    work.connector_key,
+                    work.chat_id,
+                    work.message_id,
+                    work.trigger_cursor,
+                    work.lease_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                await self._release_pending_ai_claim(work)
+            await connection.commit()
+            return updated.rowcount == 1
+        except BaseException:
+            await connection.rollback()
+            raise
 
     @_serialized
     async def recover_pending_ai_work(
@@ -1953,6 +2058,72 @@ class WeChatStateRepository:
     async def get_generation(self, connector_key: str) -> int:
         state = await self._connector_state(connector_key)
         return int(state["connection_generation"])
+
+    @_serialized
+    async def message_from_observation(
+        self,
+        connector_key: str,
+        observed: WeChatObservedMessage,
+    ) -> WeChatMessage:
+        if observed.state != "present":
+            raise ValueError("A recalled WeChat observation has no message content")
+        assert observed.sender_id is not None
+        assert observed.timestamp is not None
+        assert observed.direction is not None
+        assert observed.message_type is not None
+        cursor = await self._require_connection().execute(
+            """
+            SELECT
+                connectors.account_id,
+                chats.chat_type,
+                chats.display_name AS chat_display_name
+            FROM wechat_connectors AS connectors
+            LEFT JOIN wechat_chats AS chats
+              ON chats.connector_key = connectors.connector_key
+             AND chats.account_id = connectors.account_id
+             AND chats.chat_id = ?
+            WHERE connectors.connector_key = ?
+            """,
+            (observed.chat_id, connector_key),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("WeChat connector has not been bootstrapped")
+        account_id = str(row["account_id"])
+        chat_type = (
+            str(row["chat_type"])
+            if row["chat_type"] is not None
+            else (
+                "group"
+                if observed.chat_id.endswith("@chatroom")
+                else "direct"
+            )
+        )
+        return WeChatMessage(
+            connector_key=connector_key,
+            account_id=account_id,
+            memory_cursor=observed.id,
+            id=observed.id,
+            chat_id=observed.chat_id,
+            raw_text=observed.display_content,
+            content_redacted=observed.content_redacted,
+            sender_id=observed.sender_id,
+            reply_to_msg_id=observed.reply_to_message_id,
+            date=datetime.fromtimestamp(observed.timestamp, UTC),
+            out=observed.direction == "out",
+            self_id=account_id,
+            message_type=observed.message_type,
+            chat_type=chat_type,
+            sender_display_name=observed.sender_label,
+            scope_display_name=(
+                str(row["chat_display_name"])
+                if row["chat_display_name"] is not None
+                else None
+            ),
+            source=observed.source,
+            sequence=None,
+            media_id=observed.media_id,
+        )
 
     @_serialized
     async def get_message(

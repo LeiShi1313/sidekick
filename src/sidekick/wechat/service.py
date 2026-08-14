@@ -1,26 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import logging
-from typing import Literal, Protocol
+import time
+from typing import Any, Callable, Literal, Protocol
 
 from sidekick.ai import ReplyTarget
 from sidekick.wechat.api import (
+    WeChatAPIError,
     WeChatAPIContractError,
     WeChatCapabilities,
     WeChatChatList,
     WeChatEvent,
     WeChatGroupMemberList,
     WeChatMessageList,
+    WeChatObservedMessage,
     WeChatSession,
     WeChatUser,
     WeChatUserList,
 )
 from sidekick.wechat.message import WeChatMessage
 from sidekick.wechat.store import WeChatStateRepository
+from sidekick.wechat.store import WeChatPendingAIWork
 
 
 PumpResult = Literal["stopped", "reconnect", "rebootstrap"]
@@ -30,6 +35,226 @@ _LOGGER = logging.getLogger(__name__)
 
 class WeChatInboundHandler(Protocol):
     async def handle(self, message: ReplyTarget) -> bool: ...
+
+
+class WeChatObservedMessageClient(Protocol):
+    async def get_observed_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> WeChatObservedMessage: ...
+
+
+WorkerResult = Literal[
+    "idle",
+    "completed",
+    "ignored",
+    "duplicate",
+    "recalled",
+    "deferred",
+    "unavailable",
+    "stale",
+    "failed",
+]
+
+
+class WeChatPendingAIWorker:
+    RETRY_BASE_SECONDS = 2.0
+    RETRY_MAX_SECONDS = 300.0
+
+    def __init__(
+        self,
+        client: WeChatObservedMessageClient,
+        store: WeChatStateRepository,
+        connector_key: str,
+        *,
+        not_observed_attempts: int = 3,
+        clock: Callable[[], float] = time.time,
+        logger: Any | None = None,
+    ):
+        if not_observed_attempts < 1:
+            raise ValueError("WeChat not-observed attempts must be positive")
+        self._client = client
+        self._store = store
+        self._connector_key = connector_key
+        self._not_observed_attempts = not_observed_attempts
+        self._clock = clock
+        self._logger = logger
+
+    async def process_one(self, handler: WeChatInboundHandler) -> WorkerResult:
+        work = await self._store.claim_pending_ai_work(
+            self._connector_key,
+            now=self._clock(),
+        )
+        if work is None:
+            return "idle"
+        if work.kind == "message_remove":
+            resolved = await self._store.resolve_pending_ai_removal(work)
+            return "recalled" if resolved else "stale"
+
+        execution_version: str | None = None
+        try:
+            try:
+                observed = await self._client.get_observed_message(
+                    work.chat_id,
+                    work.message_id,
+                )
+            except WeChatAPIError as exc:
+                return await self._handle_api_error(work, exc)
+            except (TimeoutError, ConnectionError, aiohttp.ClientError) as exc:
+                return await self._defer(
+                    work,
+                    error_code=type(exc).__name__,
+                    max_attempts=None,
+                )
+
+            begin = await self._store.begin_pending_ai_execution(
+                work,
+                version=observed.version,
+                now=self._clock(),
+            )
+            if begin == "stale":
+                return "stale"
+            if begin == "duplicate":
+                await self._store.complete_pending_ai_work(
+                    work,
+                    version=observed.version,
+                    outcome="ignored",
+                    now=self._clock(),
+                )
+                return "duplicate"
+            execution_version = observed.version
+            if observed.state == "recalled":
+                await self._store.complete_pending_ai_work(
+                    work,
+                    version=observed.version,
+                    outcome="recalled",
+                    now=self._clock(),
+                )
+                return "recalled"
+
+            try:
+                message = await self._store.message_from_observation(
+                    self._connector_key,
+                    observed,
+                )
+            except Exception as exc:
+                await self._store.complete_pending_ai_work(
+                    work,
+                    version=observed.version,
+                    outcome="failed",
+                    now=self._clock(),
+                )
+                self._log_failure("message context", exc, work)
+                return "failed"
+            if not _dispatchable(message):
+                await self._store.complete_pending_ai_work(
+                    work,
+                    version=observed.version,
+                    outcome="ignored",
+                    now=self._clock(),
+                )
+                return "ignored"
+            try:
+                handled = await handler.handle(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._store.complete_pending_ai_work(
+                    work,
+                    version=observed.version,
+                    outcome="failed",
+                    now=self._clock(),
+                )
+                self._log_failure("handler", exc, work)
+                return "failed"
+            outcome: Literal["completed", "ignored"] = (
+                "completed" if handled else "ignored"
+            )
+            await self._store.complete_pending_ai_work(
+                work,
+                version=observed.version,
+                outcome=outcome,
+                now=self._clock(),
+            )
+            return outcome
+        except asyncio.CancelledError:
+            if execution_version is None:
+                cleanup = self._store.release_pending_ai_work(work)
+            else:
+                cleanup = self._store.mark_pending_ai_execution_unknown(
+                    work,
+                    version=execution_version,
+                    now=self._clock(),
+                )
+            await asyncio.shield(cleanup)
+            raise
+
+    async def _handle_api_error(
+        self,
+        work: WeChatPendingAIWork,
+        exc: WeChatAPIError,
+    ) -> WorkerResult:
+        if exc.status == 404 and exc.code == "MESSAGE_NOT_OBSERVED":
+            return await self._defer(
+                work,
+                error_code=exc.code,
+                max_attempts=self._not_observed_attempts,
+            )
+        if exc.status == 503 and exc.code == "MESSAGE_HISTORY_NOT_READY":
+            return await self._defer(
+                work,
+                error_code=exc.code,
+                max_attempts=None,
+            )
+        return await self._defer(
+            work,
+            error_code=exc.code,
+            max_attempts=1,
+        )
+
+    async def _defer(
+        self,
+        work: WeChatPendingAIWork,
+        *,
+        error_code: str,
+        max_attempts: int | None,
+    ) -> WorkerResult:
+        now = self._clock()
+        prior_attempts = (
+            work.attempt_count if work.last_error_code == error_code else 0
+        )
+        status = await self._store.defer_pending_ai_work(
+            work,
+            error_code=error_code,
+            retry_at=now + self._retry_delay(prior_attempts),
+            max_attempts=max_attempts,
+            now=now,
+        )
+        if status == "stale":
+            return "stale"
+        return "unavailable" if status == "unavailable" else "deferred"
+
+    @classmethod
+    def _retry_delay(cls, attempt_count: int) -> float:
+        return min(
+            cls.RETRY_MAX_SECONDS,
+            cls.RETRY_BASE_SECONDS * (2 ** min(attempt_count, 16)),
+        )
+
+    def _log_failure(
+        self,
+        stage: str,
+        exc: Exception,
+        work: WeChatPendingAIWork,
+    ) -> None:
+        if self._logger is not None:
+            self._logger.error(
+                "WeChat pending AI %s failed (%s; message=%s)",
+                stage,
+                type(exc).__name__,
+                work.message_id,
+            )
 
 
 class WeChatBootstrapClient(Protocol):

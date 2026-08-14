@@ -280,6 +280,7 @@ class FakeConnectorClient:
             history=False,
             inbound_image_download=True,
             request_original_image=True,
+            fetch_observed_messages=True,
         )
         self.chats = WeChatChatList(
             chats=(WeChatChat(id=CHAT_ID, type="group", display_name="Example"),),
@@ -1314,9 +1315,10 @@ async def test_wechat_event_pump_replays_new_generation_event_after_rebootstrap(
             reply_send_ready=True,
             connection_generation=42,
             history=False,
-            inbound_image_download=True,
-            request_original_image=True,
-        )
+                inbound_image_download=True,
+                request_original_image=True,
+                fetch_observed_messages=True,
+            )
         client.chats = WeChatChatList(
             chats=client.chats.chats,
             snapshot=WeChatChatSnapshot(
