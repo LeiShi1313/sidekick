@@ -9,6 +9,8 @@ import time
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import quote, unquote
 
+import aiohttp
+
 from sidekick.ai import MemoryScopeTarget, MessageIdentity, MentionedUser, ReplyTarget
 from sidekick.ai_attachments import (
     AttachmentAnalysisGateway,
@@ -30,6 +32,8 @@ from sidekick.wechat.api import (
     MAX_TEXT_BYTES,
     WeChatAPIError,
     WeChatDownloadedImage,
+    WeChatObservedMessage,
+    WeChatObservedMessagePage,
     WeChatSendFailed,
     WeChatSendOperation,
 )
@@ -136,6 +140,12 @@ WECHAT_IDENTITY_CODEC: IdentityCodec = WeChatIdentityCodec()
 
 
 class WeChatMessageSender(Protocol):
+    async def get_observed_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> WeChatObservedMessage: ...
+
     async def send_text_and_wait(
         self,
         *,
@@ -328,10 +338,13 @@ class WeChatChatTransport:
         if not isinstance(message, WeChatMessage) or message.reply_to_msg_id is None:
             return None
         try:
-            return await self._store.get_reply_message(
+            return await _fetch_observed_message(
+                self._client,
+                self._store,
                 self._connector_key,
                 message.chat_id,
                 message.reply_to_msg_id,
+                include_quoted_images=True,
             )
         except Exception as exc:
             if self._logger is not None:
@@ -876,8 +889,37 @@ class WeChatMessageMentionResolver:
         return ()
 
 
+class WeChatObservedHistoryClient(Protocol):
+    async def get_observed_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> WeChatObservedMessage: ...
+
+    async def get_observed_messages(
+        self,
+        chat_id: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        limit: int = 50,
+    ) -> WeChatObservedMessagePage: ...
+
+
 class WeChatHistorySource:
-    def __init__(self, store: WeChatStateRepository, connector_key: str):
+    PAGE_SIZE = 100
+    MAX_SCAN_MESSAGES = 10_000
+    MAX_RESULT_MESSAGES = 5_001
+
+    def __init__(
+        self,
+        client: WeChatObservedHistoryClient,
+        store: WeChatStateRepository,
+        connector_key: str,
+    ):
+        self._client = client
         self._store = store
         self._connector_key = connector_key
 
@@ -894,11 +936,12 @@ class WeChatHistorySource:
             or not isinstance(before.id, str)
         ):
             return ()
-        return await self._store.fetch_recent(
-            self._connector_key,
+        return await self._fetch_backward(
             trigger.chat_id,
-            before.id,
-            limit,
+            before=before.id,
+            since=None,
+            until=None,
+            limit=limit,
         )
 
     async def fetch_message(
@@ -906,10 +949,13 @@ class WeChatHistorySource:
         chat_id: str,
         message_id: str,
     ) -> WeChatMessage | None:
-        return await self._store.get_message(
+        return await _fetch_observed_message(
+            self._client,
+            self._store,
             self._connector_key,
             chat_id,
             message_id,
+            include_quoted_images=False,
         )
 
     async def fetch_window(
@@ -920,11 +966,12 @@ class WeChatHistorySource:
         until: datetime,
         limit: int,
     ) -> tuple[WeChatMessage, ...]:
-        return await self._store.fetch_memory_window(
-            self._connector_key,
+        since_timestamp, until_timestamp = _history_time_bounds(since, until)
+        return await self._fetch_backward(
             chat_id,
-            since=since,
-            until=until,
+            before=None,
+            since=since_timestamp,
+            until=until_timestamp,
             limit=limit,
         )
 
@@ -936,22 +983,117 @@ class WeChatHistorySource:
         until: datetime,
         limit: int,
     ) -> tuple[WeChatMessage, ...]:
-        if isinstance(after_message_id, bool) or not isinstance(
-            after_message_id,
-            int,
-        ):
-            raise ValueError("WeChat continuous memory cursor is invalid")
-        return await self._store.fetch_memory_after(
-            self._connector_key,
-            chat_id,
-            after_memory_order=after_message_id,
-            until=until,
-            limit=limit,
+        if not isinstance(after_message_id, str) or not after_message_id:
+            raise ValueError(
+                "WeChat continuous memory uses a legacy local cursor; "
+                "an explicit migration is required"
+            )
+        self._validate_limit(limit)
+        until_timestamp = max(0, int(until.timestamp()))
+        messages: list[WeChatMessage] = []
+        after = after_message_id
+        scanned = 0
+        while scanned < self.MAX_SCAN_MESSAGES and len(messages) < limit:
+            page = await self._client.get_observed_messages(
+                chat_id,
+                after=after,
+                until=until_timestamp,
+                limit=min(self.PAGE_SIZE, self.MAX_SCAN_MESSAGES - scanned),
+            )
+            scanned += len(page.messages)
+            messages.extend(
+                message
+                for message in await self._materialize(page.messages)
+                if message.date <= until
+            )
+            if (
+                not page.messages
+                or not page.page.has_more_after
+                or page.page.after is None
+            ):
+                break
+            if page.page.after == after:
+                break
+            after = page.page.after
+        return tuple(messages[:limit])
+
+    async def _fetch_backward(
+        self,
+        chat_id: str,
+        *,
+        before: str | None,
+        since: int | None,
+        until: int | None,
+        limit: int,
+    ) -> tuple[WeChatMessage, ...]:
+        self._validate_limit(limit)
+        messages: list[WeChatMessage] = []
+        scanned = 0
+        anchor = before
+        while scanned < self.MAX_SCAN_MESSAGES and len(messages) < limit:
+            page = await self._client.get_observed_messages(
+                chat_id,
+                before=anchor,
+                since=since,
+                until=until,
+                limit=min(self.PAGE_SIZE, self.MAX_SCAN_MESSAGES - scanned),
+            )
+            scanned += len(page.messages)
+            materialized = await self._materialize(page.messages)
+            messages[:0] = tuple(
+                message
+                for message in materialized
+                if (since is None or int(message.date.timestamp()) >= since)
+                and (until is None or int(message.date.timestamp()) <= until)
+            )
+            if (
+                not page.messages
+                or not page.page.has_more_before
+                or page.page.before is None
+            ):
+                break
+            if page.page.before == anchor:
+                break
+            anchor = page.page.before
+        return tuple(messages[-limit:])
+
+    async def _materialize(
+        self,
+        observed: tuple[WeChatObservedMessage, ...],
+    ) -> tuple[WeChatMessage, ...]:
+        supported = tuple(
+            message
+            for message in observed
+            if _supports_history_context(message, include_quoted_images=False)
         )
+        return await self._store.messages_from_observations(
+            self._connector_key,
+            supported,
+        )
+
+    def _validate_limit(self, limit: int) -> None:
+        if not 1 <= limit <= self.MAX_RESULT_MESSAGES:
+            raise ValueError("WeChat history result limit is outside supported bounds")
+
+
+def wechat_history_retry_delay(exc: Exception) -> float | None:
+    if isinstance(exc, WeChatAPIError) and (
+        exc.status == 503 and exc.code == "MESSAGE_HISTORY_NOT_READY"
+    ):
+        return 2.0
+    if isinstance(exc, (TimeoutError, ConnectionError, aiohttp.ClientError)):
+        return 2.0
+    return None
 
 
 class WeChatMemoryScopeTargetResolver:
-    def __init__(self, store: WeChatStateRepository, connector_key: str):
+    def __init__(
+        self,
+        client: WeChatObservedHistoryClient,
+        store: WeChatStateRepository,
+        connector_key: str,
+    ):
+        self._client = client
         self._store = store
         self._connector_key = connector_key
 
@@ -966,20 +1108,72 @@ class WeChatMemoryScopeTargetResolver:
             raise ValueError("WeChat target must be an exact stored chat ID")
         chat = await self._store.get_chat(self._connector_key, chat_id)
         if chat is None:
-            raise ValueError("WeChat chat is not present in the local projection")
-        latest_memory_cursor = (
-            await self._store.get_latest_memory_cursor(
-                self._connector_key,
-                chat_id,
-            )
-            if include_latest_message
-            else 0
-        )
+            raise ValueError("WeChat chat is not in the current connector directory")
+        latest_message_id: ExternalId = 0
+        if include_latest_message:
+            page = await self._client.get_observed_messages(chat_id, limit=1)
+            if not page.messages:
+                raise ValueError("WeChat chat has no observed message boundary")
+            latest_message_id = page.messages[-1].id
         return MemoryScopeTarget(
             chat_id=chat.id,
             display_name=chat.display_name,
-            latest_message_id=latest_memory_cursor,
+            latest_message_id=latest_message_id,
         )
+
+
+async def _fetch_observed_message(
+    client: WeChatObservedHistoryClient,
+    store: WeChatStateRepository,
+    connector_key: str,
+    chat_id: str,
+    message_id: str,
+    *,
+    include_quoted_images: bool,
+) -> WeChatMessage | None:
+    try:
+        observed = await client.get_observed_message(chat_id, message_id)
+    except WeChatAPIError as exc:
+        if exc.status == 404 and exc.code == "MESSAGE_NOT_OBSERVED":
+            return None
+        raise
+    if not _supports_history_context(
+        observed,
+        include_quoted_images=include_quoted_images,
+    ):
+        return None
+    return await store.message_from_observation(connector_key, observed)
+
+
+def _supports_history_context(
+    observed: WeChatObservedMessage,
+    *,
+    include_quoted_images: bool,
+) -> bool:
+    if (
+        observed.state != "present"
+        or observed.sender_id is None
+        or observed.timestamp is None
+        or observed.direction is None
+        or observed.message_type is None
+    ):
+        return False
+    if (
+        include_quoted_images
+        and observed.message_type == "image"
+        and observed.media_id is not None
+    ):
+        return True
+    return (
+        not observed.content_redacted
+        and observed.message_type in {"text", "link", "chat_history"}
+    )
+
+
+def _history_time_bounds(since: datetime, until: datetime) -> tuple[int, int]:
+    if since > until:
+        raise ValueError("WeChat history time bounds are invalid")
+    return max(0, int(since.timestamp())), max(0, int(until.timestamp()))
 
 
 def _component(value: ExternalId) -> str:

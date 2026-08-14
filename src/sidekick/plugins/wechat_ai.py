@@ -53,6 +53,7 @@ from sidekick.wechat.ai import (
     WeChatMessageIdentityResolver,
     WeChatMessageMentionResolver,
     WeChatQuotedImageDescriber,
+    wechat_history_retry_delay,
 )
 from sidekick.wechat.api import WeChatConnectorClient
 from sidekick.wechat.service import (
@@ -262,16 +263,17 @@ class WeChatAI(metaclass=PluginMount):
         identity_codec = WeChatIdentityCodec(
             account_id=bootstrap.session.self_id,
         )
+        history = WeChatHistorySource(
+            self._client,
+            self._wechat_store,
+            self._client.base_url,
+        )
         transport = WeChatChatTransport(
             self._client,
             self._wechat_store,
             self._client.base_url,
             native_reply_ready=bootstrap.capabilities.native_reply_ready,
             logger=self.logger,
-        )
-        history = WeChatHistorySource(
-            self._wechat_store,
-            self._client.base_url,
         )
         responder = AIResponder(
             self._gateway,
@@ -309,6 +311,7 @@ class WeChatAI(metaclass=PluginMount):
                 dream_settings=DreamSettings.from_env(),
                 ingestion_settings=MemoryIngestionSettings.from_env(),
                 identity_codec=identity_codec,
+                source_retry_delay=wechat_history_retry_delay,
                 logger=self.logger,
             )
             if self._memory is not None
@@ -358,13 +361,14 @@ class WeChatAI(metaclass=PluginMount):
             memory=self._memory,
             dream_runner=memory_ingestor,
             memory_scope_resolver=WeChatMemoryScopeTargetResolver(
+                self._client,
                 self._wechat_store,
                 self._client.base_url,
             ),
             directory_source_resolver=None,
             memory_backfill_caveat=(
-                "WeChat backfill covers only messages already observed and stored "
-                "by Sidekick; WeChat does not expose complete chat history here."
+                "WeChat backfill covers only messages retained by the connector's "
+                "partial observation catalog; it is not complete chat history."
             ),
             memory_command_delete_delay=(self._settings.memory_command_delete_delay),
             transport=transport,

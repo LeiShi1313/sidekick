@@ -8,9 +8,7 @@ import pytest
 
 from sidekick.wechat.ai import (
     WECHAT_IDENTITY_CODEC,
-    WeChatHistorySource,
     WeChatIdentityCodec,
-    WeChatMemoryScopeTargetResolver,
 )
 from sidekick.wechat.api import (
     WeChatAPIContractError,
@@ -724,9 +722,13 @@ async def test_wechat_store_upserts_revisions_and_acks_processing_atomically(tmp
         assert await store.is_processed(projected) is True
         assert await store.count_messages(CONNECTOR_KEY) == 2
 
-        history = WeChatHistorySource(store, CONNECTOR_KEY)
-        recent = await history.fetch_recent(command, before=command, limit=10)
-        parent = await history.fetch_message(GROUP_ID, oldest_id)
+        recent = await store.fetch_recent(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            command.id,
+            10,
+        )
+        parent = await store.get_message(CONNECTOR_KEY, GROUP_ID, oldest_id)
 
         assert [message.id for message in recent] == [oldest_id]
         assert parent is not None
@@ -787,7 +789,7 @@ async def test_wechat_store_hides_partial_chat_refreshes_from_concurrent_reads(
 
 
 @pytest.mark.asyncio
-async def test_wechat_memory_source_reads_stored_windows_and_late_revisions(tmp_path):
+async def test_wechat_legacy_projection_retains_windows_and_late_revisions(tmp_path):
     oldest_id = "3159667620982040828"
     latest_id = "4159667620982040828"
     store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
@@ -804,11 +806,11 @@ async def test_wechat_memory_source_reads_stored_windows_and_late_revisions(tmp_
                 cursor="bootstrap-messages",
             ),
         )
-        source = WeChatHistorySource(store, CONNECTOR_KEY)
         latest = await store.get_message(CONNECTOR_KEY, GROUP_ID, latest_id)
         assert latest is not None
 
-        window = await source.fetch_window(
+        window = await store.fetch_memory_window(
+            CONNECTOR_KEY,
             GROUP_ID,
             since=datetime.fromtimestamp(1_783_772_699, UTC),
             until=datetime.fromtimestamp(1_783_772_735, UTC),
@@ -853,9 +855,10 @@ async def test_wechat_memory_source_reads_stored_windows_and_late_revisions(tmp_
         revised = await store.project_event(CONNECTOR_KEY, revision)
         assert revised is not None
 
-        after = await source.fetch_after(
+        after = await store.fetch_memory_after(
+            CONNECTOR_KEY,
             GROUP_ID,
-            after_message_id=latest.memory_cursor,
+            after_memory_order=latest.memory_cursor,
             until=datetime.fromtimestamp(1_783_772_735, UTC),
             limit=10,
         )
@@ -864,13 +867,14 @@ async def test_wechat_memory_source_reads_stored_windows_and_late_revisions(tmp_
         assert after[0].raw_text == "earlier, corrected"
         assert after[0].memory_cursor > latest.memory_cursor
 
-        target = await WeChatMemoryScopeTargetResolver(
-            store,
+        chat = await store.get_chat(CONNECTOR_KEY, GROUP_ID)
+        assert chat is not None
+        assert chat.id == GROUP_ID
+        assert chat.display_name == "Example group"
+        assert await store.get_latest_memory_cursor(
             CONNECTOR_KEY,
-        ).resolve(GROUP_ID, include_latest_message=True)
-        assert target.chat_id == GROUP_ID
-        assert target.display_name == "Example group"
-        assert target.latest_message_id == revised.memory_cursor
+            GROUP_ID,
+        ) == revised.memory_cursor
     finally:
         await store.close()
 
@@ -907,12 +911,17 @@ async def test_wechat_history_excludes_redacted_and_unsupported_messages(tmp_pat
                 cursor="bootstrap-messages",
             ),
         )
-        source = WeChatHistorySource(store, CONNECTOR_KEY)
-        anchor = await source.fetch_message(GROUP_ID, anchor_id)
+        anchor = await store.get_message(CONNECTOR_KEY, GROUP_ID, anchor_id)
         assert anchor is not None
 
-        recent = await source.fetch_recent(anchor, before=anchor, limit=10)
-        window = await source.fetch_window(
+        recent = await store.fetch_recent(
+            CONNECTOR_KEY,
+            GROUP_ID,
+            anchor.id,
+            10,
+        )
+        window = await store.fetch_memory_window(
+            CONNECTOR_KEY,
             GROUP_ID,
             since=datetime.fromtimestamp(1_783_772_699, UTC),
             until=datetime.fromtimestamp(1_783_772_735, UTC),
@@ -921,8 +930,8 @@ async def test_wechat_history_excludes_redacted_and_unsupported_messages(tmp_pat
 
         assert [message.id for message in recent] == [visible_id]
         assert [message.id for message in window] == [visible_id, anchor_id]
-        assert await source.fetch_message(GROUP_ID, redacted_id) is None
-        assert await source.fetch_message(GROUP_ID, image_id) is None
+        assert await store.get_message(CONNECTOR_KEY, GROUP_ID, redacted_id) is None
+        assert await store.get_message(CONNECTOR_KEY, GROUP_ID, image_id) is None
     finally:
         await store.close()
 
@@ -972,10 +981,8 @@ async def test_wechat_store_promotes_shared_history_enrichment_in_place(tmp_path
         revised = await store.project_event(CONNECTOR_KEY, correction)
         visible = await store.get_message(CONNECTOR_KEY, GROUP_ID, message_id)
         quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, message_id)
-        memory_window = await WeChatHistorySource(
-            store,
+        memory_window = await store.fetch_memory_window(
             CONNECTOR_KEY,
-        ).fetch_window(
             GROUP_ID,
             since=datetime.fromtimestamp(1_783_772_700, UTC),
             until=datetime.fromtimestamp(1_783_772_735, UTC),
@@ -1125,7 +1132,8 @@ async def test_wechat_store_applies_empty_redaction_revision(tmp_path):
         )
 
         projected = await store.project_event(CONNECTOR_KEY, redaction)
-        visible = await WeChatHistorySource(store, CONNECTOR_KEY).fetch_message(
+        visible = await store.get_message(
+            CONNECTOR_KEY,
             GROUP_ID,
             message_id,
         )
