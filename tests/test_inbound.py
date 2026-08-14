@@ -29,7 +29,7 @@ async def test_pool_rechecks_queue_after_a_consumed_wakeup() -> None:
             await asyncio.Future()
 
     class UnusedHandler:
-        async def handle(self, _message):
+        async def handle(self, _message, *, attested_origin=None):
             return False
 
     worker = WakeupDuringIdleWorker()

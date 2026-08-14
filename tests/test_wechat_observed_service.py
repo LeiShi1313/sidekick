@@ -152,7 +152,8 @@ class RecordingHandler:
         self.handled = handled
         self.messages = []
 
-    async def handle(self, message) -> bool:
+    async def handle(self, message, *, attested_origin=None) -> bool:
+        assert attested_origin is None
         self.messages.append(message)
         return self.handled
 
@@ -381,7 +382,8 @@ async def test_cancelled_worker_marks_started_execution_unknown_instead_of_retry
     entered = asyncio.Event()
 
     class BlockingHandler:
-        async def handle(self, _message) -> bool:
+        async def handle(self, _message, *, attested_origin=None) -> bool:
+            assert attested_origin is None
             entered.set()
             await asyncio.Future()
             return True
@@ -587,7 +589,8 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
     release = asyncio.Event()
 
     class BlockingHandler:
-        async def handle(self, _message) -> bool:
+        async def handle(self, _message, *, attested_origin=None) -> bool:
+            assert attested_origin is None
             started.set()
             await release.wait()
             return True
@@ -714,7 +717,8 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
     emit_removal = asyncio.Event()
 
     class BlockingHandler:
-        async def handle(self, _message) -> bool:
+        async def handle(self, _message, *, attested_origin=None) -> bool:
+            assert attested_origin is None
             started.set()
             try:
                 await asyncio.Future()

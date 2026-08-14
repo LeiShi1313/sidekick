@@ -18,6 +18,7 @@ from sidekick.ai import (
 )
 from sidekick.ai_attachments import AttachmentDescription
 from sidekick.chat.attachments import ModelInputImage, OutboundAttachment
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 
 
@@ -248,6 +249,20 @@ class FakeAttachmentDescriber:
 def reset_message_ids():
     FakeMessage.next_id = 1
     FakeAnswer.next_id = 100
+
+
+@pytest.mark.asyncio
+async def test_handler_uses_durable_adapter_attested_origin() -> None:
+    gateway = FakeGateway(["must not run"])
+    handler, _ = make_handler(gateway)
+
+    handled = await handler.handle(
+        FakeMessage("/ai must not loop"),
+        attested_origin=MessageOrigin.SIDEKICK_GENERATED,
+    )
+
+    assert handled is False
+    assert gateway.requests == []
 
 
 @pytest.mark.asyncio

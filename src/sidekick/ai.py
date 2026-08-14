@@ -4212,10 +4212,20 @@ class AIConversationHandler:
         self._active_runs: dict[str, str] = {}
         self._active_request_runs: dict[tuple[str, ExternalId], str] = {}
 
-    async def handle(self, message: ReplyTarget) -> bool:
+    async def handle(
+        self,
+        message: ReplyTarget,
+        *,
+        attested_origin: MessageOrigin | None = None,
+    ) -> bool:
         if message.sender_id is None or message.chat_id is None:
             return False
-        origin = await self._transport.classify_origin(message)
+        if attested_origin is None:
+            origin = await self._transport.classify_origin(message)
+        elif not isinstance(attested_origin, MessageOrigin):
+            raise ValueError("Attested message origin is invalid")
+        else:
+            origin = attested_origin
         if origin is MessageOrigin.SIDEKICK_GENERATED:
             return False
         if origin is MessageOrigin.INDETERMINATE:

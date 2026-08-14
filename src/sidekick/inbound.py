@@ -7,6 +7,7 @@ from typing import Any, Callable, Generic, Literal, Protocol, TypeVar
 
 from sidekick.ai import ReplyTarget
 from sidekick.chat.identity import ExternalId
+from sidekick.chat.provenance import MessageOrigin
 
 
 InboundWorkKind = Literal["message", "message_remove"]
@@ -99,6 +100,7 @@ class InboundSourceRevision(Generic[_SourcePayload]):
     version: str
     state: InboundSourceState
     payload: _SourcePayload | None = None
+    attested_origin: MessageOrigin | None = None
 
     def __post_init__(self) -> None:
         if not self.version:
@@ -107,6 +109,11 @@ class InboundSourceRevision(Generic[_SourcePayload]):
             raise ValueError("Present inbound source revision requires a payload")
         if self.state == "recalled" and self.payload is not None:
             raise ValueError("Recalled inbound source revision cannot have a payload")
+        if self.attested_origin is not None and not isinstance(
+            self.attested_origin,
+            MessageOrigin,
+        ):
+            raise ValueError("Inbound source origin is invalid")
 
 
 class InboundMessageSource(Protocol[_SourcePayload]):
@@ -130,7 +137,12 @@ class InboundSourceUnavailable(Exception):
 
 
 class InboundMessageHandler(Protocol):
-    async def handle(self, message: ReplyTarget) -> bool: ...
+    async def handle(
+        self,
+        message: ReplyTarget,
+        *,
+        attested_origin: MessageOrigin | None = None,
+    ) -> bool: ...
 
 
 class InboundWorker(Protocol):
@@ -252,7 +264,10 @@ class DurableInboundWorker(Generic[_SourcePayload]):
                 )
                 return "ignored"
             try:
-                handled = await handler.handle(message)
+                handled = await handler.handle(
+                    message,
+                    attested_origin=revision.attested_origin,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
