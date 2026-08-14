@@ -258,3 +258,57 @@ async def test_restart_does_not_replay_an_execution_with_unknown_side_effects(
         ) is None
     finally:
         await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_is_durable_and_becomes_diagnosably_unavailable(
+    tmp_path,
+) -> None:
+    store = await open_store(tmp_path / "wechat.db")
+    try:
+        await store.accept_pending_ai_event(
+            CONNECTOR_KEY,
+            cursor="event-11",
+            chat_id=CHAT_ID,
+            message_id=MESSAGE_ID,
+            kind="message",
+        )
+        first = await store.claim_pending_ai_work(CONNECTOR_KEY, now=100)
+        assert first is not None
+        assert await store.defer_pending_ai_work(
+            first,
+            error_code="MESSAGE_NOT_OBSERVED",
+            retry_at=102,
+            max_attempts=2,
+            now=100,
+        ) == "pending"
+        assert await store.claim_pending_ai_work(
+            CONNECTOR_KEY,
+            now=101,
+        ) is None
+
+        second = await store.claim_pending_ai_work(CONNECTOR_KEY, now=102)
+        assert second is not None
+        assert await store.defer_pending_ai_work(
+            second,
+            error_code="MESSAGE_NOT_OBSERVED",
+            retry_at=106,
+            max_attempts=2,
+            now=102,
+        ) == "unavailable"
+
+        pending = await store.get_pending_ai_work(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            MESSAGE_ID,
+        )
+        assert pending is not None
+        assert pending.status == "unavailable"
+        assert pending.attempt_count == 2
+        assert pending.last_error_code == "MESSAGE_NOT_OBSERVED"
+        assert await store.claim_pending_ai_work(
+            CONNECTOR_KEY,
+            now=1_000,
+        ) is None
+    finally:
+        await store.close()

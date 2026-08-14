@@ -1181,6 +1181,84 @@ class WeChatStateRepository:
             raise
 
     @_serialized
+    async def defer_pending_ai_work(
+        self,
+        work: WeChatPendingAIWork,
+        *,
+        error_code: str,
+        retry_at: float,
+        max_attempts: int,
+        now: float | None = None,
+    ) -> Literal["pending", "unavailable", "stale"]:
+        if work.lease_id is None or not error_code:
+            raise ValueError("Claimed WeChat work and error code are required")
+        if max_attempts < 1:
+            raise ValueError("WeChat pending work attempts must be positive")
+        failed_at = time.time() if now is None else now
+        if retry_at < failed_at:
+            raise ValueError("WeChat pending retry cannot be scheduled in the past")
+        attempt_count = work.attempt_count + 1
+        status: Literal["pending", "unavailable"] = (
+            "unavailable" if attempt_count >= max_attempts else "pending"
+        )
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            result = await connection.execute(
+                """
+                UPDATE wechat_pending_ai_work
+                SET status = ?, attempt_count = ?, next_attempt_at = ?,
+                    last_error_code = ?, lease_id = NULL,
+                    lease_trigger_cursor = NULL, current_version = NULL,
+                    updated_at = ?
+                WHERE connector_key = ? AND chat_id = ? AND message_id = ?
+                  AND trigger_cursor = ? AND lease_id = ?
+                """,
+                (
+                    status,
+                    attempt_count,
+                    retry_at,
+                    error_code,
+                    failed_at,
+                    work.connector_key,
+                    work.chat_id,
+                    work.message_id,
+                    work.trigger_cursor,
+                    work.lease_id,
+                ),
+            )
+            if result.rowcount != 1:
+                await self._release_pending_ai_claim(work)
+                await connection.commit()
+                return "stale"
+            await connection.commit()
+            return status
+        except BaseException:
+            await connection.rollback()
+            raise
+
+    @_serialized
+    async def next_pending_ai_work_at(
+        self,
+        connector_key: str,
+    ) -> float | None:
+        cursor = await self._require_connection().execute(
+            """
+            SELECT MIN(next_attempt_at) AS next_attempt_at
+            FROM wechat_pending_ai_work
+            WHERE connector_key = ? AND status = 'pending'
+              AND lease_id IS NULL
+            """,
+            (connector_key,),
+        )
+        row = await cursor.fetchone()
+        return (
+            float(row["next_attempt_at"])
+            if row is not None and row["next_attempt_at"] is not None
+            else None
+        )
+
+    @_serialized
     async def recover_pending_ai_work(
         self,
         connector_key: str,
