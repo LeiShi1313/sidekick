@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from sidekick.inbound import DurableInboundWorker
 from sidekick.wechat.api import (
     WeChatAPIError,
     WeChatCapabilities,
@@ -17,7 +18,7 @@ from sidekick.wechat.api import (
 from sidekick.wechat.service import (
     WeChatBootstrap,
     WeChatEventPump,
-    WeChatPendingAIWorker,
+    WeChatObservedMessageSource,
 )
 from sidekick.wechat.store import WeChatStateRepository
 
@@ -156,6 +157,28 @@ class RecordingHandler:
         return self.handled
 
 
+def inbound_worker(
+    client,
+    store,
+    *,
+    not_observed_attempts: int = 3,
+    clock=None,
+) -> DurableInboundWorker:
+    source = WeChatObservedMessageSource(
+        client,
+        store,
+        CONNECTOR_KEY,
+        not_observed_attempts=not_observed_attempts,
+    )
+    options = {} if clock is None else {"clock": clock}
+    return DurableInboundWorker(
+        source,
+        store,
+        CONNECTOR_KEY,
+        **options,
+    )
+
+
 async def enqueue(store: WeChatStateRepository, *, kind: str = "message") -> None:
     await store.accept_pending_ai_event(
         CONNECTOR_KEY,
@@ -250,11 +273,7 @@ async def test_worker_fetches_authoritative_message_and_uses_connector_label(
     client = FakeObservedClient([present_message()])
     handler = RecordingHandler()
     try:
-        result = await WeChatPendingAIWorker(
-            client,
-            store,
-            CONNECTOR_KEY,
-        ).process_one(handler)
+        result = await inbound_worker(client, store).process_one(handler)
 
         assert result == "completed"
         assert client.requests == [(CHAT_ID, MESSAGE_ID)]
@@ -286,10 +305,9 @@ async def test_worker_retries_503_but_bounds_not_observed_404(tmp_path) -> None:
             WeChatAPIError(404, "MESSAGE_NOT_OBSERVED", "not observed"),
         ]
     )
-    worker = WeChatPendingAIWorker(
+    worker = inbound_worker(
         client,
         store,
-        CONNECTOR_KEY,
         not_observed_attempts=2,
         clock=lambda: now,
     )
@@ -321,11 +339,7 @@ async def test_worker_resolves_removal_without_fetching_or_generating(tmp_path) 
     client = FakeObservedClient([])
     handler = RecordingHandler()
     try:
-        assert await WeChatPendingAIWorker(
-            client,
-            store,
-            CONNECTOR_KEY,
-        ).process_one(handler) == "recalled"
+        assert await inbound_worker(client, store).process_one(handler) == "recalled"
         assert client.requests == []
         assert handler.messages == []
         assert await store.get_pending_ai_work(
@@ -345,10 +359,9 @@ async def test_worker_treats_fetched_recall_as_terminal_without_content(
     await enqueue(store)
     handler = RecordingHandler()
     try:
-        assert await WeChatPendingAIWorker(
+        assert await inbound_worker(
             FakeObservedClient([recalled_message()]),
             store,
-            CONNECTOR_KEY,
         ).process_one(handler) == "recalled"
         assert handler.messages == []
         assert await store.get_processed_revision_status(
@@ -375,10 +388,9 @@ async def test_cancelled_worker_marks_started_execution_unknown_instead_of_retry
 
     store = await open_store(tmp_path / "wechat.db")
     await enqueue(store)
-    worker = WeChatPendingAIWorker(
+    worker = inbound_worker(
         FakeObservedClient([present_message(version="mv1:running")]),
         store,
-        CONNECTOR_KEY,
     )
     task = asyncio.create_task(worker.process_one(BlockingHandler()))
     await entered.wait()
