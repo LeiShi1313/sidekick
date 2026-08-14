@@ -2070,12 +2070,43 @@ class WeChatStateRepository:
         connector_key: str,
         observed: WeChatObservedMessage,
     ) -> WeChatMessage:
-        if observed.state != "present":
-            raise ValueError("A recalled WeChat observation has no message content")
-        assert observed.sender_id is not None
-        assert observed.timestamp is not None
-        assert observed.direction is not None
-        assert observed.message_type is not None
+        messages = await self._messages_from_observations(
+            connector_key,
+            (observed,),
+        )
+        return messages[0]
+
+    @_serialized
+    async def messages_from_observations(
+        self,
+        connector_key: str,
+        observed: tuple[WeChatObservedMessage, ...],
+    ) -> tuple[WeChatMessage, ...]:
+        return await self._messages_from_observations(connector_key, observed)
+
+    async def _messages_from_observations(
+        self,
+        connector_key: str,
+        observed: tuple[WeChatObservedMessage, ...],
+    ) -> tuple[WeChatMessage, ...]:
+        if not observed:
+            return ()
+        for message in observed:
+            if message.state != "present":
+                raise ValueError(
+                    "A recalled WeChat observation has no message content"
+                )
+            if (
+                message.sender_id is None
+                or message.timestamp is None
+                or message.direction is None
+                or message.message_type is None
+            ):
+                raise ValueError("WeChat observation has incomplete message content")
+
+        chat_id = observed[0].chat_id
+        if any(message.chat_id != chat_id for message in observed):
+            raise ValueError("WeChat observations must belong to one chat")
         cursor = await self._require_connection().execute(
             """
             SELECT
@@ -2089,45 +2120,32 @@ class WeChatStateRepository:
              AND chats.chat_id = ?
             WHERE connectors.connector_key = ?
             """,
-            (observed.chat_id, connector_key),
+            (chat_id, connector_key),
         )
         row = await cursor.fetchone()
         if row is None:
             raise RuntimeError("WeChat connector has not been bootstrapped")
         account_id = str(row["account_id"])
-        chat_type = (
-            str(row["chat_type"])
-            if row["chat_type"] is not None
-            else (
-                "group"
-                if observed.chat_id.endswith("@chatroom")
-                else "direct"
+        chat_context = (
+            (
+                str(row["chat_type"]),
+                (
+                    str(row["chat_display_name"])
+                    if row["chat_display_name"] is not None
+                    else None
+                ),
             )
+            if row["chat_type"] is not None
+            else None
         )
-        return WeChatMessage(
-            connector_key=connector_key,
-            account_id=account_id,
-            memory_cursor=observed.id,
-            id=observed.id,
-            chat_id=observed.chat_id,
-            raw_text=observed.display_content,
-            content_redacted=observed.content_redacted,
-            sender_id=observed.sender_id,
-            reply_to_msg_id=observed.reply_to_message_id,
-            date=datetime.fromtimestamp(observed.timestamp, UTC),
-            out=observed.direction == "out",
-            self_id=account_id,
-            message_type=observed.message_type,
-            chat_type=chat_type,
-            sender_display_name=observed.sender_label,
-            scope_display_name=(
-                str(row["chat_display_name"])
-                if row["chat_display_name"] is not None
-                else None
-            ),
-            source=observed.source,
-            sequence=None,
-            media_id=observed.media_id,
+        return tuple(
+            _message_from_observation(
+                connector_key,
+                account_id,
+                message,
+                chat_context,
+            )
+            for message in observed
         )
 
     @_serialized
@@ -2662,4 +2680,41 @@ def _pending_ai_work_from_row(row: aiosqlite.Row) -> WeChatPendingAIWork:
             else None
         ),
         updated_at=float(row["updated_at"]),
+    )
+
+
+def _message_from_observation(
+    connector_key: str,
+    account_id: str,
+    observed: WeChatObservedMessage,
+    chat_context: tuple[str, str | None] | None,
+) -> WeChatMessage:
+    assert observed.sender_id is not None
+    assert observed.timestamp is not None
+    assert observed.direction is not None
+    assert observed.message_type is not None
+    chat_type, chat_display_name = chat_context or (
+        "group" if observed.chat_id.endswith("@chatroom") else "direct",
+        None,
+    )
+    return WeChatMessage(
+        connector_key=connector_key,
+        account_id=account_id,
+        memory_cursor=observed.id,
+        id=observed.id,
+        chat_id=observed.chat_id,
+        raw_text=observed.display_content,
+        content_redacted=observed.content_redacted,
+        sender_id=observed.sender_id,
+        reply_to_msg_id=observed.reply_to_message_id,
+        date=datetime.fromtimestamp(observed.timestamp, UTC),
+        out=observed.direction == "out",
+        self_id=account_id,
+        message_type=observed.message_type,
+        chat_type=chat_type,
+        sender_display_name=observed.sender_label,
+        scope_display_name=chat_display_name,
+        source=observed.source,
+        sequence=None,
+        media_id=observed.media_id,
     )

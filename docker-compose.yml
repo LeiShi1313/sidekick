@@ -79,11 +79,10 @@ x-wechat-ai: &wechat-ai
                 timeout=4,
             )
             try:
-                session, capabilities, chats, _messages = await asyncio.gather(
+                session, capabilities, chats = await asyncio.gather(
                     client.get_session(),
                     client.get_capabilities(),
                     client.get_chats(),
-                    client.get_messages(limit=1_000),
                 )
                 session.require_current_login()
                 capabilities.require_ai_channel()

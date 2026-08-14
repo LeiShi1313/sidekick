@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 import struct
@@ -54,6 +55,10 @@ from sidekick.wechat.api import (
     WeChatGroupMember,
     WeChatGroupMemberList,
     WeChatMessageList,
+    WeChatObservationCoverage,
+    WeChatObservedMessage,
+    WeChatObservedMessagePage,
+    WeChatObservedPageInfo,
     WeChatSendFailed,
     WeChatSendOperation,
     WeChatSendOutcomeUnknown,
@@ -71,11 +76,94 @@ GROUP_ID = "56825427596@chatroom"
 
 
 class RecordingConnectorClient:
-    def __init__(self, responses: tuple[object, ...]):
+    def __init__(
+        self,
+        responses: tuple[object, ...],
+        *,
+        observed_messages: tuple[WeChatObservedMessage, ...] = (),
+    ):
         self.responses = list(responses)
         self.calls: list[dict[str, str | None]] = []
         self.attachment_calls: list[dict[str, object]] = []
         self.reconcile_calls: list[dict[str, str]] = []
+        self.observed_messages = {
+            message.id: message for message in observed_messages
+        }
+
+    async def get_observed_message(self, chat_id: str, message_id: str):
+        message = self.observed_messages.get(message_id)
+        if message is None or message.chat_id != chat_id:
+            raise WeChatAPIError(404, "MESSAGE_NOT_OBSERVED", "not retained")
+        return message
+
+    async def get_observed_messages(
+        self,
+        chat_id: str,
+        *,
+        before=None,
+        after=None,
+        since=None,
+        until=None,
+        limit=50,
+    ):
+        messages = sorted(
+            (
+                message
+                for message in self.observed_messages.values()
+                if message.chat_id == chat_id
+                and (since is None or message.order_timestamp >= since)
+                and (until is None or message.order_timestamp <= until)
+            ),
+            key=lambda message: (message.order_timestamp, int(message.id)),
+        )
+        anchor_index = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.id == (before or after)
+            ),
+            None,
+        )
+        if (before is not None or after is not None) and anchor_index is None:
+            raise WeChatAPIError(
+                404,
+                "MESSAGE_ANCHOR_NOT_OBSERVED",
+                "anchor not retained",
+            )
+        if before is not None:
+            candidates = messages[:anchor_index]
+            selected = candidates[-limit:]
+        elif after is not None:
+            candidates = messages[anchor_index + 1 :]
+            selected = candidates[:limit]
+        else:
+            candidates = messages
+            selected = candidates[-limit:]
+        first_index = messages.index(selected[0]) if selected else None
+        last_index = messages.index(selected[-1]) if selected else None
+        return WeChatObservedMessagePage(
+            messages=tuple(selected),
+            page=WeChatObservedPageInfo(
+                before=selected[0].id if selected else None,
+                after=selected[-1].id if selected else None,
+                has_more_before=first_index is not None and first_index > 0,
+                has_more_after=(
+                    last_index is not None and last_index < len(messages) - 1
+                ),
+            ),
+            coverage=WeChatObservationCoverage(
+                kind="partial",
+                oldest_available=None,
+                newest_available=None,
+                may_have_unobserved_messages=True,
+                observation_gaps=(),
+                gaps_are_exhaustive=False,
+                sources=("test",),
+            ),
+        )
+
+    def observe(self, message: WeChatObservedMessage) -> None:
+        self.observed_messages[message.id] = message
 
     async def send_text_and_wait(
         self,
@@ -138,8 +226,9 @@ class RecordingMediaConnectorClient(RecordingConnectorClient):
         *,
         original: object,
         preview: object,
+        observed_messages: tuple[WeChatObservedMessage, ...] = (),
     ):
-        super().__init__(responses)
+        super().__init__(responses, observed_messages=observed_messages)
         self.original = original
         self.preview = preview
         self.media_calls: list[tuple[str, str]] = []
@@ -290,6 +379,44 @@ async def bootstrap_store(
     )
     assert observed is not None
     return store, observed
+
+
+def as_observed(
+    message: WeChatMessage,
+    *,
+    sender_group_alias: str | None = None,
+    content: str | None = None,
+) -> WeChatObservedMessage:
+    link_title = None
+    link_url = None
+    observed_content = message.raw_text if content is None else content
+    if message.message_type == "link":
+        lines = message.raw_text.splitlines()
+        link_title = lines[0].removeprefix("[Link] ") if lines else None
+        link_url = lines[1] if len(lines) > 1 else None
+        observed_content = link_title or ""
+    timestamp = int(message.date.timestamp())
+    return WeChatObservedMessage(
+        id=message.id,
+        chat_id=message.chat_id,
+        state="present",
+        version=f"mv1:test-{message.id}-{timestamp}",
+        order_timestamp=timestamp,
+        observed_at=timestamp + 1,
+        source=message.source or "wechat+test",
+        direction="out" if message.out else "in",
+        message_type=message.message_type,
+        content=observed_content,
+        content_redacted=message.content_redacted,
+        sender_id=message.sender_id,
+        sender_display_name=message.sender_display_name,
+        sender_group_alias=sender_group_alias,
+        timestamp=timestamp,
+        reply_to_message_id=message.reply_to_msg_id,
+        media_id=message.media_id,
+        link_title=link_title,
+        link_url=link_url,
+    )
 
 
 def image_bytes() -> bytes:
@@ -2156,14 +2283,17 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
 ) -> None:
     wechat_store, trigger = await bootstrap_store(tmp_path / "wechat.db")
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
-    client = RecordingConnectorClient((submitted(),))
+    client = RecordingConnectorClient(
+        (submitted(),),
+        observed_messages=(as_observed(trigger),),
+    )
     transport = WeChatChatTransport(
         client,
         wechat_store,
         CONNECTOR_KEY,
         native_reply_ready=False,
     )
-    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(client, wechat_store, CONNECTOR_KEY)
     gateway = FinalGateway("hello from Sidekick")
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
@@ -2258,7 +2388,10 @@ async def test_wechat_conversation_handler_uses_quoted_message_as_context(
     )
     command = await project_quoted_reply(wechat_store, reply_to=target.id)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
-    client = RecordingConnectorClient((submitted(),))
+    client = RecordingConnectorClient(
+        (submitted(),),
+        observed_messages=(as_observed(target),),
+    )
     transport = WeChatChatTransport(
         client,
         wechat_store,
@@ -2277,7 +2410,7 @@ async def test_wechat_conversation_handler_uses_quoted_message_as_context(
         store=ai_store,
         prompt_builder=PromptBuilder(
             transport=transport,
-            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            history_source=WeChatHistorySource(client, wechat_store, CONNECTOR_KEY),
             identity_resolver=WeChatMessageIdentityResolver(identity_codec),
             mention_resolver=WeChatMessageMentionResolver(),
             identity_codec=identity_codec,
@@ -2321,7 +2454,10 @@ async def test_wechat_conversation_handler_uses_quoted_link_as_context(
     )
     command = await project_quoted_reply(wechat_store, reply_to=target.id)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
-    client = RecordingConnectorClient((submitted(),))
+    client = RecordingConnectorClient(
+        (submitted(),),
+        observed_messages=(as_observed(target),),
+    )
     transport = WeChatChatTransport(
         client,
         wechat_store,
@@ -2340,7 +2476,7 @@ async def test_wechat_conversation_handler_uses_quoted_link_as_context(
         store=ai_store,
         prompt_builder=PromptBuilder(
             transport=transport,
-            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            history_source=WeChatHistorySource(client, wechat_store, CONNECTOR_KEY),
             identity_resolver=WeChatMessageIdentityResolver(identity_codec),
             mention_resolver=WeChatMessageMentionResolver(),
             identity_codec=identity_codec,
@@ -2384,6 +2520,7 @@ async def test_wechat_conversation_handler_uses_quoted_original_image_as_context
             variant="original",
         ),
         preview=AssertionError("preview should not be requested"),
+        observed_messages=(as_observed(target),),
     )
     transport = WeChatChatTransport(
         client,
@@ -2399,7 +2536,7 @@ async def test_wechat_conversation_handler_uses_quoted_original_image_as_context
         store=ai_store,
         prompt_builder=PromptBuilder(
             transport=transport,
-            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            history_source=WeChatHistorySource(client, wechat_store, CONNECTOR_KEY),
             quoted_attachment_describer=WeChatQuotedImageDescriber(
                 client,
                 gateway,
@@ -2611,11 +2748,11 @@ async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
     )
 
     async def unavailable_reply(*_args, **_kwargs):
-        raise RuntimeError("projection unavailable")
+        raise RuntimeError("connector history unavailable")
 
-    monkeypatch.setattr(wechat_store, "get_reply_message", unavailable_reply)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
+    monkeypatch.setattr(client, "get_observed_message", unavailable_reply)
     transport = WeChatChatTransport(
         client,
         wechat_store,
@@ -2634,7 +2771,7 @@ async def test_wechat_conversation_handler_treats_quoted_lookup_as_best_effort(
         store=ai_store,
         prompt_builder=PromptBuilder(
             transport=transport,
-            history_source=WeChatHistorySource(wechat_store, CONNECTOR_KEY),
+            history_source=WeChatHistorySource(client, wechat_store, CONNECTOR_KEY),
             identity_resolver=WeChatMessageIdentityResolver(identity_codec),
             mention_resolver=WeChatMessageMentionResolver(),
             identity_codec=identity_codec,
@@ -2728,14 +2865,19 @@ async def test_wechat_manual_memory_command_uses_refreshed_group_alias(
     command = await wechat_store.project_event(CONNECTOR_KEY, command_event)
     assert command is not None
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
-    client = RecordingConnectorClient((submitted(),))
+    client = RecordingConnectorClient(
+        (submitted(),),
+        observed_messages=(
+            as_observed(target, sender_group_alias="项目阿丽"),
+        ),
+    )
     transport = WeChatChatTransport(
         client,
         wechat_store,
         CONNECTOR_KEY,
         native_reply_ready=False,
     )
-    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(client, wechat_store, CONNECTOR_KEY)
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(
@@ -2778,11 +2920,11 @@ async def test_wechat_manual_memory_command_uses_refreshed_group_alias(
 
 
 @pytest.mark.asyncio
-async def test_wechat_backfill_reports_and_ingests_only_locally_stored_history(
+async def test_wechat_backfill_reports_and_ingests_partial_connector_history(
     tmp_path,
 ) -> None:
     caveat = (
-        "WeChat backfill covers only messages already observed and stored by Sidekick."
+        "WeChat backfill covers only the connector's partial observation catalog."
     )
     wechat_store, target = await bootstrap_store(
         tmp_path / "wechat.db",
@@ -2812,7 +2954,8 @@ async def test_wechat_backfill_reports_and_ingests_only_locally_stored_history(
         (
             submitted(message_id="7158246912028861544"),
             submitted(message_id="8158246912028861544"),
-        )
+        ),
+        observed_messages=(as_observed(target), as_observed(command)),
     )
     transport = WeChatChatTransport(
         client,
@@ -2820,7 +2963,7 @@ async def test_wechat_backfill_reports_and_ingests_only_locally_stored_history(
         CONNECTOR_KEY,
         native_reply_ready=False,
     )
-    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(client, wechat_store, CONNECTOR_KEY)
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     prompt_builder = PromptBuilder(
@@ -2880,7 +3023,7 @@ async def test_wechat_backfill_reports_and_ingests_only_locally_stored_history(
 
 
 @pytest.mark.asyncio
-async def test_wechat_memory_enable_starts_after_command_projection_cursor(
+async def test_wechat_memory_enable_starts_after_connector_message_id(
     tmp_path,
 ) -> None:
     class NoopDreamRunner:
@@ -2895,6 +3038,7 @@ async def test_wechat_memory_enable_starts_after_command_projection_cursor(
         trigger_text="/ai_memory_enable",
         direction="out",
     )
+    command.memory_cursor = command.id
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient((submitted(),))
     transport = WeChatChatTransport(
@@ -2903,7 +3047,7 @@ async def test_wechat_memory_enable_starts_after_command_projection_cursor(
         CONNECTOR_KEY,
         native_reply_ready=False,
     )
-    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(client, wechat_store, CONNECTOR_KEY)
     memory = RecordingMemory()
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(
@@ -2961,7 +3105,7 @@ async def test_wechat_memory_enable_reports_when_hindsight_is_disabled(
         CONNECTOR_KEY,
         native_reply_ready=False,
     )
-    history = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    history = WeChatHistorySource(client, wechat_store, CONNECTOR_KEY)
     identity_codec = WeChatIdentityCodec(account_id=ACCOUNT_ID)
     handler = AIConversationHandler(
         owner_id=ACCOUNT_ID,
@@ -3038,7 +3182,9 @@ async def test_continuous_memory_scheduler_accepts_wechat_scope_ids(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_wechat_continuous_memory_checkpoints_projection_cursor(tmp_path) -> None:
+async def test_wechat_continuous_memory_checkpoints_connector_message_id(
+    tmp_path,
+) -> None:
     wechat_store, trigger = await bootstrap_store(
         tmp_path / "wechat.db",
         trigger_text="project decision",
@@ -3046,7 +3192,17 @@ async def test_wechat_continuous_memory_checkpoints_projection_cursor(tmp_path) 
     )
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     memory = RecordingMemory()
-    source = WeChatHistorySource(wechat_store, CONNECTOR_KEY)
+    first = as_observed(trigger)
+    seed = replace(
+        first,
+        id="3159667620982040828",
+        version="mv1:test-seed",
+        order_timestamp=first.order_timestamp - 1,
+        timestamp=first.timestamp - 1 if first.timestamp is not None else None,
+        content="seed boundary",
+    )
+    client = RecordingConnectorClient((), observed_messages=(seed, first))
+    source = WeChatHistorySource(client, wechat_store, CONNECTOR_KEY)
     scanner = ChatMemoryIngestor(
         source=source,
         store=ai_store,
@@ -3071,45 +3227,35 @@ async def test_wechat_continuous_memory_checkpoints_projection_cursor(tmp_path) 
     await ai_store.set_continuous_memory_enabled(
         scope_id,
         True,
-        cursor_message_id=0,
+        cursor_message_id=seed.id,
     )
     try:
         initial_result = await scanner.run_continuous_scope(GROUP_ID)
         initial_state = await ai_store.get_memory_scope_state(scope_id)
 
-        revision = WeChatEvent.parse(
-            {
-                "schemaVersion": "wechat-bridge/v1alpha1",
-                "cursor": "late-revision",
-                "event": "message",
-                "connectionGeneration": 41,
-                "id": trigger.id,
-                "chatId": GROUP_ID,
-                "direction": "in",
-                "messageType": "text",
-                "senderId": "wxid_alice",
-                "content": "project decision, corrected",
-                "timestamp": 1_783_772_734,
-                "source": "wechat+localdb",
-            }
+        follow_up = replace(
+            first,
+            id="5159667620982040828",
+            version="mv1:test-follow-up",
+            order_timestamp=first.order_timestamp + 2,
+            timestamp=first.timestamp + 2 if first.timestamp is not None else None,
+            content="project decision, confirmed",
         )
-        corrected = await wechat_store.project_event(CONNECTOR_KEY, revision)
-        assert corrected is not None
+        client.observe(follow_up)
 
-        revised_result = await scanner.run_continuous_scope(GROUP_ID)
-        revised_state = await ai_store.get_memory_scope_state(scope_id)
+        follow_up_result = await scanner.run_continuous_scope(GROUP_ID)
+        follow_up_state = await ai_store.get_memory_scope_state(scope_id)
     finally:
         await ai_store.close()
         await wechat_store.close()
 
     assert initial_result.messages_seen == 1
     assert initial_result.messages_retained == 1
-    assert initial_state.continuous_cursor_message_id == trigger.memory_cursor
-    assert revised_result.messages_seen == 1
-    assert revised_result.messages_retained == 1
-    assert revised_state.continuous_cursor_message_id == corrected.memory_cursor
-    assert corrected.memory_cursor > trigger.memory_cursor
+    assert initial_state.continuous_cursor_message_id == trigger.id
+    assert follow_up_result.messages_seen == 1
+    assert follow_up_result.messages_retained == 1
+    assert follow_up_state.continuous_cursor_message_id == follow_up.id
     assert [event.source_id for event in memory.episodes[0].events] == [
         WECHAT_IDENTITY_CODEC.message_source_id(GROUP_ID, trigger.id)
     ]
-    assert memory.episodes[-1].events[0].text == "project decision, corrected"
+    assert memory.episodes[-1].events[0].text == "project decision, confirmed"
