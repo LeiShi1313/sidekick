@@ -46,6 +46,25 @@ def test_wechat_runtime_settings_and_cli_command(monkeypatch, tmp_path) -> None:
     assert command_registry.as_fire_commands()["wechat"]["ai"]
 
 
+def test_wechat_plugin_keeps_inbound_work_in_the_ai_database(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    ai_path = tmp_path / "wechat-ai.db"
+    wechat_path = tmp_path / "wechat.db"
+    monkeypatch.setenv("SIDEKICK_AI_STATE_PATH", str(ai_path))
+    monkeypatch.setenv("SIDEKICK_WECHAT_STATE_PATH", str(wechat_path))
+    monkeypatch.setenv("SIDEKICK_PI_TOKEN", "p" * 24)
+    monkeypatch.setenv("SIDEKICK_OPS_TOKEN", "o" * 24)
+    monkeypatch.setenv("SIDEKICK_HINDSIGHT_URL", "")
+
+    plugin = WeChatAI()
+
+    assert plugin._inbound_store.path == ai_path
+    assert plugin._ai_store.path == ai_path
+    assert plugin._wechat_store.path == wechat_path
+
+
 @pytest.mark.asyncio
 async def test_duplicate_wechat_adapter_fails_before_opening_ai_state(
     monkeypatch,
@@ -318,7 +337,7 @@ class FakeConnectorClient:
 
 
 @pytest.mark.asyncio
-async def test_wechat_bootstrap_uses_session_cursor_without_legacy_history(
+async def test_wechat_bootstrap_does_not_read_or_store_legacy_history(
     tmp_path,
 ) -> None:
     client = FakeConnectorClient()
@@ -331,8 +350,11 @@ async def test_wechat_bootstrap_uses_session_cursor_without_legacy_history(
         )
 
         assert bootstrap.session.cursor == "10"
-        assert await store.get_cursor(CONNECTOR_KEY) == "10"
-        assert await store.count_messages(CONNECTOR_KEY) == 0
+        cursor = await store._require_connection().execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("wechat_messages",),
+        )
+        assert await cursor.fetchone() is None
         assert client.legacy_message_reads == 0
         assert client.legacy_identity_reads == 0
     finally:

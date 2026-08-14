@@ -182,7 +182,6 @@ async def test_recent_history_pages_connector_catalog_without_local_projection(
             "Bob",
         ]
         assert [call["before"] for call in client.page_calls] == ["105", "103"]
-        assert await store.count_messages(CONNECTOR_KEY) == 0
     finally:
         await store.close()
 

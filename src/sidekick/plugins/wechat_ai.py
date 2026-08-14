@@ -43,6 +43,7 @@ from sidekick.channel_status import (
     ChannelOpsSettings,
     ChannelSnapshotService,
 )
+from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.plugins.base import PluginMount
 from sidekick.runtime import build_logger
 from sidekick.wechat.ai import (
@@ -138,6 +139,7 @@ class WeChatAI(metaclass=PluginMount):
         )
         self._wechat_store = WeChatStateRepository(self._runtime.state_path)
         self._ai_store = AIStateRepository(self._settings.state_path)
+        self._inbound_store = SQLiteInboundWorkStore(self._settings.state_path)
         self._gateway = PiAgentGateway(
             self._settings.agent_url,
             token=self._settings.agent_token,
@@ -197,6 +199,7 @@ class WeChatAI(metaclass=PluginMount):
                 self._client.base_url
             )
             await self._ai_store.connect()
+            await self._inbound_store.connect()
             try:
                 account_id = await self._wechat_store.get_account_id(
                     self._client.base_url
@@ -209,7 +212,7 @@ class WeChatAI(metaclass=PluginMount):
             while not stop.is_set():
                 try:
                     # Stop account-scoped ingestion before bootstrap can switch the
-                    # active connector account in the local projection.
+                    # active connector account.
                     await self._close_channel_runtime()
                     bootstrap = await bootstrap_wechat_channel(
                         self._client,
@@ -228,8 +231,10 @@ class WeChatAI(metaclass=PluginMount):
                     result = await WeChatEventPump(
                         self._client,
                         self._wechat_store,
-                        self._client.base_url,
-                        bootstrap,
+                        self._inbound_store,
+                        connector_key=self._client.base_url,
+                        source_id=self._ops_settings.instance_id,
+                        bootstrap=bootstrap,
                     ).run(handler, stop)
                     if result == "stopped":
                         break
@@ -252,6 +257,7 @@ class WeChatAI(metaclass=PluginMount):
             if self._memory is not None:
                 await self._memory.close()
             await self._gateway.close()
+            await self._inbound_store.close()
             await self._ai_store.close()
             await self._wechat_store.close()
 

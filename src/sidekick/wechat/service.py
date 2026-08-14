@@ -17,6 +17,7 @@ from sidekick.inbound import (
     InboundSourceUnavailable,
     InboundWork,
 )
+from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.wechat.api import (
     WeChatAPIError,
     WeChatAPIContractError,
@@ -156,17 +157,21 @@ class WeChatEventPump:
     def __init__(
         self,
         client: WeChatBootstrapClient,
-        store: WeChatStateRepository,
-        connector_key: str,
-        bootstrap: WeChatBootstrap,
+        directory: WeChatStateRepository,
+        inbox: SQLiteInboundWorkStore,
         *,
+        connector_key: str,
+        source_id: str,
+        bootstrap: WeChatBootstrap,
         handler_concurrency: int = 8,
     ):
         if handler_concurrency < 1:
             raise ValueError("WeChat handler concurrency must be positive")
         self._client = client
-        self._store = store
+        self._directory = directory
+        self._inbox = inbox
         self._connector_key = connector_key
+        self._source_id = source_id
         self._bootstrap = bootstrap
         self._handler_concurrency = handler_concurrency
         self._directory_tasks: set[asyncio.Task[None]] = set()
@@ -176,28 +181,34 @@ class WeChatEventPump:
         handler: InboundMessageHandler,
         stop: asyncio.Event,
     ) -> PumpResult:
-        await self._store.recover_pending_ai_work(self._connector_key)
+        after = await self._inbox.initialize_source(
+            self._source_id,
+            epoch=self._bootstrap.session.self_id,
+            initial_cursor=self._bootstrap.session.cursor,
+        )
+        if not isinstance(after, str):
+            raise RuntimeError("WeChat inbound cursor must be a string")
+        await self._inbox.recover_pending_ai_work(self._source_id)
         source = WeChatObservedMessageSource(
             self._client,
-            self._store,
+            self._directory,
             self._connector_key,
         )
         worker = DurableInboundWorker(
             source,
-            self._store,
-            self._connector_key,
+            self._inbox,
+            self._source_id,
             logger=_LOGGER,
         )
         pool = DurableInboundPool(
             worker,
-            self._store,
-            self._connector_key,
+            self._inbox,
+            self._source_id,
             handler,
             concurrency=self._handler_concurrency,
             logger=_LOGGER,
         )
         pool.start()
-        after = await self._store.get_cursor(self._connector_key)
         stream = self._client.events(after=after)
         iterator = stream.__aiter__()
         next_event: asyncio.Task[WeChatEvent] | None = None
@@ -252,22 +263,22 @@ class WeChatEventPump:
             and event.connection_generation != generation
         ):
             if event.connection_generation < generation:
-                await self._store.acknowledge_event(
-                    self._connector_key,
+                await self._inbox.acknowledge_event(
+                    self._source_id,
                     event.cursor,
                 )
             return True
 
         if event.name == "hook_connection":
-            await self._store.acknowledge_event(
-                self._connector_key,
+            await self._inbox.acknowledge_event(
+                self._source_id,
                 event.cursor,
             )
             return event.payload.get("status") == "disconnected"
 
         if event.name == "session_update":
-            await self._store.acknowledge_event(
-                self._connector_key,
+            await self._inbox.acknowledge_event(
+                self._source_id,
                 event.cursor,
             )
             return True
@@ -282,14 +293,14 @@ class WeChatEventPump:
                         "wechat_message_type": event.payload.get("messageType"),
                     },
                 )
-                await self._store.acknowledge_event(
-                    self._connector_key,
+                await self._inbox.acknowledge_event(
+                    self._source_id,
                     event.cursor,
                 )
                 return False
             if event.is_senderless_unsupported_message():
-                await self._store.acknowledge_event(
-                    self._connector_key,
+                await self._inbox.acknowledge_event(
+                    self._source_id,
                     event.cursor,
                 )
                 return False
@@ -297,17 +308,18 @@ class WeChatEventPump:
                 message = event.message()
             except WeChatAPIContractError:
                 self._log_dropped_message(event)
-                await self._store.acknowledge_event(
-                    self._connector_key,
+                await self._inbox.acknowledge_event(
+                    self._source_id,
                     event.cursor,
                 )
                 return False
-            await self._store.accept_pending_ai_event(
-                self._connector_key,
+            await self._inbox.accept_pending_ai_event(
+                self._source_id,
                 cursor=event.cursor,
                 chat_id=message.chat_id,
                 message_id=message.id,
                 kind="message",
+                attested_origin=None,
             )
             pool.notify()
             return False
@@ -317,24 +329,25 @@ class WeChatEventPump:
                 chat_id, message_id = event.removed_message()
             except WeChatAPIContractError:
                 self._log_dropped_message(event)
-                await self._store.acknowledge_event(
-                    self._connector_key,
+                await self._inbox.acknowledge_event(
+                    self._source_id,
                     event.cursor,
                 )
                 return False
-            await self._store.accept_pending_ai_event(
-                self._connector_key,
+            await self._inbox.accept_pending_ai_event(
+                self._source_id,
                 cursor=event.cursor,
                 chat_id=chat_id,
                 message_id=message_id,
                 kind="message_remove",
+                attested_origin=None,
             )
             worker.cancel_message(chat_id, message_id)
             pool.notify()
             return False
 
-        await self._store.acknowledge_event(
-            self._connector_key,
+        await self._inbox.acknowledge_event(
+            self._source_id,
             event.cursor,
         )
         self._schedule_directory_refresh(event, generation)
@@ -384,7 +397,7 @@ class WeChatEventPump:
     async def _refresh_chats(self, generation: int) -> None:
         chats = await self._client.get_chats()
         chats.require_current(generation)
-        await self._store.refresh_chats(self._connector_key, chats)
+        await self._directory.refresh_chats(self._connector_key, chats)
 
 
 def _dispatchable(message: WeChatMessage) -> bool:

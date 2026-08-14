@@ -190,3 +190,115 @@ async def test_new_source_epoch_discards_old_account_work(tmp_path) -> None:
         ) is None
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_same_source_epoch_preserves_durable_cursor(tmp_path) -> None:
+    store = await open_store(tmp_path / "ai.db")
+    try:
+        await store.acknowledge_event(SOURCE_ID, 41)
+
+        cursor = await store.initialize_source(
+            SOURCE_ID,
+            epoch="account-99",
+            initial_cursor=99,
+        )
+
+        assert cursor == 41
+        assert await store.get_cursor(SOURCE_ID) == 41
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_processed_revision_is_deduplicated_by_semantic_version(
+    tmp_path,
+) -> None:
+    store = await open_store(tmp_path / "ai.db")
+    try:
+        await store.accept_pending_ai_event(
+            SOURCE_ID,
+            cursor=11,
+            chat_id=CHAT_ID,
+            message_id=MESSAGE_ID,
+            kind="message",
+            attested_origin=None,
+        )
+        first = await store.claim_pending_ai_work(SOURCE_ID, now=100)
+        assert first is not None
+        assert await store.begin_pending_ai_execution(
+            first,
+            version="same-revision",
+            now=100,
+        ) == "started"
+        assert await store.complete_pending_ai_work(
+            first,
+            version="same-revision",
+            outcome="completed",
+            now=101,
+        ) is True
+
+        await store.accept_pending_ai_event(
+            SOURCE_ID,
+            cursor=12,
+            chat_id=CHAT_ID,
+            message_id=MESSAGE_ID,
+            kind="message",
+            attested_origin=None,
+        )
+        replay = await store.claim_pending_ai_work(SOURCE_ID, now=102)
+        assert replay is not None
+        assert await store.begin_pending_ai_execution(
+            replay,
+            version="same-revision",
+            now=102,
+        ) == "duplicate"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_becomes_diagnosably_unavailable(tmp_path) -> None:
+    store = await open_store(tmp_path / "ai.db")
+    try:
+        await store.accept_pending_ai_event(
+            SOURCE_ID,
+            cursor=11,
+            chat_id=CHAT_ID,
+            message_id=MESSAGE_ID,
+            kind="message",
+            attested_origin=None,
+        )
+        first = await store.claim_pending_ai_work(SOURCE_ID, now=100)
+        assert first is not None
+        assert await store.defer_pending_ai_work(
+            first,
+            error_code="SOURCE_NOT_OBSERVED",
+            retry_at=102,
+            max_attempts=2,
+            now=100,
+        ) == "pending"
+        assert await store.claim_pending_ai_work(SOURCE_ID, now=101) is None
+
+        second = await store.claim_pending_ai_work(SOURCE_ID, now=102)
+        assert second is not None
+        assert await store.defer_pending_ai_work(
+            second,
+            error_code="SOURCE_NOT_OBSERVED",
+            retry_at=106,
+            max_attempts=2,
+            now=102,
+        ) == "unavailable"
+
+        pending = await store.get_pending_ai_work(
+            SOURCE_ID,
+            CHAT_ID,
+            MESSAGE_ID,
+        )
+        assert pending is not None
+        assert pending.status == "unavailable"
+        assert pending.attempt_count == 2
+        assert pending.last_error_code == "SOURCE_NOT_OBSERVED"
+        assert await store.claim_pending_ai_work(SOURCE_ID, now=1_000) is None
+    finally:
+        await store.close()
