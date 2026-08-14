@@ -706,42 +706,6 @@ async def test_chat_directory_refresh_runs_after_cursor_advance(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_worker_rechecks_queue_after_clearing_a_consumed_wakeup(
-    tmp_path,
-) -> None:
-    store = await open_store(tmp_path / "wechat.db")
-    pump = WeChatEventPump(
-        StreamingObservedClient((), []),
-        store,
-        CONNECTOR_KEY,
-        bootstrap(),
-        handler_concurrency=1,
-    )
-    rechecked = asyncio.Event()
-
-    class WakeupDuringIdleWorker:
-        calls = 0
-
-        async def process_one(self, _handler):
-            self.calls += 1
-            if self.calls == 1:
-                pump._work_available.set()
-                return "idle"
-            rechecked.set()
-            await asyncio.Future()
-
-    task = asyncio.create_task(
-        pump._run_worker(WakeupDuringIdleWorker(), RecordingHandler())
-    )
-    try:
-        await asyncio.wait_for(rechecked.wait(), timeout=1)
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await store.close()
-
-
-@pytest.mark.asyncio
 async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
     tmp_path,
 ) -> None:

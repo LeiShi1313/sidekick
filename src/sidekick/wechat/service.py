@@ -4,13 +4,13 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import logging
-import time
 from typing import Literal, Protocol
 
 import aiohttp
 
 from sidekick.ai import ReplyTarget
 from sidekick.inbound import (
+    DurableInboundPool,
     DurableInboundWorker,
     InboundMessageHandler,
     InboundSourceRevision,
@@ -169,7 +169,6 @@ class WeChatEventPump:
         self._connector_key = connector_key
         self._bootstrap = bootstrap
         self._handler_concurrency = handler_concurrency
-        self._work_available = asyncio.Event()
         self._directory_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
@@ -189,14 +188,15 @@ class WeChatEventPump:
             self._connector_key,
             logger=_LOGGER,
         )
-        worker_tasks = tuple(
-            asyncio.create_task(
-                self._run_worker(worker, handler),
-                name=f"wechat-ai-worker-{index}",
-            )
-            for index in range(self._handler_concurrency)
+        pool = DurableInboundPool(
+            worker,
+            self._store,
+            self._connector_key,
+            handler,
+            concurrency=self._handler_concurrency,
+            logger=_LOGGER,
         )
-        self._work_available.set()
+        pool.start()
         after = await self._store.get_cursor(self._connector_key)
         stream = self._client.events(after=after)
         iterator = stream.__aiter__()
@@ -219,15 +219,13 @@ class WeChatEventPump:
                 except StopAsyncIteration:
                     return "reconnect"
                 next_event = None
-                if await self._accept_event(event, worker):
+                if await self._accept_event(event, worker, pool):
                     return "rebootstrap"
         finally:
             if next_event is not None:
                 next_event.cancel()
                 await asyncio.gather(next_event, return_exceptions=True)
-            for task in worker_tasks:
-                task.cancel()
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            await pool.close()
             for task in self._directory_tasks:
                 task.cancel()
             if self._directory_tasks:
@@ -246,6 +244,7 @@ class WeChatEventPump:
         self,
         event: WeChatEvent,
         worker: DurableInboundWorker[WeChatObservedMessage],
+        pool: DurableInboundPool,
     ) -> bool:
         generation = self._bootstrap.session.connection_generation
         if (
@@ -310,7 +309,7 @@ class WeChatEventPump:
                 message_id=message.id,
                 kind="message",
             )
-            self._work_available.set()
+            pool.notify()
             return False
 
         if event.name == "message_remove":
@@ -331,7 +330,7 @@ class WeChatEventPump:
                 kind="message_remove",
             )
             worker.cancel_message(chat_id, message_id)
-            self._work_available.set()
+            pool.notify()
             return False
 
         await self._store.acknowledge_event(
@@ -340,47 +339,6 @@ class WeChatEventPump:
         )
         self._schedule_directory_refresh(event, generation)
         return False
-
-    async def _run_worker(
-        self,
-        worker: DurableInboundWorker[WeChatObservedMessage],
-        handler: InboundMessageHandler,
-    ) -> None:
-        while True:
-            self._work_available.clear()
-            processing = asyncio.create_task(worker.process_one(handler))
-            try:
-                result = await processing
-            except asyncio.CancelledError:
-                processing.cancel()
-                await asyncio.gather(processing, return_exceptions=True)
-                raise
-            except Exception as exc:
-                _LOGGER.error(
-                    "WeChat pending AI worker failed (%s)",
-                    type(exc).__name__,
-                    exc_info=True,
-                )
-                result = "idle"
-            if result != "idle":
-                continue
-            next_attempt_at = await self._store.next_pending_ai_work_at(
-                self._connector_key
-            )
-            timeout = (
-                max(0.0, next_attempt_at - time.time())
-                if next_attempt_at is not None
-                else None
-            )
-            if timeout == 0:
-                continue
-            try:
-                await asyncio.wait_for(
-                    self._work_available.wait(),
-                    timeout=timeout,
-                )
-            except TimeoutError:
-                pass
 
     def _schedule_directory_refresh(
         self,

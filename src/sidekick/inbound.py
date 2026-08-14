@@ -84,6 +84,13 @@ class InboundWorkStore(Protocol):
     ) -> bool: ...
 
 
+class InboundWorkSchedule(Protocol):
+    async def next_pending_ai_work_at(
+        self,
+        source_id: str,
+    ) -> float | None: ...
+
+
 _SourcePayload = TypeVar("_SourcePayload")
 
 
@@ -124,6 +131,13 @@ class InboundSourceUnavailable(Exception):
 
 class InboundMessageHandler(Protocol):
     async def handle(self, message: ReplyTarget) -> bool: ...
+
+
+class InboundWorker(Protocol):
+    async def process_one(
+        self,
+        handler: InboundMessageHandler,
+    ) -> InboundWorkerResult: ...
 
 
 class DurableInboundWorker(Generic[_SourcePayload]):
@@ -320,4 +334,96 @@ class DurableInboundWorker(Generic[_SourcePayload]):
                 type(exc).__name__,
                 self._source_id,
                 work.message_id,
+            )
+
+
+class DurableInboundPool:
+    def __init__(
+        self,
+        worker: InboundWorker,
+        store: InboundWorkSchedule,
+        source_id: str,
+        handler: InboundMessageHandler,
+        *,
+        concurrency: int,
+        clock: Callable[[], float] = time.time,
+        logger: Any | None = None,
+    ) -> None:
+        if not source_id:
+            raise ValueError("Inbound source ID cannot be empty")
+        if concurrency < 1:
+            raise ValueError("Inbound worker concurrency must be positive")
+        self._worker = worker
+        self._store = store
+        self._source_id = source_id
+        self._handler = handler
+        self._concurrency = concurrency
+        self._clock = clock
+        self._logger = logger
+        self._work_available = asyncio.Event()
+        self._tasks: tuple[asyncio.Task[None], ...] = ()
+
+    def start(self) -> None:
+        if self._tasks:
+            raise RuntimeError("Inbound worker pool is already running")
+        self._tasks = tuple(
+            asyncio.create_task(
+                self._run_worker(),
+                name=f"inbound-ai-worker-{self._source_id}-{index}",
+            )
+            for index in range(self._concurrency)
+        )
+
+    def notify(self) -> None:
+        self._work_available.set()
+
+    async def close(self) -> None:
+        tasks, self._tasks = self._tasks, ()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_worker(self) -> None:
+        while True:
+            self._work_available.clear()
+            processing = asyncio.create_task(
+                self._worker.process_one(self._handler)
+            )
+            try:
+                result = await processing
+            except asyncio.CancelledError:
+                processing.cancel()
+                await asyncio.gather(processing, return_exceptions=True)
+                raise
+            except Exception as exc:
+                self._log_failure(exc)
+                result = "idle"
+            if result != "idle":
+                continue
+            next_attempt_at = await self._store.next_pending_ai_work_at(
+                self._source_id
+            )
+            timeout = (
+                max(0.0, next_attempt_at - self._clock())
+                if next_attempt_at is not None
+                else None
+            )
+            if timeout == 0:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._work_available.wait(),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                pass
+
+    def _log_failure(self, exc: Exception) -> None:
+        if self._logger is not None:
+            self._logger.error(
+                "Inbound AI worker failed (%s; source=%s)",
+                type(exc).__name__,
+                self._source_id,
+                exc_info=True,
             )
