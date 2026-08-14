@@ -1049,6 +1049,28 @@ async def test_wechat_event_pump_drops_inconsistent_shared_history_and_continues
             ),
         )
     )
+    client.messages = WeChatMessageList(
+        messages=(
+            message_event(
+                cursor="10",
+                message_id=invalid_message_id,
+                content="Authoritative history",
+                message_type="chat_history",
+                shared_chat_history={
+                    "title": "Authoritative history",
+                    "itemCount": 1,
+                    "items": [
+                        {
+                            "kind": "text",
+                            "senderName": "Alice",
+                            "content": "Keep this",
+                        },
+                    ],
+                },
+            ).message(),
+        ),
+        cursor="10",
+    )
     store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
     handler = RecordingHandler()
     try:
@@ -1063,11 +1085,18 @@ async def test_wechat_event_pump_drops_inconsistent_shared_history_and_continues
 
         assert result == "reconnect"
         assert [message.id for message in handler.messages] == [next_message_id]
-        assert await store.get_message(
+        authoritative = await store.get_message(
             CONNECTOR_KEY,
             CHAT_ID,
             invalid_message_id,
-        ) is None
+        )
+        assert authoritative is not None
+        assert authoritative.message_type == "chat_history"
+        assert authoritative.raw_text == (
+            "[Forwarded chat history]\n"
+            "Authoritative history\n"
+            "Alice: Keep this"
+        )
         assert await store.get_cursor(CONNECTOR_KEY) == "1249406"
         dropped = [
             record
