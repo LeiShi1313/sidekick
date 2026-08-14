@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from sidekick.wechat.api import (
@@ -309,6 +311,75 @@ async def test_retry_backoff_is_durable_and_becomes_diagnosably_unavailable(
         assert await store.claim_pending_ai_work(
             CONNECTOR_KEY,
             now=1_000,
+        ) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_clears_connector_work_when_login_changes(tmp_path) -> None:
+    store = await open_store(tmp_path / "wechat.db")
+    try:
+        await store.accept_pending_ai_event(
+            CONNECTOR_KEY,
+            cursor="event-11",
+            chat_id=CHAT_ID,
+            message_id=MESSAGE_ID,
+            kind="message",
+        )
+        claimed = await store.claim_pending_ai_work(CONNECTOR_KEY, now=100)
+        assert claimed is not None
+        assert await store.begin_pending_ai_execution(
+            claimed,
+            version="mv1:old-login",
+            now=100,
+        ) == "started"
+        assert await store.complete_pending_ai_work(
+            claimed,
+            version="mv1:old-login",
+            outcome="completed",
+            now=101,
+        ) is True
+        await store.accept_pending_ai_event(
+            CONNECTOR_KEY,
+            cursor="event-12",
+            chat_id=CHAT_ID,
+            message_id=MESSAGE_ID,
+            kind="message",
+        )
+
+        await store.bootstrap(
+            connector_key=CONNECTOR_KEY,
+            session=replace(
+                session(),
+                self_id="wxid_other_login",
+                display_name="Other login",
+                connection_generation=42,
+                cursor="other-login-cursor",
+            ),
+            chats=replace(
+                chats(),
+                snapshot=replace(
+                    chats().snapshot,
+                    id="snapshot-42",
+                    cursor="other-login-cursor",
+                    connection_generation=42,
+                ),
+                cursor="other-login-cursor",
+            ),
+        )
+
+        assert await store.get_cursor(CONNECTOR_KEY) == "other-login-cursor"
+        assert await store.get_pending_ai_work(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            MESSAGE_ID,
+        ) is None
+        assert await store.get_processed_revision_status(
+            CONNECTOR_KEY,
+            CHAT_ID,
+            MESSAGE_ID,
+            "mv1:old-login",
         ) is None
     finally:
         await store.close()

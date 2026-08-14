@@ -62,6 +62,38 @@ def recalled_message() -> WeChatObservedMessage:
     )
 
 
+def shared_history_message() -> WeChatObservedMessage:
+    return WeChatObservedMessage.parse(
+        {
+            "id": MESSAGE_ID,
+            "chatId": CHAT_ID,
+            "state": "present",
+            "version": "mv1:shared-history",
+            "direction": "in",
+            "messageType": "chat_history",
+            "content": "Team history",
+            "senderId": "wxid_alice",
+            "senderDisplayName": "Alice",
+            "senderGroupAlias": "Team Alice",
+            "timestamp": 1_700_000_010,
+            "orderTimestamp": 1_700_000_000,
+            "sharedChatHistory": {
+                "title": "Team history",
+                "itemCount": 1,
+                "items": [
+                    {
+                        "kind": "text",
+                        "senderName": "Bob",
+                        "content": "Hello",
+                    }
+                ],
+            },
+            "observedAt": 1_786_651_200,
+            "source": "wechat+localdb",
+        }
+    )
+
+
 async def open_store(path) -> WeChatStateRepository:
     store = await WeChatStateRepository(path).connect()
     await store.bootstrap(
@@ -443,6 +475,101 @@ async def test_event_pump_drops_poison_but_advances_to_later_ai_command(
 
 
 @pytest.mark.asyncio
+async def test_event_pump_dispatches_valid_shared_chat_history(tmp_path) -> None:
+    event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "event-11",
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": MESSAGE_ID,
+            "chatId": CHAT_ID,
+            "direction": "in",
+            "messageType": "chat_history",
+            "senderId": "wxid_alice",
+            "content": "Team history",
+            "sharedChatHistory": {
+                "title": "Team history",
+                "itemCount": 1,
+                "items": [
+                    {
+                        "kind": "text",
+                        "senderName": "Bob",
+                        "content": "Hello",
+                    }
+                ],
+            },
+            "timestamp": 1_700_000_010,
+        }
+    )
+    client = StreamingObservedClient((event,), [shared_history_message()])
+    store = await open_store(tmp_path / "wechat.db")
+    handler = RecordingHandler()
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap(),
+            handler_concurrency=1,
+        ).run(handler, stop)
+    )
+    try:
+        await wait_until(_async_predicate(lambda: bool(handler.messages)))
+
+        assert handler.messages[0].message_type == "chat_history"
+        assert handler.messages[0].raw_text == (
+            "[Forwarded chat history]\nTeam history\nBob: Hello"
+        )
+        assert await store.get_cursor(CONNECTOR_KEY) == "event-11"
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_null_shared_history_does_not_match_the_poison_guard(
+    tmp_path,
+    caplog,
+) -> None:
+    payload = dict(message_event(cursor="event-11").payload)
+    payload["sharedChatHistory"] = None
+    client = StreamingObservedClient((WeChatEvent.parse(payload),), [])
+    store = await open_store(tmp_path / "wechat.db")
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap(),
+            handler_concurrency=1,
+        ).run(RecordingHandler(), stop)
+    )
+    try:
+        await wait_until(
+            _async_predicate_from_async(
+                store.get_cursor,
+                CONNECTOR_KEY,
+                expected="event-11",
+            )
+        )
+
+        assert client.requests == []
+        assert (
+            "Dropped inconsistent WeChat shared chat history event"
+            not in caplog.text
+        )
+        assert "Dropped malformed WeChat message event" in caplog.text
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -503,6 +630,102 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
         stop.set()
         result = await asyncio.wait_for(task, timeout=1)
         assert result == "stopped"
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_directory_refresh_runs_after_cursor_advance(tmp_path) -> None:
+    chat_event = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "event-12",
+            "event": "chat",
+            "connectionGeneration": 41,
+            "id": CHAT_ID,
+        }
+    )
+    renamed_chats = WeChatChatList(
+        chats=(
+            WeChatChat(
+                id=CHAT_ID,
+                type="group",
+                display_name="Renamed group",
+            ),
+        ),
+        snapshot=WeChatChatSnapshot(
+            id="snapshot-42",
+            complete=True,
+            current=True,
+            count=1,
+            cursor="event-12",
+            connection_generation=41,
+        ),
+        cursor="event-12",
+    )
+
+    class RefreshClient(StreamingObservedClient):
+        async def get_chats(self):
+            return renamed_chats
+
+    client = RefreshClient((chat_event,), [])
+    store = await open_store(tmp_path / "wechat.db")
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            store,
+            CONNECTOR_KEY,
+            bootstrap(),
+            handler_concurrency=1,
+        ).run(RecordingHandler(), stop)
+    )
+
+    async def directory_refreshed() -> bool:
+        chat = await store.get_chat(CONNECTOR_KEY, CHAT_ID)
+        return chat is not None and chat.display_name == "Renamed group"
+
+    try:
+        await wait_until(directory_refreshed)
+        assert await store.get_cursor(CONNECTOR_KEY) == "event-12"
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_rechecks_queue_after_clearing_a_consumed_wakeup(
+    tmp_path,
+) -> None:
+    store = await open_store(tmp_path / "wechat.db")
+    pump = WeChatEventPump(
+        StreamingObservedClient((), []),
+        store,
+        CONNECTOR_KEY,
+        bootstrap(),
+        handler_concurrency=1,
+    )
+    rechecked = asyncio.Event()
+
+    class WakeupDuringIdleWorker:
+        calls = 0
+
+        async def process_one(self, _handler):
+            self.calls += 1
+            if self.calls == 1:
+                pump._work_available.set()
+                return "idle"
+            rechecked.set()
+            await asyncio.Future()
+
+    task = asyncio.create_task(
+        pump._run_worker(WakeupDuringIdleWorker(), RecordingHandler())
+    )
+    try:
+        await asyncio.wait_for(rechecked.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await store.close()
 
 

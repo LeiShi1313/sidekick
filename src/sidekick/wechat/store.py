@@ -517,6 +517,9 @@ class WeChatStateRepository:
         )
         existing = await cursor.fetchone()
         baseline_cursor = messages.cursor if messages is not None else session.cursor
+        account_changed = (
+            existing is not None and existing["account_id"] != session.self_id
+        )
         durable_cursor = (
             str(existing["cursor"])
             if existing is not None and existing["account_id"] == session.self_id
@@ -525,6 +528,18 @@ class WeChatStateRepository:
         now = time.time()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            if account_changed:
+                await connection.execute(
+                    "DELETE FROM wechat_pending_ai_work WHERE connector_key = ?",
+                    (connector_key,),
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM wechat_processed_message_revisions
+                    WHERE connector_key = ?
+                    """,
+                    (connector_key,),
+                )
             await connection.execute(
                 """
                 INSERT INTO wechat_connectors (

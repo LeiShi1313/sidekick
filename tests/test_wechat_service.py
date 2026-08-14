@@ -19,9 +19,7 @@ from sidekick.wechat.api import (
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
-    WeChatGroupMemberList,
     WeChatSession,
-    WeChatUserList,
 )
 from sidekick.wechat.service import bootstrap_wechat_channel
 from sidekick.wechat.store import WeChatStateRepository
@@ -286,16 +284,8 @@ class FakeConnectorClient:
             ),
             cursor="10",
         )
-        self.users = WeChatUserList(users=(), cursor="10")
-        self.group_members = WeChatGroupMemberList(
-            group_id=CHAT_ID,
-            members=(),
-            cursor="10",
-            snapshot_complete=False,
-            snapshot_current=False,
-            snapshot_connection_generation=None,
-        )
         self.legacy_message_reads = 0
+        self.legacy_identity_reads = 0
 
     async def get_session(self):
         return self.session
@@ -311,13 +301,16 @@ class FakeConnectorClient:
         raise AssertionError(f"legacy history was requested with limit={limit}")
 
     async def get_users(self):
-        return self.users
+        self.legacy_identity_reads += 1
+        raise AssertionError("legacy user directory was requested")
 
     async def get_user(self, _user_id):
-        return None
+        self.legacy_identity_reads += 1
+        raise AssertionError("legacy user profile was requested")
 
     async def get_group_members(self, _group_id):
-        return self.group_members
+        self.legacy_identity_reads += 1
+        raise AssertionError("legacy group member directory was requested")
 
     async def events(self, *, after):
         if False:
@@ -341,6 +334,7 @@ async def test_wechat_bootstrap_uses_session_cursor_without_legacy_history(
         assert await store.get_cursor(CONNECTOR_KEY) == "10"
         assert await store.count_messages(CONNECTOR_KEY) == 0
         assert client.legacy_message_reads == 0
+        assert client.legacy_identity_reads == 0
     finally:
         await store.close()
 

@@ -131,7 +131,7 @@ class WeChatCapabilities:
     history: bool
     inbound_image_download: bool
     request_original_image: bool
-    fetch_observed_messages: bool = False
+    fetch_observed_messages: bool
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatCapabilities:
@@ -833,7 +833,13 @@ class WeChatObservedMessagePage:
             WeChatObservedMessage.parse(_object(value, "observed message"))
             for value in _required_array(payload, "data")
         )
-        if tuple(sorted(messages, key=lambda item: (item.order_timestamp, int(item.id)))) != messages:
+        chronological = tuple(
+            sorted(
+                messages,
+                key=lambda item: (item.order_timestamp, int(item.id)),
+            )
+        )
+        if chronological != messages:
             raise WeChatAPIContractError(
                 "WeChat observed message page is not chronologically ordered"
             )
