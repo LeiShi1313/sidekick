@@ -131,6 +131,7 @@ class WeChatCapabilities:
     history: bool
     inbound_image_download: bool
     request_original_image: bool
+    fetch_observed_messages: bool = False
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> WeChatCapabilities:
@@ -177,6 +178,10 @@ class WeChatCapabilities:
                 "inboundImageDownload",
             ),
             request_original_image=_required_bool(media, "requestOriginalImage"),
+            fetch_observed_messages=_required_bool(
+                messages,
+                "fetchObservedMessages",
+            ),
         )
 
     @property
@@ -190,6 +195,7 @@ class WeChatCapabilities:
             "messages.sendText": self.send_text,
             "messages.requestIdempotency": self.request_idempotency,
             "messages.outboundStableMessageId": self.outbound_stable_message_id,
+            "messages.fetchObservedMessages": self.fetch_observed_messages,
             "events.websocket": self.websocket,
             "events.cursor": self.cursor,
             "events.replay": self.replay,
@@ -593,6 +599,260 @@ class WeChatConnectorMessage:
         return self.content
 
 
+_RECALLED_MESSAGE_PAYLOAD_FIELDS = frozenset(
+    {
+        "direction",
+        "messageType",
+        "content",
+        "contentRedacted",
+        "senderId",
+        "senderDisplayName",
+        "senderGroupAlias",
+        "timestamp",
+        "replyToMessageId",
+        "media",
+        "sharedChatHistory",
+        "title",
+        "url",
+        "fileName",
+        "fileSize",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatObservedMessage:
+    id: str
+    chat_id: str
+    state: Literal["present", "recalled"]
+    version: str
+    order_timestamp: int
+    observed_at: int
+    source: str
+    direction: str | None = None
+    message_type: str | None = None
+    content: str = ""
+    content_redacted: bool = False
+    sender_id: str | None = None
+    sender_display_name: str | None = None
+    sender_group_alias: str | None = None
+    timestamp: int | None = None
+    reply_to_message_id: str | None = None
+    media_id: str | None = None
+    shared_chat_history: WeChatSharedChatHistory | None = None
+    link_title: str | None = None
+    link_url: str | None = None
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatObservedMessage:
+        state = _required_enum(payload, "state", {"present", "recalled"})
+        version = _required_text(payload, "version")
+        if not version.startswith("mv1:") or len(version) == 4:
+            raise WeChatAPIContractError(
+                "WeChat observed message version is unsupported"
+            )
+        common = {
+            "id": _required_native_message_id(payload, "id"),
+            "chat_id": _required_wechat_id(payload, "chatId"),
+            "state": state,
+            "version": version,
+            "order_timestamp": _required_positive_int(
+                payload,
+                "orderTimestamp",
+            ),
+            "observed_at": _required_positive_int(payload, "observedAt"),
+            "source": _required_text(payload, "source"),
+        }
+        if state == "recalled":
+            if any(field in payload for field in _RECALLED_MESSAGE_PAYLOAD_FIELDS):
+                raise WeChatAPIContractError(
+                    "WeChat recalled message must omit message payload fields"
+                )
+            return cls(**common)
+
+        message = WeChatConnectorMessage.parse(payload)
+        if message.timestamp < 1:
+            raise WeChatAPIContractError(
+                "WeChat observed message timestamp must be positive"
+            )
+        return cls(
+            **common,
+            direction=message.direction,
+            message_type=message.message_type,
+            content=message.content,
+            content_redacted=message.content_redacted,
+            sender_id=message.sender_id,
+            sender_display_name=_optional_text(payload, "senderDisplayName"),
+            sender_group_alias=_optional_text(payload, "senderGroupAlias"),
+            timestamp=message.timestamp,
+            reply_to_message_id=message.reply_to_message_id,
+            media_id=message.media_id,
+            shared_chat_history=message.shared_chat_history,
+            link_title=message.link_title,
+            link_url=message.link_url,
+        )
+
+    @property
+    def sender_label(self) -> str | None:
+        return (
+            self.sender_group_alias
+            or self.sender_display_name
+            or self.sender_id
+        )
+
+    @property
+    def display_content(self) -> str:
+        if self.state == "recalled":
+            return ""
+        if self.shared_chat_history is not None and not self.content_redacted:
+            return self.shared_chat_history.text
+        if self.message_type == "link" and not self.content_redacted:
+            title = self.link_title or self.content
+            lines = [f"[Link] {title}" if title else "[Link]"]
+            if self.link_url is not None:
+                lines.append(self.link_url)
+            return "\n".join(lines)
+        return self.content
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatObservedBoundary:
+    id: str
+    order_timestamp: int
+
+    @classmethod
+    def parse(cls, value: Any, field: str) -> WeChatObservedBoundary:
+        payload = _object(value, field)
+        return cls(
+            id=_required_native_message_id(payload, "id"),
+            order_timestamp=_required_positive_int(payload, "orderTimestamp"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatObservationGap:
+    source: str
+    reason: str
+    cursor: str | None
+    from_timestamp: int | None
+    to_timestamp: int | None
+
+    @classmethod
+    def parse(cls, value: Any) -> WeChatObservationGap:
+        payload = _object(value, "coverage observation gap")
+        return cls(
+            source=_required_text(payload, "source"),
+            reason=_required_text(payload, "reason"),
+            cursor=_optional_id(payload, "cursor"),
+            from_timestamp=_optional_nonnegative_int(payload, "from"),
+            to_timestamp=_optional_nonnegative_int(payload, "to"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatObservationCoverage:
+    kind: Literal["partial"]
+    oldest_available: WeChatObservedBoundary | None
+    newest_available: WeChatObservedBoundary | None
+    may_have_unobserved_messages: bool
+    observation_gaps: tuple[WeChatObservationGap, ...]
+    gaps_are_exhaustive: bool
+    sources: tuple[str, ...]
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatObservationCoverage:
+        if payload.get("kind") != "partial":
+            raise WeChatAPIContractError(
+                "WeChat observation coverage must remain explicitly partial"
+            )
+        kind: Literal["partial"] = "partial"
+        may_have_unobserved = _required_bool(
+            payload,
+            "mayHaveUnobservedMessages",
+        )
+        gaps_are_exhaustive = _required_bool(payload, "gapsAreExhaustive")
+        if not may_have_unobserved or gaps_are_exhaustive:
+            raise WeChatAPIContractError(
+                "WeChat observation coverage must remain explicitly partial"
+            )
+        gaps = tuple(
+            WeChatObservationGap.parse(value)
+            for value in _required_array(payload, "observationGaps")
+        )
+        raw_sources = _required_array(payload, "sources")
+        sources = tuple(
+            _external_id(value, "coverage source") for value in raw_sources
+        )
+        oldest = payload.get("oldestAvailable")
+        newest = payload.get("newestAvailable")
+        return cls(
+            kind=kind,
+            oldest_available=(
+                WeChatObservedBoundary.parse(oldest, "oldestAvailable")
+                if oldest is not None
+                else None
+            ),
+            newest_available=(
+                WeChatObservedBoundary.parse(newest, "newestAvailable")
+                if newest is not None
+                else None
+            ),
+            may_have_unobserved_messages=may_have_unobserved,
+            observation_gaps=gaps,
+            gaps_are_exhaustive=gaps_are_exhaustive,
+            sources=sources,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatObservedPageInfo:
+    before: str | None
+    after: str | None
+    has_more_before: bool
+    has_more_after: bool
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatObservedPageInfo:
+        return cls(
+            before=_optional_native_message_id(payload, "before"),
+            after=_optional_native_message_id(payload, "after"),
+            has_more_before=_required_bool(payload, "hasMoreBefore"),
+            has_more_after=_required_bool(payload, "hasMoreAfter"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatObservedMessagePage:
+    messages: tuple[WeChatObservedMessage, ...]
+    page: WeChatObservedPageInfo
+    coverage: WeChatObservationCoverage
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> WeChatObservedMessagePage:
+        messages = tuple(
+            WeChatObservedMessage.parse(_object(value, "observed message"))
+            for value in _required_array(payload, "data")
+        )
+        if tuple(sorted(messages, key=lambda item: (item.order_timestamp, int(item.id)))) != messages:
+            raise WeChatAPIContractError(
+                "WeChat observed message page is not chronologically ordered"
+            )
+        page = WeChatObservedPageInfo.parse(_required_object(payload, "page"))
+        if messages and (
+            page.before != messages[0].id or page.after != messages[-1].id
+        ):
+            raise WeChatAPIContractError(
+                "WeChat observed message page anchors are inconsistent"
+            )
+        return cls(
+            messages=messages,
+            page=page,
+            coverage=WeChatObservationCoverage.parse(
+                _required_object(payload, "coverage")
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WeChatDownloadedImage:
     data: bytes
@@ -857,6 +1117,78 @@ class WeChatConnectorClient:
             params["chatId"] = _canonical_wechat_id(chat_id, "chat_id")
         payload = await self._request_json("GET", "/messages", params=params)
         return WeChatMessageList.parse(payload)
+
+    async def get_observed_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> WeChatObservedMessage:
+        target_chat = _canonical_wechat_id(chat_id, "chat_id")
+        target_message = _native_message_id(
+            _external_id(message_id, "message_id"),
+            "message_id",
+        )
+        payload = await self._request_json(
+            "GET",
+            f"/chats/{quote(target_chat, safe='')}/messages/"
+            f"{quote(target_message, safe='')}",
+        )
+        message = WeChatObservedMessage.parse(payload)
+        if message.chat_id != target_chat or message.id != target_message:
+            raise WeChatAPIContractError(
+                "WeChat exact message response returned a different identity"
+            )
+        return message
+
+    async def get_observed_messages(
+        self,
+        chat_id: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        limit: int = 50,
+    ) -> WeChatObservedMessagePage:
+        target_chat = _canonical_wechat_id(chat_id, "chat_id")
+        if before is not None and after is not None:
+            raise ValueError("WeChat observed page cannot combine before and after")
+        if not 1 <= limit <= 100:
+            raise ValueError("WeChat observed page limit must be between 1 and 100")
+        if (
+            isinstance(since, bool)
+            or (since is not None and (not isinstance(since, int) or since < 0))
+            or isinstance(until, bool)
+            or (until is not None and (not isinstance(until, int) or until < 0))
+            or (since is not None and until is not None and since > until)
+        ):
+            raise ValueError("WeChat observed page time bounds are invalid")
+        params = {"limit": str(limit)}
+        if before is not None:
+            params["before"] = _native_message_id(
+                _external_id(before, "before"),
+                "before",
+            )
+        if after is not None:
+            params["after"] = _native_message_id(
+                _external_id(after, "after"),
+                "after",
+            )
+        if since is not None:
+            params["since"] = str(since)
+        if until is not None:
+            params["until"] = str(until)
+        payload = await self._request_json(
+            "GET",
+            f"/chats/{quote(target_chat, safe='')}/messages",
+            params=params,
+        )
+        page = WeChatObservedMessagePage.parse(payload)
+        if any(message.chat_id != target_chat for message in page.messages):
+            raise WeChatAPIContractError(
+                "WeChat message page returned a different chat"
+            )
+        return page
 
     async def download_original_image(
         self,
@@ -1587,6 +1919,20 @@ def _required_nonnegative_int(payload: Mapping[str, Any], field: str) -> int:
     value = payload.get(field)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise WeChatAPIContractError(f"WeChat {field} must be a non-negative integer")
+    return value
+
+
+def _optional_nonnegative_int(
+    payload: Mapping[str, Any],
+    field: str,
+) -> int | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WeChatAPIContractError(
+            f"WeChat {field} must be a non-negative integer"
+        )
     return value
 
 

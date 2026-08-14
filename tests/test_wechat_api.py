@@ -877,6 +877,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
                     "sendNativeReply": True,
                     "requestIdempotency": True,
                     "outboundStableMessageId": True,
+                    "fetchObservedMessages": True,
                 },
                 "events": {
                     "websocket": True,
@@ -1010,6 +1011,7 @@ async def test_wechat_client_validates_bootstrap_and_waits_for_stable_send() -> 
     assert observed_capabilities.inbound_image_download is True
     assert observed_capabilities.request_original_image is True
     assert observed_capabilities.receive_shared_chat_history is True
+    assert observed_capabilities.fetch_observed_messages is True
     assert observed_capabilities.native_reply_ready is True
     assert observed_chats.snapshot.id == "snapshot-41"
     assert observed_chats.chats[0].id == "56825427596@chatroom"
