@@ -10,8 +10,7 @@ memory system without making either layer depend on Telegram or QQ concepts.
   attachments, response transport, and conversation handling.
 - `src/sidekick/telegram`: Telegram adapter and history/identity integration.
 - `src/sidekick/onebot`: OneBot 11 adapter for QQ groups.
-- `src/sidekick/wechat`: WeChat Linux connector client, durable event
-  projection, and AI transport.
+- `src/sidekick/wechat`: WeChat Linux connector integration and AI transport.
 - `agent`: Pi-based agent loop, web/code tools, memory tools, session history,
   and run auditing.
 - `memory`: pinned Hindsight deployment and local patches.
@@ -74,20 +73,22 @@ The WeChat adapter reads `SIDEKICK_WECHAT_URL` (default
 `http://127.0.0.1:18188`) and the optional `SIDEKICK_WECHAT_TOKEN`. It requires
 the connector's complete/current chat snapshot, durable event replay,
 idempotent text send, and stable outbound message-ID capabilities. Its local
-projection defaults to `~/.sidekick/wechat.db`. Connector history remains
-partial by contract: Sidekick can backfill only messages that this connector
-instance has already observed and stored, never a complete WeChat chat history.
+operational state defaults to `~/.sidekick/wechat.db`; it contains chat metadata
+and outbound-send recovery state, not message history. The AI database stores
+only the durable event cursor and pending message references. Sidekick refetches
+message content from the connector when it executes work or builds context.
+Connector history remains partial by contract: Sidekick can backfill only
+messages retained in the connector's observation catalog, never a complete
+WeChat chat history.
 Retained non-text rows without a canonical `senderId` are ignored because they
 cannot be safely attributed; text rows still require a canonical sender.
 Bounded `chat_history` rows are retained as one provenance-marked text message
 under the outer stable ID; nested media remains descriptive text rather than a
 separate download or message.
-Group messages prefer the connector's room-local member nickname over the
-member's global display name. A `group_member_directory` event refreshes only
-the affected group's aliases, independently of membership completeness. A
-complete/current member response also removes members that disappeared. New
-memory episodes capture the refreshed room-local label, while already-retained
-historical memory is not rewritten.
+Group messages prefer the connector's room-local member nickname, then the
+member's global display name, then the stable WeChat ID. New memory episodes
+capture that connector-provided label, while already-retained historical memory
+is not rewritten.
 Keep an unauthenticated connector bound to loopback; use its bearer token (and
 TLS outside a trusted local network) whenever it is reachable by another host.
 
@@ -96,7 +97,7 @@ required. The WeChat channel then uses the same memory commands as the other
 chat adapters. `/ai` receives an account-scoped Hindsight
 memory target, replying with `/ai_memory` retains that stored reply chain,
 `/ai_memory_backfill days <1-30>` or `/ai_memory_backfill messages <1-5000>`
-performs the bounded best-effort local backfill, and `/ai_memory_enable` starts
+performs a bounded best-effort connector backfill, and `/ai_memory_enable` starts
 continuous ingestion for new messages in that chat. The configured Sidekick
 owner can inspect or change a group's per-person AI cooldown with `/ai_limit`,
 `/ai_limit <0-86400>`, or `/ai_limit default`; zero disables the cooldown but
@@ -107,13 +108,13 @@ fixed `/ai_*` management commands remain unchanged. Continuous and Dream
 ingestion are off per chat until explicitly enabled. Setting
 `SIDEKICK_HINDSIGHT_URL` to an empty value disables memory; memory commands then
 report that Hindsight is disabled instead of silently changing ingestion state.
-A recalled or redacted WeChat message is excluded from later local reads and
+A recalled or redacted WeChat message is excluded from later connector reads and
 backfills, but recall cannot erase a copy that was already retained in
 Hindsight; that memory must be revised or removed through the memory service.
 
 The root Compose stack declares `wechat-host-ai` and `wechat-peer-ai`. Each
-worker joins only its matching bridge network, uses its own WeChat projection
-and AI state databases, and shares the existing Pi agent and Hindsight services.
+worker joins only its matching bridge network, uses its own WeChat operational
+state and AI databases, and shares the existing Pi agent and Hindsight services.
 Start or update them one at a time without recreating the Telegram or OneBot
 adapters, completing the rollout gates below before advancing:
 
@@ -127,6 +128,15 @@ The Compose healthcheck applies the same live capability gates and parses the
 same bounded history window as the adapter bootstrap.
 Optional connector bearer tokens are configured independently with
 `SIDEKICK_WECHAT_HOST_TOKEN` and `SIDEKICK_WECHAT_PEER_TOKEN`.
+
+The first upgrade to the shared inbound inbox is a controlled cursor cutover.
+Stop the old worker, back up both of its SQLite databases, and verify its legacy
+pending-work table is empty. Before the new worker starts, seed
+`ai_inbound_sources` in the AI database with the configured
+`SIDEKICK_ADAPTER_INSTANCE_ID`, the active WeChat account ID as its epoch, and
+the old worker's durable cursor. Legacy message and revision tables stay
+untouched but are no longer read. For rollback, copy the shared inbox cursor
+back to `wechat_connectors.cursor` before starting an older worker.
 
 ### Generated-send rollout safety
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import OrderedDict
 import logging
 from datetime import UTC, datetime
 from io import BytesIO
@@ -29,6 +28,7 @@ from sidekick.onebot.ai import (
     OneBotDirectory,
     OneBotDirectorySourceResolver,
     OneBotHistorySource,
+    OneBotInboundMessageSource,
     OneBotMessageIdentityResolver,
     OneBotMessageMentionResolver,
 )
@@ -73,6 +73,13 @@ async def test_onebot_runtime_applies_mainland_output_policy(tmp_path) -> None:
         async def connect(self):
             return self
 
+    class SetupInboundStore(SetupStore):
+        async def initialize_source(self, *_args, **_kwargs):
+            return 0
+
+        async def recover_pending_ai_work(self, _source_id):
+            return None
+
     class SetupBridge:
         def set_event_handler(self, handler):
             self.event_handler = handler
@@ -90,6 +97,7 @@ async def test_onebot_runtime_applies_mainland_output_policy(tmp_path) -> None:
     )
     plugin._gateway = object()
     plugin._store = SetupStore()
+    plugin._inbound_store = SetupInboundStore()
     plugin._memory = None
     plugin._bridge = SetupBridge()
     plugin._directory = OneBotDirectory()
@@ -356,26 +364,117 @@ def test_onebot_private_self_message_uses_target_as_conversation_scope():
 
 @pytest.mark.asyncio
 async def test_onebot_plugin_rejects_events_for_another_account() -> None:
-    handled: list[OneBotMessage] = []
-
-    class Handler:
-        async def handle(self, message: OneBotMessage) -> None:
-            handled.append(message)
-
     payload = group_event()
     payload["self_id"] = 100
     plugin = object.__new__(OneBotAI)
     plugin._runtime = SimpleNamespace(self_id=99)
     plugin._bridge = RecordingActionClient()
     plugin._directory = OneBotDirectory()
-    plugin._seen_messages = OrderedDict()
-    plugin._handler = Handler()
+    plugin._handler = object()
     plugin.logger = logging.getLogger("test-onebot-account-boundary")
 
     await plugin._on_event(payload)
 
-    assert handled == []
-    assert plugin._seen_messages == OrderedDict()
+
+
+@pytest.mark.asyncio
+async def test_onebot_plugin_persists_only_candidate_identity_and_origin() -> None:
+    class InboundStore:
+        def __init__(self):
+            self.accepted = []
+
+        async def accept_pending_ai_event(self, source_id, **work):
+            self.accepted.append((source_id, work))
+
+    class Pool:
+        notified = False
+
+        def notify(self):
+            self.notified = True
+
+    class Transport:
+        async def classify_origin(self, _message):
+            return MessageOrigin.INCOMING
+
+    plugin = object.__new__(OneBotAI)
+    plugin._runtime = SimpleNamespace(self_id=99)
+    plugin._ops_settings = SimpleNamespace(instance_id="qq-test")
+    plugin._bridge = RecordingActionClient()
+    plugin._directory = OneBotDirectory()
+    plugin._handler = object()
+    plugin._transport = Transport()
+    plugin._inbound_store = InboundStore()
+    plugin._inbound_pool = Pool()
+    plugin.logger = logging.getLogger("test-onebot-durable-accept")
+
+    await plugin._on_event(group_event(text="ambient chat"))
+
+    assert plugin._inbound_store.accepted == []
+    assert plugin._inbound_pool.notified is False
+
+    await plugin._on_event(group_event())
+
+    assert plugin._inbound_store.accepted == [
+        (
+            "qq-test",
+            {
+                "cursor": 101,
+                "chat_id": 700,
+                "message_id": 101,
+                "kind": "message",
+                "attested_origin": MessageOrigin.INCOMING,
+            },
+        )
+    ]
+    assert plugin._inbound_pool.notified is True
+
+
+@pytest.mark.asyncio
+async def test_onebot_plugin_never_queues_generated_echo() -> None:
+    class RejectingStore:
+        async def accept_pending_ai_event(self, *_args, **_kwargs):
+            raise AssertionError("generated echo must not be persisted")
+
+    class Transport:
+        async def classify_origin(self, _message):
+            return MessageOrigin.SIDEKICK_GENERATED
+
+    plugin = object.__new__(OneBotAI)
+    plugin._runtime = SimpleNamespace(self_id=99)
+    plugin._ops_settings = SimpleNamespace(instance_id="qq-test")
+    plugin._bridge = RecordingActionClient()
+    plugin._directory = OneBotDirectory()
+    plugin._handler = object()
+    plugin._transport = Transport()
+    plugin._inbound_store = RejectingStore()
+    plugin._inbound_pool = SimpleNamespace(notify=lambda: None)
+    plugin.logger = logging.getLogger("test-onebot-generated-drop")
+
+    await plugin._on_event(group_event(post_type="message_sent", sender_id=99))
+
+
+@pytest.mark.asyncio
+async def test_onebot_inbound_source_refetches_exact_message_and_keeps_origin() -> None:
+    client = RecordingActionClient(responses=[group_event()])
+    source = OneBotInboundMessageSource(
+        client,
+        self_id=99,
+        directory=OneBotDirectory(),
+    )
+    work = SimpleNamespace(
+        chat_id=700,
+        message_id=101,
+        attested_origin=MessageOrigin.MANUAL_OUTGOING,
+    )
+
+    revision = await source.fetch(work)
+    message = await source.materialize(revision.payload)
+
+    assert revision.version == "onebot:v1:101"
+    assert revision.attested_origin is MessageOrigin.MANUAL_OUTGOING
+    assert message is not None
+    assert message.id == 101
+    assert client.calls == [("get_msg", {"message_id": "101"}, None)]
 
 
 def test_onebot_private_history_uses_explicit_peer_when_target_is_absent():

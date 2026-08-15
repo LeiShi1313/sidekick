@@ -3,9 +3,82 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 
 from sidekick.ai import ReplyTarget, _message_datetime
+from sidekick.chat.provenance import observed_message_fingerprint
+from sidekick.inbound import (
+    InboundSourceRevision,
+    InboundSourceUnavailable,
+    InboundWork,
+)
+
+
+class TelegramInboundMessageSource:
+    def __init__(self, client: Any):
+        self._client = client
+
+    async def fetch(
+        self,
+        work: InboundWork,
+    ) -> InboundSourceRevision[Any]:
+        if (
+            isinstance(work.chat_id, bool)
+            or not isinstance(work.chat_id, int)
+            or isinstance(work.message_id, bool)
+            or not isinstance(work.message_id, int)
+        ):
+            raise ValueError("Telegram work requires integer message identity")
+        try:
+            message = await self._client.get_messages(
+                work.chat_id,
+                ids=work.message_id,
+            )
+        except FloodWaitError as exc:
+            raise InboundSourceUnavailable(
+                "TELEGRAM_FLOOD_WAIT",
+                max_attempts=None,
+                retry_after_seconds=float(exc.seconds),
+            ) from exc
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            raise InboundSourceUnavailable(
+                type(exc).__name__,
+                max_attempts=None,
+            ) from exc
+        except RPCError as exc:
+            raise InboundSourceUnavailable(
+                f"TELEGRAM_{type(exc).__name__}",
+                max_attempts=1,
+            ) from exc
+        if isinstance(message, list):
+            message = message[0] if message else None
+        if (
+            message is None
+            or getattr(message, "chat_id", None) != work.chat_id
+            or getattr(message, "id", None) != work.message_id
+        ):
+            raise InboundSourceUnavailable(
+                "TELEGRAM_MESSAGE_UNAVAILABLE",
+                max_attempts=1,
+            )
+        edited_at = getattr(message, "edit_date", None)
+        edit_version = (
+            edited_at.isoformat()
+            if isinstance(edited_at, datetime)
+            else "original"
+        )
+        fingerprint = observed_message_fingerprint(message).digest.hex()
+        return InboundSourceRevision(
+            version=(
+                f"telegram:v1:{work.message_id}:{edit_version}:{fingerprint}"
+            ),
+            state="present",
+            payload=message,
+            attested_origin=work.attested_origin,
+        )
+
+    async def materialize(self, message: Any) -> ReplyTarget | None:
+        return message
 
 
 class TelegramHistorySource:

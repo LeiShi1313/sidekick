@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 
+from sidekick.inbound import DurableInboundWorker
+from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.wechat.api import (
     WeChatAPIError,
     WeChatCapabilities,
@@ -17,12 +19,13 @@ from sidekick.wechat.api import (
 from sidekick.wechat.service import (
     WeChatBootstrap,
     WeChatEventPump,
-    WeChatPendingAIWorker,
+    WeChatObservedMessageSource,
 )
 from sidekick.wechat.store import WeChatStateRepository
 
 
 CONNECTOR_KEY = "http://wechat-connector:18188"
+SOURCE_ID = "wechat-test"
 CHAT_ID = "56825427596@chatroom"
 MESSAGE_ID = "4159667620982040828"
 
@@ -94,9 +97,9 @@ def shared_history_message() -> WeChatObservedMessage:
     )
 
 
-async def open_store(path) -> WeChatStateRepository:
-    store = await WeChatStateRepository(path).connect()
-    await store.bootstrap(
+async def open_stores(tmp_path):
+    directory = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    await directory.bootstrap(
         connector_key=CONNECTOR_KEY,
         session=WeChatSession(
             status="logged_in",
@@ -126,7 +129,13 @@ async def open_store(path) -> WeChatStateRepository:
             cursor="bootstrap-cursor",
         ),
     )
-    return store
+    inbox = await SQLiteInboundWorkStore(tmp_path / "ai.db").connect()
+    await inbox.initialize_source(
+        SOURCE_ID,
+        epoch="wxid_self",
+        initial_cursor="bootstrap-cursor",
+    )
+    return directory, inbox
 
 
 class FakeObservedClient:
@@ -151,18 +160,43 @@ class RecordingHandler:
         self.handled = handled
         self.messages = []
 
-    async def handle(self, message) -> bool:
+    async def handle(self, message, *, attested_origin=None) -> bool:
+        assert attested_origin is None
         self.messages.append(message)
         return self.handled
 
 
-async def enqueue(store: WeChatStateRepository, *, kind: str = "message") -> None:
-    await store.accept_pending_ai_event(
+def inbound_worker(
+    client,
+    directory,
+    inbox,
+    *,
+    not_observed_attempts: int = 3,
+    clock=None,
+) -> DurableInboundWorker:
+    source = WeChatObservedMessageSource(
+        client,
+        directory,
         CONNECTOR_KEY,
+        not_observed_attempts=not_observed_attempts,
+    )
+    options = {} if clock is None else {"clock": clock}
+    return DurableInboundWorker(
+        source,
+        inbox,
+        SOURCE_ID,
+        **options,
+    )
+
+
+async def enqueue(inbox: SQLiteInboundWorkStore, *, kind: str = "message") -> None:
+    await inbox.accept_pending_ai_event(
+        SOURCE_ID,
         cursor="event-11",
         chat_id=CHAT_ID,
         message_id=MESSAGE_ID,
         kind=kind,
+        attested_origin=None,
     )
 
 
@@ -245,16 +279,12 @@ def message_event(
 async def test_worker_fetches_authoritative_message_and_uses_connector_label(
     tmp_path,
 ) -> None:
-    store = await open_store(tmp_path / "wechat.db")
-    await enqueue(store)
+    directory, inbox = await open_stores(tmp_path)
+    await enqueue(inbox)
     client = FakeObservedClient([present_message()])
     handler = RecordingHandler()
     try:
-        result = await WeChatPendingAIWorker(
-            client,
-            store,
-            CONNECTOR_KEY,
-        ).process_one(handler)
+        result = await inbound_worker(client, directory, inbox).process_one(handler)
 
         assert result == "completed"
         assert client.requests == [(CHAT_ID, MESSAGE_ID)]
@@ -264,20 +294,20 @@ async def test_worker_fetches_authoritative_message_and_uses_connector_label(
         assert message.memory_cursor == MESSAGE_ID
         assert message.sender_display_name == "Team Alice"
         assert message.scope_display_name == "Example group"
-        assert await store.get_pending_ai_work(
-            CONNECTOR_KEY,
+        assert await inbox.get_pending_ai_work(
+            SOURCE_ID,
             CHAT_ID,
             MESSAGE_ID,
         ) is None
-        assert await store.count_messages(CONNECTOR_KEY) == 0
     finally:
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
 async def test_worker_retries_503_but_bounds_not_observed_404(tmp_path) -> None:
-    store = await open_store(tmp_path / "wechat.db")
-    await enqueue(store)
+    directory, inbox = await open_stores(tmp_path)
+    await enqueue(inbox)
     now = 100.0
     client = FakeObservedClient(
         [
@@ -286,10 +316,10 @@ async def test_worker_retries_503_but_bounds_not_observed_404(tmp_path) -> None:
             WeChatAPIError(404, "MESSAGE_NOT_OBSERVED", "not observed"),
         ]
     )
-    worker = WeChatPendingAIWorker(
+    worker = inbound_worker(
         client,
-        store,
-        CONNECTOR_KEY,
+        directory,
+        inbox,
         not_observed_attempts=2,
         clock=lambda: now,
     )
@@ -301,8 +331,8 @@ async def test_worker_retries_503_but_bounds_not_observed_404(tmp_path) -> None:
         now = 106
         assert await worker.process_one(handler) == "unavailable"
 
-        pending = await store.get_pending_ai_work(
-            CONNECTOR_KEY,
+        pending = await inbox.get_pending_ai_work(
+            SOURCE_ID,
             CHAT_ID,
             MESSAGE_ID,
         )
@@ -311,54 +341,57 @@ async def test_worker_retries_503_but_bounds_not_observed_404(tmp_path) -> None:
         assert pending.last_error_code == "MESSAGE_NOT_OBSERVED"
         assert handler.messages == []
     finally:
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
 async def test_worker_resolves_removal_without_fetching_or_generating(tmp_path) -> None:
-    store = await open_store(tmp_path / "wechat.db")
-    await enqueue(store, kind="message_remove")
+    directory, inbox = await open_stores(tmp_path)
+    await enqueue(inbox, kind="message_remove")
     client = FakeObservedClient([])
     handler = RecordingHandler()
     try:
-        assert await WeChatPendingAIWorker(
+        assert await inbound_worker(
             client,
-            store,
-            CONNECTOR_KEY,
+            directory,
+            inbox,
         ).process_one(handler) == "recalled"
         assert client.requests == []
         assert handler.messages == []
-        assert await store.get_pending_ai_work(
-            CONNECTOR_KEY,
+        assert await inbox.get_pending_ai_work(
+            SOURCE_ID,
             CHAT_ID,
             MESSAGE_ID,
         ) is None
     finally:
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
 async def test_worker_treats_fetched_recall_as_terminal_without_content(
     tmp_path,
 ) -> None:
-    store = await open_store(tmp_path / "wechat.db")
-    await enqueue(store)
+    directory, inbox = await open_stores(tmp_path)
+    await enqueue(inbox)
     handler = RecordingHandler()
     try:
-        assert await WeChatPendingAIWorker(
+        assert await inbound_worker(
             FakeObservedClient([recalled_message()]),
-            store,
-            CONNECTOR_KEY,
+            directory,
+            inbox,
         ).process_one(handler) == "recalled"
         assert handler.messages == []
-        assert await store.get_processed_revision_status(
-            CONNECTOR_KEY,
+        assert await inbox.get_processed_revision_status(
+            SOURCE_ID,
             CHAT_ID,
             MESSAGE_ID,
             "mv1:recalled",
         ) == "recalled"
     finally:
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
@@ -368,17 +401,18 @@ async def test_cancelled_worker_marks_started_execution_unknown_instead_of_retry
     entered = asyncio.Event()
 
     class BlockingHandler:
-        async def handle(self, _message) -> bool:
+        async def handle(self, _message, *, attested_origin=None) -> bool:
+            assert attested_origin is None
             entered.set()
             await asyncio.Future()
             return True
 
-    store = await open_store(tmp_path / "wechat.db")
-    await enqueue(store)
-    worker = WeChatPendingAIWorker(
+    directory, inbox = await open_stores(tmp_path)
+    await enqueue(inbox)
+    worker = inbound_worker(
         FakeObservedClient([present_message(version="mv1:running")]),
-        store,
-        CONNECTOR_KEY,
+        directory,
+        inbox,
     )
     task = asyncio.create_task(worker.process_one(BlockingHandler()))
     await entered.wait()
@@ -387,16 +421,17 @@ async def test_cancelled_worker_marks_started_execution_unknown_instead_of_retry
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        pending = await store.get_pending_ai_work(
-            CONNECTOR_KEY,
+        pending = await inbox.get_pending_ai_work(
+            SOURCE_ID,
             CHAT_ID,
             MESSAGE_ID,
         )
         assert pending is not None
         assert pending.status == "failed_unknown"
-        assert await store.claim_pending_ai_work(CONNECTOR_KEY) is None
+        assert await inbox.claim_pending_ai_work(SOURCE_ID) is None
     finally:
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 class StreamingObservedClient(FakeObservedClient):
@@ -450,28 +485,32 @@ async def test_event_pump_drops_poison_but_advances_to_later_ai_command(
     )
     valid = message_event(cursor="1249406")
     client = StreamingObservedClient((poison, valid), [present_message()])
-    store = await open_store(tmp_path / "wechat.db")
+    directory, inbox = await open_stores(tmp_path)
+    await inbox.acknowledge_event(SOURCE_ID, "migrated-cursor")
     handler = RecordingHandler()
     stop = asyncio.Event()
     task = asyncio.create_task(
         WeChatEventPump(
             client,
-            store,
-            CONNECTOR_KEY,
-            bootstrap(),
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
             handler_concurrency=1,
         ).run(handler, stop)
     )
     try:
         await wait_until(_async_predicate(lambda: bool(handler.messages)))
 
-        assert await store.get_cursor(CONNECTOR_KEY) == "1249406"
+        assert await inbox.get_cursor(SOURCE_ID) == "1249406"
+        assert client.after_values == ["migrated-cursor"]
         assert [message.id for message in handler.messages] == [MESSAGE_ID]
-        assert await store.count_messages(CONNECTOR_KEY) == 0
     finally:
         stop.set()
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
@@ -503,15 +542,17 @@ async def test_event_pump_dispatches_valid_shared_chat_history(tmp_path) -> None
         }
     )
     client = StreamingObservedClient((event,), [shared_history_message()])
-    store = await open_store(tmp_path / "wechat.db")
+    directory, inbox = await open_stores(tmp_path)
     handler = RecordingHandler()
     stop = asyncio.Event()
     task = asyncio.create_task(
         WeChatEventPump(
             client,
-            store,
-            CONNECTOR_KEY,
-            bootstrap(),
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
             handler_concurrency=1,
         ).run(handler, stop)
     )
@@ -522,11 +563,12 @@ async def test_event_pump_dispatches_valid_shared_chat_history(tmp_path) -> None
         assert handler.messages[0].raw_text == (
             "[Forwarded chat history]\nTeam history\nBob: Hello"
         )
-        assert await store.get_cursor(CONNECTOR_KEY) == "event-11"
+        assert await inbox.get_cursor(SOURCE_ID) == "event-11"
     finally:
         stop.set()
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
@@ -537,22 +579,24 @@ async def test_null_shared_history_does_not_match_the_poison_guard(
     payload = dict(message_event(cursor="event-11").payload)
     payload["sharedChatHistory"] = None
     client = StreamingObservedClient((WeChatEvent.parse(payload),), [])
-    store = await open_store(tmp_path / "wechat.db")
+    directory, inbox = await open_stores(tmp_path)
     stop = asyncio.Event()
     task = asyncio.create_task(
         WeChatEventPump(
             client,
-            store,
-            CONNECTOR_KEY,
-            bootstrap(),
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
             handler_concurrency=1,
         ).run(RecordingHandler(), stop)
     )
     try:
         await wait_until(
             _async_predicate_from_async(
-                store.get_cursor,
-                CONNECTOR_KEY,
+                inbox.get_cursor,
+                SOURCE_ID,
                 expected="event-11",
             )
         )
@@ -566,7 +610,8 @@ async def test_null_shared_history_does_not_match_the_poison_guard(
     finally:
         stop.set()
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
@@ -575,7 +620,8 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
     release = asyncio.Event()
 
     class BlockingHandler:
-        async def handle(self, _message) -> bool:
+        async def handle(self, _message, *, attested_origin=None) -> bool:
+            assert attested_origin is None
             started.set()
             await release.wait()
             return True
@@ -592,14 +638,16 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
         (message_event(cursor="event-11"), later),
         [present_message()],
     )
-    store = await open_store(tmp_path / "wechat.db")
+    directory, inbox = await open_stores(tmp_path)
     stop = asyncio.Event()
     task = asyncio.create_task(
         WeChatEventPump(
             client,
-            store,
-            CONNECTOR_KEY,
-            bootstrap(),
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
             handler_concurrency=1,
         ).run(BlockingHandler(), stop)
     )
@@ -607,8 +655,8 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
         try:
             await asyncio.wait_for(started.wait(), timeout=1)
         except TimeoutError as exc:
-            pending = await store.get_pending_ai_work(
-                CONNECTOR_KEY,
+            pending = await inbox.get_pending_ai_work(
+                SOURCE_ID,
                 CHAT_ID,
                 MESSAGE_ID,
             )
@@ -618,8 +666,8 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
             ) from exc
         await wait_until(
             _async_predicate_from_async(
-                store.get_cursor,
-                CONNECTOR_KEY,
+                inbox.get_cursor,
+                SOURCE_ID,
                 expected="event-12",
             )
         )
@@ -630,7 +678,8 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
         stop.set()
         result = await asyncio.wait_for(task, timeout=1)
         assert result == "stopped"
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
@@ -668,65 +717,32 @@ async def test_chat_directory_refresh_runs_after_cursor_advance(tmp_path) -> Non
             return renamed_chats
 
     client = RefreshClient((chat_event,), [])
-    store = await open_store(tmp_path / "wechat.db")
+    directory, inbox = await open_stores(tmp_path)
     stop = asyncio.Event()
     task = asyncio.create_task(
         WeChatEventPump(
             client,
-            store,
-            CONNECTOR_KEY,
-            bootstrap(),
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
             handler_concurrency=1,
         ).run(RecordingHandler(), stop)
     )
 
     async def directory_refreshed() -> bool:
-        chat = await store.get_chat(CONNECTOR_KEY, CHAT_ID)
+        chat = await directory.get_chat(CONNECTOR_KEY, CHAT_ID)
         return chat is not None and chat.display_name == "Renamed group"
 
     try:
         await wait_until(directory_refreshed)
-        assert await store.get_cursor(CONNECTOR_KEY) == "event-12"
+        assert await inbox.get_cursor(SOURCE_ID) == "event-12"
     finally:
         stop.set()
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_worker_rechecks_queue_after_clearing_a_consumed_wakeup(
-    tmp_path,
-) -> None:
-    store = await open_store(tmp_path / "wechat.db")
-    pump = WeChatEventPump(
-        StreamingObservedClient((), []),
-        store,
-        CONNECTOR_KEY,
-        bootstrap(),
-        handler_concurrency=1,
-    )
-    rechecked = asyncio.Event()
-
-    class WakeupDuringIdleWorker:
-        calls = 0
-
-        async def process_one(self, _handler):
-            self.calls += 1
-            if self.calls == 1:
-                pump._work_available.set()
-                return "idle"
-            rechecked.set()
-            await asyncio.Future()
-
-    task = asyncio.create_task(
-        pump._run_worker(WakeupDuringIdleWorker(), RecordingHandler())
-    )
-    try:
-        await asyncio.wait_for(rechecked.wait(), timeout=1)
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 @pytest.mark.asyncio
@@ -738,7 +754,8 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
     emit_removal = asyncio.Event()
 
     class BlockingHandler:
-        async def handle(self, _message) -> bool:
+        async def handle(self, _message, *, attested_origin=None) -> bool:
+            assert attested_origin is None
             started.set()
             try:
                 await asyncio.Future()
@@ -766,14 +783,16 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
             await self.keep_open.wait()
 
     client = RemovalClient((), [present_message(version="mv1:before-recall")])
-    store = await open_store(tmp_path / "wechat.db")
+    directory, inbox = await open_stores(tmp_path)
     stop = asyncio.Event()
     task = asyncio.create_task(
         WeChatEventPump(
             client,
-            store,
-            CONNECTOR_KEY,
-            bootstrap(),
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
             handler_concurrency=1,
         ).run(BlockingHandler(), stop)
     )
@@ -783,22 +802,22 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
         await asyncio.wait_for(cancelled.wait(), timeout=1)
         await wait_until(
             _async_predicate_from_async(
-                store.get_cursor,
-                CONNECTOR_KEY,
+                inbox.get_cursor,
+                SOURCE_ID,
                 expected="event-12",
             )
         )
 
         async def removal_finished() -> bool:
-            return await store.get_pending_ai_work(
-                CONNECTOR_KEY,
+            return await inbox.get_pending_ai_work(
+                SOURCE_ID,
                 CHAT_ID,
                 MESSAGE_ID,
             ) is None
 
         await wait_until(removal_finished)
-        assert await store.get_processed_revision_status(
-            CONNECTOR_KEY,
+        assert await inbox.get_processed_revision_status(
+            SOURCE_ID,
             CHAT_ID,
             MESSAGE_ID,
             "mv1:before-recall",
@@ -807,7 +826,8 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
         emit_removal.set()
         stop.set()
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
-        await store.close()
+        await inbox.close()
+        await directory.close()
 
 
 def _async_predicate(predicate):

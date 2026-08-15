@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 import sqlite3
 
 import pytest
@@ -11,18 +10,10 @@ from sidekick.wechat.ai import (
     WeChatIdentityCodec,
 )
 from sidekick.wechat.api import (
-    WeChatAPIContractError,
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
-    WeChatConnectorMessage,
-    WeChatEvent,
-    WeChatGroupMember,
-    WeChatGroupMemberList,
-    WeChatMessageList,
     WeChatSession,
-    WeChatUser,
-    WeChatUserList,
 )
 from sidekick.wechat.store import WeChatStateRepository
 
@@ -62,6 +53,85 @@ class PausingWeChatStateRepository(WeChatStateRepository):
             chats,
             now=now,
         )
+
+
+@pytest.mark.asyncio
+async def test_wechat_store_does_not_create_retired_message_or_ingress_tables(
+    tmp_path,
+) -> None:
+    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
+    try:
+        cursor = await store._require_connection().execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+        tables = {str(row["name"]) async for row in cursor}
+
+        assert tables.isdisjoint(
+            {
+                "wechat_messages",
+                "wechat_pending_ai_work",
+                "wechat_processed_message_revisions",
+                "wechat_processed_messages",
+                "wechat_projection_counters",
+            }
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_wechat_store_leaves_existing_legacy_messages_untouched(tmp_path) -> None:
+    state_path = tmp_path / "wechat.db"
+    connection = sqlite3.connect(state_path)
+    connection.executescript(
+        """
+        CREATE TABLE wechat_messages (
+            local_order INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_order INTEGER,
+            connector_key TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            message_type TEXT NOT NULL,
+            media_id TEXT,
+            sender_id TEXT NOT NULL,
+            reply_to_message_id TEXT,
+            content TEXT NOT NULL,
+            content_redacted INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            source TEXT,
+            sequence TEXT,
+            removed INTEGER NOT NULL DEFAULT 0,
+            last_event_cursor TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE (connector_key, account_id, chat_id, message_id)
+        );
+        INSERT INTO wechat_messages (
+            memory_order, connector_key, account_id, chat_id, message_id,
+            direction, message_type, sender_id, content, content_redacted,
+            timestamp, removed, last_event_cursor, updated_at
+        ) VALUES (
+            NULL, 'connector', 'account', 'chat', 'message',
+            'in', 'text', 'sender', 'legacy body', 0,
+            1, 0, 'cursor', 1
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = await WeChatStateRepository(state_path).connect()
+    await store.close()
+
+    connection = sqlite3.connect(state_path)
+    try:
+        row = connection.execute(
+            "SELECT memory_order, content FROM wechat_messages"
+        ).fetchone()
+        assert row == (None, "legacy body")
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio
@@ -305,275 +375,6 @@ async def test_stale_reconciliation_lease_cannot_mutate_replacement(
         await store.close()
 
 
-def connector_message(
-    message_id: str,
-    content: str,
-    *,
-    chat_id: str = GROUP_ID,
-    direction: str = "in",
-    sender_id: str = "wxid_alice",
-    reply_to_message_id: str | None = None,
-    timestamp: int = 1_783_772_734,
-    message_type: str = "text",
-    content_redacted: bool = False,
-    media_id: str | None = None,
-    link_title: str | None = None,
-    link_url: str | None = None,
-) -> WeChatConnectorMessage:
-    return WeChatConnectorMessage(
-        id=message_id,
-        chat_id=chat_id,
-        direction=direction,
-        message_type=message_type,
-        sender_id=sender_id,
-        reply_to_message_id=reply_to_message_id,
-        content=content,
-        content_redacted=content_redacted,
-        timestamp=timestamp,
-        source="wechat+localdb",
-        sequence=None,
-        media_id=media_id,
-        link_title=link_title,
-        link_url=link_url,
-    )
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_resolves_group_scoped_sender_labels(tmp_path) -> None:
-    other_group_id = "56825427597@chatroom"
-    direct_chat_id = "wxid_alice"
-    chats = (
-        WeChatChat(id=GROUP_ID, type="group", display_name="First group"),
-        WeChatChat(id=other_group_id, type="group", display_name="Second group"),
-        WeChatChat(id=direct_chat_id, type="direct", display_name="Alice"),
-    )
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=WeChatChatList(
-                chats=chats,
-                snapshot=WeChatChatSnapshot(
-                    id="identity-snapshot",
-                    complete=True,
-                    current=True,
-                    count=len(chats),
-                    cursor="identity-chats",
-                    connection_generation=41,
-                ),
-                cursor="identity-chats",
-            ),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message("1001", "first", chat_id=GROUP_ID),
-                    connector_message("1002", "second", chat_id=other_group_id),
-                    connector_message("1003", "direct", chat_id=direct_chat_id),
-                    connector_message(
-                        "1004",
-                        "member fallback",
-                        chat_id=GROUP_ID,
-                        sender_id="wxid_bob",
-                    ),
-                    connector_message(
-                        "1005",
-                        "identifier fallback",
-                        chat_id=other_group_id,
-                        sender_id="wxid_unknown",
-                    ),
-                ),
-                cursor="identity-messages",
-            ),
-        )
-        await store.refresh_users(
-            CONNECTOR_KEY,
-            WeChatUserList(
-                users=(WeChatUser(id="wxid_alice", display_name="Alice Global"),),
-                cursor="users-1",
-            ),
-        )
-        await store.refresh_group_members(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            WeChatGroupMemberList(
-                group_id=GROUP_ID,
-                members=(
-                    WeChatGroupMember(
-                        group_id=GROUP_ID,
-                        user_id="wxid_alice",
-                        display_name="Alice Stale",
-                        nickname="Alice in First",
-                    ),
-                    WeChatGroupMember(
-                        group_id=GROUP_ID,
-                        user_id="wxid_bob",
-                        display_name="Bob Member",
-                        nickname=None,
-                    ),
-                ),
-                cursor="members-first",
-                snapshot_complete=False,
-                snapshot_current=False,
-                snapshot_connection_generation=None,
-            ),
-        )
-        await store.refresh_group_members(
-            CONNECTOR_KEY,
-            other_group_id,
-            WeChatGroupMemberList(
-                group_id=other_group_id,
-                members=(
-                    WeChatGroupMember(
-                        group_id=other_group_id,
-                        user_id="wxid_alice",
-                        display_name="Alice Stale",
-                        nickname=None,
-                    ),
-                ),
-                cursor="members-second",
-                snapshot_complete=False,
-                snapshot_current=False,
-                snapshot_connection_generation=None,
-            ),
-        )
-
-        resolved = []
-        for chat_id, message_id in (
-            (GROUP_ID, "1001"),
-            (other_group_id, "1002"),
-            (direct_chat_id, "1003"),
-            (GROUP_ID, "1004"),
-            (other_group_id, "1005"),
-        ):
-            message = await store.get_message(CONNECTOR_KEY, chat_id, message_id)
-            assert message is not None
-            resolved.append(message.sender_display_name)
-
-        assert resolved == [
-            "Alice in First",
-            "Alice Global",
-            "Alice Global",
-            "Bob Member",
-            "wxid_unknown",
-        ]
-
-        await store.refresh_user(
-            CONNECTOR_KEY,
-            "wxid_alice",
-            WeChatUser(id="wxid_alice", display_name="Alice Renamed"),
-        )
-        await store.refresh_user(
-            CONNECTOR_KEY,
-            "wxid_alice",
-            WeChatUser(id="wxid_alice", display_name=None),
-        )
-        await store.refresh_user(CONNECTOR_KEY, "wxid_alice", None)
-        group_message = await store.get_message(
-            CONNECTOR_KEY,
-            other_group_id,
-            "1002",
-        )
-        direct_message = await store.get_message(
-            CONNECTOR_KEY,
-            direct_chat_id,
-            "1003",
-        )
-        assert group_message is not None
-        assert direct_message is not None
-        assert group_message.sender_display_name == "Alice Renamed"
-        assert direct_message.sender_display_name == "Alice Renamed"
-
-        await store.refresh_users(
-            CONNECTOR_KEY,
-            WeChatUserList(
-                users=(WeChatUser(id="wxid_alice", display_name=None),),
-                cursor="users-partial-omitted-name",
-            ),
-        )
-        await store.refresh_group_members(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            WeChatGroupMemberList(
-                group_id=GROUP_ID,
-                members=(
-                    WeChatGroupMember(
-                        group_id=GROUP_ID,
-                        user_id="wxid_alice",
-                        display_name=None,
-                        nickname=None,
-                    ),
-                ),
-                cursor="members-partial-omitted-name",
-                snapshot_complete=False,
-                snapshot_current=False,
-                snapshot_connection_generation=None,
-            ),
-        )
-
-        aliased = await store.get_message(CONNECTOR_KEY, GROUP_ID, "1001")
-        member_fallback = await store.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            "1004",
-        )
-        direct_message = await store.get_message(
-            CONNECTOR_KEY,
-            direct_chat_id,
-            "1003",
-        )
-        assert aliased is not None
-        assert member_fallback is not None
-        assert direct_message is not None
-        assert aliased.sender_display_name == "Alice in First"
-        assert member_fallback.sender_display_name == "Bob Member"
-        assert direct_message.sender_display_name == "Alice Renamed"
-
-        with pytest.raises(WeChatAPIContractError, match="generation is stale"):
-            await store.refresh_group_members(
-                CONNECTOR_KEY,
-                GROUP_ID,
-                WeChatGroupMemberList(
-                    group_id=GROUP_ID,
-                    members=(),
-                    cursor="members-stale",
-                    snapshot_complete=True,
-                    snapshot_current=True,
-                    snapshot_connection_generation=42,
-                ),
-            )
-
-        await store.refresh_group_members(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            WeChatGroupMemberList(
-                group_id=GROUP_ID,
-                members=(
-                    WeChatGroupMember(
-                        group_id=GROUP_ID,
-                        user_id="wxid_alice",
-                        display_name=None,
-                        nickname=None,
-                    ),
-                ),
-                cursor="members-authoritative",
-                snapshot_complete=True,
-                snapshot_current=True,
-                snapshot_connection_generation=41,
-            ),
-        )
-
-        aliased = await store.get_message(CONNECTOR_KEY, GROUP_ID, "1001")
-        removed_member = await store.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            "1004",
-        )
-        assert aliased is not None
-        assert removed_member is not None
-        assert aliased.sender_display_name == "Alice in First"
-        assert removed_member.sender_display_name == "wxid_bob"
-    finally:
-        await store.close()
 
 
 def session(
@@ -607,16 +408,6 @@ def chat_list(
     )
 
 
-def event(payload: dict[str, object], *, cursor: str) -> WeChatEvent:
-    return WeChatEvent.parse(
-        {
-            "schemaVersion": "wechat-bridge/v1alpha1",
-            "cursor": cursor,
-            "event": "message",
-            "connectionGeneration": 41,
-            **payload,
-        }
-    )
 
 
 def test_wechat_identity_codec_round_trips_opaque_ids() -> None:
@@ -653,101 +444,6 @@ def test_wechat_account_identity_codec_isolates_memory_banks() -> None:
     assert second.parse_message_source_id(source_id) is None
 
 
-@pytest.mark.asyncio
-async def test_wechat_store_upserts_revisions_and_acks_processing_atomically(tmp_path):
-    path = tmp_path / "wechat.db"
-    oldest_id = "3159667620982040828"
-    command_id = "4159667620982040828"
-    store = await WeChatStateRepository(path).connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(oldest_id, "earlier", timestamp=1_783_772_700),
-                    connector_message(command_id, "/ai hello"),
-                ),
-                cursor="bootstrap-messages",
-            ),
-        )
-
-        command = await store.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            command_id,
-        )
-        assert command is not None
-        assert command.id == command_id
-        assert command.chat_id == GROUP_ID
-        assert command.chat_type == "group"
-        assert command.scope_display_name == "Example group"
-        assert await store.get_cursor(CONNECTOR_KEY) == "bootstrap-messages"
-        stored_chats = await store.list_chats(CONNECTOR_KEY)
-        assert len(stored_chats) == 1
-        assert stored_chats[0].chat_id == GROUP_ID
-        assert stored_chats[0].chat_type == "group"
-        assert stored_chats[0].display_name == "Example group"
-        assert stored_chats[0].last_observed_at > 0
-
-        revision = event(
-            {
-                "id": command_id,
-                "chatId": GROUP_ID,
-                "direction": "in",
-                "messageType": "text",
-                "senderId": "wxid_alice",
-                "replyToMessageId": oldest_id,
-                "content": "/ai hello",
-                "timestamp": 1_783_772_734,
-                "source": "wechat+localdb",
-            },
-            cursor="opaque-revision",
-        )
-        projected = await store.project_event(CONNECTOR_KEY, revision)
-
-        assert projected is not None
-        assert projected.reply_to_msg_id == oldest_id
-        assert await store.get_cursor(CONNECTOR_KEY) == "bootstrap-messages"
-        assert await store.is_processed(projected) is False
-
-        await store.acknowledge_event(
-            CONNECTOR_KEY,
-            revision.cursor,
-            processed_message=projected,
-        )
-
-        assert await store.get_cursor(CONNECTOR_KEY) == "opaque-revision"
-        assert await store.is_processed(projected) is True
-        assert await store.count_messages(CONNECTOR_KEY) == 2
-
-        recent = await store.fetch_recent(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            command.id,
-            10,
-        )
-        parent = await store.get_message(CONNECTOR_KEY, GROUP_ID, oldest_id)
-
-        assert [message.id for message in recent] == [oldest_id]
-        assert parent is not None
-        assert parent.raw_text == "earlier"
-    finally:
-        await store.close()
-
-    restarted = await WeChatStateRepository(path).connect()
-    try:
-        command = await restarted.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            command_id,
-        )
-        assert command is not None
-        assert await restarted.get_cursor(CONNECTOR_KEY) == "opaque-revision"
-        assert await restarted.is_processed(command) is True
-    finally:
-        await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -762,7 +458,6 @@ async def test_wechat_store_hides_partial_chat_refreshes_from_concurrent_reads(
             connector_key=CONNECTOR_KEY,
             session=session(),
             chats=chat_list(),
-            messages=WeChatMessageList(messages=(), cursor="bootstrap-messages"),
         )
         store.pause_chat_refresh = True
         refresh_task = asyncio.create_task(
@@ -785,489 +480,4 @@ async def test_wechat_store_hides_partial_chat_refreshes_from_concurrent_reads(
             await asyncio.gather(refresh_task, return_exceptions=True)
         if read_task is not None:
             await asyncio.gather(read_task, return_exceptions=True)
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_legacy_projection_retains_windows_and_late_revisions(tmp_path):
-    oldest_id = "3159667620982040828"
-    latest_id = "4159667620982040828"
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(oldest_id, "earlier", timestamp=1_783_772_700),
-                    connector_message(latest_id, "latest", timestamp=1_783_772_734),
-                ),
-                cursor="bootstrap-messages",
-            ),
-        )
-        latest = await store.get_message(CONNECTOR_KEY, GROUP_ID, latest_id)
-        assert latest is not None
-
-        window = await store.fetch_memory_window(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            since=datetime.fromtimestamp(1_783_772_699, UTC),
-            until=datetime.fromtimestamp(1_783_772_735, UTC),
-            limit=1,
-        )
-
-        assert [message.id for message in window] == [latest_id]
-
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(oldest_id, "earlier", timestamp=1_783_772_700),
-                    connector_message(latest_id, "latest", timestamp=1_783_772_734),
-                ),
-                cursor="second-bootstrap",
-            ),
-        )
-        unchanged = await store.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            latest_id,
-        )
-        assert unchanged is not None
-        assert unchanged.memory_cursor == latest.memory_cursor
-
-        revision = event(
-            {
-                "id": oldest_id,
-                "chatId": GROUP_ID,
-                "direction": "in",
-                "messageType": "text",
-                "senderId": "wxid_alice",
-                "content": "earlier, corrected",
-                "timestamp": 1_783_772_700,
-                "source": "wechat+localdb",
-            },
-            cursor="late-revision",
-        )
-        revised = await store.project_event(CONNECTOR_KEY, revision)
-        assert revised is not None
-
-        after = await store.fetch_memory_after(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            after_memory_order=latest.memory_cursor,
-            until=datetime.fromtimestamp(1_783_772_735, UTC),
-            limit=10,
-        )
-
-        assert [message.id for message in after] == [oldest_id]
-        assert after[0].raw_text == "earlier, corrected"
-        assert after[0].memory_cursor > latest.memory_cursor
-
-        chat = await store.get_chat(CONNECTOR_KEY, GROUP_ID)
-        assert chat is not None
-        assert chat.id == GROUP_ID
-        assert chat.display_name == "Example group"
-        assert await store.get_latest_memory_cursor(
-            CONNECTOR_KEY,
-            GROUP_ID,
-        ) == revised.memory_cursor
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_history_excludes_redacted_and_unsupported_messages(tmp_path):
-    visible_id = "3159667620982040828"
-    redacted_id = "4159667620982040828"
-    image_id = "5159667620982040828"
-    anchor_id = "6159667620982040828"
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(visible_id, "visible", timestamp=1_783_772_700),
-                    connector_message(
-                        redacted_id,
-                        "must not escape",
-                        timestamp=1_783_772_701,
-                        content_redacted=True,
-                    ),
-                    connector_message(
-                        image_id,
-                        "unsupported image metadata",
-                        timestamp=1_783_772_702,
-                        message_type="image",
-                    ),
-                    connector_message(anchor_id, "/ai summarize"),
-                ),
-                cursor="bootstrap-messages",
-            ),
-        )
-        anchor = await store.get_message(CONNECTOR_KEY, GROUP_ID, anchor_id)
-        assert anchor is not None
-
-        recent = await store.fetch_recent(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            anchor.id,
-            10,
-        )
-        window = await store.fetch_memory_window(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            since=datetime.fromtimestamp(1_783_772_699, UTC),
-            until=datetime.fromtimestamp(1_783_772_735, UTC),
-            limit=10,
-        )
-
-        assert [message.id for message in recent] == [visible_id]
-        assert [message.id for message in window] == [visible_id, anchor_id]
-        assert await store.get_message(CONNECTOR_KEY, GROUP_ID, redacted_id) is None
-        assert await store.get_message(CONNECTOR_KEY, GROUP_ID, image_id) is None
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_promotes_shared_history_enrichment_in_place(tmp_path):
-    message_id = "5159667620982040828"
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(
-                        message_id,
-                        "[Chat history] Team history",
-                        message_type="app",
-                    ),
-                ),
-                cursor="bootstrap-messages",
-            ),
-        )
-        correction = event(
-            {
-                "id": message_id,
-                "chatId": GROUP_ID,
-                "direction": "in",
-                "messageType": "chat_history",
-                "senderId": "wxid_alice",
-                "content": "Team history",
-                "sharedChatHistory": {
-                    "title": "Team history",
-                    "itemCount": 2,
-                    "items": [
-                        {"kind": "text", "senderName": "Alice", "content": "Hi"},
-                        {"kind": "image", "senderName": "Bob"},
-                    ],
-                },
-                "timestamp": 1_783_772_734,
-                "source": "wechat+localdb",
-            },
-            cursor="shared-history-correction",
-        )
-
-        revised = await store.project_event(CONNECTOR_KEY, correction)
-        visible = await store.get_message(CONNECTOR_KEY, GROUP_ID, message_id)
-        quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, message_id)
-        memory_window = await store.fetch_memory_window(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            since=datetime.fromtimestamp(1_783_772_700, UTC),
-            until=datetime.fromtimestamp(1_783_772_735, UTC),
-            limit=10,
-        )
-
-        assert revised is not None
-        assert revised.message_type == "chat_history"
-        assert revised.raw_text == (
-            "[Forwarded chat history]\n"
-            "Team history\n"
-            "Alice: Hi\n"
-            "Bob: [Image]"
-        )
-        assert visible is not None
-        assert quoted is not None
-        assert [message.id for message in memory_window] == [message_id]
-        assert await store.count_messages(CONNECTOR_KEY) == 1
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_promotes_link_enrichment_into_readable_context(tmp_path):
-    message_id = "5159667620982040828"
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(
-                        message_id,
-                        "Shared article",
-                        message_type="app",
-                    ),
-                ),
-                cursor="bootstrap-messages",
-            ),
-        )
-        correction = event(
-            {
-                "id": message_id,
-                "chatId": GROUP_ID,
-                "direction": "in",
-                "messageType": "link",
-                "senderId": "wxid_alice",
-                "content": "Shared article",
-                "title": "Shared article",
-                "url": "https://example.com/article?id=1&source=wechat",
-                "timestamp": 1_783_772_734,
-                "source": "wechat+localdb",
-            },
-            cursor="link-correction",
-        )
-
-        revised = await store.project_event(CONNECTOR_KEY, correction)
-        quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, message_id)
-
-        assert revised is not None
-        assert revised.message_type == "link"
-        assert quoted is not None
-        assert quoted.raw_text == (
-            "[Link] Shared article\n"
-            "https://example.com/article?id=1&source=wechat"
-        )
-        assert await store.count_messages(CONNECTOR_KEY) == 1
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_persists_images_for_direct_reply_lookup_only(tmp_path):
-    path = tmp_path / "wechat.db"
-    image_id = "5159667620982040828"
-    media_id = "0123456789abcdef0123456789abcdef"
-    store = await WeChatStateRepository(path).connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(
-                    connector_message(
-                        image_id,
-                        "",
-                        message_type="image",
-                        content_redacted=True,
-                        media_id=media_id,
-                    ),
-                ),
-                cursor="bootstrap-messages",
-            ),
-        )
-
-        assert await store.get_message(CONNECTOR_KEY, GROUP_ID, image_id) is None
-        quoted = await store.get_reply_message(CONNECTOR_KEY, GROUP_ID, image_id)
-
-        assert quoted is not None
-        assert quoted.message_type == "image"
-        assert quoted.media_id == media_id
-    finally:
-        await store.close()
-
-    restarted = await WeChatStateRepository(path).connect()
-    try:
-        quoted = await restarted.get_reply_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            image_id,
-        )
-        assert quoted is not None
-        assert quoted.media_id == media_id
-    finally:
-        await restarted.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_applies_empty_redaction_revision(tmp_path):
-    message_id = "3159667620982040828"
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(connector_message(message_id, "private text"),),
-                cursor="bootstrap-messages",
-            ),
-        )
-        redaction = event(
-            {
-                "id": message_id,
-                "chatId": GROUP_ID,
-                "direction": "in",
-                "messageType": "text",
-                "senderId": "wxid_alice",
-                "contentRedacted": True,
-                "timestamp": 1_783_772_734,
-                "source": "wechat+hook",
-            },
-            cursor="redacted-revision",
-        )
-
-        projected = await store.project_event(CONNECTOR_KEY, redaction)
-        visible = await store.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            message_id,
-        )
-
-        assert projected is not None
-        assert projected.content_redacted is True
-        assert projected.raw_text == ""
-        assert visible is None
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_migrates_existing_messages_to_memory_order(tmp_path):
-    path = tmp_path / "wechat.db"
-    connection = sqlite3.connect(path)
-    try:
-        connection.executescript(
-            """
-            CREATE TABLE wechat_messages (
-                local_order INTEGER PRIMARY KEY AUTOINCREMENT,
-                connector_key TEXT NOT NULL,
-                account_id TEXT NOT NULL,
-                chat_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                message_type TEXT NOT NULL,
-                sender_id TEXT NOT NULL,
-                reply_to_message_id TEXT,
-                content TEXT NOT NULL,
-                content_redacted INTEGER NOT NULL,
-                timestamp INTEGER NOT NULL,
-                source TEXT,
-                sequence TEXT,
-                removed INTEGER NOT NULL DEFAULT 0,
-                last_event_cursor TEXT NOT NULL,
-                updated_at REAL NOT NULL,
-                UNIQUE (connector_key, account_id, chat_id, message_id)
-            );
-            INSERT INTO wechat_messages (
-                connector_key, account_id, chat_id, message_id, direction,
-                message_type, sender_id, content, content_redacted, timestamp,
-                source, last_event_cursor, updated_at
-            ) VALUES (
-                'http://127.0.0.1:18188', 'wxid_self',
-                '56825427596@chatroom', '4159667620982040828', 'in',
-                'text', 'wxid_alice', 'existing', 0, 1783772734,
-                'wechat+localdb', 'legacy-cursor', 1783772734
-            );
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-    store = await WeChatStateRepository(path).connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(
-                messages=(connector_message("4159667620982040828", "existing"),),
-                cursor="bootstrap-messages",
-            ),
-        )
-        message = await store.get_message(
-            CONNECTOR_KEY,
-            GROUP_ID,
-            "4159667620982040828",
-        )
-
-        assert message is not None
-        assert message.memory_cursor == 1
-        assert message.media_id is None
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_preserves_existing_cursor_on_same_account_bootstrap(
-    tmp_path,
-):
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(messages=(), cursor="initial-cut"),
-        )
-        await store.acknowledge_event(CONNECTOR_KEY, "durable-progress")
-
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(cursor="new-chat-cut"),
-            messages=WeChatMessageList(messages=(), cursor="new-message-cut"),
-        )
-
-        assert await store.get_cursor(CONNECTOR_KEY) == "durable-progress"
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_wechat_store_rebaselines_cursor_when_endpoint_account_changes(tmp_path):
-    store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
-    try:
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=session(),
-            chats=chat_list(),
-            messages=WeChatMessageList(messages=(), cursor="account-one"),
-        )
-        await store.acknowledge_event(CONNECTOR_KEY, "account-one-progress")
-
-        replacement = WeChatSession(
-            status="logged_in",
-            self_id="wxid_other_account",
-            display_name="Other",
-            hook_connected=True,
-            connection_generation=1,
-            content_redacted=False,
-            cursor="replacement-session",
-        )
-        await store.bootstrap(
-            connector_key=CONNECTOR_KEY,
-            session=replacement,
-            chats=chat_list(generation=1, cursor="replacement-chats"),
-            messages=WeChatMessageList(messages=(), cursor="replacement-messages"),
-        )
-
-        assert await store.get_cursor(CONNECTOR_KEY) == "replacement-messages"
-        assert await store.get_account_id(CONNECTOR_KEY) == "wxid_other_account"
-    finally:
         await store.close()

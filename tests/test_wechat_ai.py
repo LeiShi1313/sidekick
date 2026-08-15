@@ -49,12 +49,10 @@ from sidekick.wechat.api import (
     WeChatChat,
     WeChatChatList,
     WeChatChatSnapshot,
-    WeChatConnectorMessage,
     WeChatDownloadedImage,
     WeChatEvent,
     WeChatGroupMember,
     WeChatGroupMemberList,
-    WeChatMessageList,
     WeChatObservationCoverage,
     WeChatObservedMessage,
     WeChatObservedMessagePage,
@@ -325,18 +323,25 @@ async def bootstrap_store(
     link_url=None,
 ):
     store = await WeChatStateRepository(path).connect()
-    trigger = WeChatConnectorMessage(
+    observed = WeChatObservedMessage(
         id="4159667620982040828",
         chat_id=GROUP_ID,
+        state="present",
+        version="mv1:trigger",
+        order_timestamp=1_783_772_734,
+        observed_at=1_783_772_735,
+        source="wechat+localdb",
         direction=direction,
         message_type=message_type,
-        sender_id=ACCOUNT_ID if direction == "out" else "wxid_alice",
-        reply_to_message_id=None,
         content=trigger_text,
         content_redacted=content_redacted,
+        sender_id=ACCOUNT_ID if direction == "out" else "wxid_alice",
+        sender_display_name=(
+            "Sidekick" if direction == "out" else "Alice"
+        ),
+        sender_group_alias=None,
         timestamp=1_783_772_734,
-        source="wechat+localdb",
-        sequence=None,
+        reply_to_message_id=None,
         media_id=media_id,
         link_title=link_title,
         link_url=link_url,
@@ -370,15 +375,9 @@ async def bootstrap_store(
             ),
             cursor="10",
         ),
-        messages=WeChatMessageList(messages=(trigger,), cursor="10"),
     )
-    observed = await (
-        store.get_reply_message(CONNECTOR_KEY, GROUP_ID, trigger.id)
-        if message_type == "image"
-        else store.get_message(CONNECTOR_KEY, GROUP_ID, trigger.id)
-    )
-    assert observed is not None
-    return store, observed
+    trigger = await store.message_from_observation(CONNECTOR_KEY, observed)
+    return store, trigger
 
 
 def as_observed(
@@ -419,6 +418,36 @@ def as_observed(
     )
 
 
+async def materialize_event(
+    store: WeChatStateRepository,
+    event: WeChatEvent,
+) -> WeChatMessage:
+    message = event.message()
+    observed = WeChatObservedMessage(
+        id=message.id,
+        chat_id=message.chat_id,
+        state="present",
+        version=f"mv1:event-{event.cursor}",
+        order_timestamp=message.timestamp,
+        observed_at=message.timestamp + 1,
+        source=message.source or "wechat+test",
+        direction=message.direction,
+        message_type=message.message_type,
+        content=message.content,
+        content_redacted=message.content_redacted,
+        sender_id=message.sender_id,
+        sender_display_name=None,
+        sender_group_alias=None,
+        timestamp=message.timestamp,
+        reply_to_message_id=message.reply_to_message_id,
+        media_id=message.media_id,
+        shared_chat_history=message.shared_chat_history,
+        link_title=message.link_title,
+        link_url=message.link_url,
+    )
+    return await store.message_from_observation(CONNECTOR_KEY, observed)
+
+
 def image_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (2_000, 1_000), (255, 255, 255)).save(output, format="PNG")
@@ -441,26 +470,25 @@ async def project_quoted_reply(
     reply_to: str,
     content: str = "/ai explain this",
 ) -> WeChatMessage:
-    event = WeChatEvent.parse(
+    observed = WeChatObservedMessage.parse(
         {
-            "schemaVersion": "wechat-bridge/v1alpha1",
-            "cursor": "quoted-command",
-            "event": "message",
-            "connectionGeneration": 41,
             "id": "5159667620982040828",
             "chatId": GROUP_ID,
+            "state": "present",
+            "version": "mv1:quoted-command",
+            "orderTimestamp": 1_783_772_735,
+            "observedAt": 1_783_772_736,
             "direction": "out",
             "messageType": "app",
             "senderId": ACCOUNT_ID,
+            "senderDisplayName": "Sidekick",
             "replyToMessageId": reply_to,
             "content": content,
             "timestamp": 1_783_772_735,
             "source": "wechat+message-reconciler",
         }
     )
-    message = await store.project_event(CONNECTOR_KEY, event)
-    assert message is not None
-    return message
+    return await store.message_from_observation(CONNECTOR_KEY, observed)
 
 
 @pytest.mark.asyncio
@@ -969,13 +997,8 @@ async def test_wechat_unknown_send_is_quarantined_without_blocking_ingress(
         }
     )
     try:
-        generated = await restarted_store.project_event(
-            CONNECTOR_KEY,
-            generated_event,
-        )
-        manual = await restarted_store.project_event(CONNECTOR_KEY, manual_event)
-        assert generated is not None
-        assert manual is not None
+        generated = await materialize_event(restarted_store, generated_event)
+        manual = await materialize_event(restarted_store, manual_event)
         classifications = await asyncio.wait_for(
             asyncio.gather(
                 *(
@@ -1140,8 +1163,7 @@ async def test_wechat_quarantined_manual_message_is_released_after_send_failure(
         }
     )
     try:
-        manual = await restarted_store.project_event(CONNECTOR_KEY, manual_event)
-        assert manual is not None
+        manual = await materialize_event(restarted_store, manual_event)
         assert await restarted.reconcile_pending(ACCOUNT_ID) == 0
         assert (
             await restarted.classify_origin(manual)
@@ -1191,7 +1213,7 @@ async def test_wechat_missing_reconciled_send_releases_durable_quarantine(
 
 
 @pytest.mark.asyncio
-async def test_wechat_processed_manual_message_is_not_generated_provenance(
+async def test_wechat_manual_message_is_not_generated_provenance(
     tmp_path,
 ) -> None:
     store, manual = await bootstrap_store(
@@ -1206,13 +1228,6 @@ async def test_wechat_processed_manual_message_is_not_generated_provenance(
         native_reply_ready=False,
     )
     try:
-        await store.mark_processed_identity(
-            CONNECTOR_KEY,
-            manual.account_id,
-            manual.chat_id,
-            manual.id,
-        )
-
         assert (
             await transport.classify_origin(manual)
             is MessageOrigin.MANUAL_OUTGOING
@@ -1343,7 +1358,9 @@ async def test_wechat_reconciles_durable_generated_send_before_event_replay(
         )
 
         assert reservations == ()
-        assert await restarted_store.is_processed(echoed) is True
+        assert await restarted_store.generated_message_provenance(echoed) == (
+            "confirmed"
+        )
         assert (
             await restarted.classify_origin(echoed)
             is MessageOrigin.SIDEKICK_GENERATED
@@ -2338,11 +2355,7 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
             identity_codec.scope_id(GROUP_ID),
             "7158246912028861544",
         )
-        echoed_message = await wechat_store.project_event(
-            CONNECTOR_KEY,
-            outbound_echo,
-        )
-        assert echoed_message is not None
+        echoed_message = await materialize_event(wechat_store, outbound_echo)
         assert (
             await transport.classify_origin(echoed_message)
             is MessageOrigin.SIDEKICK_GENERATED
@@ -2367,12 +2380,10 @@ async def test_wechat_conversation_handler_runs_ai_and_persists_opaque_answer_id
 
     replay_store = await WeChatStateRepository(tmp_path / "wechat.db").connect()
     try:
-        echoed_message = await replay_store.project_event(
-            CONNECTOR_KEY,
-            outbound_echo,
+        echoed_message = await materialize_event(replay_store, outbound_echo)
+        assert await replay_store.generated_message_provenance(echoed_message) == (
+            "confirmed"
         )
-        assert echoed_message is not None
-        assert await replay_store.is_processed(echoed_message) is True
     finally:
         await replay_store.close()
 
@@ -2862,8 +2873,7 @@ async def test_wechat_manual_memory_command_uses_refreshed_group_alias(
             "source": "wechat+hook",
         }
     )
-    command = await wechat_store.project_event(CONNECTOR_KEY, command_event)
-    assert command is not None
+    command = await materialize_event(wechat_store, command_event)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient(
         (submitted(),),
@@ -2947,8 +2957,7 @@ async def test_wechat_backfill_reports_and_ingests_partial_connector_history(
             "source": "wechat+hook",
         }
     )
-    command = await wechat_store.project_event(CONNECTOR_KEY, command_event)
-    assert command is not None
+    command = await materialize_event(wechat_store, command_event)
     ai_store = await AIStateRepository(tmp_path / "ai.db").connect()
     client = RecordingConnectorClient(
         (

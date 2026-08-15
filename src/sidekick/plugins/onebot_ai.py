@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import signal
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,12 +37,19 @@ from sidekick.ai_memory_outbox import (
 )
 from sidekick.chat.formatting import agent_system_prompt
 from sidekick.chat.output_policy import MainlandMessagingOutputPolicy
+from sidekick.chat.provenance import MessageOrigin
 from sidekick.channel_status import (
     AdapterRuntimeState,
     ChannelOpsServer,
     ChannelOpsSettings,
     ChannelSnapshotService,
 )
+from sidekick.inbound import (
+    DurableInboundPool,
+    DurableInboundWorker,
+    is_ai_candidate,
+)
+from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
     QQ_IDENTITY_CODEC,
@@ -51,6 +57,7 @@ from sidekick.onebot.ai import (
     OneBotDirectory,
     OneBotDirectorySourceResolver,
     OneBotHistorySource,
+    OneBotInboundMessageSource,
     OneBotMemoryScopeTargetResolver,
     OneBotMessageIdentityResolver,
     OneBotMessageMentionResolver,
@@ -97,6 +104,7 @@ class OneBotRuntimeSettings:
 class OneBotAI(metaclass=PluginMount):
     command_group = "onebot"
     command_name = "ai"
+    INBOUND_CONCURRENCY = 8
 
     def __init__(self, log_level: str = "info"):
         self._runtime = OneBotRuntimeSettings.from_env()
@@ -111,6 +119,7 @@ class OneBotAI(metaclass=PluginMount):
             timeout=self._settings.request_timeout,
         )
         self._store = AIStateRepository(self._settings.state_path)
+        self._inbound_store = SQLiteInboundWorkStore(self._settings.state_path)
         self._memory = (
             HindsightMemoryClient(
                 self._settings.hindsight_url,
@@ -131,7 +140,7 @@ class OneBotAI(metaclass=PluginMount):
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_scheduler: ContinuousMemoryScheduler | None = None
         self._memory_outbox_scheduler: MemoryOutboxScheduler | None = None
-        self._seen_messages: OrderedDict[tuple[int, int], None] = OrderedDict()
+        self._inbound_pool: DurableInboundPool | None = None
         self._adapter_status = AdapterRuntimeState(
             id=self._ops_settings.instance_id,
             platform="qq",
@@ -179,6 +188,9 @@ class OneBotAI(metaclass=PluginMount):
             await self._verify_account()
             self._adapter_status.update(connected=True)
             await self._refresh_directory()
+            if self._inbound_pool is None:
+                raise RuntimeError("OneBot inbound worker pool is unavailable")
+            self._inbound_pool.start()
             if self._continuous_scheduler is not None:
                 self._continuous_scheduler.start()
             if self._dream_scheduler is not None:
@@ -189,6 +201,8 @@ class OneBotAI(metaclass=PluginMount):
             await stop.wait()
         finally:
             self._adapter_status.update(connected=False)
+            if self._inbound_pool is not None:
+                await self._inbound_pool.close()
             await self._ops_server.close()
             if self._continuous_scheduler is not None:
                 await self._continuous_scheduler.close()
@@ -200,6 +214,7 @@ class OneBotAI(metaclass=PluginMount):
             if self._memory is not None:
                 await self._memory.close()
             await self._gateway.close()
+            await self._inbound_store.close()
             await self._store.close()
 
     async def _setup(self) -> None:
@@ -214,6 +229,15 @@ class OneBotAI(metaclass=PluginMount):
             logger=self.logger,
         )
         await self._store.connect()
+        await self._inbound_store.connect()
+        await self._inbound_store.initialize_source(
+            self._ops_settings.instance_id,
+            epoch=str(self._runtime.self_id),
+            initial_cursor=0,
+        )
+        await self._inbound_store.recover_pending_ai_work(
+            self._ops_settings.instance_id
+        )
         history_source = OneBotHistorySource(
             self._bridge,
             directory=self._directory,
@@ -301,6 +325,25 @@ class OneBotAI(metaclass=PluginMount):
             adapter_instance_id=self._ops_settings.instance_id,
             logger=self.logger,
         )
+        inbound_source = OneBotInboundMessageSource(
+            self._bridge,
+            self_id=self._runtime.self_id,
+            directory=self._directory,
+        )
+        inbound_worker = DurableInboundWorker(
+            inbound_source,
+            self._inbound_store,
+            self._ops_settings.instance_id,
+            logger=self.logger,
+        )
+        self._inbound_pool = DurableInboundPool(
+            inbound_worker,
+            self._inbound_store,
+            self._ops_settings.instance_id,
+            self._handler,
+            concurrency=self.INBOUND_CONCURRENCY,
+            logger=self.logger,
+        )
         self._bridge.set_event_handler(self._on_event)
 
     async def _verify_account(self) -> None:
@@ -334,22 +377,36 @@ class OneBotAI(metaclass=PluginMount):
             return
         if message.scope_display_name is None:
             message.scope_display_name = self._directory.scope_name(message.chat_id)
-        key = (message.chat_id, message.id)
-        if key in self._seen_messages:
-            return
-        self._seen_messages[key] = None
-        self._seen_messages.move_to_end(key)
-        while len(self._seen_messages) > 4_096:
-            self._seen_messages.popitem(last=False)
-        if self._handler is None:
+        if (
+            self._handler is None
+            or self._transport is None
+            or self._inbound_pool is None
+        ):
             return
         try:
-            await self._handler.handle(message)
+            origin = await self._transport.classify_origin(message)
         except Exception as exc:
             self.logger.error(
-                "OneBot AI message handling failed (%s)",
+                "OneBot message origin classification failed (%s)",
                 type(exc).__name__,
             )
+            return
+        if origin in {
+            MessageOrigin.SIDEKICK_GENERATED,
+            MessageOrigin.INDETERMINATE,
+        }:
+            return
+        if not is_ai_candidate(message):
+            return
+        await self._inbound_store.accept_pending_ai_event(
+            self._ops_settings.instance_id,
+            cursor=message.id,
+            chat_id=message.chat_id,
+            message_id=message.id,
+            kind="message",
+            attested_origin=origin,
+        )
+        self._inbound_pool.notify()
 
 
 class _OneBotMemoryAdminCommand:
