@@ -9,8 +9,9 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Concatenate, Literal, ParamSpec, Protocol, TypeVar
 from uuid import uuid4
 
 import aiosqlite
@@ -1709,11 +1710,52 @@ class PromptBuilder:
         return "\n\n".join(parts)
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _serialized(
+    method: Callable[
+        Concatenate[AIStateRepository, _P],
+        Awaitable[_R],
+    ],
+) -> Callable[
+    Concatenate[AIStateRepository, _P],
+    Awaitable[_R],
+]:
+    @wraps(method)
+    async def locked(
+        self: AIStateRepository,
+        /,
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _R:
+        async with self._access_lock:
+            try:
+                return await method(self, *args, **kwargs)
+            except BaseException:
+                if self._connection is not None:
+                    await _rollback_quietly(self._connection)
+                raise
+
+    return locked
+
+
+async def _rollback_quietly(connection: aiosqlite.Connection) -> None:
+    try:
+        await asyncio.shield(connection.rollback())
+    except BaseException:
+        pass
+
+
 class AIStateRepository:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._connection: aiosqlite.Connection | None = None
+        # aiosqlite serializes statements, not cursor lifetimes or transactions.
+        self._access_lock = asyncio.Lock()
 
+    @_serialized
     async def connect(self) -> AIStateRepository:
         parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1786,6 +1828,7 @@ class AIStateRepository:
         self.path.chmod(0o600)
         return self
 
+    @_serialized
     async def close(self) -> None:
         if self._connection is not None:
             await self._connection.close()
@@ -2339,6 +2382,7 @@ class AIStateRepository:
             """
         )
 
+    @_serialized
     async def get_answer(
         self, scope_id: str, answer_message_id: ExternalId
     ) -> AIAnswerMarker | None:
@@ -2350,6 +2394,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return _marker_from_row(row) if row else None
 
+    @_serialized
     async def get_turn_for_message(
         self, scope_id: str, message_id: ExternalId
     ) -> AIAnswerMarker | None:
@@ -2367,6 +2412,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return _marker_from_row(row) if row else None
 
+    @_serialized
     async def save_answer(self, marker: AIAnswerMarker) -> None:
         connection = self._require_connection()
         await connection.execute(
@@ -2411,6 +2457,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def start_ai_run(
         self,
         *,
@@ -2447,6 +2494,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def mark_ai_run_running(
         self,
         run_id: str,
@@ -2465,6 +2513,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def finish_ai_run(
         self,
         run_id: str,
@@ -2495,6 +2544,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def list_channel_operational_states(
         self,
     ) -> tuple[StoredChannelState, ...]:
@@ -2765,6 +2815,7 @@ class AIStateRepository:
             )
         return tuple(states)
 
+    @_serialized
     async def get_model_override(self, scope_id: str) -> str | None:
         cursor = await self._require_connection().execute(
             "SELECT model_id FROM ai_model_overrides WHERE scope_id = ?",
@@ -2773,6 +2824,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return str(row["model_id"]) if row is not None else None
 
+    @_serialized
     async def set_model_override(
         self,
         scope_id: str,
@@ -2797,6 +2849,7 @@ class AIStateRepository:
             )
         await connection.commit()
 
+    @_serialized
     async def get_ai_command_prefix(self, scope_id: str) -> str | None:
         if not is_canonical_bank_id(scope_id):
             raise ValueError("AI command prefixes require a canonical chat identity")
@@ -2807,6 +2860,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return str(row["command_prefix"]) if row is not None else None
 
+    @_serialized
     async def set_ai_command_prefix(
         self,
         scope_id: str,
@@ -2840,6 +2894,7 @@ class AIStateRepository:
             )
         await connection.commit()
 
+    @_serialized
     async def get_ai_cooldown_override(self, scope_id: str) -> int | None:
         if not is_canonical_bank_id(scope_id):
             raise ValueError("AI cooldown overrides require a canonical chat identity")
@@ -2850,6 +2905,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return int(row["cooldown_seconds"]) if row is not None else None
 
+    @_serialized
     async def set_ai_cooldown_override(
         self,
         scope_id: str,
@@ -2884,6 +2940,7 @@ class AIStateRepository:
             )
         await connection.commit()
 
+    @_serialized
     async def is_allowed(self, actor_id: str) -> bool:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -2892,6 +2949,7 @@ class AIStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    @_serialized
     async def allow_user(self, actor_id: str) -> None:
         connection = self._require_connection()
         await connection.execute(
@@ -2901,6 +2959,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def deny_user(self, actor_id: str) -> None:
         connection = self._require_connection()
         await connection.execute(
@@ -2916,6 +2975,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def is_chat_access_open(self, scope_id: str) -> bool:
         if not is_canonical_bank_id(scope_id):
             raise ValueError("Chat access requires a canonical chat identity")
@@ -2925,6 +2985,7 @@ class AIStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    @_serialized
     async def set_chat_access_open(self, scope_id: str, enabled: bool) -> None:
         if not is_canonical_bank_id(scope_id):
             raise ValueError("Chat access requires a canonical chat identity")
@@ -2942,6 +3003,7 @@ class AIStateRepository:
             )
         await connection.commit()
 
+    @_serialized
     async def grant_bank(self, actor_id: str, bank_id: str) -> bool:
         if not is_canonical_actor_id(actor_id) or not is_canonical_bank_id(bank_id):
             raise ValueError("Bank grants require canonical actor and bank identities")
@@ -2966,6 +3028,7 @@ class AIStateRepository:
         await connection.commit()
         return granted
 
+    @_serialized
     async def revoke_bank(self, actor_id: str, bank_id: str) -> None:
         if not is_canonical_actor_id(actor_id) or not is_canonical_bank_id(bank_id):
             raise ValueError("Bank grants require canonical actor and bank identities")
@@ -2976,6 +3039,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def list_bank_grants(self, actor_id: str) -> tuple[str, ...]:
         if not is_canonical_actor_id(actor_id):
             raise ValueError("Bank grants require a canonical actor identity")
@@ -2985,6 +3049,7 @@ class AIStateRepository:
         )
         return tuple([str(row["bank_id"]) async for row in cursor])
 
+    @_serialized
     async def get_last_request_at(
         self,
         scope_id: str,
@@ -3001,6 +3066,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return float(row["last_request_at"]) if row else None
 
+    @_serialized
     async def set_last_request_at(
         self,
         scope_id: str,
@@ -3019,6 +3085,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def is_memory_forward_processed(
         self,
         *,
@@ -3033,6 +3100,7 @@ class AIStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    @_serialized
     async def record_memory_forward(
         self,
         *,
@@ -3059,6 +3127,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def get_memory_document_receipt(
         self,
         scope_id: str,
@@ -3073,6 +3142,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return _memory_document_receipt_from_row(row) if row else None
 
+    @_serialized
     async def get_memory_document_receipts(
         self,
         scope_id: str,
@@ -3096,6 +3166,7 @@ class AIStateRepository:
                 )
         return receipts
 
+    @_serialized
     async def find_memory_document_ids_for_sources(
         self,
         scope_id: str,
@@ -3142,6 +3213,7 @@ class AIStateRepository:
                 documents[str(row["source_id"])] = str(row["document_id"])
         return documents
 
+    @_serialized
     async def get_latest_memory_document_receipt(
         self,
         scope_id: str,
@@ -3163,6 +3235,7 @@ class AIStateRepository:
             return None
         return str(row["document_id"]), _memory_document_receipt_from_row(row)
 
+    @_serialized
     async def save_memory_document_receipt(
         self,
         scope_id: str,
@@ -3191,6 +3264,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def list_memory_outbox_documents(
         self,
         scope_id: str,
@@ -3211,6 +3285,7 @@ class AIStateRepository:
         cursor = await connection.execute(query, parameters)
         return tuple([_memory_outbox_item_from_row(row) async for row in cursor])
 
+    @_serialized
     async def list_due_memory_outbox_documents(
         self,
         scope_id: str,
@@ -3235,6 +3310,7 @@ class AIStateRepository:
         )
         return tuple([_memory_outbox_item_from_row(row) async for row in cursor])
 
+    @_serialized
     async def list_due_memory_outbox_scopes(
         self,
         *,
@@ -3258,6 +3334,7 @@ class AIStateRepository:
         )
         return tuple([str(row["scope_id"]) async for row in cursor])
 
+    @_serialized
     async def has_retryable_memory_outbox_documents(self, scope_id: str) -> bool:
         cursor = await self._require_connection().execute(
             """
@@ -3272,6 +3349,7 @@ class AIStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    @_serialized
     async def stage_continuous_memory_scan(
         self,
         scope_id: str,
@@ -3315,6 +3393,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def stage_dream_memory_scan(
         self,
         scope_id: str,
@@ -3434,6 +3513,7 @@ class AIStateRepository:
             ),
         )
 
+    @_serialized
     async def complete_memory_outbox_documents(
         self,
         scope_id: str,
@@ -3483,6 +3563,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def record_memory_outbox_failure(
         self,
         scope_id: str,
@@ -3516,6 +3597,7 @@ class AIStateRepository:
         )
         await self._require_connection().commit()
 
+    @_serialized
     async def requeue_memory_dead_letters(
         self,
         scope_id: str,
@@ -3550,6 +3632,7 @@ class AIStateRepository:
         await connection.commit()
         return cursor.rowcount
 
+    @_serialized
     async def find_memory_document_id_for_source(
         self,
         scope_id: str,
@@ -3571,6 +3654,7 @@ class AIStateRepository:
         row = await cursor.fetchone()
         return str(row["document_id"]) if row else None
 
+    @_serialized
     async def get_memory_scope_state(self, scope_id: str) -> MemoryScopeState:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -3594,6 +3678,7 @@ class AIStateRepository:
             last_retained_at=row["last_retained_at"],
         )
 
+    @_serialized
     async def list_enabled_memory_scope_states(
         self,
     ) -> tuple[MemoryScopeState, ...]:
@@ -3624,6 +3709,7 @@ class AIStateRepository:
         )
         return tuple([_memory_scope_state_from_row(row) async for row in cursor])
 
+    @_serialized
     async def record_memory_labels(
         self,
         scope_id: str,
@@ -3661,6 +3747,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def set_continuous_memory_enabled(
         self,
         scope_id: str,
@@ -3709,6 +3796,7 @@ class AIStateRepository:
             )
         await connection.commit()
 
+    @_serialized
     async def set_dream_memory_enabled(
         self,
         scope_id: str,
@@ -3731,6 +3819,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def list_memory_dream_scopes(self) -> tuple[str, ...]:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -3740,6 +3829,7 @@ class AIStateRepository:
         )
         return tuple([str(row["scope_id"]) async for row in cursor])
 
+    @_serialized
     async def list_continuous_memory_scopes(self) -> tuple[str, ...]:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -3748,6 +3838,7 @@ class AIStateRepository:
         )
         return tuple([str(row["scope_id"]) async for row in cursor])
 
+    @_serialized
     async def record_continuous_memory_attempt(
         self,
         scope_id: str,
@@ -3764,6 +3855,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def record_continuous_memory_success(
         self,
         scope_id: str,
@@ -3794,6 +3886,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def record_continuous_memory_failure(
         self,
         scope_id: str,
@@ -3814,6 +3907,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def get_memory_dream_state(self, scope_id: str) -> MemoryDreamState:
         connection = self._require_connection()
         cursor = await connection.execute(
@@ -3834,6 +3928,7 @@ class AIStateRepository:
             lease_expires_at=row["lease_expires_at"],
         )
 
+    @_serialized
     async def acquire_memory_dream_lease(
         self,
         scope_id: str,
@@ -3872,6 +3967,7 @@ class AIStateRepository:
         await connection.commit()
         return cursor.rowcount == 1
 
+    @_serialized
     async def renew_memory_dream_lease(
         self,
         scope_id: str,
@@ -3896,6 +3992,7 @@ class AIStateRepository:
         await connection.commit()
         return cursor.rowcount == 1
 
+    @_serialized
     async def release_memory_dream_lease(
         self,
         scope_id: str,
@@ -3913,6 +4010,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def record_memory_dream_attempt(
         self,
         scope_id: str,
@@ -3930,6 +4028,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def record_memory_dream_success(
         self,
         scope_id: str,
@@ -3965,6 +4064,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def record_memory_dream_failure(
         self,
         scope_id: str,
@@ -3986,6 +4086,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def mark_memory_excluded_message(
         self,
         scope_id: str,
@@ -4003,6 +4104,7 @@ class AIStateRepository:
         )
         await connection.commit()
 
+    @_serialized
     async def is_memory_excluded_message(
         self,
         scope_id: str,
@@ -4016,6 +4118,7 @@ class AIStateRepository:
         )
         return await cursor.fetchone() is not None
 
+    @_serialized
     async def get_memory_excluded_message_ids(
         self,
         scope_id: str,
@@ -4036,6 +4139,7 @@ class AIStateRepository:
                 excluded.add(row["message_id"])
         return frozenset(excluded)
 
+    @_serialized
     async def get_ai_answer_message_ids(
         self,
         scope_id: str,
@@ -4056,6 +4160,7 @@ class AIStateRepository:
                 answers.add(row["answer_message_id"])
         return frozenset(answers)
 
+    @_serialized
     async def get_ai_trigger_command_prefixes(
         self,
         scope_id: str,
