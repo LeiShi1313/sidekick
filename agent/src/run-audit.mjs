@@ -161,7 +161,8 @@ function memoryContextMetadata(value) {
 export function minimizeAuditData(type, value = {}) {
   const data = objectValue(value);
   switch (type) {
-    case "run.request":
+    case "run.request": {
+      const runBudgetMs = safeInteger(data.runBudgetMs);
       return {
         sessionId: safeString(data.sessionId, 128),
         parentEntryId: safeString(data.parentEntryId, 128),
@@ -169,6 +170,7 @@ export function minimizeAuditData(type, value = {}) {
         contextCount: suppliedCount(data, "contextCount", "context"),
         imageCount: safeInteger(data.imageCount) ?? 0,
         toolPolicy: safeString(data.toolPolicy, 32),
+        ...(runBudgetMs === null ? {} : { runBudgetMs }),
         model: safeString(data.model, 256),
         memoryEnabled:
           data.memoryEnabled === true ||
@@ -176,6 +178,7 @@ export function minimizeAuditData(type, value = {}) {
           objectValue(data.memory).scopeId != null,
         includeMemorySnapshot: data.includeMemorySnapshot === true,
       };
+    }
     case "memory.context":
       return memoryContextMetadata(data);
     case "memory.directory.policy":
@@ -237,6 +240,12 @@ export function minimizeAuditData(type, value = {}) {
       };
     case "model.turn.started":
       return { turn: safeInteger(data.turn) };
+    case "run.budget.finalizing":
+      return {
+        elapsedMs: safeInteger(data.elapsedMs),
+        remainingMs: safeInteger(data.remainingMs),
+        reserveMs: safeInteger(data.reserveMs),
+      };
     case "model.turn.completed":
       return {
         turn: safeInteger(data.turn),

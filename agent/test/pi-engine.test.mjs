@@ -353,7 +353,7 @@ async function fixture(handler, overrides = {}) {
     reasoningEffort: overrides.reasoningEffort ?? "off",
     maxOutputTokens: 1_000,
     contextWindow: 32_000,
-    requestTimeoutMs: 5_000,
+    requestTimeoutMs: overrides.requestTimeoutMs ?? 5_000,
     imageModel: overrides.imageModel ?? null,
     imageRequestTimeoutMs: 5_000,
     imageClient: overrides.imageClient,
@@ -403,6 +403,129 @@ test("lists bounded provider models and selects one for a single run", async () 
     assert.equal(app.provider.requests[0].model, "alternate-model");
     assert.equal(events.at(-1).answer, "alternate-model");
     assert.equal(app.engine.model.id, "test-model");
+  } finally {
+    await app.close();
+  }
+});
+
+test("uses the final provider window to answer without more tools", async () => {
+  const app = await fixture(
+    (_body, response, requestNumber) => {
+      if (requestNumber === 1) {
+        setTimeout(() => sendCodeToolCall(response), 300);
+        return;
+      }
+      setTimeout(
+        () => sendText(response, "Best answer from the evidence already gathered."),
+        200,
+      );
+    },
+    { requestTimeoutMs: 400 },
+  );
+  const runId = "18181818-1818-4818-8818-181818181818";
+  try {
+    const events = await collect(
+      app.engine,
+      request(runId, { runBudgetMs: 1_000 }),
+    );
+
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(
+      events.at(-1).answer,
+      "Best answer from the evidence already gathered.",
+    );
+    assert.equal(app.provider.requests.length, 2);
+    assert.ok((app.provider.requests[0].tools ?? []).length > 0);
+    assert.deepEqual(app.provider.requests[1].tools ?? [], []);
+    assert.equal(
+      events.some(
+        (event) =>
+          event.type === "tool_snapshot" &&
+          event.tool === "code_exec" &&
+          event.phase === "failed",
+      ),
+      true,
+    );
+    assert.match(
+      JSON.stringify(app.provider.requests[1].messages),
+      /run budget is nearly exhausted/i,
+    );
+
+    const audit = await app.engine.getRunAudit(runId);
+    const finalizing = audit.events.find(
+      (event) => event.type === "run.budget.finalizing",
+    );
+    assert.equal(
+      audit.events.find((event) => event.type === "run.request").data.runBudgetMs,
+      1_000,
+    );
+    assert.equal(finalizing.data.reserveMs, 800);
+    assert.ok(finalizing.data.remainingMs <= 800);
+    assert.equal(
+      audit.events.filter((event) => event.type === "model.turn.started").length,
+      app.provider.requests.length,
+    );
+
+    const sessionFile = (await readdir(app.engine.config.sessionDir)).find(
+      (name) => name.endsWith(".jsonl"),
+    );
+    const persisted = await readFile(
+      join(app.engine.config.sessionDir, sessionFile),
+      "utf8",
+    );
+    assert.doesNotMatch(persisted, /run budget is nearly exhausted/i);
+  } finally {
+    await app.close();
+  }
+});
+
+test("does not add a budget turn when the current turn already answers", async () => {
+  const app = await fixture(
+    (_body, response) => {
+      setTimeout(
+        () => sendText(response, "The current turn completed the answer."),
+        300,
+      );
+    },
+    { requestTimeoutMs: 400 },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("19191919-1919-4919-8919-191919191919", {
+        runBudgetMs: 1_000,
+      }),
+    );
+
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "The current turn completed the answer.");
+    assert.equal(app.provider.requests.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
+test("starts without tools when only the final response window remains", async () => {
+  const app = await fixture(
+    (_body, response) => sendText(response, "A concise answer."),
+    { requestTimeoutMs: 400 },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("20202020-2020-4020-8020-202020202020", {
+        runBudgetMs: 700,
+      }),
+    );
+
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "A concise answer.");
+    assert.equal(app.provider.requests.length, 1);
+    assert.deepEqual(app.provider.requests[0].tools ?? [], []);
+    assert.match(
+      JSON.stringify(app.provider.requests[0].messages),
+      /run budget is nearly exhausted/i,
+    );
   } finally {
     await app.close();
   }
@@ -1493,6 +1616,53 @@ test("terminates after streaming generated image bytes without persisting them",
     const audit = await app.engine.getRunAudit(runId);
     assert.doesNotMatch(rawSession, new RegExp(encoded));
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
+test("does not delay a generated image with a queued budget turn", async () => {
+  const encoded = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture(
+    (_body, response, requestNumber) => {
+      if (requestNumber === 1) {
+        sendToolCall(response, {
+          id: "call-slow-budget-image",
+          name: "image_generate",
+          args: { prompt: "A fox under the stars" },
+        });
+        return;
+      }
+      sendText(response, "This extra turn should not happen.");
+    },
+    {
+      requestTimeoutMs: 400,
+      imageModel: "gpt-image-2",
+      imageClient: {
+        images: {
+          async generate() {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            return { data: [{ b64_json: encoded }] };
+          },
+        },
+      },
+    },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("21212121-2121-4121-8121-212121212121", {
+        prompt: "Generate a fox under the stars",
+        runBudgetMs: 1_000,
+      }),
+    );
+
+    assert.equal(app.provider.requests.length, 1);
+    assert.equal(events.filter((event) => event.type === "attachment").length, 1);
+    assert.equal(events.at(-1).type, "run_completed");
+    assert.equal(events.at(-1).answer, "");
   } finally {
     await app.close();
   }
@@ -3093,7 +3263,7 @@ test("keeps runs available when audit storage cannot start", async () => {
   }
 });
 
-test("classifies provider rate limits without exposing provider details", async () => {
+test("classifies provider rate limits and scopes provider retries", async () => {
   const app = await fixture((_body, response) => {
     response.writeHead(429, { "content-type": "application/json" });
     response.end(
@@ -3111,6 +3281,7 @@ test("classifies provider rate limits without exposing provider details", async 
     );
 
     assert.equal(events.at(-1).type, "run_failed");
+    assert.equal(app.provider.requests.length, 9);
     assert.equal(events.at(-1).code, "RATE_LIMITED");
     assert.equal(
       events.at(-1).message,
@@ -3122,6 +3293,16 @@ test("classifies provider rate limits without exposing provider details", async 
     );
     assert(audit.events.some((event) => event.type === "run.failed"));
     assert.doesNotMatch(JSON.stringify(audit), /credential detail/);
+
+    const budgetedEvents = await collect(
+      app.engine,
+      request("56565656-5656-4656-8656-565656565656", {
+        runBudgetMs: 1,
+      }),
+    );
+    assert.equal(budgetedEvents.at(-1).type, "run_failed");
+    assert.equal(budgetedEvents.at(-1).code, "RATE_LIMITED");
+    assert.equal(app.provider.requests.length, 10);
   } finally {
     await app.close();
   }

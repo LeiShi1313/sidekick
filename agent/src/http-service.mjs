@@ -20,6 +20,7 @@ const MAX_ATTACHMENT_TEXT_CHARS = 50_000;
 const MAX_MEMORY_ANCHORS = 64;
 const MAX_BANK_GRANTS = 64;
 const MAX_PARTICIPANTS = 16;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const CONTEXT_KINDS = new Set(["conversation", "reference"]);
 const CUSTOMIZATION_TARGET_HANDLE_RE =
   /^(?:reply_author|direct_chat_participant|mention_[1-9][0-9]*)$/;
@@ -182,6 +183,7 @@ export function validateRunRequest(value) {
   const sessionId = value.sessionId;
   const parentEntryId = value.parentEntryId;
   const includeMemorySnapshot = value.includeMemorySnapshot;
+  const runBudgetMs = value.runBudgetMs;
   const model = value.model;
   const suppliedOrigin = value.origin;
   const suppliedIdentity = value.identity;
@@ -198,6 +200,12 @@ export function validateRunRequest(value) {
     !isBoundedString(value.prompt, 1, 16_000) ||
     !isBoundedString(value.systemPrompt, 1, 32_000) ||
     !new Set(["owner", "delegated", "none"]).has(value.toolPolicy) ||
+    !(
+      runBudgetMs === undefined ||
+      (Number.isSafeInteger(runBudgetMs) &&
+        runBudgetMs > 0 &&
+        runBudgetMs <= MAX_TIMER_DELAY_MS)
+    ) ||
     !(
       model === undefined ||
       isModelId(model)
@@ -434,6 +442,7 @@ export function validateRunRequest(value) {
     toolPolicy: value.toolPolicy,
     identity,
     origin,
+    ...(runBudgetMs === undefined ? {} : { runBudgetMs }),
     ...(model ? { model } : {}),
     ...(includeMemorySnapshot ? { includeMemorySnapshot: true } : {}),
     ...(memory ? { memory } : {}),
