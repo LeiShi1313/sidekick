@@ -145,6 +145,7 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
 
     assert received == {
         "runId": "11111111-1111-4111-8111-111111111111",
+        "runBudgetMs": 5_000,
         "sessionId": None,
         "parentEntryId": None,
         "prompt": "Calculate 6 * 7",
@@ -242,8 +243,10 @@ async def test_pi_gateway_sends_nonempty_customization_targets() -> None:
 
 @pytest.mark.asyncio
 async def test_pi_gateway_removes_only_the_owner_run_deadline() -> None:
+    received: list[dict] = []
+
     async def runs(request: web.Request) -> web.Response:
-        await request.json()
+        received.append(await request.json())
         await asyncio.sleep(0.15)
         return web.Response(
             text=(
@@ -265,10 +268,12 @@ async def test_pi_gateway_removes_only_the_owner_run_deadline() -> None:
             async for event in gateway.run(run_request(tool_policy="owner"))
         ]
         assert owner_events[-1].answer == "done"
+        assert "runBudgetMs" not in received[0]
 
         with pytest.raises(TimeoutError):
             async for _ in gateway.run(run_request()):
                 pass
+        assert received[1]["runBudgetMs"] == 50
     finally:
         await gateway.close()
         await runner.cleanup()

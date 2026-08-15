@@ -17,6 +17,7 @@ from sidekick.ai import (
     AgentRunRequest,
     PromptBuilder,
 )
+from sidekick.chat.output_policy import MainlandMessagingOutputPolicy
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 from sidekick.telegram.ai_transport import TelegramChatTransport
 
@@ -421,6 +422,214 @@ async def test_provider_timeout_gets_an_explicit_telegram_message():
     )
 
     result = await responder.answer(trigger, request)
+
+    assert result.succeeded is False
+    assert result.failure_code == "TIMEOUT"
+    assert trigger.replies[0].text == "AI request timed out. Try again later."
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_preserves_a_streamed_telegram_answer():
+    class PartialTimeoutGateway(FakeAgentGateway):
+        async def run(self, request):
+            self.requests.append(request)
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-timeout",
+            )
+            yield AgentEvent(
+                type="text_delta",
+                delta="I found Alice and Bob, but I could not verify Carol.",
+                reset=True,
+            )
+            raise TimeoutError
+
+    gateway = PartialTimeoutGateway()
+    responder = make_telegram_responder(gateway)
+    trigger = FakeMessage("/ai hello")
+    request = AgentRunRequest(
+        run_id="11111111-1111-4111-8111-111111111111",
+        session_id=None,
+        parent_entry_id=None,
+        prompt="hello",
+        context=(),
+        system_prompt=PromptBuilder().system_prompt,
+        tool_policy="delegated",
+        identity=AgentRequestIdentity(
+            requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+            anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+        ),
+        origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
+    )
+
+    result = await responder.answer(trigger, request)
+
+    assert result.succeeded is False
+    assert result.failure_code == "TIMEOUT"
+    assert result.text == (
+        "I found Alice and Bob, but I could not verify Carol.\n\n"
+        "AI time limit reached; this answer may be incomplete."
+    )
+    assert trigger.replies[0].text == result.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_settled", [False, True])
+async def test_provider_timeout_does_not_publish_pre_tool_narration(tool_settled):
+    class ToolTimeoutGateway(FakeAgentGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-timeout",
+            )
+            yield AgentEvent(
+                type="text_delta",
+                delta="I will update that now.",
+                reset=True,
+            )
+            yield AgentEvent(
+                type="tool_snapshot",
+                phase="started",
+                tool="requester_memory",
+                summary="Updating requester customization",
+            )
+            if tool_settled:
+                yield AgentEvent(
+                    type="tool_snapshot",
+                    phase="completed",
+                    tool="requester_memory",
+                    summary="Requester customization saved",
+                )
+            raise TimeoutError
+
+    responder = make_telegram_responder(ToolTimeoutGateway())
+    trigger = FakeMessage("/ai update it")
+
+    result = await responder.answer(
+        trigger,
+        AgentRunRequest(
+            run_id="11111111-1111-4111-8111-111111111111",
+            session_id=None,
+            parent_entry_id=None,
+            prompt="update it",
+            context=(),
+            system_prompt=PromptBuilder().system_prompt,
+            tool_policy="delegated",
+            identity=AgentRequestIdentity(
+                requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+                anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+            ),
+            origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
+        ),
+    )
+
+    assert result.succeeded is False
+    assert result.failure_code == "TOOL_OUTCOME_UNCONFIRMED"
+    assert trigger.replies[0].text == (
+        "AI returned no final response after using a tool. "
+        "The action may already have completed; verify before retrying."
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_preserves_post_tool_answer_text():
+    class PostToolTimeoutGateway(FakeAgentGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-timeout",
+            )
+            yield AgentEvent(
+                type="text_delta",
+                delta="I will check that.",
+                reset=True,
+            )
+            yield AgentEvent(
+                type="tool_snapshot",
+                phase="started",
+                tool="web_search",
+                summary="Searching web",
+            )
+            yield AgentEvent(
+                type="tool_snapshot",
+                phase="completed",
+                tool="web_search",
+                summary="Web search completed",
+            )
+            yield AgentEvent(
+                type="text_delta",
+                delta="The verified result is 42.",
+                reset=True,
+            )
+            raise TimeoutError
+
+    responder = make_telegram_responder(PostToolTimeoutGateway())
+    trigger = FakeMessage("/ai check")
+
+    result = await responder.answer(
+        trigger,
+        AgentRunRequest(
+            run_id="11111111-1111-4111-8111-111111111111",
+            session_id=None,
+            parent_entry_id=None,
+            prompt="check",
+            context=(),
+            system_prompt=PromptBuilder().system_prompt,
+            tool_policy="delegated",
+            identity=AgentRequestIdentity(
+                requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+                anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+            ),
+            origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
+        ),
+    )
+
+    assert result.succeeded is False
+    assert result.failure_code == "TIMEOUT"
+    assert result.text == (
+        "The verified result is 42.\n\n"
+        "AI time limit reached; this answer may be incomplete."
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_does_not_bypass_output_policy():
+    class PartialTimeoutGateway(FakeAgentGateway):
+        async def run(self, request):
+            yield AgentEvent(
+                type="run_started",
+                run_id=request.run_id,
+                session_id="session-timeout",
+            )
+            yield AgentEvent(type="text_delta", delta="partial", reset=True)
+            raise TimeoutError
+
+    responder = make_telegram_responder(
+        PartialTimeoutGateway(),
+        output_policy=MainlandMessagingOutputPolicy(),
+    )
+    trigger = FakeMessage("/ai hello")
+
+    result = await responder.answer(
+        trigger,
+        AgentRunRequest(
+            run_id="11111111-1111-4111-8111-111111111111",
+            session_id=None,
+            parent_entry_id=None,
+            prompt="hello",
+            context=(),
+            system_prompt=PromptBuilder().system_prompt,
+            tool_policy="delegated",
+            identity=AgentRequestIdentity(
+                requester=AgentIdentityAnchor("telegram:user:10", "Tester"),
+                anchors=(AgentIdentityAnchor("telegram:user:10", "Tester"),),
+            ),
+            origin=AgentRunOrigin("telegram:chat:-1001", "telegram-test"),
+        ),
+    )
 
     assert result.succeeded is False
     assert result.failure_code == "TIMEOUT"

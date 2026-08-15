@@ -71,6 +71,10 @@ const PUBLIC_AGENT_CWD = "/workspace";
 const EMPTY_RESPONSE_RETRY_PROMPT =
   "Your previous response was empty. Complete the original request now, " +
   "using an appropriate tool if needed.";
+const RUN_BUDGET_FINALIZATION_PROMPT =
+  "The host run budget is nearly exhausted. Do not call any more tools. " +
+  "Answer the original request now using only the information already " +
+  "available. Be concise and state any important uncertainty.";
 
 class SessionUnavailableError extends Error {
   constructor() {
@@ -392,7 +396,24 @@ function createCodeTool() {
   });
 }
 
-function constrainExtensions(result, { requireWeb, requireMcp }) {
+function guardToolExecution(definition, canExecuteTool) {
+  return defineTool({
+    ...definition,
+    async execute(...args) {
+      if (!canExecuteTool()) {
+        throw new Error(
+          "Tool execution skipped because the host run budget is ending",
+        );
+      }
+      return await definition.execute(...args);
+    },
+  });
+}
+
+function constrainExtensions(
+  result,
+  { requireWeb, requireMcp, canExecuteTool },
+) {
   let foundWebTools = false;
   let foundMcp = false;
   const extensions = result.extensions.map((extension) => {
@@ -419,6 +440,18 @@ function constrainExtensions(result, { requireWeb, requireMcp }) {
       tools.set("mcp", mcp);
       foundMcp = true;
     }
+    tools = new Map(
+      [...tools].map(([name, registeredTool]) => [
+        name,
+        {
+          ...registeredTool,
+          definition: guardToolExecution(
+            registeredTool.definition,
+            canExecuteTool,
+          ),
+        },
+      ]),
+    );
     return {
       ...extension,
       tools,
@@ -871,6 +904,7 @@ export class PiEngine {
       context: request.context,
       systemPrompt: request.systemPrompt,
       toolPolicy: request.toolPolicy,
+      runBudgetMs: request.runBudgetMs ?? null,
       model: request.model ?? null,
       origin: request.origin,
       identity: request.identity,
@@ -898,6 +932,7 @@ export class PiEngine {
         yield await cancelledEvent();
         return;
       }
+      const budgetState = { finalizing: false };
       let persistenceState = {
         privacyOptions: {
           sensitiveValues: [this.config.apiKey],
@@ -1048,6 +1083,7 @@ export class PiEngine {
         request.toolPolicy !== "none" && Boolean(this.config.mcpExtensionPath);
       const resourceLoader = await this.#resourceLoader(request.systemPrompt, {
         enableMcp: mcpEnabled,
+        canExecuteTool: () => !budgetState.finalizing,
       });
       const settingsManager = SettingsManager.inMemory(
         {
@@ -1058,7 +1094,7 @@ export class PiEngine {
             baseDelayMs: 1_000,
             provider: {
               timeoutMs: this.config.requestTimeoutMs,
-              maxRetries: 2,
+              maxRetries: request.runBudgetMs === undefined ? 2 : 0,
               maxRetryDelayMs: 10_000,
             },
           },
@@ -1101,6 +1137,10 @@ export class PiEngine {
         imageTools.length > 0,
       );
       const modelRuntime = await this.#modelRuntime();
+      const customTools = [this.codeTool, ...allMemoryTools, ...imageTools].map(
+        (definition) =>
+          guardToolExecution(definition, () => !budgetState.finalizing),
+      );
       const { session } = await createAgentSession({
         cwd: PUBLIC_AGENT_CWD,
         agentDir: this.config.agentDir,
@@ -1108,7 +1148,7 @@ export class PiEngine {
         model,
         thinkingLevel: this.thinkingLevel,
         tools: toolNames,
-        customTools: [this.codeTool, ...allMemoryTools, ...imageTools],
+        customTools,
         resourceLoader,
         sessionManager,
         settingsManager,
@@ -1160,12 +1200,63 @@ export class PiEngine {
       };
       sanitizeConversationHistoryInPlace(session.messages, privacyOptions);
 
+      const runStartedAtMs = Date.parse(activeRun.startedAt);
+      const elapsedRunMs = () => Math.max(0, Date.now() - runStartedAtMs);
+      const remainingRunMs = () =>
+        Math.max(0, request.runBudgetMs - elapsedRunMs());
+      const finalizationReserveMs = this.config.requestTimeoutMs * 2;
+      const finalizationDelayMs =
+        request.runBudgetMs === undefined
+          ? null
+          : Math.max(
+              0,
+              request.runBudgetMs -
+                finalizationReserveMs -
+                elapsedRunMs(),
+            );
+      let budgetInstructionQueued = false;
+      let budgetInstructionTask = Promise.resolve();
+      let budgetNeedsFinalTurn = false;
+      let finalAnswer = "";
+      let hasGeneratedAttachment = false;
+      const budgetInstruction = () => ({
+        customType: "run-budget-finalization",
+        content: RUN_BUDGET_FINALIZATION_PROMPT,
+        display: false,
+      });
+      const queueBudgetInstruction = () => {
+        if (budgetInstructionQueued) return;
+        budgetInstructionQueued = true;
+        budgetNeedsFinalTurn = true;
+        if (session.isStreaming) {
+          budgetInstructionTask = session
+            .sendCustomMessage(budgetInstruction(), { deliverAs: "steer" })
+            .catch(() => {});
+        }
+      };
+      const beginBudgetFinalization = ({ queueInstruction = true } = {}) => {
+        if (budgetState.finalizing) return;
+        budgetState.finalizing = true;
+        session.setActiveToolsByName([]);
+        session.setAutoRetryEnabled(false);
+        session.abortRetry();
+        if (
+          queueInstruction &&
+          !finalAnswer.trim() &&
+          !hasGeneratedAttachment
+        ) {
+          queueBudgetInstruction();
+        }
+        void record("run.budget.finalizing", {
+          elapsedMs: elapsedRunMs(),
+          remainingMs: remainingRunMs(),
+          reserveMs: finalizationReserveMs,
+        });
+      };
       const queue = new AsyncQueue();
       const toolStartedAt = new Map();
       let firstTextInTurn = true;
       let textStream = new SensitiveTextStream(privacyOptions);
-      let finalAnswer = "";
-      let hasGeneratedAttachment = false;
       let nativeImageOutput = null;
       let nativeImageIgnored = false;
       let toolExecutionStarted = false;
@@ -1180,17 +1271,20 @@ export class PiEngine {
         });
         firstTextInTurn = false;
       };
+      const markTurnStarted = () => {
+        firstTextInTurn = true;
+        textStream = new SensitiveTextStream(privacyOptions);
+        turnNumber += 1;
+        turnStartedAt = Date.now();
+        this.#updateActiveRun(activeRun, {
+          phase: "model_running",
+          currentTool: null,
+        });
+        void record("model.turn.started", { turn: turnNumber });
+      };
       const unsubscribe = session.subscribe((event) => {
         if (event.type === "turn_start") {
-          firstTextInTurn = true;
-          textStream = new SensitiveTextStream(privacyOptions);
-          turnNumber += 1;
-          turnStartedAt = Date.now();
-          this.#updateActiveRun(activeRun, {
-            phase: "model_running",
-            currentTool: null,
-          });
-          void record("model.turn.started", { turn: turnNumber });
+          markTurnStarted();
         } else if (
           event.type === "message_update" &&
           event.assistantMessageEvent.type === "text_delta"
@@ -1256,6 +1350,10 @@ export class PiEngine {
           generatedArtifacts.delete(event.toolCallId);
           if (!event.isError && artifact) {
             hasGeneratedAttachment = true;
+            if (budgetState.finalizing) {
+              budgetNeedsFinalTurn = false;
+              session.clearQueue();
+            }
             queue.push({ type: "attachment", ...artifact });
             void record("image.output.accepted", {
               source: IMAGE_TOOL_NAME,
@@ -1277,6 +1375,13 @@ export class PiEngine {
           turnStartedAt = null;
           if (event.toolResults.length === 0) {
             finalAnswer = extractText(event.message);
+            if (
+              budgetState.finalizing &&
+              (finalAnswer.trim() || hasGeneratedAttachment)
+            ) {
+              budgetNeedsFinalTurn = false;
+              session.clearQueue();
+            }
           }
         }
       });
@@ -1286,6 +1391,13 @@ export class PiEngine {
         continuation: request.sessionId !== null,
         identityAliasKey: this.config.identityAliasKey,
       });
+      let initialPrompt = preparedPrompt;
+      if (finalizationDelayMs === 0) {
+        beginBudgetFinalization({ queueInstruction: false });
+        initialPrompt =
+          `${preparedPrompt}\n\n<host_run_budget>\n` +
+          `${RUN_BUDGET_FINALIZATION_PROMPT}\n</host_run_budget>`;
+      }
       await record("model.input", {
         model: {
           id: model.id,
@@ -1295,8 +1407,8 @@ export class PiEngine {
           thinkingLevel: this.thinkingLevel,
         },
         systemPrompt: request.systemPrompt,
-        prompt: preparedPrompt,
-        tools: toolNames,
+        prompt: initialPrompt,
+        tools: session.getActiveToolNames(),
         sessionMessagesBeforePrompt: session.messages,
         imageCount: request.images?.length ?? 0,
       });
@@ -1328,24 +1440,50 @@ export class PiEngine {
         nativeImageOutput = output;
         hasGeneratedAttachment = true;
       };
+      let finalizationTimer = null;
       const task = (async () => {
         try {
-          await this.nativeImageReceiver.run(receiveNativeImage, () =>
-            session.prompt(preparedPrompt, {
-              expandPromptTemplates: false,
-              source: "rpc",
-              images: request.images?.map((image) => ({
-                type: "image",
-                data: image.data.toString("base64"),
-                mimeType: image.mimeType,
-              })),
-            }),
+          const promptTask = this.nativeImageReceiver.run(
+            receiveNativeImage,
+            () =>
+              session.prompt(initialPrompt, {
+                expandPromptTemplates: false,
+                source: "rpc",
+                images: request.images?.map((image) => ({
+                  type: "image",
+                  data: image.data.toString("base64"),
+                  mimeType: image.mimeType,
+                })),
+              }),
           );
+          if (finalizationDelayMs !== null && finalizationDelayMs > 0) {
+            finalizationTimer = setTimeout(
+              beginBudgetFinalization,
+              finalizationDelayMs,
+            );
+          }
+          await promptTask;
+          await budgetInstructionTask;
+          if (
+            budgetState.finalizing &&
+            budgetNeedsFinalTurn &&
+            !activeRun.cancelRequested &&
+            !finalAnswer.trim() &&
+            !hasGeneratedAttachment
+          ) {
+            session.clearQueue();
+            await this.nativeImageReceiver.run(receiveNativeImage, () =>
+              session.sendCustomMessage(budgetInstruction(), {
+                triggerTurn: true,
+              }),
+            );
+          }
           let lastAssistant = [...session.messages]
             .reverse()
             .find((message) => message.role === "assistant");
           if (
             lastAssistant?.stopReason === "stop" &&
+            !budgetState.finalizing &&
             !toolExecutionStarted &&
             !hasGeneratedAttachment &&
             !extractText(lastAssistant).trim()
@@ -1447,6 +1585,7 @@ export class PiEngine {
         } catch (error) {
           queue.fail(error);
         } finally {
+          if (finalizationTimer !== null) clearTimeout(finalizationTimer);
           this.#removeActiveRun(activeRun);
           unsubscribe();
           await closeAgentSession(session);
@@ -1564,7 +1703,10 @@ export class PiEngine {
     return manager;
   }
 
-  async #resourceLoader(systemPrompt, { enableMcp = true } = {}) {
+  async #resourceLoader(
+    systemPrompt,
+    { enableMcp = true, canExecuteTool = () => true } = {},
+  ) {
     const settingsManager = SettingsManager.inMemory(
       { packages: [], defaultProjectTrust: "never" },
       { projectTrusted: false },
@@ -1598,6 +1740,7 @@ export class PiEngine {
               constrainExtensions(result, {
                 requireWeb: hasWeb,
                 requireMcp: hasMcp,
+                canExecuteTool,
               }),
           }
         : {}),

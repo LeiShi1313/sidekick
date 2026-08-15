@@ -118,6 +118,51 @@ test("streams a run as NDJSON", async () => {
   }
 });
 
+test("accepts a positive timer-safe run budget and rejects invalid values", async () => {
+  const received = [];
+  const engine = {
+    async *run(request) {
+      received.push(request);
+      yield {
+        type: "run_completed",
+        sessionId: "s",
+        entryId: "e",
+        answer: "ok",
+      };
+    },
+    async cancel() {
+      return false;
+    },
+  };
+  const app = await listen(engine);
+  const headers = {
+    "content-type": "application/json",
+    authorization: `Bearer ${OPERATOR_TOKEN}`,
+  };
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...validRun, runBudgetMs: 300_000 }),
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.equal(received[0].runBudgetMs, 300_000);
+
+    for (const runBudgetMs of [null, 0, -1, 1.5, "300000", 2_147_483_648]) {
+      const rejected = await fetch(`${app.baseUrl}/v1/runs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ ...validRun, runBudgetMs }),
+      });
+      assert.equal(rejected.status, 400);
+    }
+    assert.equal(received.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
 test("accepts one bounded JPEG model input and rejects invalid image arrays", async () => {
   const received = [];
   const engine = {

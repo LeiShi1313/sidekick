@@ -109,6 +109,10 @@ MAX_AGENT_ATTACHMENT_EVENT_BYTES = (
 MAX_AGENT_MEMORY_ANCHORS = 64
 MAX_AGENT_BANK_GRANTS = 64
 MAX_AGENT_PARTICIPANTS = 16
+_TOOL_OUTCOME_UNCONFIRMED = (
+    "AI returned no final response after using a tool. "
+    "The action may already have completed; verify before retrying."
+)
 _PERSISTED_ERROR_KIND_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{0,127})(?::|$)")
 
 
@@ -243,6 +247,7 @@ class PiAgentGateway:
             raise ValueError("Pi agent timeout must be positive")
         self._headers = {"Authorization": f"Bearer {token}"}
         self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._run_budget_ms = max(1, int(timeout * 1_000))
         self._session: aiohttp.ClientSession | None = None
 
     async def close(self) -> None:
@@ -307,6 +312,8 @@ class PiAgentGateway:
                 "adapterInstanceId": request.origin.adapter_instance_id,
             },
         }
+        if request.tool_policy != "owner":
+            payload["runBudgetMs"] = self._run_budget_ms
         if request.model is not None:
             payload["model"] = request.model
         if request.images:
@@ -935,12 +942,21 @@ class AIResponder:
         attachment_message: SentMessage | None = None
         session_id: str | None = None
         entry_id: str | None = None
+        tool_seen = False
+        active_tools = 0
+        partial_safe = False
         try:
             async for event in self._gateway.run(request):
                 if event.type == "run_started":
                     session_id = event.session_id
                     continue
                 if event.type == "tool_snapshot":
+                    tool_seen = True
+                    if event.phase == "started":
+                        active_tools += 1
+                        partial_safe = False
+                    elif event.phase in {"completed", "failed"}:
+                        active_tools = max(0, active_tools - 1)
                     if event.summary and self._output_policy is None:
                         await self._edit_message(
                             answer,
@@ -958,6 +974,8 @@ class AIResponder:
                 if event.type == "text_delta":
                     assert event.delta is not None
                     text = event.delta if event.reset else text + event.delta
+                    if event.reset:
+                        partial_safe = active_tools == 0
                     if self._output_policy is None:
                         visible = self._truncate(text)
                         await self._edit_formatted(answer, visible, wait=False)
@@ -1018,19 +1036,14 @@ class AIResponder:
                             failure_code="EMPTY_RESPONSE",
                         )
                     if event.code == "TOOL_OUTCOME_UNCONFIRMED":
-                        unconfirmed = (
-                            "AI returned no final response after using a tool. "
-                            "The action may already have completed; verify before "
-                            "retrying."
-                        )
                         await self._edit_message(
                             answer,
-                            unconfirmed,
+                            _TOOL_OUTCOME_UNCONFIRMED,
                             wait=True,
                         )
                         return AnswerResult(
                             message=answer,
-                            text=unconfirmed,
+                            text=_TOOL_OUTCOME_UNCONFIRMED,
                             succeeded=False,
                             failure_code="TOOL_OUTCOME_UNCONFIRMED",
                         )
@@ -1147,6 +1160,30 @@ class AIResponder:
             )
         except TimeoutError as exc:
             self._log_failure(exc)
+            partial_candidate = bool(
+                text.strip() and partial_safe and active_tools == 0
+            )
+            if partial_candidate and self._output_policy is None:
+                partial = self._timeout_partial(text)
+                if await self._edit_formatted(answer, partial, wait=True):
+                    return AnswerResult(
+                        message=answer,
+                        text=partial,
+                        succeeded=False,
+                        failure_code="TIMEOUT",
+                    )
+            if not partial_candidate and tool_seen:
+                await self._edit_message(
+                    answer,
+                    _TOOL_OUTCOME_UNCONFIRMED,
+                    wait=True,
+                )
+                return AnswerResult(
+                    message=answer,
+                    text=_TOOL_OUTCOME_UNCONFIRMED,
+                    succeeded=False,
+                    failure_code="TOOL_OUTCOME_UNCONFIRMED",
+                )
             failure = "AI request timed out. Try again later."
             await self._edit_message(
                 answer,
@@ -1188,6 +1225,17 @@ class AIResponder:
         if len(text) <= self._max_output_chars:
             return text
         return f"{text[: self._max_output_chars - 3]}..."
+
+    def _timeout_partial(self, text: str) -> str:
+        notice = "AI time limit reached; this answer may be incomplete."
+        separator = "\n\n"
+        available = self._max_output_chars - len(separator) - len(notice)
+        if available < 4:
+            return self._truncate(notice)
+        partial = text.strip()
+        if len(partial) > available:
+            partial = f"{partial[: available - 3]}..."
+        return f"{partial}{separator}{notice}"
 
     async def _edit_formatted(
         self,
