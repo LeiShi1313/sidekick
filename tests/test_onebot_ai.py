@@ -379,18 +379,12 @@ async def test_onebot_plugin_rejects_events_for_another_account() -> None:
 
 @pytest.mark.asyncio
 async def test_onebot_plugin_persists_only_candidate_identity_and_origin() -> None:
-    class InboundStore:
+    class Workflow:
         def __init__(self):
             self.accepted = []
 
-        async def accept_pending_ai_event(self, source_id, **work):
-            self.accepted.append((source_id, work))
-
-    class Pool:
-        notified = False
-
-        def notify(self):
-            self.notified = True
+        async def accept(self, **work):
+            self.accepted.append(work)
 
     class Transport:
         async def classify_origin(self, _message):
@@ -403,36 +397,30 @@ async def test_onebot_plugin_persists_only_candidate_identity_and_origin() -> No
     plugin._directory = OneBotDirectory()
     plugin._handler = object()
     plugin._transport = Transport()
-    plugin._inbound_store = InboundStore()
-    plugin._inbound_pool = Pool()
+    plugin._ai_workflow = Workflow()
     plugin.logger = logging.getLogger("test-onebot-durable-accept")
 
     await plugin._on_event(group_event(text="ambient chat"))
 
-    assert plugin._inbound_store.accepted == []
-    assert plugin._inbound_pool.notified is False
+    assert plugin._ai_workflow.accepted == []
 
     await plugin._on_event(group_event())
 
-    assert plugin._inbound_store.accepted == [
-        (
-            "qq-test",
-            {
-                "cursor": 101,
-                "chat_id": 700,
-                "message_id": 101,
-                "kind": "message",
-                "attested_origin": MessageOrigin.INCOMING,
-            },
-        )
+    assert plugin._ai_workflow.accepted == [
+        {
+            "cursor": 101,
+            "chat_id": 700,
+            "message_id": 101,
+            "kind": "message",
+            "attested_origin": MessageOrigin.INCOMING,
+        }
     ]
-    assert plugin._inbound_pool.notified is True
 
 
 @pytest.mark.asyncio
 async def test_onebot_plugin_never_queues_generated_echo() -> None:
-    class RejectingStore:
-        async def accept_pending_ai_event(self, *_args, **_kwargs):
+    class RejectingWorkflow:
+        async def accept(self, **_kwargs):
             raise AssertionError("generated echo must not be persisted")
 
     class Transport:
@@ -446,8 +434,7 @@ async def test_onebot_plugin_never_queues_generated_echo() -> None:
     plugin._directory = OneBotDirectory()
     plugin._handler = object()
     plugin._transport = Transport()
-    plugin._inbound_store = RejectingStore()
-    plugin._inbound_pool = SimpleNamespace(notify=lambda: None)
+    plugin._ai_workflow = RejectingWorkflow()
     plugin.logger = logging.getLogger("test-onebot-generated-drop")
 
     await plugin._on_event(group_event(post_type="message_sent", sender_id=99))

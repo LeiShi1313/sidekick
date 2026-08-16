@@ -10,6 +10,7 @@ from sidekick.ai import (
     AIAnswerMarker,
     AIConversationHandler,
     AIResponder,
+    AIWorkflowCancellation,
     AgentEvent,
     AgentIdentityAnchor,
     AgentRequestIdentity,
@@ -691,6 +692,52 @@ async def test_ai_cancel_aborts_only_the_requesters_active_run():
     assert gateway.cancelled == [run_id]
     assert cancel.replies[0].text == "AI request cancellation requested."
     assert trigger.replies[0].text == "AI request cancelled."
+
+
+@pytest.mark.asyncio
+async def test_ai_cancel_persists_queue_intent_before_fallible_pi_cancel():
+    events: list[str] = []
+
+    class FailingCancelGateway(FakeAgentGateway):
+        async def cancel(self, run_id: str) -> bool:
+            del run_id
+            events.append("pi-cancel")
+            raise RuntimeError("cancel transport failed")
+
+    class WorkflowControl:
+        async def cancel_generations(
+            self,
+            principal_actor_id: str,
+            *,
+            interrupt_running: bool,
+        ) -> AIWorkflowCancellation:
+            assert principal_actor_id == TELEGRAM_IDENTITY_CODEC.actor_id(10)
+            assert interrupt_running
+            events.append("durable-cancel")
+            return AIWorkflowCancellation(queued=1, running=1)
+
+        async def reschedule_scope(self, _scope_id: str) -> int:
+            return 0
+
+    handler = AIConversationHandler(
+        owner_id=10,
+        responder=make_telegram_responder(FailingCancelGateway()),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(identity_codec=TELEGRAM_IDENTITY_CODEC),
+        identity_codec=TELEGRAM_IDENTITY_CODEC,
+    )
+    control = WorkflowControl()
+    handler.bind_workflow_control(control)
+    actor_id = TELEGRAM_IDENTITY_CODEC.actor_id(10)
+    handler._active_runs[actor_id] = {"run-with-failed-cancel"}
+
+    cancel = FakeMessage("/ai_cancel")
+    assert await handler.handle(cancel) is True
+
+    assert events == ["durable-cancel", "pi-cancel"]
+    assert cancel.replies[0].text == (
+        "AI request cancellation requested; cancelled 1 queued request."
+    )
 
 
 @pytest.mark.asyncio

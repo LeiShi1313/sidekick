@@ -164,6 +164,11 @@ class WeChatAI(metaclass=PluginMount):
                 if self._channel_runtime is not None
                 else None
             ),
+            generation_queue_probe=lambda: (
+                self._inbound_store.get_ai_generation_queue_snapshot(
+                    self._ops_settings.instance_id
+                )
+            ),
         )
         self._ops_server = ChannelOpsServer(
             snapshot_service=ChannelSnapshotService(
@@ -222,10 +227,10 @@ class WeChatAI(metaclass=PluginMount):
                     handler = await self._activate_channel_runtime(bootstrap)
                     self._adapter_status.update(
                         account_id=bootstrap.session.self_id,
-                        connected=True,
+                        connected=False,
                     )
                     self.logger.info(
-                        "WeChat AI connected (generation=%s)",
+                        "WeChat AI bootstrap ready (generation=%s)",
                         bootstrap.session.connection_generation,
                     )
                     result = await WeChatEventPump(
@@ -235,6 +240,10 @@ class WeChatAI(metaclass=PluginMount):
                         connector_key=self._client.base_url,
                         source_id=self._ops_settings.instance_id,
                         bootstrap=bootstrap,
+                        reconnect_delay=self._runtime.reconnect_delay,
+                        stream_status_callback=lambda connected: (
+                            self._adapter_status.update(connected=connected)
+                        ),
                     ).run(handler, stop)
                     if result == "stopped":
                         break

@@ -44,11 +44,8 @@ from sidekick.channel_status import (
     ChannelOpsSettings,
     ChannelSnapshotService,
 )
-from sidekick.inbound import (
-    DurableInboundPool,
-    DurableInboundWorker,
-    is_ai_candidate,
-)
+from sidekick.ai_workflow import AIWorkflow
+from sidekick.inbound import is_ai_candidate
 from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.memory_admin import MemoryAdminService
 from sidekick.onebot.ai import (
@@ -104,7 +101,7 @@ class OneBotRuntimeSettings:
 class OneBotAI(metaclass=PluginMount):
     command_group = "onebot"
     command_name = "ai"
-    INBOUND_CONCURRENCY = 8
+    GENERATION_CONCURRENCY = 8
 
     def __init__(self, log_level: str = "info"):
         self._runtime = OneBotRuntimeSettings.from_env()
@@ -140,7 +137,7 @@ class OneBotAI(metaclass=PluginMount):
         self._dream_scheduler: DreamScheduler | None = None
         self._continuous_scheduler: ContinuousMemoryScheduler | None = None
         self._memory_outbox_scheduler: MemoryOutboxScheduler | None = None
-        self._inbound_pool: DurableInboundPool | None = None
+        self._ai_workflow: AIWorkflow | None = None
         self._adapter_status = AdapterRuntimeState(
             id=self._ops_settings.instance_id,
             platform="qq",
@@ -150,6 +147,11 @@ class OneBotAI(metaclass=PluginMount):
                 self._transport.indeterminate_outbound_count
                 if self._transport is not None
                 else None
+            ),
+            generation_queue_probe=lambda: (
+                self._inbound_store.get_ai_generation_queue_snapshot(
+                    self._ops_settings.instance_id
+                )
             ),
         )
         self._ops_server = ChannelOpsServer(
@@ -188,9 +190,9 @@ class OneBotAI(metaclass=PluginMount):
             await self._verify_account()
             self._adapter_status.update(connected=True)
             await self._refresh_directory()
-            if self._inbound_pool is None:
-                raise RuntimeError("OneBot inbound worker pool is unavailable")
-            self._inbound_pool.start()
+            if self._ai_workflow is None:
+                raise RuntimeError("OneBot AI workflow is unavailable")
+            self._ai_workflow.start()
             if self._continuous_scheduler is not None:
                 self._continuous_scheduler.start()
             if self._dream_scheduler is not None:
@@ -201,8 +203,8 @@ class OneBotAI(metaclass=PluginMount):
             await stop.wait()
         finally:
             self._adapter_status.update(connected=False)
-            if self._inbound_pool is not None:
-                await self._inbound_pool.close()
+            if self._ai_workflow is not None:
+                await self._ai_workflow.close()
             await self._ops_server.close()
             if self._continuous_scheduler is not None:
                 await self._continuous_scheduler.close()
@@ -330,18 +332,12 @@ class OneBotAI(metaclass=PluginMount):
             self_id=self._runtime.self_id,
             directory=self._directory,
         )
-        inbound_worker = DurableInboundWorker(
+        self._ai_workflow = AIWorkflow(
             inbound_source,
             self._inbound_store,
             self._ops_settings.instance_id,
-            logger=self.logger,
-        )
-        self._inbound_pool = DurableInboundPool(
-            inbound_worker,
-            self._inbound_store,
-            self._ops_settings.instance_id,
             self._handler,
-            concurrency=self.INBOUND_CONCURRENCY,
+            generation_concurrency=self.GENERATION_CONCURRENCY,
             logger=self.logger,
         )
         self._bridge.set_event_handler(self._on_event)
@@ -380,7 +376,7 @@ class OneBotAI(metaclass=PluginMount):
         if (
             self._handler is None
             or self._transport is None
-            or self._inbound_pool is None
+            or self._ai_workflow is None
         ):
             return
         try:
@@ -398,15 +394,13 @@ class OneBotAI(metaclass=PluginMount):
             return
         if not is_ai_candidate(message):
             return
-        await self._inbound_store.accept_pending_ai_event(
-            self._ops_settings.instance_id,
+        await self._ai_workflow.accept(
             cursor=message.id,
             chat_id=message.chat_id,
             message_id=message.id,
             kind="message",
             attested_origin=origin,
         )
-        self._inbound_pool.notify()
 
 
 class _OneBotMemoryAdminCommand:
@@ -501,22 +495,26 @@ def _onebot_memory_admin_client(
     timeout: float = 900,
 ) -> OneBotMemoryAdminClient:
     runtime = OneBotRuntimeSettings.from_env()
-    resolved_url = admin_url.strip() or os.environ.get(
-        "SIDEKICK_ONEBOT_ADMIN_URL",
-        "",
-    ).strip()
+    resolved_url = (
+        admin_url.strip()
+        or os.environ.get(
+            "SIDEKICK_ONEBOT_ADMIN_URL",
+            "",
+        ).strip()
+    )
     if not resolved_url:
         publish_port = _positive_int(
             os.environ.get("SIDEKICK_ONEBOT_PUBLISH_PORT", "18867")
         )
         if publish_port is None or publish_port > 65_535:
-            raise ValueError(
-                "SIDEKICK_ONEBOT_PUBLISH_PORT must be between 1 and 65535"
-            )
-        publish_host = os.environ.get(
-            "SIDEKICK_ONEBOT_PUBLISH_HOST",
-            "127.0.0.1",
-        ).strip() or "127.0.0.1"
+            raise ValueError("SIDEKICK_ONEBOT_PUBLISH_PORT must be between 1 and 65535")
+        publish_host = (
+            os.environ.get(
+                "SIDEKICK_ONEBOT_PUBLISH_HOST",
+                "127.0.0.1",
+            ).strip()
+            or "127.0.0.1"
+        )
         if publish_host == "0.0.0.0":
             publish_host = "127.0.0.1"
         resolved_url = f"http://{publish_host}:{publish_port}"

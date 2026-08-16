@@ -49,6 +49,7 @@ from sidekick.chat.commands import (
     AIPrefixCommand,
     AccessCommand,
     BankGrantCommand,
+    ChatCommand,
     ChatAccessCommand,
     DirectoryPublishCommand,
     InvalidCommand,
@@ -4288,6 +4289,30 @@ class AIRateLimiter:
             self._in_flight.add(actor_id)
             return True
 
+    async def eligible_at(
+        self,
+        *,
+        scope_id: str,
+        actor_id: str,
+        is_owner: bool,
+    ) -> float:
+        """Return the first time a durably queued request may start.
+
+        In-flight ownership belongs to the workflow queue. This method only
+        evaluates the durable cooldown policy and never reserves capacity.
+        """
+        now = self._clock()
+        if is_owner:
+            return now
+        last_request_at = await self._store.get_last_request_at(
+            scope_id,
+            actor_id,
+        )
+        if last_request_at is None:
+            return now
+        cooldown_seconds = await self.cooldown_seconds_for(scope_id)
+        return max(now, last_request_at + cooldown_seconds)
+
     async def release(
         self,
         *,
@@ -4306,6 +4331,59 @@ class AIRateLimiter:
                 )
             finally:
                 self._in_flight.discard(actor_id)
+
+
+AIMessageDisposition = Literal["immediate", "generation"]
+
+
+@dataclass(frozen=True, slots=True)
+class AIMessageClassification:
+    disposition: AIMessageDisposition
+    principal_actor_id: str | None = None
+    scope_id: str | None = None
+    is_owner: bool = False
+
+    def __post_init__(self) -> None:
+        if self.disposition == "generation":
+            if not self.principal_actor_id or not self.scope_id:
+                raise ValueError(
+                    "Generation classification requires principal and scope"
+                )
+        elif self.principal_actor_id is not None or self.scope_id is not None:
+            raise ValueError(
+                "Immediate classification cannot carry generation identity"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class AIWorkflowCancellation:
+    queued: int = 0
+    running: int = 0
+
+
+class AIWorkflowControl(Protocol):
+    async def cancel_generations(
+        self,
+        principal_actor_id: str,
+        *,
+        interrupt_running: bool,
+    ) -> AIWorkflowCancellation: ...
+
+    async def reschedule_scope(self, scope_id: str) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _AIMessageRouting:
+    origin: MessageOrigin
+    requester_actor_id: str
+    principal_actor_id: str
+    message_text: str | None
+    scope_id: str
+    ai_prefix: str
+    command: ChatCommand | None
+    is_owner: bool
+    allow_individual_access: bool
+    is_owner_control: bool
 
 
 class AIConversationHandler:
@@ -4362,17 +4440,26 @@ class AIConversationHandler:
         self._adapter_instance_id = (
             adapter_instance_id or f"{self._identity_codec.source}-local"
         )
-        self._active_runs: dict[str, str] = {}
+        self._active_runs: dict[str, set[str]] = {}
         self._active_request_runs: dict[tuple[str, ExternalId], str] = {}
+        self._workflow_control: AIWorkflowControl | None = None
 
-    async def handle(
+    def bind_workflow_control(self, control: AIWorkflowControl) -> None:
+        if self._workflow_control is not None and self._workflow_control is not control:
+            raise RuntimeError("AI workflow control is already bound")
+        self._workflow_control = control
+
+    def unbind_workflow_control(self, control: AIWorkflowControl) -> None:
+        if self._workflow_control is control:
+            self._workflow_control = None
+
+    async def _route_message(
         self,
         message: ReplyTarget,
-        *,
-        attested_origin: MessageOrigin | None = None,
-    ) -> bool:
+        attested_origin: MessageOrigin | None,
+    ) -> _AIMessageRouting | None:
         if message.sender_id is None or message.chat_id is None:
-            return False
+            return None
         if attested_origin is None:
             origin = await self._transport.classify_origin(message)
         elif not isinstance(attested_origin, MessageOrigin):
@@ -4380,16 +4467,16 @@ class AIConversationHandler:
         else:
             origin = attested_origin
         if origin is MessageOrigin.SIDEKICK_GENERATED:
-            return False
+            return None
         if origin is MessageOrigin.INDETERMINATE:
             if self._logger is not None:
                 self._logger.warning(
                     "Ignoring outgoing message with indeterminate local provenance"
                 )
-            return False
+            return None
         requester_actor_id = self._prompt_builder.message_actor_id(message)
         if requester_actor_id is None:
-            return False
+            return None
         principal_actor_id = self._identity_codec.actor_id(message.sender_id)
         message_text = self._prompt_builder.message_text(message)
         scope_id = self._identity_codec.scope_id(message.chat_id)
@@ -4403,6 +4490,143 @@ class AIConversationHandler:
         # legitimately attribute such a post to a channel rather than the
         # account's user identity.
         is_owner_control = is_owner or origin is MessageOrigin.MANUAL_OUTGOING
+        return _AIMessageRouting(
+            origin=origin,
+            requester_actor_id=requester_actor_id,
+            principal_actor_id=principal_actor_id,
+            message_text=message_text,
+            scope_id=scope_id,
+            ai_prefix=ai_prefix,
+            command=command,
+            is_owner=is_owner,
+            allow_individual_access=allow_individual_access,
+            is_owner_control=is_owner_control,
+        )
+
+    async def classify(
+        self,
+        message: ReplyTarget,
+        *,
+        attested_origin: MessageOrigin | None = None,
+    ) -> AIMessageClassification:
+        """Classify without performing a native or model-side effect.
+
+        Controls and non-generating messages stay on the immediate intake lane.
+        Only an authorized request that can plausibly generate an answer is
+        promoted to the durable per-Principal queue. The message is resolved
+        and classified again immediately before execution.
+        """
+        immediate = AIMessageClassification("immediate")
+        routing = await self._route_message(message, attested_origin)
+        if routing is None:
+            return immediate
+        principal_actor_id = routing.principal_actor_id
+        scope_id = routing.scope_id
+        message_text = routing.message_text
+        command = routing.command
+        ai_trigger = command if isinstance(command, AIAskCommand) else None
+        if isinstance(command, (MemoryBackfillCommand, MemoryDreamCommand)):
+            if not routing.is_owner_control:
+                return immediate
+            return AIMessageClassification(
+                "generation",
+                principal_actor_id=principal_actor_id,
+                scope_id=scope_id,
+                is_owner=routing.is_owner,
+            )
+        if command is not None and ai_trigger is None:
+            return immediate
+        if ai_trigger is None and message.reply_to_msg_id is None:
+            return immediate
+
+        if not await self._has_ai_access(
+            message,
+            scope_id=scope_id,
+            actor_id=principal_actor_id,
+            is_owner=routing.is_owner,
+            allow_individual=routing.allow_individual_access,
+        ):
+            return immediate
+        if ai_trigger is not None:
+            if (
+                ai_trigger.recent_messages is not None
+                and not 1
+                <= ai_trigger.recent_messages
+                <= self._prompt_builder.max_context_messages
+            ):
+                return immediate
+            has_current_attachment = self._prompt_builder.has_attachment(message)
+            if not ai_trigger.prompt and not has_current_attachment:
+                if not await self._prompt_builder.has_direct_reply_attachment(message):
+                    return immediate
+        else:
+            assert message.reply_to_msg_id is not None
+            if (scope_id, message.reply_to_msg_id) in self._active_request_runs:
+                return immediate
+            parent = await self._store.get_answer(
+                scope_id,
+                message.reply_to_msg_id,
+            )
+            if parent is None or not parent.agent_session_id or not parent.agent_entry_id:
+                return immediate
+            if not (message_text or "").strip() and not self._prompt_builder.has_attachment(
+                message
+            ):
+                return immediate
+        return AIMessageClassification(
+            "generation",
+            principal_actor_id=principal_actor_id,
+            scope_id=scope_id,
+            is_owner=routing.is_owner,
+        )
+
+    async def generation_eligible_at(
+        self,
+        classification: AIMessageClassification,
+    ) -> float:
+        if classification.disposition != "generation":
+            raise ValueError("Generation classification is required")
+        assert classification.scope_id is not None
+        assert classification.principal_actor_id is not None
+        return await self._rate_limiter.eligible_at(
+            scope_id=classification.scope_id,
+            actor_id=classification.principal_actor_id,
+            is_owner=classification.is_owner,
+        )
+
+    async def reply_workflow_notice(
+        self,
+        message: ReplyTarget,
+        notice: Literal["queued", "queue_full"],
+    ) -> None:
+        text = {
+            "queued": "AI request queued. Use /ai_cancel to cancel it.",
+            "queue_full": (
+                "You already have an AI request queued. "
+                "Wait for it or use /ai_cancel."
+            ),
+        }[notice]
+        await self._reply_memory_excluded(message, text, kind="ai-control")
+
+    async def handle(
+        self,
+        message: ReplyTarget,
+        *,
+        attested_origin: MessageOrigin | None = None,
+        workflow_admitted: bool = False,
+    ) -> bool:
+        routing = await self._route_message(message, attested_origin)
+        if routing is None:
+            return False
+        requester_actor_id = routing.requester_actor_id
+        principal_actor_id = routing.principal_actor_id
+        message_text = routing.message_text
+        scope_id = routing.scope_id
+        ai_prefix = routing.ai_prefix
+        command = routing.command
+        is_owner = routing.is_owner
+        allow_individual_access = routing.allow_individual_access
+        is_owner_control = routing.is_owner_control
         if command is not None and not isinstance(command, AIAskCommand):
             await self._mark_memory_excluded(scope_id, message.id, "ai-control")
         if isinstance(command, MemoryRememberCommand):
@@ -4620,7 +4844,7 @@ class AIConversationHandler:
                 return False
             prompt = authored_prompt or "Describe the attached content."
 
-        acquired = await self._rate_limiter.acquire(
+        acquired = workflow_admitted or await self._rate_limiter.acquire(
             scope_id=scope_id,
             actor_id=principal_actor_id,
             is_owner=is_owner,
@@ -4750,7 +4974,7 @@ class AIConversationHandler:
                 ),
             )
             await self._record_ai_run_running(run_id)
-            self._active_runs[principal_actor_id] = run_id
+            self._active_runs.setdefault(principal_actor_id, set()).add(run_id)
             result = await self._responder.answer(message, request)
             if result.succeeded:
                 terminal_status = "COMPLETED"
@@ -4779,8 +5003,7 @@ class AIConversationHandler:
                     answer_message.id,
                     kind,
                 )
-            if self._active_runs.get(principal_actor_id) == run_id:
-                self._active_runs.pop(principal_actor_id, None)
+            self._discard_active_run(principal_actor_id, run_id)
             if self._active_request_runs.get(active_request_key) == run_id:
                 self._active_request_runs.pop(active_request_key, None)
             if result.succeeded:
@@ -4831,10 +5054,19 @@ class AIConversationHandler:
                             tuple(retained_observations),
                         )
             return True
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             if terminal_status is None:
                 terminal_status = "INTERRUPTED"
-                terminal_error_code = "ADAPTER_RESTARTED"
+                terminal_error_code = (
+                    str(exc.args[0])
+                    if exc.args
+                    and exc.args[0]
+                    in {
+                        "SOURCE_RECALLED",
+                        "USER_CANCELLED_OUTCOME_UNKNOWN",
+                    }
+                    else "ADAPTER_RESTARTED"
+                )
             if not run_finished:
                 run_finished = await self._record_ai_run_finish(
                     run_id,
@@ -4866,8 +5098,7 @@ class AIConversationHandler:
                     session_id=terminal_session_id,
                     error_code=terminal_error_code,
                 )
-            if self._active_runs.get(principal_actor_id) == run_id:
-                self._active_runs.pop(principal_actor_id, None)
+            self._discard_active_run(principal_actor_id, run_id)
             if self._active_request_runs.get(active_request_key) == run_id:
                 self._active_request_runs.pop(active_request_key, None)
             if not rate_released:
@@ -4961,22 +5192,63 @@ class AIConversationHandler:
         message: ReplyTarget,
         actor_id: str,
     ) -> bool:
-        run_id = self._active_runs.get(actor_id)
-        if run_id is None:
+        run_ids = tuple(self._active_runs.get(actor_id, ()))
+        # Make the local queue authoritative before any fallible network call.
+        # Interrupting the local handler also closes its Pi response stream,
+        # which asks Pi to cancel the run even if the explicit cancel call fails.
+        workflow_cancelled = (
+            await self._workflow_control.cancel_generations(
+                actor_id,
+                interrupt_running=True,
+            )
+            if self._workflow_control is not None
+            else AIWorkflowCancellation()
+        )
+        cancel_results = (
+            await asyncio.gather(
+                *(self._responder.cancel(run_id) for run_id in run_ids),
+                return_exceptions=True,
+            )
+            if run_ids
+            else ()
+        )
+        for result in cancel_results:
+            if isinstance(result, BaseException) and self._logger is not None:
+                self._logger.warning(
+                    "Pi cancellation was not confirmed (%s)",
+                    type(result).__name__,
+                )
+        running_cancelled = bool(run_ids) or workflow_cancelled.running > 0
+        if not running_cancelled and workflow_cancelled.queued == 0:
             await self._reply_memory_excluded(
                 message,
                 "No active AI request.",
                 kind="ai-control",
             )
             return True
-        cancelled = await self._responder.cancel(run_id)
-        response = (
-            "AI request cancellation requested."
-            if cancelled
-            else "No active AI request."
-        )
+        if running_cancelled and workflow_cancelled.queued:
+            response = (
+                "AI request cancellation requested; cancelled "
+                f"{workflow_cancelled.queued} queued request"
+                f"{'s' if workflow_cancelled.queued != 1 else ''}."
+            )
+        elif running_cancelled:
+            response = "AI request cancellation requested."
+        else:
+            response = (
+                f"Cancelled {workflow_cancelled.queued} queued AI request"
+                f"{'s' if workflow_cancelled.queued != 1 else ''}."
+            )
         await self._reply_memory_excluded(message, response, kind="memory-control")
         return True
+
+    def _discard_active_run(self, actor_id: str, run_id: str) -> None:
+        runs = self._active_runs.get(actor_id)
+        if runs is None:
+            return
+        runs.discard(run_id)
+        if not runs:
+            self._active_runs.pop(actor_id, None)
 
     async def _ai_command_prefix_for(self, scope_id: str) -> str:
         override = await self._store.get_ai_command_prefix(scope_id)
@@ -5099,6 +5371,7 @@ class AIConversationHandler:
         default = self._rate_limiter.default_cooldown_seconds
         if command.action == "reset":
             await self._store.set_ai_cooldown_override(scope_id, None)
+            await self._reschedule_workflow_scope(scope_id)
             await self._reply_memory_excluded(
                 message,
                 "AI limit for this group reset to the server default "
@@ -5113,6 +5386,7 @@ class AIConversationHandler:
                 scope_id,
                 command.cooldown_seconds,
             )
+            await self._reschedule_workflow_scope(scope_id)
             await self._reply_memory_excluded(
                 message,
                 "AI limit for this group set to "
@@ -5131,6 +5405,10 @@ class AIConversationHandler:
             kind="ai-control",
         )
         return True
+
+    async def _reschedule_workflow_scope(self, scope_id: str) -> None:
+        if self._workflow_control is not None:
+            await self._workflow_control.reschedule_scope(scope_id)
 
     @staticmethod
     def _format_cooldown(cooldown_seconds: float) -> str:
