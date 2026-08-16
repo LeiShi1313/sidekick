@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 import logging
 from typing import Literal, Protocol
 
 import aiohttp
 
-from sidekick.ai import ReplyTarget
+from sidekick.ai import AIConversationHandler, ReplyTarget
+from sidekick.ai_workflow import AIWorkflow
 from sidekick.inbound import (
-    DurableInboundPool,
-    DurableInboundWorker,
-    InboundMessageHandler,
     InboundSourceRevision,
     InboundSourceUnavailable,
     InboundWork,
@@ -116,7 +114,12 @@ class WeChatBootstrapClient(Protocol):
 
     async def get_chats(self) -> WeChatChatList: ...
 
-    def events(self, *, after: str) -> AsyncIterator[WeChatEvent]: ...
+    def events(
+        self,
+        *,
+        after: str,
+        on_connected: Callable[[], None] | None = None,
+    ) -> AsyncIterator[WeChatEvent]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,9 +167,13 @@ class WeChatEventPump:
         source_id: str,
         bootstrap: WeChatBootstrap,
         handler_concurrency: int = 8,
+        reconnect_delay: float = 2.0,
+        stream_status_callback: Callable[[bool], None] | None = None,
     ):
         if handler_concurrency < 1:
             raise ValueError("WeChat handler concurrency must be positive")
+        if reconnect_delay < 0:
+            raise ValueError("WeChat reconnect delay cannot be negative")
         self._client = client
         self._directory = directory
         self._inbox = inbox
@@ -174,11 +181,13 @@ class WeChatEventPump:
         self._source_id = source_id
         self._bootstrap = bootstrap
         self._handler_concurrency = handler_concurrency
+        self._reconnect_delay = reconnect_delay
+        self._stream_status_callback = stream_status_callback
         self._directory_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
         self,
-        handler: InboundMessageHandler,
+        handler: AIConversationHandler,
         stop: asyncio.Event,
     ) -> PumpResult:
         after = await self._inbox.initialize_source(
@@ -194,22 +203,63 @@ class WeChatEventPump:
             self._directory,
             self._connector_key,
         )
-        worker = DurableInboundWorker(
+        workflow = AIWorkflow(
             source,
             self._inbox,
             self._source_id,
-            logger=_LOGGER,
-        )
-        pool = DurableInboundPool(
-            worker,
-            self._inbox,
-            self._source_id,
             handler,
-            concurrency=self._handler_concurrency,
+            generation_concurrency=self._handler_concurrency,
             logger=_LOGGER,
         )
-        pool.start()
-        stream = self._client.events(after=after)
+        workflow.start()
+        try:
+            while True:
+                if stop.is_set():
+                    return "stopped"
+                self._report_stream_status(False)
+                try:
+                    result = await self._run_stream(workflow, stop, after=after)
+                except (ConnectionError, TimeoutError, aiohttp.ClientError) as exc:
+                    _LOGGER.warning(
+                        "WeChat event stream interrupted (%s); reconnecting",
+                        type(exc).__name__,
+                    )
+                    result = "reconnect"
+                else:
+                    if result == "reconnect":
+                        _LOGGER.warning("WeChat event stream ended; reconnecting")
+                finally:
+                    self._report_stream_status(False)
+                if result != "reconnect":
+                    return result
+                if await _wait_or_stop(stop, self._reconnect_delay):
+                    return "stopped"
+                after = await self._inbox.get_cursor(self._source_id)
+                if not isinstance(after, str):
+                    raise RuntimeError("WeChat inbound cursor must be a string")
+        finally:
+            self._report_stream_status(False)
+            await workflow.close()
+            for task in self._directory_tasks:
+                task.cancel()
+            if self._directory_tasks:
+                await asyncio.gather(
+                    *self._directory_tasks,
+                    return_exceptions=True,
+                )
+            self._directory_tasks.clear()
+
+    async def _run_stream(
+        self,
+        workflow: AIWorkflow[WeChatObservedMessage],
+        stop: asyncio.Event,
+        *,
+        after: str,
+    ) -> PumpResult:
+        stream = self._client.events(
+            after=after,
+            on_connected=lambda: self._report_stream_status(True),
+        )
         iterator = stream.__aiter__()
         next_event: asyncio.Task[WeChatEvent] | None = None
         stopped = asyncio.create_task(stop.wait())
@@ -230,32 +280,33 @@ class WeChatEventPump:
                 except StopAsyncIteration:
                     return "reconnect"
                 next_event = None
-                if await self._accept_event(event, worker, pool):
+                if await self._accept_event(event, workflow):
                     return "rebootstrap"
         finally:
             if next_event is not None:
                 next_event.cancel()
                 await asyncio.gather(next_event, return_exceptions=True)
-            await pool.close()
-            for task in self._directory_tasks:
-                task.cancel()
-            if self._directory_tasks:
-                await asyncio.gather(
-                    *self._directory_tasks,
-                    return_exceptions=True,
-                )
-            self._directory_tasks.clear()
             stopped.cancel()
             await asyncio.gather(stopped, return_exceptions=True)
             close = getattr(iterator, "aclose", None)
             if callable(close):
                 await close()
 
+    def _report_stream_status(self, connected: bool) -> None:
+        if self._stream_status_callback is None:
+            return
+        try:
+            self._stream_status_callback(connected)
+        except Exception as exc:
+            _LOGGER.warning(
+                "WeChat event stream status callback failed (%s)",
+                type(exc).__name__,
+            )
+
     async def _accept_event(
         self,
         event: WeChatEvent,
-        worker: DurableInboundWorker[WeChatObservedMessage],
-        pool: DurableInboundPool,
+        workflow: AIWorkflow[WeChatObservedMessage],
     ) -> bool:
         generation = self._bootstrap.session.connection_generation
         if (
@@ -313,15 +364,27 @@ class WeChatEventPump:
                     event.cursor,
                 )
                 return False
-            await self._inbox.accept_pending_ai_event(
+            is_candidate = (
+                message.content.strip().startswith("/")
+                or message.reply_to_message_id is not None
+            )
+            if not is_candidate and not await self._inbox.has_live_ai_message(
                 self._source_id,
+                message.chat_id,
+                message.id,
+            ):
+                await self._inbox.acknowledge_event(
+                    self._source_id,
+                    event.cursor,
+                )
+                return False
+            await workflow.accept(
                 cursor=event.cursor,
                 chat_id=message.chat_id,
                 message_id=message.id,
                 kind="message",
                 attested_origin=None,
             )
-            pool.notify()
             return False
 
         if event.name == "message_remove":
@@ -334,16 +397,13 @@ class WeChatEventPump:
                     event.cursor,
                 )
                 return False
-            await self._inbox.accept_pending_ai_event(
-                self._source_id,
+            await workflow.accept(
                 cursor=event.cursor,
                 chat_id=chat_id,
                 message_id=message_id,
                 kind="message_remove",
                 attested_origin=None,
             )
-            worker.cancel_message(chat_id, message_id)
-            pool.notify()
             return False
 
         await self._inbox.acknowledge_event(
@@ -406,10 +466,7 @@ def _dispatchable(message: WeChatMessage) -> bool:
         and bool(message.raw_text.strip())
         and (
             message.message_type in {"text", "chat_history"}
-            or (
-                message.message_type == "app"
-                and message.reply_to_msg_id is not None
-            )
+            or (message.message_type == "app" and message.reply_to_msg_id is not None)
         )
     )
 
@@ -420,3 +477,13 @@ def _is_inconsistent_shared_chat_history(event: WeChatEvent) -> bool:
         and event.payload.get("sharedChatHistory") is not None
         and event.payload.get("messageType") != "chat_history"
     )
+
+
+async def _wait_or_stop(stop: asyncio.Event, delay: float) -> bool:
+    if stop.is_set():
+        return True
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=delay)
+    except TimeoutError:
+        return False
+    return True

@@ -331,7 +331,9 @@ class FakeConnectorClient:
         self.legacy_identity_reads += 1
         raise AssertionError("legacy group member directory was requested")
 
-    async def events(self, *, after):
+    async def events(self, *, after, on_connected=None):
+        if on_connected is not None:
+            on_connected()
         if False:
             yield after
 

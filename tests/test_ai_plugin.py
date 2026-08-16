@@ -89,20 +89,12 @@ class FakeStateRepository:
         )
 
 
-class FakeInboundStore:
+class FakeAIWorkflow:
     def __init__(self):
         self.accepted = []
 
-    async def accept_pending_ai_event(self, source_id, **work):
-        self.accepted.append((source_id, work))
-
-
-class FakeInboundPool:
-    def __init__(self):
-        self.notified = False
-
-    def notify(self):
-        self.notified = True
+    async def accept(self, **work):
+        self.accepted.append(work)
 
 
 class FakeTelegramClient:
@@ -278,8 +270,7 @@ def make_plugin(
     owner_id=10,
     edit_limiter=None,
     transport=None,
-    inbound_store=None,
-    inbound_pool=None,
+    ai_workflow=None,
 ):
     plugin = TelegramAI.__new__(TelegramAI)
     plugin._handler = handler
@@ -289,8 +280,7 @@ def make_plugin(
     plugin._edit_limiter = edit_limiter or RecordingEditLimiter()
     plugin._transport = transport or FakePluginTransport()
     plugin._ops_settings = SimpleNamespace(instance_id="telegram-test")
-    plugin._inbound_store = inbound_store or FakeInboundStore()
-    plugin._inbound_pool = inbound_pool or FakeInboundPool()
+    plugin._ai_workflow = ai_workflow or FakeAIWorkflow()
     plugin._continuous_memory_scheduler = None
     plugin.service = SimpleNamespace(client=client)
     plugin.logger = RecordingLogger()
@@ -484,8 +474,8 @@ async def test_telegram_directory_rejects_private_and_cross_platform_sources():
 
 @pytest.mark.asyncio
 async def test_ai_plugin_logs_inbound_accept_failures():
-    class FailingInboundStore:
-        async def accept_pending_ai_event(self, *_args, **_kwargs):
+    class FailingAIWorkflow:
+        async def accept(self, **_kwargs):
             raise RuntimeError("inbox failed")
 
     plugin = TelegramAI.__new__(TelegramAI)
@@ -493,8 +483,7 @@ async def test_ai_plugin_logs_inbound_accept_failures():
     plugin._owner_id = 10
     plugin._transport = FakePluginTransport()
     plugin._ops_settings = SimpleNamespace(instance_id="telegram-test")
-    plugin._inbound_store = FailingInboundStore()
-    plugin._inbound_pool = FakeInboundPool()
+    plugin._ai_workflow = FailingAIWorkflow()
     plugin._saved_memory_lock = asyncio.Lock()
     plugin.logger = RecordingLogger()
     event = SimpleNamespace(
@@ -816,7 +805,7 @@ async def test_saved_messages_note_containing_link_stays_an_ordinary_message():
 
     assert handler.memory_targets == []
     assert handler.messages == []
-    assert plugin._inbound_store.accepted == []
+    assert plugin._ai_workflow.accepted == []
     assert client.get_input_entity_calls == []
     assert client.requests == []
 
@@ -965,19 +954,15 @@ async def test_ai_candidate_is_queued_for_conversation_handler():
 
     assert handler.memory_targets == []
     assert handler.messages == []
-    assert plugin._inbound_store.accepted == [
-        (
-            "telegram-test",
-            {
-                "cursor": message.id,
-                "chat_id": message.chat_id,
-                "message_id": message.id,
-                "kind": "message",
-                "attested_origin": MessageOrigin.MANUAL_OUTGOING,
-            },
-        )
+    assert plugin._ai_workflow.accepted == [
+        {
+            "cursor": message.id,
+            "chat_id": message.chat_id,
+            "message_id": message.id,
+            "kind": "message",
+            "attested_origin": MessageOrigin.MANUAL_OUTGOING,
+        }
     ]
-    assert plugin._inbound_pool.notified is True
     assert client.requests == []
 
 

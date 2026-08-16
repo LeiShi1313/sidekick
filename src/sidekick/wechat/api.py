@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 import json
 import re
@@ -456,10 +456,13 @@ class WeChatSharedChatHistory:
                 "item timestamp",
             )
             item_lines = [_format_shared_history_part(kind, sender, content)]
-            total_bytes += sum(
-                _shared_history_utf8_size(value)
-                for value in (kind, sender, content)
-            ) + 32
+            total_bytes += (
+                sum(
+                    _shared_history_utf8_size(value)
+                    for value in (kind, sender, content)
+                )
+                + 32
+            )
             if item.get("reply") is not None:
                 reply = _shared_history_object(item["reply"], "reply")
                 reply_kind = _shared_history_kind(reply.get("kind"))
@@ -480,10 +483,13 @@ class WeChatSharedChatHistory:
                         reply_content,
                     )
                 )
-                total_bytes += sum(
-                    _shared_history_utf8_size(value)
-                    for value in (reply_kind, reply_sender, reply_content)
-                ) + 16
+                total_bytes += (
+                    sum(
+                        _shared_history_utf8_size(value)
+                        for value in (reply_kind, reply_sender, reply_content)
+                    )
+                    + 16
+                )
             if total_bytes > MAX_SHARED_CHAT_HISTORY_BYTES:
                 raise _shared_history_error("payload is oversized")
             formatted_items.append(tuple(item_lines))
@@ -694,11 +700,7 @@ class WeChatObservedMessage:
 
     @property
     def sender_label(self) -> str | None:
-        return (
-            self.sender_group_alias
-            or self.sender_display_name
-            or self.sender_id
-        )
+        return self.sender_group_alias or self.sender_display_name or self.sender_id
 
     @property
     def display_content(self) -> str:
@@ -780,9 +782,7 @@ class WeChatObservationCoverage:
             for value in _required_array(payload, "observationGaps")
         )
         raw_sources = _required_array(payload, "sources")
-        sources = tuple(
-            _external_id(value, "coverage source") for value in raw_sources
-        )
+        sources = tuple(_external_id(value, "coverage source") for value in raw_sources)
         oldest = payload.get("oldestAvailable")
         newest = payload.get("newestAvailable")
         return cls(
@@ -883,9 +883,7 @@ class _WeChatOriginalImage:
         _required_enum(media, "variant", {"original"})
         size = _required_positive_int(media, "size")
         if size > MAX_MEDIA_BYTES:
-            raise WeChatAPIContractError(
-                "WeChat original image metadata is oversized"
-            )
+            raise WeChatAPIContractError("WeChat original image metadata is oversized")
         return cls(
             request_id=_required_id(payload, "requestId"),
             chat_id=_required_wechat_id(payload, "chatId"),
@@ -1394,7 +1392,12 @@ class WeChatConnectorClient:
             "WeChat send outcome is unknown; never retry under a new request ID",
         )
 
-    async def events(self, *, after: str) -> AsyncIterator[WeChatEvent]:
+    async def events(
+        self,
+        *,
+        after: str,
+        on_connected: Callable[[], None] | None = None,
+    ) -> AsyncIterator[WeChatEvent]:
         cursor = _external_id(after, "after cursor")
         session = self._get_session()
         async with session.ws_connect(
@@ -1405,6 +1408,8 @@ class WeChatConnectorClient:
             max_msg_size=1 * 1024 * 1024,
             compress=0,
         ) as websocket:
+            if on_connected is not None:
+                on_connected()
             async for incoming in websocket:
                 if incoming.type == WSMsgType.TEXT:
                     try:
@@ -1534,9 +1539,7 @@ class WeChatConnectorClient:
             async for chunk in response.content.iter_chunked(64 * 1024):
                 body.extend(chunk)
                 if len(body) > MAX_MEDIA_BYTES:
-                    raise WeChatAPIContractError(
-                        "WeChat connector image is oversized"
-                    )
+                    raise WeChatAPIContractError("WeChat connector image is oversized")
             data = bytes(body)
             if not data:
                 raise WeChatAPIContractError("WeChat connector image is empty")
@@ -1641,8 +1644,7 @@ def _shared_history_text(value: Any) -> str:
     if value.strip() != value or len(value) > MAX_SHARED_CHAT_HISTORY_CONTENT_CHARS:
         raise _shared_history_error("content is invalid or oversized")
     if any(
-        (ord(character) < 0x20 and character not in "\n\r\t")
-        or ord(character) == 0x7F
+        (ord(character) < 0x20 and character not in "\n\r\t") or ord(character) == 0x7F
         for character in value
     ):
         raise _shared_history_error("content contains control characters")
@@ -1663,7 +1665,9 @@ def _optional_link_title(payload: Mapping[str, Any]) -> str | None:
     try:
         value.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise WeChatAPIContractError("WeChat link title is invalid or oversized") from exc
+        raise WeChatAPIContractError(
+            "WeChat link title is invalid or oversized"
+        ) from exc
     if (
         not value
         or value.strip() != value
@@ -1851,9 +1855,7 @@ def _required_image_mime_type(
 ) -> str:
     value = _required_text(payload, field)
     if value not in IMAGE_MIME_TYPES:
-        raise WeChatAPIContractError(
-            f"WeChat {field} has an unsupported image type"
-        )
+        raise WeChatAPIContractError(f"WeChat {field} has an unsupported image type")
     return value
 
 
@@ -1936,9 +1938,7 @@ def _optional_nonnegative_int(
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise WeChatAPIContractError(
-            f"WeChat {field} must be a non-negative integer"
-        )
+        raise WeChatAPIContractError(f"WeChat {field} must be a non-negative integer")
     return value
 
 

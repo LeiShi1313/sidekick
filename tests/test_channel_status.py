@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -42,13 +44,16 @@ def test_ops_settings_default_to_loopback() -> None:
 def test_adapter_instance_ids_follow_the_128_character_pi_contract() -> None:
     valid = "a" * 128
 
-    assert ChannelOpsSettings.from_env(
-        default_instance_id="default",
-        environ={
-            "SIDEKICK_ADAPTER_INSTANCE_ID": valid,
-            "SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough",
-        },
-    ).instance_id == valid
+    assert (
+        ChannelOpsSettings.from_env(
+            default_instance_id="default",
+            environ={
+                "SIDEKICK_ADAPTER_INSTANCE_ID": valid,
+                "SIDEKICK_OPS_TOKEN": "channel-ops-token-that-is-long-enough",
+            },
+        ).instance_id
+        == valid
+    )
     assert AgentRunOrigin("qq:group:700", valid).adapter_instance_id == valid
 
     with pytest.raises(ValueError, match="1 to 128"):
@@ -61,6 +66,24 @@ def test_adapter_instance_ids_follow_the_128_character_pi_contract() -> None:
         )
     with pytest.raises(ValueError, match="adapter instance"):
         AgentRunOrigin("qq:group:700", "a" * 129)
+
+
+@pytest.mark.asyncio
+async def test_slow_generation_queue_probe_degrades_without_blocking_health() -> None:
+    never = asyncio.Event()
+
+    async def slow_queue():
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    adapter = AdapterRuntimeState(
+        id="wechat-peer",
+        platform="wechat",
+        generation_queue_probe=slow_queue,
+        generation_queue_timeout=0.01,
+    )
+
+    assert await adapter.generation_queue() is None
 
 
 @pytest.mark.asyncio
@@ -105,6 +128,14 @@ async def test_snapshot_merges_live_inventory_with_nested_operational_state() ->
         connected=True,
         observed_at=1_800_000_000,
         indeterminate_outbound_probe=lambda: 3,
+        generation_queue_probe=lambda: _queue_snapshot(
+            pending_intake=3,
+            queued=2,
+            active=1,
+            failed_unknown=4,
+            oldest_pending_intake_at=1_799_999_990,
+            oldest_queued_at=1_800_000_000,
+        ),
     )
 
     async def inventory() -> tuple[ChannelInventoryItem, ...]:
@@ -127,6 +158,15 @@ async def test_snapshot_merges_live_inventory_with_nested_operational_state() ->
 
     assert snapshot["adapter"]["accountId"] == "wxid@example.com"
     assert snapshot["adapter"]["indeterminateOutboundCount"] == 3
+    queue = snapshot["adapter"]["aiQueue"]
+    assert queue["pendingIntake"] == 3
+    assert queue["queued"] == 2
+    assert queue["active"] == 1
+    assert queue["failedUnknown"] == 4
+    assert queue["oldestQueuedAt"] == "2027-01-15T08:00:00Z"
+    assert queue["oldestQueuedAgeSeconds"] >= 0
+    assert queue["oldestPendingIntakeAt"] == "2027-01-15T07:59:50Z"
+    assert queue["oldestPendingIntakeAgeSeconds"] >= 0
     assert adapter.observed_at is not None and adapter.observed_at >= before
     assert len(snapshot["items"]) == 1
     row = snapshot["items"][0]
@@ -227,6 +267,7 @@ async def test_ops_routes_require_the_dedicated_channel_bearer_token() -> None:
                     "accountId": "42",
                     "connected": True,
                     "indeterminateOutboundCount": None,
+                    "aiQueue": None,
                 },
                 "items": [],
             }
@@ -237,9 +278,15 @@ async def test_ops_routes_require_the_dedicated_channel_bearer_token() -> None:
                 },
             )
             assert health.status == 200
-            assert (await health.json())["ok"] is True
+            health_payload = await health.json()
+            assert health_payload["ok"] is True
+            assert health_payload["adapter"]["aiQueue"] is None
     finally:
         await server.close()
+
+
+async def _queue_snapshot(**values):
+    return SimpleNamespace(**values)
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,15 @@ class ChannelStateReader(Protocol):
     ) -> tuple[StoredChannelState, ...]: ...
 
 
+class GenerationQueueState(Protocol):
+    pending_intake: int
+    queued: int
+    active: int
+    failed_unknown: int
+    oldest_pending_intake_at: float | None
+    oldest_queued_at: float | None
+
+
 class AIRunStateWriter(Protocol):
     async def start_ai_run(
         self,
@@ -122,9 +131,7 @@ class ChannelInventoryItem:
     last_observed_at: float | None = None
 
 
-ChannelInventoryLoader = Callable[
-    [], Awaitable[tuple[ChannelInventoryItem, ...]]
-]
+ChannelInventoryLoader = Callable[[], Awaitable[tuple[ChannelInventoryItem, ...]]]
 
 
 class CachedChannelInventory:
@@ -210,9 +217,7 @@ class ChannelOpsSettings:
         if not host:
             raise ValueError("SIDEKICK_OPS_HOST cannot be empty")
         if len(token) < 24:
-            raise ValueError(
-                "SIDEKICK_OPS_TOKEN must contain at least 24 characters"
-            )
+            raise ValueError("SIDEKICK_OPS_TOKEN must contain at least 24 characters")
         try:
             port = int(raw_port)
         except ValueError as exc:
@@ -231,6 +236,12 @@ class AdapterRuntimeState:
     observed_at: float | None = None
     connected_probe: Callable[[], bool] | None = None
     indeterminate_outbound_probe: Callable[[], int | None] | None = None
+    generation_queue_probe: Callable[[], Awaitable[GenerationQueueState]] | None = None
+    generation_queue_timeout: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.generation_queue_timeout <= 0:
+            raise ValueError("Generation queue probe timeout must be positive")
 
     def update(
         self,
@@ -265,6 +276,34 @@ class AdapterRuntimeState:
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             return None
         return count
+
+    async def generation_queue(self) -> GenerationQueueState | None:
+        if self.generation_queue_probe is None:
+            return None
+        try:
+            snapshot = await asyncio.wait_for(
+                self.generation_queue_probe(),
+                timeout=self.generation_queue_timeout,
+            )
+        except Exception:
+            return None
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (
+                snapshot.pending_intake,
+                snapshot.queued,
+                snapshot.active,
+                snapshot.failed_unknown,
+            )
+        ) or any(
+            value is not None and value < 0
+            for value in (
+                snapshot.oldest_pending_intake_at,
+                snapshot.oldest_queued_at,
+            )
+        ):
+            return None
+        return snapshot
 
 
 class ChannelSnapshotService:
@@ -303,7 +342,15 @@ class ChannelSnapshotService:
         states = await self._state_reader.list_channel_operational_states()
         items = self._merge(inventory, states)
         self._adapter.update(observed_at=time.time())
-        adapter = {
+        adapter = await self.adapter_snapshot()
+        if inventory_error is not None:
+            adapter["error"] = inventory_error
+        return {"adapter": adapter, "items": items}
+
+    async def adapter_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        queue = await self._adapter.generation_queue()
+        return {
             "id": self._adapter.id,
             "platform": self._adapter.platform,
             "accountId": self._adapter.account_id,
@@ -311,11 +358,30 @@ class ChannelSnapshotService:
             "indeterminateOutboundCount": (
                 self._adapter.indeterminate_outbound_count()
             ),
+            "aiQueue": (
+                {
+                    "pendingIntake": queue.pending_intake,
+                    "queued": queue.queued,
+                    "active": queue.active,
+                    "failedUnknown": queue.failed_unknown,
+                    "oldestQueuedAt": _timestamp(queue.oldest_queued_at),
+                    "oldestQueuedAgeSeconds": (
+                        max(0.0, now - queue.oldest_queued_at)
+                        if queue.oldest_queued_at is not None
+                        else None
+                    ),
+                    "oldestPendingIntakeAt": _timestamp(queue.oldest_pending_intake_at),
+                    "oldestPendingIntakeAgeSeconds": (
+                        max(0.0, now - queue.oldest_pending_intake_at)
+                        if queue.oldest_pending_intake_at is not None
+                        else None
+                    ),
+                }
+                if queue is not None
+                else None
+            ),
             "observedAt": _timestamp(self._adapter.observed_at),
         }
-        if inventory_error is not None:
-            adapter["error"] = inventory_error
-        return {"adapter": adapter, "items": items}
 
     def _merge(
         self,
@@ -530,20 +596,10 @@ class ChannelOpsServer:
     async def _health(self, request: web.Request) -> web.Response:
         if not self._authenticated(request):
             return _unauthorized()
-        adapter = self._snapshot_service._adapter
         return _json_response(
             {
                 "ok": True,
-                "adapter": {
-                    "id": adapter.id,
-                    "platform": adapter.platform,
-                    "accountId": adapter.account_id,
-                    "connected": adapter.is_connected(),
-                    "indeterminateOutboundCount": (
-                        adapter.indeterminate_outbound_count()
-                    ),
-                    "observedAt": _timestamp(adapter.observed_at),
-                },
+                "adapter": await self._snapshot_service.adapter_snapshot(),
             }
         )
 

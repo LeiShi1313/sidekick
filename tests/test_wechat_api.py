@@ -144,7 +144,7 @@ def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
                     "displayName": "Unsupported learned identity",
                     "source": "native-group-member-snapshot",
                     "isPartial": True,
-                }
+                },
             ],
             "isPartial": True,
             "source": "learned-hook-events",
@@ -178,9 +178,7 @@ def test_wechat_client_parses_readable_user_and_group_member_names() -> None:
         group_id="56825427596@chatroom",
     )
 
-    assert users.users == (
-        WeChatUser(id="wxid_alice", display_name="Alice Global"),
-    )
+    assert users.users == (WeChatUser(id="wxid_alice", display_name="Alice Global"),)
     assert members.members[0].display_name == "Alice Global"
     assert members.members[0].nickname == "Alice in this group"
     assert members.snapshot_complete is True
@@ -374,9 +372,7 @@ async def test_wechat_client_reads_identity_directories_and_missing_users() -> N
             observed_users = await client.get_users()
             observed_user = await client.get_user("wxid_alice")
             missing_user = await client.get_user("wxid_missing")
-            observed_members = await client.get_group_members(
-                "56825427596@chatroom"
-            )
+            observed_members = await client.get_group_members("56825427596@chatroom")
         finally:
             await client.close()
 
@@ -458,8 +454,7 @@ def test_wechat_client_preserves_structured_link_destination() -> None:
     assert message.link_title == "Shared article"
     assert message.link_url == "https://example.com/article?id=1&source=wechat"
     assert message.display_content == (
-        "[Link] Shared article\n"
-        "https://example.com/article?id=1&source=wechat"
+        "[Link] Shared article\nhttps://example.com/article?id=1&source=wechat"
     )
 
 
@@ -1282,6 +1277,7 @@ async def test_wechat_client_treats_missing_send_as_proven_not_admitted() -> Non
 @pytest.mark.asyncio
 async def test_wechat_client_replays_events_after_opaque_cursor() -> None:
     observed_after: list[str] = []
+    connected: list[bool] = []
 
     async def events(request: web.Request) -> web.StreamResponse:
         observed_after.append(request.query["after"])
@@ -1310,7 +1306,10 @@ async def test_wechat_client_replays_events_after_opaque_cursor() -> None:
     async with TestServer(app) as server:
         client = WeChatConnectorClient(str(server.make_url("/")))
         try:
-            stream: AsyncIterator = client.events(after="opaque-current")
+            stream: AsyncIterator = client.events(
+                after="opaque-current",
+                on_connected=lambda: connected.append(True),
+            )
             event = await stream.__anext__()
             await stream.aclose()
         finally:
@@ -1320,3 +1319,4 @@ async def test_wechat_client_replays_events_after_opaque_cursor() -> None:
     assert event.name == "message"
     assert event.payload["id"] == "4159667620982040828"
     assert observed_after == ["opaque-current"]
+    assert connected == [True]

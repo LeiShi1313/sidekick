@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any, cast
 
 import pytest
 
-from sidekick.inbound import DurableInboundWorker
+from sidekick.ai import AIMessageClassification
+from sidekick.ai_workflow import AIWorkflow
 from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.wechat.api import (
     WeChatAPIError,
@@ -155,15 +157,69 @@ class FakeObservedClient:
         return result
 
 
-class RecordingHandler:
+class ImmediateHandler:
+    def __init__(self) -> None:
+        self.control = None
+
+    def bind_workflow_control(self, control) -> None:
+        self.control = control
+
+    def unbind_workflow_control(self, control) -> None:
+        if self.control is control:
+            self.control = None
+
+    async def classify(
+        self,
+        _message,
+        *,
+        attested_origin=None,
+    ) -> AIMessageClassification:
+        assert attested_origin is None
+        return AIMessageClassification("immediate")
+
+    async def generation_eligible_at(self, _classification) -> float:
+        raise AssertionError("immediate test handler cannot queue generation")
+
+    async def reply_workflow_notice(self, _message, _notice) -> None:
+        raise AssertionError("immediate test handler has no workflow notice")
+
+
+class RecordingHandler(ImmediateHandler):
     def __init__(self, *, handled: bool = True):
+        super().__init__()
         self.handled = handled
         self.messages = []
 
-    async def handle(self, message, *, attested_origin=None) -> bool:
+    async def handle(
+        self,
+        message,
+        *,
+        attested_origin=None,
+        workflow_admitted: bool = False,
+    ) -> bool:
         assert attested_origin is None
+        assert not workflow_admitted
         self.messages.append(message)
         return self.handled
+
+
+class IntakeHarness:
+    def __init__(self, source, inbox, *, clock=None) -> None:
+        self._source = source
+        self._inbox = inbox
+        self._clock = clock
+
+    async def process_one(self, handler) -> str:
+        options = {} if self._clock is None else {"clock": self._clock}
+        workflow = AIWorkflow(
+            self._source,
+            self._inbox,
+            SOURCE_ID,
+            cast(Any, handler),
+            generation_concurrency=1,
+            **options,
+        )
+        return await workflow._process_intake_one()
 
 
 def inbound_worker(
@@ -173,20 +229,14 @@ def inbound_worker(
     *,
     not_observed_attempts: int = 3,
     clock=None,
-) -> DurableInboundWorker:
+) -> IntakeHarness:
     source = WeChatObservedMessageSource(
         client,
         directory,
         CONNECTOR_KEY,
         not_observed_attempts=not_observed_attempts,
     )
-    options = {} if clock is None else {"clock": clock}
-    return DurableInboundWorker(
-        source,
-        inbox,
-        SOURCE_ID,
-        **options,
-    )
+    return IntakeHarness(source, inbox, clock=clock)
 
 
 async def enqueue(inbox: SQLiteInboundWorkStore, *, kind: str = "message") -> None:
@@ -294,11 +344,14 @@ async def test_worker_fetches_authoritative_message_and_uses_connector_label(
         assert message.memory_cursor == MESSAGE_ID
         assert message.sender_display_name == "Team Alice"
         assert message.scope_display_name == "Example group"
-        assert await inbox.get_pending_ai_work(
-            SOURCE_ID,
-            CHAT_ID,
-            MESSAGE_ID,
-        ) is None
+        assert (
+            await inbox.get_pending_ai_work(
+                SOURCE_ID,
+                CHAT_ID,
+                MESSAGE_ID,
+            )
+            is None
+        )
     finally:
         await inbox.close()
         await directory.close()
@@ -352,18 +405,24 @@ async def test_worker_resolves_removal_without_fetching_or_generating(tmp_path) 
     client = FakeObservedClient([])
     handler = RecordingHandler()
     try:
-        assert await inbound_worker(
-            client,
-            directory,
-            inbox,
-        ).process_one(handler) == "recalled"
+        assert (
+            await inbound_worker(
+                client,
+                directory,
+                inbox,
+            ).process_one(handler)
+            == "recalled"
+        )
         assert client.requests == []
         assert handler.messages == []
-        assert await inbox.get_pending_ai_work(
-            SOURCE_ID,
-            CHAT_ID,
-            MESSAGE_ID,
-        ) is None
+        assert (
+            await inbox.get_pending_ai_work(
+                SOURCE_ID,
+                CHAT_ID,
+                MESSAGE_ID,
+            )
+            is None
+        )
     finally:
         await inbox.close()
         await directory.close()
@@ -377,18 +436,24 @@ async def test_worker_treats_fetched_recall_as_terminal_without_content(
     await enqueue(inbox)
     handler = RecordingHandler()
     try:
-        assert await inbound_worker(
-            FakeObservedClient([recalled_message()]),
-            directory,
-            inbox,
-        ).process_one(handler) == "recalled"
+        assert (
+            await inbound_worker(
+                FakeObservedClient([recalled_message()]),
+                directory,
+                inbox,
+            ).process_one(handler)
+            == "recalled"
+        )
         assert handler.messages == []
-        assert await inbox.get_processed_revision_status(
-            SOURCE_ID,
-            CHAT_ID,
-            MESSAGE_ID,
-            "mv1:recalled",
-        ) == "recalled"
+        assert (
+            await inbox.get_processed_revision_status(
+                SOURCE_ID,
+                CHAT_ID,
+                MESSAGE_ID,
+                "mv1:recalled",
+            )
+            == "recalled"
+        )
     finally:
         await inbox.close()
         await directory.close()
@@ -400,9 +465,16 @@ async def test_cancelled_worker_marks_started_execution_unknown_instead_of_retry
 ) -> None:
     entered = asyncio.Event()
 
-    class BlockingHandler:
-        async def handle(self, _message, *, attested_origin=None) -> bool:
+    class BlockingHandler(ImmediateHandler):
+        async def handle(
+            self,
+            _message,
+            *,
+            attested_origin=None,
+            workflow_admitted: bool = False,
+        ) -> bool:
             assert attested_origin is None
+            assert not workflow_admitted
             entered.set()
             await asyncio.Future()
             return True
@@ -441,8 +513,10 @@ class StreamingObservedClient(FakeObservedClient):
         self.after_values: list[str] = []
         self.keep_open = asyncio.Event()
 
-    async def events(self, *, after: str):
+    async def events(self, *, after: str, on_connected=None):
         self.after_values.append(after)
+        if on_connected is not None:
+            on_connected()
         for event in self._events:
             yield event
         await self.keep_open.wait()
@@ -527,6 +601,7 @@ async def test_event_pump_dispatches_valid_shared_chat_history(tmp_path) -> None
             "messageType": "chat_history",
             "senderId": "wxid_alice",
             "content": "Team history",
+            "replyToMessageId": "4159667620982040000",
             "sharedChatHistory": {
                 "title": "Team history",
                 "itemCount": 1,
@@ -603,10 +678,241 @@ async def test_null_shared_history_does_not_match_the_poison_guard(
 
         assert client.requests == []
         assert (
-            "Dropped inconsistent WeChat shared chat history event"
-            not in caplog.text
+            "Dropped inconsistent WeChat shared chat history event" not in caplog.text
         )
         assert "Dropped malformed WeChat message event" in caplog.text
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        await inbox.close()
+        await directory.close()
+
+
+@pytest.mark.asyncio
+async def test_plain_edit_of_live_ai_message_reaches_workflow(tmp_path) -> None:
+    plain_edit = WeChatEvent.parse(
+        {
+            "schemaVersion": "wechat-bridge/v1alpha1",
+            "cursor": "event-12",
+            "event": "message",
+            "connectionGeneration": 41,
+            "id": MESSAGE_ID,
+            "chatId": CHAT_ID,
+            "direction": "in",
+            "messageType": "text",
+            "senderId": "wxid_alice",
+            "content": "never mind",
+            "timestamp": 1_700_000_011,
+        }
+    )
+    directory, inbox = await open_stores(tmp_path)
+    await inbox.accept_pending_ai_event(
+        SOURCE_ID,
+        cursor="event-11",
+        chat_id=CHAT_ID,
+        message_id=MESSAGE_ID,
+        kind="message",
+        attested_origin=None,
+    )
+
+    class RecordingWorkflow:
+        def __init__(self) -> None:
+            self.accepted: list[dict[str, Any]] = []
+
+        async def accept(self, **event: Any) -> None:
+            self.accepted.append(event)
+
+    workflow = RecordingWorkflow()
+    pump = WeChatEventPump(
+        StreamingObservedClient((), []),
+        directory,
+        inbox,
+        connector_key=CONNECTOR_KEY,
+        source_id=SOURCE_ID,
+        bootstrap=bootstrap(),
+        handler_concurrency=1,
+    )
+    try:
+        assert not await pump._accept_event(plain_edit, cast(Any, workflow))
+        assert workflow.accepted == [
+            {
+                "cursor": "event-12",
+                "chat_id": CHAT_ID,
+                "message_id": MESSAGE_ID,
+                "kind": "message",
+                "attested_origin": None,
+            }
+        ]
+    finally:
+        await inbox.close()
+        await directory.close()
+
+
+@pytest.mark.asyncio
+async def test_event_stream_reconnect_keeps_running_generation_alive(
+    tmp_path,
+) -> None:
+    close_first_stream = asyncio.Event()
+    second_stream_connected = asyncio.Event()
+    keep_second_stream_open = asyncio.Event()
+
+    class ReconnectingClient(FakeObservedClient):
+        def __init__(self) -> None:
+            # Intake classification and generation revalidation each refetch
+            # the authoritative connector observation.
+            super().__init__([present_message(), present_message()])
+            self.after_values: list[str] = []
+            self.stream_count = 0
+
+        async def events(self, *, after: str, on_connected=None):
+            self.after_values.append(after)
+            self.stream_count += 1
+            if on_connected is not None:
+                on_connected()
+            if self.stream_count == 1:
+                yield message_event(cursor="event-11")
+                await close_first_stream.wait()
+                return
+            second_stream_connected.set()
+            await keep_second_stream_open.wait()
+
+        async def get_chats(self):
+            return bootstrap().chats
+
+        async def get_user(self, _user_id):
+            return None
+
+        async def get_group_members(self, _group_id):
+            return ()
+
+    class BlockingGenerationHandler(ImmediateHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.completed = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def classify(
+            self,
+            _message,
+            *,
+            attested_origin=None,
+        ) -> AIMessageClassification:
+            assert attested_origin is None
+            return AIMessageClassification(
+                "generation",
+                principal_actor_id="wechat:user:alice",
+                scope_id="wechat:chat:example",
+            )
+
+        async def generation_eligible_at(self, _classification) -> float:
+            return 0
+
+        async def reply_workflow_notice(self, _message, _notice) -> None:
+            raise AssertionError("first generation must not queue")
+
+        async def handle(
+            self,
+            _message,
+            *,
+            attested_origin=None,
+            workflow_admitted: bool = False,
+        ) -> bool:
+            assert attested_origin is None
+            assert workflow_admitted
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            self.completed.set()
+            return True
+
+    client = ReconnectingClient()
+    handler = BlockingGenerationHandler()
+    directory, inbox = await open_stores(tmp_path)
+    stop = asyncio.Event()
+    stream_statuses: list[bool] = []
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
+            handler_concurrency=1,
+            reconnect_delay=0,
+            stream_status_callback=stream_statuses.append,
+        ).run(handler, stop)
+    )
+    try:
+        await asyncio.wait_for(handler.started.wait(), timeout=1)
+        close_first_stream.set()
+        await asyncio.wait_for(second_stream_connected.wait(), timeout=1)
+
+        assert client.after_values == ["bootstrap-cursor", "event-11"]
+        assert stream_statuses[:5] == [False, True, False, False, True]
+        assert not handler.cancelled.is_set()
+        assert not task.done()
+
+        handler.release.set()
+        await asyncio.wait_for(handler.completed.wait(), timeout=1)
+    finally:
+        handler.release.set()
+        close_first_stream.set()
+        keep_second_stream_open.set()
+        stop.set()
+        assert await asyncio.wait_for(task, timeout=1) == "stopped"
+        assert stream_statuses[-1] is False
+        await inbox.close()
+        await directory.close()
+
+
+@pytest.mark.asyncio
+async def test_event_stream_failures_report_adapter_disconnected(tmp_path) -> None:
+    attempted_twice = asyncio.Event()
+
+    class FailingStreamClient(FakeObservedClient):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.attempts = 0
+
+        async def events(self, *, after: str, on_connected=None):
+            del after, on_connected
+            self.attempts += 1
+            if self.attempts >= 2:
+                attempted_twice.set()
+            raise ConnectionError("stream unavailable")
+            if False:
+                yield
+
+        async def get_chats(self):
+            return bootstrap().chats
+
+    client = FailingStreamClient()
+    directory, inbox = await open_stores(tmp_path)
+    stop = asyncio.Event()
+    stream_statuses: list[bool] = []
+    task = asyncio.create_task(
+        WeChatEventPump(
+            client,
+            directory,
+            inbox,
+            connector_key=CONNECTOR_KEY,
+            source_id=SOURCE_ID,
+            bootstrap=bootstrap(),
+            handler_concurrency=1,
+            reconnect_delay=0,
+            stream_status_callback=stream_statuses.append,
+        ).run(ImmediateHandler(), stop)
+    )
+    try:
+        await asyncio.wait_for(attempted_twice.wait(), timeout=1)
+        assert stream_statuses
+        assert all(status is False for status in stream_statuses)
     finally:
         stop.set()
         assert await asyncio.wait_for(task, timeout=1) == "stopped"
@@ -619,9 +925,16 @@ async def test_event_cursor_is_not_blocked_by_running_ai_handler(tmp_path) -> No
     started = asyncio.Event()
     release = asyncio.Event()
 
-    class BlockingHandler:
-        async def handle(self, _message, *, attested_origin=None) -> bool:
+    class BlockingHandler(ImmediateHandler):
+        async def handle(
+            self,
+            _message,
+            *,
+            attested_origin=None,
+            workflow_admitted: bool = False,
+        ) -> bool:
             assert attested_origin is None
+            assert not workflow_admitted
             started.set()
             await release.wait()
             return True
@@ -753,9 +1066,16 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
     cancelled = asyncio.Event()
     emit_removal = asyncio.Event()
 
-    class BlockingHandler:
-        async def handle(self, _message, *, attested_origin=None) -> bool:
+    class BlockingHandler(ImmediateHandler):
+        async def handle(
+            self,
+            _message,
+            *,
+            attested_origin=None,
+            workflow_admitted: bool = False,
+        ) -> bool:
             assert attested_origin is None
+            assert not workflow_admitted
             started.set()
             try:
                 await asyncio.Future()
@@ -775,8 +1095,10 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
     )
 
     class RemovalClient(StreamingObservedClient):
-        async def events(self, *, after: str):
+        async def events(self, *, after: str, on_connected=None):
             self.after_values.append(after)
+            if on_connected is not None:
+                on_connected()
             yield message_event(cursor="event-11")
             await emit_removal.wait()
             yield removal
@@ -809,19 +1131,25 @@ async def test_removal_event_cancels_in_flight_generation_and_resolves_work(
         )
 
         async def removal_finished() -> bool:
-            return await inbox.get_pending_ai_work(
+            return (
+                await inbox.get_pending_ai_work(
+                    SOURCE_ID,
+                    CHAT_ID,
+                    MESSAGE_ID,
+                )
+                is None
+            )
+
+        await wait_until(removal_finished)
+        assert (
+            await inbox.get_processed_revision_status(
                 SOURCE_ID,
                 CHAT_ID,
                 MESSAGE_ID,
-            ) is None
-
-        await wait_until(removal_finished)
-        assert await inbox.get_processed_revision_status(
-            SOURCE_ID,
-            CHAT_ID,
-            MESSAGE_ID,
-            "mv1:before-recall",
-        ) == "failed_unknown"
+                "mv1:before-recall",
+            )
+            == "failed_unknown"
+        )
     finally:
         emit_removal.set()
         stop.set()

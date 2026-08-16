@@ -175,6 +175,44 @@ and could treat a delayed generated echo as a manual command. Keep the new
 worker running until reconciliation reaches zero, then quiesce and repeat the
 active-run and send-journal audit before rollback.
 
+### AI generation queue rollout safety
+
+Authenticated `/health` and `/v1/channels` responses expose
+`adapter.aiQueue` with content-free `queued`, `active`, `failedUnknown`,
+`pendingIntake`, `oldestQueuedAt`, `oldestQueuedAgeSeconds`,
+`oldestPendingIntakeAt`, and `oldestPendingIntakeAgeSeconds` fields. For a
+planned restart, stop accepting new AI commands and wait for
+`pendingIntake == 0`, `queued == 0`, and `active == 0`. Treat a missing (`null`)
+queue snapshot as an unavailable gate, not as zero.
+
+An older release cannot consume the durable generation queue. Before rolling
+back, stop the worker, back up its AI SQLite database and WAL files, then run
+the following transaction against that stopped database before starting the
+older worker:
+
+```sql
+BEGIN IMMEDIATE;
+UPDATE ai_inbound_work
+SET status = 'unavailable',
+    last_error_code = 'ROLLBACK_ABANDONED',
+    lease_id = NULL,
+    lease_trigger_cursor = NULL,
+    current_version = NULL,
+    updated_at = CAST(strftime('%s', 'now') AS REAL)
+WHERE status = 'pending';
+UPDATE ai_generation_jobs
+SET status = 'cancelled',
+    last_error_code = 'ROLLBACK_ABANDONED',
+    lease_id = NULL,
+    finished_at = CAST(strftime('%s', 'now') AS REAL),
+    updated_at = CAST(strftime('%s', 'now') AS REAL)
+WHERE status IN ('queued', 'running', 'cancel_requested');
+COMMIT;
+```
+
+This deliberately abandons accepted work under the best-effort rollback
+contract and prevents a later roll-forward from executing stale requests.
+
 Mount each WeChat state database through its whole parent directory or a named
 volume so SQLite WAL and ownership sidecars share the same filesystem identity.
 Hard-linked databases and file-only bind mounts are unsupported.
