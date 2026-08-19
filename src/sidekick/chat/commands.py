@@ -10,7 +10,7 @@ MAX_MEMORY_BACKFILL_MESSAGES = 5_000
 MAX_AI_COOLDOWN_SECONDS = 86_400
 DEFAULT_AI_COMMAND_PREFIX = "/ai"
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
-AI_COMMAND_PREFIX_RE = re.compile(r"/[A-Za-z][A-Za-z0-9_]{0,30}")
+AI_COMMAND_PREFIX_RE = re.compile(r"[^\w\s][A-Za-z][A-Za-z0-9_]{0,30}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +166,9 @@ ChatCommand: TypeAlias = (
 
 def normalize_ai_command_prefix(prefix: str) -> str:
     if AI_COMMAND_PREFIX_RE.fullmatch(prefix) is None:
-        raise ValueError("AI command prefix must be a slash command")
+        raise ValueError(
+            "AI command prefix must start with a punctuation character followed by letters"
+        )
     normalized = prefix.casefold()
     if normalized.startswith("/ai_"):
         raise ValueError("AI command prefix conflicts with the control namespace")
@@ -178,49 +180,57 @@ def parse_chat_command(
     *,
     ai_prefix: str = DEFAULT_AI_COMMAND_PREFIX,
 ) -> ChatCommand | None:
-    if text is None or not text.startswith("/"):
+    if text is None:
         return None
     ai_prefix = normalize_ai_command_prefix(ai_prefix)
+    is_slash_command = text.startswith("/")
+    is_ai_command = text.casefold().startswith(ai_prefix)
+    
+    if not is_slash_command and not is_ai_command:
+        return None
+        
+    if is_slash_command:
+        prefix = _parse_ai_prefix_control(text.strip())
+        if prefix is not None:
+            return prefix
 
-    prefix = _parse_ai_prefix_control(text.strip())
-    if prefix is not None:
-        return prefix
+        directory = _parse_directory_control(text)
+        if directory is not None:
+            return directory
 
-    directory = _parse_directory_control(text)
-    if directory is not None:
-        return directory
+        ai_limit = _parse_ai_limit_control(text.strip())
+        if ai_limit is not None:
+            return ai_limit
 
-    ai_limit = _parse_ai_limit_control(text.strip())
-    if ai_limit is not None:
-        return ai_limit
+        model = _parse_model_control(text.strip())
+        if model is not None:
+            return model
 
-    model = _parse_model_control(text.strip())
-    if model is not None:
-        return model
-
-    chat_access = _parse_chat_access_control(text.strip())
-    if chat_access is not None:
-        return chat_access
+        chat_access = _parse_chat_access_control(text.strip())
+        if chat_access is not None:
+            return chat_access
 
     ai = _parse_ai(text, ai_prefix)
     if ai is not None:
         return ai
 
-    memory_revision = _parse_memory_revision(text)
-    if memory_revision is not None:
-        return memory_revision
+    if is_slash_command:
+        memory_revision = _parse_memory_revision(text)
+        if memory_revision is not None:
+            return memory_revision
 
-    control = text.strip()
-    if control == "/ai_cancel":
-        return AICancelCommand()
-    if control == "/ai_allow":
-        return AccessCommand(allowed=True)
-    if control == "/ai_deny":
-        return AccessCommand(allowed=False)
+        control = text.strip()
+        if control == "/ai_cancel":
+            return AICancelCommand()
+        if control == "/ai_allow":
+            return AccessCommand(allowed=True)
+        if control == "/ai_deny":
+            return AccessCommand(allowed=False)
 
-    memory = _parse_memory_control(control)
-    if memory is not None:
-        return memory
+        memory = _parse_memory_control(control)
+        if memory is not None:
+            return memory
+
     return None
 
 

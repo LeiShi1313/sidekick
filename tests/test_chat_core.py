@@ -458,7 +458,7 @@ async def test_chat_ai_command_prefix_is_scoped_persistent_and_resettable(tmp_pa
 
         assert await store.get_ai_command_prefix(first_scope) == "/ask"
         assert await store.get_ai_command_prefix(second_scope) is None
-        with pytest.raises(ValueError, match="slash command"):
+        with pytest.raises(ValueError, match="punctuation character"):
             await store.set_ai_command_prefix(first_scope, "ask")
         with pytest.raises(ValueError, match="control namespace"):
             await store.set_ai_command_prefix(first_scope, "/ai_future")
