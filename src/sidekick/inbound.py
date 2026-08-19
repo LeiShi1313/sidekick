@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Generic, Literal, Protocol, TypeVar
 
 from sidekick.ai import ReplyTarget
+from sidekick.chat.commands import is_ai_candidate_text
 from sidekick.chat.identity import ExternalId
 from sidekick.chat.provenance import MessageOrigin
 
@@ -79,7 +80,4 @@ class InboundSourceUnavailable(Exception):
 
 
 def is_ai_candidate(message: ReplyTarget) -> bool:
-    text = message.raw_text
-    return (
-        isinstance(text, str) and text.strip().startswith("/")
-    ) or message.reply_to_msg_id is not None
+    return is_ai_candidate_text(message.raw_text) or message.reply_to_msg_id is not None

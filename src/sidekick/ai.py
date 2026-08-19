@@ -62,6 +62,7 @@ from sidekick.chat.commands import (
     DEFAULT_AI_COMMAND_PREFIX,
     MAX_AI_COOLDOWN_SECONDS,
     MODEL_ID_RE,
+    is_ai_candidate_text,
     normalize_ai_command_prefix,
     parse_chat_command,
 )
@@ -4481,7 +4482,7 @@ class AIConversationHandler:
         message_text = self._prompt_builder.message_text(message)
         scope_id = self._identity_codec.scope_id(message.chat_id)
         ai_prefix = DEFAULT_AI_COMMAND_PREFIX
-        if message_text is not None and message_text.startswith("/"):
+        if is_ai_candidate_text(message_text):
             ai_prefix = await self._ai_command_prefix_for(scope_id)
         command = parse_chat_command(message_text, ai_prefix=ai_prefix)
         is_owner = principal_actor_id == self._owner_actor_id
@@ -4659,7 +4660,7 @@ class AIConversationHandler:
             elif command.name == "/ai_prefix":
                 await self._reply_memory_excluded(
                     message,
-                    "Usage: /ai_prefix [/command|default]",
+                    "Usage: /ai_prefix [<punctuation><name>|default]",
                     kind="ai-control",
                 )
             elif command.name == "/ai_access":

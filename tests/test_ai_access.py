@@ -359,19 +359,19 @@ async def test_owner_can_set_inspect_and_reset_ai_command_for_one_group(tmp_path
             "AI command for this group: /ai (server default)."
         )
 
-        set_prefix = FakeMessage("/ai_prefix /Ask", sender_id=10)
+        set_prefix = FakeMessage("/ai_prefix $Ask", sender_id=10)
         assert await handler.handle(set_prefix) is True
         assert set_prefix.replies[0].text == (
-            "AI command for this group set to /ask."
+            "AI command for this group set to $ask."
         )
-        assert await store.get_ai_command_prefix(first_scope) == "/ask"
+        assert await store.get_ai_command_prefix(first_scope) == "$ask"
         assert await store.get_ai_command_prefix(second_scope) is None
 
         old_command = FakeMessage("/ai no longer a trigger", sender_id=10)
         assert await handler.handle(old_command) is False
         assert old_command.replies == []
 
-        custom_command = FakeMessage("/Ask group question", sender_id=10)
+        custom_command = FakeMessage("$Ask group question", sender_id=10)
         assert await handler.handle(custom_command) is True
         assert gateway.requests[0].prompt == "group question"
 
@@ -386,12 +386,12 @@ async def test_owner_can_set_inspect_and_reset_ai_command_for_one_group(tmp_path
         show_override = FakeMessage("/ai_prefix", sender_id=10)
         assert await handler.handle(show_override) is True
         assert show_override.replies[0].text == (
-            "AI command for this group: /ask (group override)."
+            "AI command for this group: $ask (group override)."
         )
 
-        empty_custom_command = FakeMessage("/ask", sender_id=10)
+        empty_custom_command = FakeMessage("$ask", sender_id=10)
         assert await handler.handle(empty_custom_command) is True
-        assert empty_custom_command.replies[0].text == "Usage: /ask <question>"
+        assert empty_custom_command.replies[0].text == "Usage: $ask <question>"
 
         reset = FakeMessage("/ai_prefix default", sender_id=10)
         assert await handler.handle(reset) is True
@@ -433,7 +433,7 @@ async def test_ai_command_prefix_rejects_private_member_and_invalid_changes(tmp_
         invalid_command = FakeMessage("/ai_prefix /ai_model", sender_id=10)
         assert await handler.handle(invalid_command) is True
         assert invalid_command.replies[0].text == (
-            "Usage: /ai_prefix [/command|default]"
+            "Usage: /ai_prefix [<punctuation><name>|default]"
         )
         assert await store.get_ai_command_prefix(scope_id) is None
     finally:

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 import sqlite3
+from string import punctuation
 
 import pytest
 from PIL import Image
@@ -47,6 +48,8 @@ from sidekick.chat.commands import (
     MemoryModeCommand,
     MemoryRememberCommand,
     MemoryStatusCommand,
+    is_ai_candidate_text,
+    normalize_ai_command_prefix,
     parse_chat_command,
 )
 from sidekick.chat.identity import NamespacedIdentityCodec
@@ -94,8 +97,8 @@ def model_input_image(color: tuple[int, int, int] = (255, 0, 0)) -> ModelInputIm
         ("/ai_model two models", InvalidCommand(name="/ai_model")),
         ("/ai_prefix", AIPrefixCommand(action="show")),
         (
-            "/ai_prefix /Ask",
-            AIPrefixCommand(action="set", prefix="/ask"),
+            "/ai_prefix $Ask",
+            AIPrefixCommand(action="set", prefix="$ask"),
         ),
         ("/ai_prefix default", AIPrefixCommand(action="reset")),
         ("/ai_prefix ask", InvalidCommand(name="/ai_prefix")),
@@ -137,14 +140,44 @@ def test_chat_commands_are_parsed_without_transport_assumptions(text, expected):
 
 def test_ai_trigger_uses_the_configured_group_command():
     assert parse_chat_command(
-        "/Ask10@SidekickBot summarize",
-        ai_prefix="/ask",
+        "$Ask10@SidekickBot summarize",
+        ai_prefix="$ask",
     ) == AIAskCommand(prompt="summarize", recent_messages=10)
-    assert parse_chat_command("/ai old command", ai_prefix="/ask") is None
-    assert parse_chat_command("/asker boundary", ai_prefix="/ask") is None
-    assert parse_chat_command("/ai_model", ai_prefix="/ask") == AIModelCommand(
+    assert parse_chat_command("/ai old command", ai_prefix="$ask") is None
+    assert parse_chat_command("$asker boundary", ai_prefix="$ask") is None
+    assert parse_chat_command("/ai_model", ai_prefix="$ask") == AIModelCommand(
         action="show"
     )
+    assert parse_chat_command("/Ask legacy", ai_prefix="/ask") == AIAskCommand(
+        prompt="legacy"
+    )
+
+
+@pytest.mark.parametrize("leader", punctuation)
+def test_ai_command_prefix_accepts_ascii_punctuation(leader):
+    assert normalize_ai_command_prefix(f"{leader}Ask") == f"{leader}ask"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["ask", "🙂ask", "\x00ask", "\u200bask", "€ask", "©ask", "$1ask", "$$ask"],
+)
+def test_ai_command_prefix_rejects_non_ascii_or_invalid_leaders(prefix):
+    with pytest.raises(ValueError, match="ASCII punctuation character"):
+        normalize_ai_command_prefix(prefix)
+
+
+@pytest.mark.parametrize("text", ["$ask hello", "  !query", "_ask", "/ai"])
+def test_ai_candidate_text_accepts_supported_command_shapes(text):
+    assert is_ai_candidate_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [None, "", "ambient chat", "🙂ask", "\x00ask", "\u200bask", "$1ask", "$$ask"],
+)
+def test_ai_candidate_text_rejects_non_command_shapes(text):
+    assert not is_ai_candidate_text(text)
 
 
 def test_identity_codec_keeps_network_identities_disjoint():
@@ -458,7 +491,7 @@ async def test_chat_ai_command_prefix_is_scoped_persistent_and_resettable(tmp_pa
 
         assert await store.get_ai_command_prefix(first_scope) == "/ask"
         assert await store.get_ai_command_prefix(second_scope) is None
-        with pytest.raises(ValueError, match="slash command"):
+        with pytest.raises(ValueError, match="punctuation character"):
             await store.set_ai_command_prefix(first_scope, "ask")
         with pytest.raises(ValueError, match="control namespace"):
             await store.set_ai_command_prefix(first_scope, "/ai_future")
