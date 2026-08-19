@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from string import punctuation
 from typing import Literal, TypeAlias
 
 
@@ -10,7 +11,7 @@ MAX_MEMORY_BACKFILL_MESSAGES = 5_000
 MAX_AI_COOLDOWN_SECONDS = 86_400
 DEFAULT_AI_COMMAND_PREFIX = "/ai"
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
-AI_COMMAND_PREFIX_RE = re.compile(r"[^\w\s][A-Za-z][A-Za-z0-9_]{0,30}")
+AI_COMMAND_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,30}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,14 +166,31 @@ ChatCommand: TypeAlias = (
 
 
 def normalize_ai_command_prefix(prefix: str) -> str:
-    if AI_COMMAND_PREFIX_RE.fullmatch(prefix) is None:
+    if (
+        len(prefix) < 2
+        or prefix[0] not in punctuation
+        or AI_COMMAND_NAME_RE.fullmatch(prefix[1:]) is None
+    ):
         raise ValueError(
-            "AI command prefix must start with a punctuation character followed by letters"
+            "AI command prefix must start with an ASCII punctuation character "
+            "followed by an ASCII letter"
         )
     normalized = prefix.casefold()
     if normalized.startswith("/ai_"):
         raise ValueError("AI command prefix conflicts with the control namespace")
     return normalized
+
+
+def is_ai_candidate_text(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    candidate = text.strip()
+    return (
+        len(candidate) >= 2
+        and candidate[0] in punctuation
+        and candidate[1].isascii()
+        and candidate[1].isalpha()
+    )
 
 
 def parse_chat_command(
@@ -185,10 +203,10 @@ def parse_chat_command(
     ai_prefix = normalize_ai_command_prefix(ai_prefix)
     is_slash_command = text.startswith("/")
     is_ai_command = text.casefold().startswith(ai_prefix)
-    
+
     if not is_slash_command and not is_ai_command:
         return None
-        
+
     if is_slash_command:
         prefix = _parse_ai_prefix_control(text.strip())
         if prefix is not None:

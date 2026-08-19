@@ -234,7 +234,7 @@ async def test_telegram_preserves_candidate_filter_and_attested_origin() -> None
         id=41,
         chat_id=-1001,
         peer_id=None,
-        raw_text="/ai hello",
+        raw_text="$ask hello",
         reply_to_msg_id=None,
     )
     transport.origin = MessageOrigin.SIDEKICK_GENERATED
@@ -309,7 +309,7 @@ async def test_qq_preserves_candidate_filter_and_generated_echo_guard() -> None:
     await plugin._on_event(
         onebot_group_event(
             message_id=102,
-            text="/ai hello",
+            text="$ask hello",
             post_type="message_sent",
             sender_id=99,
         )
@@ -408,7 +408,7 @@ async def test_wechat_pump_passes_only_source_references_for_commands_replies_an
     command = wechat_message_event(
         cursor="event-11",
         message_id="4159667620982040828",
-        content="  /ai connector-owned secret",
+        content="  $ask connector-owned secret",
     )
     reply = wechat_message_event(
         cursor="event-12",

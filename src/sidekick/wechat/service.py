@@ -10,6 +10,7 @@ import aiohttp
 
 from sidekick.ai import AIConversationHandler, ReplyTarget
 from sidekick.ai_workflow import AIWorkflow
+from sidekick.chat.commands import is_ai_candidate_text
 from sidekick.inbound import (
     InboundSourceRevision,
     InboundSourceUnavailable,
@@ -365,7 +366,7 @@ class WeChatEventPump:
                 )
                 return False
             is_candidate = (
-                message.content.strip().startswith("/")
+                is_ai_candidate_text(message.content)
                 or message.reply_to_message_id is not None
             )
             if not is_candidate and not await self._inbox.has_live_ai_message(
