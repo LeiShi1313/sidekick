@@ -1,7 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { loadConfig } from "../src/config.mjs";
+import { buildWebSearchConfig, loadConfig } from "../src/config.mjs";
+
+test("builds proxy-backed OpenAI search with bounded Exa fallback", () => {
+  const config = buildWebSearchConfig({
+    baseUrl: "https://provider.internal/v1/",
+    model: "test-model",
+  });
+
+  assert.deepEqual(config, {
+    workflow: "none",
+    allowBrowserCookies: false,
+    openaiApiKey: "$AI_API_KEY",
+    openaiResponsesUrl: "https://provider.internal/v1/responses",
+    openaiSearchModel: "test-model",
+    searchRouting: {
+      providers: ["openai", "exa"],
+      fallbackOn: ["transient", "quota", "network", "invalid-response"],
+    },
+    webSearch: { enabled: true },
+    githubClone: { enabled: false },
+    youtube: { enabled: false },
+  });
+  assert.equal("provider" in config, false);
+});
+
+test("rejects a non-HTTP OpenAI-compatible base URL", () => {
+  assert.throws(
+    () =>
+      buildWebSearchConfig({
+        baseUrl: "file:///tmp/provider/v1",
+        model: "test-model",
+      }),
+    /AI_BASE_URL/,
+  );
+});
 
 test("loads the standalone agent configuration without Sidekick names", () => {
   Object.assign(process.env, {

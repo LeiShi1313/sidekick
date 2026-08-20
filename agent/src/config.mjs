@@ -56,6 +56,39 @@ function integer(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}
   return value;
 }
 
+export function buildWebSearchConfig({ baseUrl, model }) {
+  let responsesUrl;
+  try {
+    responsesUrl = new URL(baseUrl);
+  } catch {
+    throw new Error("Invalid configuration: AI_BASE_URL");
+  }
+  if (
+    responsesUrl.protocol !== "http:" &&
+    responsesUrl.protocol !== "https:"
+  ) {
+    throw new Error("Invalid configuration: AI_BASE_URL");
+  }
+  responsesUrl.pathname = `${responsesUrl.pathname.replace(/\/+$/, "")}/responses`;
+  responsesUrl.search = "";
+  responsesUrl.hash = "";
+
+  return {
+    workflow: "none",
+    allowBrowserCookies: false,
+    openaiApiKey: "$AI_API_KEY",
+    openaiResponsesUrl: responsesUrl.toString(),
+    openaiSearchModel: model,
+    searchRouting: {
+      providers: ["openai", "exa"],
+      fallbackOn: ["transient", "quota", "network", "invalid-response"],
+    },
+    webSearch: { enabled: true },
+    githubClone: { enabled: false },
+    youtube: { enabled: false },
+  };
+}
+
 export function loadConfig() {
   const reasoningEffort =
     process.env.AI_REASONING_EFFORT?.trim().toLowerCase() || "none";

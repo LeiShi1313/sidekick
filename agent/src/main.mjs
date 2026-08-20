@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { loadConfig } from "./config.mjs";
+import { buildWebSearchConfig, loadConfig } from "./config.mjs";
 import { createAgentServer } from "./http-service.mjs";
 import { PiEngine } from "./pi-engine.mjs";
 
@@ -17,20 +17,16 @@ function logger(level, message, fields = {}) {
   process.stderr.write(`${JSON.stringify(safe)}\n`);
 }
 
-async function writeWebConfig() {
+async function writeWebConfig(engineConfig) {
   const path = join(homedir(), ".pi", "web-search.json");
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await writeFile(
     path,
     `${JSON.stringify(
-      {
-        provider: "exa",
-        workflow: "none",
-        allowBrowserCookies: false,
-        webSearch: { enabled: true },
-        githubClone: { enabled: false },
-        youtube: { enabled: false },
-      },
+      buildWebSearchConfig({
+        baseUrl: engineConfig.baseUrl,
+        model: engineConfig.model,
+      }),
       null,
       2,
     )}\n`,
@@ -40,7 +36,7 @@ async function writeWebConfig() {
 
 async function main() {
   const config = loadConfig();
-  await writeWebConfig();
+  await writeWebConfig(config.engine);
   const packagePath = require.resolve("pi-web-access/package.json");
   const engine = new PiEngine({
     ...config.engine,
