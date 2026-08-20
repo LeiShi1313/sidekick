@@ -1318,10 +1318,14 @@ test("exposes participant customization only to an owner with a host target", as
   const app = await fixture(
     (body, response, requestNumber) => {
       const tools = body.tools.map((tool) => tool.function);
+      const requesterTool = tools.find(
+        ({ name }) => name === "memory_update_requester",
+      );
       const participantTool = tools.find(
         ({ name }) => name === "memory_update_participant",
       );
       if (requestNumber === 1) {
+        assert.equal(requesterTool, undefined);
         assert(participantTool);
         assert.match(JSON.stringify(participantTool.parameters), /reply_author/);
         assert.doesNotMatch(

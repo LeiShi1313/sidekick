@@ -1116,6 +1116,98 @@ async def test_owner_reply_issues_one_reply_author_customization_target():
         (target.handle, target.identity, target.label)
         for target in memory.customization_targets
     ] == [("reply_author", "qq:user:20", None)]
+    assert gateway.requests[0].identity.requester_can_customize is True
+
+
+@pytest.mark.asyncio
+async def test_owner_group_reply_without_human_target_disables_self_customization():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    replied = MinimalMessage(
+        "AI answer",
+        message_id=2,
+        sender_id=99,
+        is_group=True,
+    )
+    trigger = MinimalMessage(
+        "/ai Update his preference",
+        message_id=3,
+        sender_id=42,
+        reply_to_message_id=replied.id,
+        is_group=True,
+    )
+    transport.reply_targets[trigger] = replied
+
+    class AnswerStore(FakeStore):
+        async def get_answer(self, scope_id, answer_message_id):
+            if answer_message_id != replied.id:
+                return None
+            return AIAnswerMarker(
+                scope_id=scope_id,
+                answer_message_id=replied.id,
+                trigger_message_id=1,
+                command_prefix="/ai",
+                requester_id="qq:user:20",
+                parent_answer_message_id=None,
+                agent_session_id="session",
+                agent_entry_id="entry",
+            )
+
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=AnswerStore(),
+        prompt_builder=PromptBuilder(transport=transport, identity_codec=codec),
+        transport=transport,
+        memory=object(),
+        identity_codec=codec,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    request = gateway.requests[0]
+    assert request.identity.requester_can_customize is False
+    assert request.memory is not None
+    assert request.memory.requester_is_owner is True
+    assert request.memory.customization_targets == ()
+
+
+@pytest.mark.asyncio
+async def test_owner_standalone_group_request_keeps_self_customization():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(transport=transport, identity_codec=codec),
+        transport=transport,
+        memory=object(),
+        identity_codec=codec,
+    )
+    trigger = MinimalMessage(
+        "/ai Call me Captain from now on",
+        sender_id=42,
+        is_group=True,
+    )
+
+    assert await handler.handle(trigger) is True
+
+    request = gateway.requests[0]
+    assert request.identity.requester_can_customize is True
+    assert request.memory is not None
+    assert request.memory.requester_is_owner is True
+    assert request.memory.customization_targets == ()
 
 
 @pytest.mark.asyncio

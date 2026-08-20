@@ -974,10 +974,16 @@ export class RequesterMemoryStore {
     const store = this;
     const tools = [];
     const mutation = { used: false };
+    const hasExplicitParticipantTarget =
+      requesterIsOwner &&
+      customizationTargets.some(
+        ({ handle }) => handle !== "direct_chat_participant",
+      );
     if (
       requesterState?.writeEnabled &&
       requesterState.customizationStatus !== "unavailable" &&
-      requesterState.customizationStatus !== "integrity_error"
+      requesterState.customizationStatus !== "integrity_error" &&
+      !hasExplicitParticipantTarget
     ) {
       tools.push(
         defineTool({

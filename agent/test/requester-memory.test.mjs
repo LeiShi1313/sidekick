@@ -967,6 +967,29 @@ test("lets an owner update one host-bound participant customization", async () =
   assert.notDeepEqual(targetTags, requesterTags);
 });
 
+test("gives an owner only participant mutation for an explicit target", async () => {
+  const store = createStore(async (url) =>
+    url.endsWith("/memories/recall")
+      ? jsonResponse({ results: [] })
+      : jsonResponse({ items: [] }),
+  );
+  const requesterMemory = await retrieve(store);
+  const customizationTargets = await store.retrieveTargets({
+    bankId: BANK_ID,
+    requesterIsOwner: true,
+    targets: [{ handle: "reply_author", id: TARGET_ID, label: "Bob" }],
+  });
+  const tools = store.createTools(requesterMemory, {
+    requesterIsOwner: true,
+    customizationTargets,
+  });
+
+  assert.deepEqual(
+    tools.map(({ name }) => name),
+    [PARTICIPANT_MEMORY_TOOL_NAME],
+  );
+});
+
 test("clears owner defaults without clearing target requester customization", async () => {
   const requesterDirectiveId = "33333333-3333-4333-8333-333333333333";
   const ownerDirectiveId = "22222222-2222-4222-8222-222222222222";
@@ -1085,7 +1108,13 @@ test("shares one mutation budget across requester and participant tools", async 
   const customizationTargets = await store.retrieveTargets({
     bankId: BANK_ID,
     requesterIsOwner: true,
-    targets: [{ handle: "mention_1", id: TARGET_ID, label: "Bob" }],
+    targets: [
+      {
+        handle: "direct_chat_participant",
+        id: TARGET_ID,
+        label: "Bob",
+      },
+    ],
   });
   const tools = store.createTools(requesterMemory, {
     requesterIsOwner: true,
@@ -1100,7 +1129,7 @@ test("shares one mutation budget across requester and participant tools", async 
 
   const first = await requesterTool.execute("call-self", { operation: "clear" });
   const second = await participantTool.execute("call-participant", {
-    target: "mention_1",
+    target: "direct_chat_participant",
     operation: "clear",
   });
 

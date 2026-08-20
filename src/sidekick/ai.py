@@ -4931,14 +4931,26 @@ class AIConversationHandler:
                 current_mentions=current_mentions,
                 observations=anchor_observations,
             )
+            is_group = self._transport.is_group(message)
             customization_targets = self._build_agent_customization_targets(
                 request_identity=request_identity,
                 current_mentions=current_mentions,
                 context=loaded_context,
                 assistant_message_ids=assistant_message_ids,
-                is_group=self._transport.is_group(message),
+                is_group=is_group,
                 scope_id=scope_id,
             )
+            if (
+                is_group
+                and loaded_context.current_reply_to_message_id is not None
+                and not customization_targets
+                and request_identity.requester.identity == self._owner_actor_id
+            ):
+                request_identity = AgentRequestIdentity(
+                    requester=request_identity.requester,
+                    anchors=request_identity.anchors,
+                    requester_can_customize=False,
+                )
             memory_target = await self._build_agent_memory_target(
                 chat_id=message.chat_id,
                 request_identity=request_identity,
