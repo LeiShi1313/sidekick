@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { CODEX_ACCESS_TOKEN_COMMAND } from "./codex-access-token.mjs";
+
 const REASONING_LEVELS = new Set([
   "none",
   "minimal",
@@ -56,29 +58,11 @@ function integer(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}
   return value;
 }
 
-export function buildWebSearchConfig({ baseUrl, model }) {
-  let responsesUrl;
-  try {
-    responsesUrl = new URL(baseUrl);
-  } catch {
-    throw new Error("Invalid configuration: AI_BASE_URL");
-  }
-  if (
-    responsesUrl.protocol !== "http:" &&
-    responsesUrl.protocol !== "https:"
-  ) {
-    throw new Error("Invalid configuration: AI_BASE_URL");
-  }
-  responsesUrl.pathname = `${responsesUrl.pathname.replace(/\/+$/, "")}/responses`;
-  responsesUrl.search = "";
-  responsesUrl.hash = "";
-
+export function buildWebSearchConfig() {
   return {
     workflow: "none",
     allowBrowserCookies: false,
-    openaiApiKey: "$AI_API_KEY",
-    openaiResponsesUrl: responsesUrl.toString(),
-    openaiSearchModel: model,
+    openaiApiKey: CODEX_ACCESS_TOKEN_COMMAND,
     searchRouting: {
       providers: ["openai", "exa"],
       fallbackOn: ["transient", "quota", "network", "invalid-response"],

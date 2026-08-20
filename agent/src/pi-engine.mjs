@@ -412,7 +412,7 @@ function guardToolExecution(definition, canExecuteTool) {
 
 function constrainExtensions(
   result,
-  { requireWeb, requireMcp, canExecuteTool },
+  { requireWeb, requireMcp, canExecuteTool, hasCodexAuth },
 ) {
   let foundWebTools = false;
   let foundMcp = false;
@@ -423,6 +423,7 @@ function constrainExtensions(
     if (names.has("web_search") && names.has("fetch_content")) {
       const constrained = constrainWebTools(
         registered.map(({ definition }) => definition),
+        { ...(hasCodexAuth ? { hasCodexAuth } : {}) },
       );
       const sourceByName = new Map(
         registered.map(({ definition, sourceInfo }) => [definition.name, sourceInfo]),
@@ -1741,6 +1742,7 @@ export class PiEngine {
                 requireWeb: hasWeb,
                 requireMcp: hasMcp,
                 canExecuteTool,
+                hasCodexAuth: this.config.hasCodexAuth,
               }),
           }
         : {}),

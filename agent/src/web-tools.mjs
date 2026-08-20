@@ -6,6 +6,7 @@ import { BlockList, isIP } from "node:net";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 
+import { readUsableCodexAccessToken } from "./codex-access-token.mjs";
 import { sanitizeSensitiveValue } from "./privacy-redaction.mjs";
 
 const FORBIDDEN_HOSTS = new Set([
@@ -302,11 +303,35 @@ function normalizeQueries(params) {
   return queries;
 }
 
-function constrainSearch(definition) {
+function isOpenAIAuthFailure(error) {
+  return (
+    error?.provider === "openai" &&
+    (error?.kind === "auth" || error?.kind === "credential")
+  );
+}
+
+function isOpenAIAuthFailureResult(result) {
+  if (
+    result?.details?.successfulQueries !== 0 ||
+    result?.details?.totalResults !== 0 ||
+    !Array.isArray(result?.content)
+  ) {
+    return false;
+  }
+  const text = result.content
+    .filter((item) => item?.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n");
+  return /(?:^|\n)Error: openai search failed \((?:auth|credential)\):/i.test(
+    text,
+  );
+}
+
+function constrainSearch(definition, hasCodexAuth) {
   return {
     ...definition,
     description:
-      "Search the public web through OpenAI with Exa fallback. Returns raw cited results for the agent to synthesize.",
+      "Search the public web through mounted Codex authentication when available, otherwise Exa. Returns raw cited results for the agent to synthesize.",
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const queries = normalizeQueries(params ?? {});
       const safe = {
@@ -329,7 +354,31 @@ function constrainSearch(definition) {
           .filter(Boolean)
           .slice(0, 10);
       }
-      return await definition.execute(toolCallId, safe, signal, onUpdate, ctx);
+      let codexAvailable = false;
+      try {
+        codexAvailable = Boolean(await hasCodexAuth());
+      } catch {
+        codexAvailable = false;
+      }
+      if (!codexAvailable) safe.provider = "exa";
+      const executeSearch = (searchParams) =>
+        definition.execute(
+          toolCallId,
+          searchParams,
+          signal,
+          onUpdate,
+          ctx,
+        );
+      try {
+        const result = await executeSearch(safe);
+        if (codexAvailable && isOpenAIAuthFailureResult(result)) {
+          return await executeSearch({ ...safe, provider: "exa" });
+        }
+        return result;
+      } catch (error) {
+        if (!codexAvailable || !isOpenAIAuthFailure(error)) throw error;
+        return await executeSearch({ ...safe, provider: "exa" });
+      }
     },
   };
 }
@@ -512,7 +561,12 @@ function constrainFetch(definition, options) {
 
 export function constrainWebTools(
   definitions,
-  { lookup = defaultLookup, request = defaultPinnedRequest } = {},
+  {
+    lookup = defaultLookup,
+    request = defaultPinnedRequest,
+    hasCodexAuth = async () =>
+      Boolean(await readUsableCodexAccessToken()),
+  } = {},
 ) {
   const byName = new Map(definitions.map((definition) => [definition.name, definition]));
   const search = byName.get("web_search");
@@ -521,7 +575,7 @@ export function constrainWebTools(
     throw new Error("pi-web-access did not register the required tools");
   }
   return [
-    constrainSearch(search),
+    constrainSearch(search, hasCodexAuth),
     constrainFetch(fetchContent, { lookup, request }),
   ];
 }
