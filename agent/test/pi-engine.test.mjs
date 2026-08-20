@@ -92,7 +92,7 @@ async function fakeProvider(handler) {
   };
 }
 
-async function fakeResponsesProxy() {
+async function fakeResponsesProxy({ status = 200 } = {}) {
   const requests = [];
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -104,6 +104,11 @@ async function fakeResponsesProxy() {
       method: request.method,
       url: request.url,
     });
+    if (status !== 200) {
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "unauthorized" } }));
+      return;
+    }
     const citationUrl =
       "https://developers.openai.com/api/docs/guides/tools-web-search";
     const text = "Web search | OpenAI API";
@@ -150,6 +155,39 @@ async function fakeResponsesProxy() {
   const { port } = server.address();
   return {
     baseUrl: `http://127.0.0.1:${port}/v1`,
+    requests,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function fakeExaProxy() {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({
+      apiKey: request.headers["x-api-key"],
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      method: request.method,
+      url: request.url,
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        answer: "Codex authentication documentation",
+        citations: [
+          {
+            title: "Codex authentication",
+            url: "https://learn.chatgpt.com/docs/auth",
+          },
+        ],
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
     requests,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
@@ -2180,7 +2218,7 @@ test("does not retry an empty response after a tool starts", async () => {
   }
 });
 
-test("routes production web search through the configured Responses proxy", async () => {
+test("prefers OpenAI search when mounted Codex auth is available", async () => {
   const proxy = await fakeResponsesProxy();
   const provider = await fakeProvider((_body, response, requestNumber) => {
     if (requestNumber === 1) {
@@ -2203,7 +2241,12 @@ test("routes production web search through the configured Responses proxy", asyn
   await writeFile(
     join(configDir, "web-search.json"),
     `${JSON.stringify(
-      buildWebSearchConfig({ baseUrl: proxy.baseUrl, model: "search-model" }),
+      {
+        ...buildWebSearchConfig(),
+        openaiApiKey: "$AI_API_KEY",
+        openaiResponsesUrl: `${proxy.baseUrl}/responses`,
+        openaiSearchModel: "search-model",
+      },
       null,
       2,
     )}\n`,
@@ -2231,6 +2274,7 @@ test("routes production web search through the configured Responses proxy", asyn
       auditDir: join(root, "audit"),
       agentDir: join(root, "agent"),
       webExtensionPath: PRODUCTION_WEB_EXTENSION_PATH,
+      hasCodexAuth: async () => true,
       mcpExtensionPath: null,
       memoryUrl: null,
       memoryToken: null,
@@ -2293,6 +2337,119 @@ test("routes production web search through the configured Responses proxy", asyn
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     if (previousApiKey === undefined) delete process.env.AI_API_KEY;
     else process.env.AI_API_KEY = previousApiKey;
+  }
+});
+
+test("retries Exa when production OpenAI search rejects Codex auth", async () => {
+  const openai = await fakeResponsesProxy({ status: 401 });
+  const exa = await fakeExaProxy();
+  const provider = await fakeProvider((_body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendToolCall(response, {
+        id: "call-production-auth-fallback",
+        name: "web_search",
+        args: { query: "official Codex authentication documentation" },
+      });
+      return;
+    }
+    sendText(response, "Search completed through Exa fallback.");
+  });
+  const root = await mkdtemp(join(tmpdir(), "sidekick-web-fallback-test-"));
+  const configDir = join(root, "pi-config");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(
+    join(configDir, "web-search.json"),
+    `${JSON.stringify(
+      {
+        ...buildWebSearchConfig(),
+        openaiApiKey: "$AI_API_KEY",
+        openaiResponsesUrl: `${openai.baseUrl}/responses`,
+        openaiSearchModel: "search-model",
+        exaApiKey: "$EXA_API_KEY",
+        exaBaseUrl: "https://exa.test",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousApiKey = process.env.AI_API_KEY;
+  const previousExaApiKey = process.env.EXA_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.PI_CODING_AGENT_DIR = configDir;
+  process.env.AI_API_KEY = "rejected-codex-token";
+  process.env.EXA_API_KEY = "exa-search-key";
+  globalThis.fetch = (input, init) => {
+    const url = new URL(
+      typeof input === "string" || input instanceof URL ? input : input.url,
+    );
+    if (url.origin === "https://exa.test") {
+      return previousFetch(
+        new URL(`${url.pathname}${url.search}`, exa.baseUrl),
+        init,
+      );
+    }
+    return previousFetch(input, init);
+  };
+  let engine;
+
+  try {
+    engine = new PiEngine({
+      baseUrl: provider.baseUrl,
+      apiKey: "test-key",
+      identityAliasKey: IDENTITY_ALIAS_KEY,
+      model: "test-model",
+      reasoningEffort: "off",
+      maxOutputTokens: 1_000,
+      contextWindow: 32_000,
+      requestTimeoutMs: 5_000,
+      imageModel: null,
+      imageRequestTimeoutMs: 5_000,
+      workspaceDir: join(root, "workspace"),
+      sessionDir: join(root, "sessions"),
+      auditDir: join(root, "audit"),
+      agentDir: join(root, "agent"),
+      webExtensionPath: PRODUCTION_WEB_EXTENSION_PATH,
+      hasCodexAuth: async () => true,
+      mcpExtensionPath: null,
+      memoryUrl: null,
+      memoryToken: null,
+    });
+    await engine.initialize();
+    const events = await collect(
+      engine,
+      request("55555555-5555-4555-8555-555555555555", {
+        prompt: "Search the web.",
+      }),
+    );
+
+    assert.equal(events.at(-1).answer, "Search completed through Exa fallback.");
+    assert.equal(openai.requests.length, 1);
+    assert.deepEqual(exa.requests, [
+      {
+        apiKey: "exa-search-key",
+        body: { query: "official Codex authentication documentation" },
+        method: "POST",
+        url: "/answer",
+      },
+    ]);
+    assert.match(
+      JSON.stringify(provider.requests[1].messages),
+      /learn\.chatgpt\.com\/docs\/auth/,
+    );
+  } finally {
+    await engine?.shutdown();
+    await provider.close();
+    await openai.close();
+    await exa.close();
+    await rm(root, { recursive: true, force: true });
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousApiKey === undefined) delete process.env.AI_API_KEY;
+    else process.env.AI_API_KEY = previousApiKey;
+    if (previousExaApiKey === undefined) delete process.env.EXA_API_KEY;
+    else process.env.EXA_API_KEY = previousExaApiKey;
+    globalThis.fetch = previousFetch;
   }
 });
 

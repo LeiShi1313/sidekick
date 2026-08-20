@@ -62,7 +62,7 @@ test("uses configured search routing and bounds query count", async () => {
       return { content: [{ type: "text", text: "ok" }], details: {} };
     }),
     tool("fetch_content", async () => ({ content: [], details: {} })),
-  ]);
+  ], { hasCodexAuth: async () => true });
 
   await search.execute(
     "call-1",
@@ -79,6 +79,109 @@ test("uses configured search routing and bounds query count", async () => {
   assert.deepEqual(received.queries, ["one", "two", "three", "four"]);
   assert.equal("provider" in received, false);
   assert.equal(received.workflow, "none");
+});
+
+test("makes Exa primary when mounted Codex auth is unavailable", async () => {
+  let received;
+  const [search] = constrainWebTools(
+    [
+      tool("web_search", async (_id, params) => {
+        received = params;
+        return { content: [{ type: "text", text: "ok" }], details: {} };
+      }),
+      tool("fetch_content", async () => ({ content: [], details: {} })),
+    ],
+    { hasCodexAuth: async () => false },
+  );
+
+  await search.execute("call-exa", { query: "today's news" });
+
+  assert.equal(received.provider, "exa");
+});
+
+test("falls back to Exa when mounted Codex auth is rejected remotely", async () => {
+  const attempts = [];
+  const [search] = constrainWebTools(
+    [
+      tool("web_search", async (_id, params) => {
+        attempts.push(params);
+        if (attempts.length === 1) {
+          throw Object.assign(new Error("OpenAI authentication failed"), {
+            provider: "openai",
+            kind: "auth",
+          });
+        }
+        return { content: [{ type: "text", text: "exa" }], details: {} };
+      }),
+      tool("fetch_content", async () => ({ content: [], details: {} })),
+    ],
+    { hasCodexAuth: async () => true },
+  );
+
+  const result = await search.execute("call-auth-fallback", {
+    query: "today's news",
+  });
+
+  assert.equal("provider" in attempts[0], false);
+  assert.equal(attempts[1].provider, "exa");
+  assert.equal(result.content[0].text, "exa");
+});
+
+test("falls back when pi-web-access returns an OpenAI auth error result", async () => {
+  const attempts = [];
+  const [search] = constrainWebTools(
+    [
+      tool("web_search", async (_id, params) => {
+        attempts.push(params);
+        if (attempts.length === 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: openai search failed (auth): OpenAI API error 401",
+              },
+            ],
+            details: { successfulQueries: 0, totalResults: 0 },
+          };
+        }
+        return { content: [{ type: "text", text: "exa" }], details: {} };
+      }),
+      tool("fetch_content", async () => ({ content: [], details: {} })),
+    ],
+    { hasCodexAuth: async () => true },
+  );
+
+  const result = await search.execute("call-result-fallback", {
+    query: "today's news",
+  });
+
+  assert.equal("provider" in attempts[0], false);
+  assert.equal(attempts[1].provider, "exa");
+  assert.equal(result.content[0].text, "exa");
+});
+
+test("does not duplicate non-auth search failures", async () => {
+  let attempts = 0;
+  const failure = Object.assign(new Error("search unavailable"), {
+    provider: "openai",
+    kind: "network",
+  });
+  const [search] = constrainWebTools(
+    [
+      tool("web_search", async () => {
+        attempts += 1;
+        throw failure;
+      }),
+      tool("fetch_content", async () => ({ content: [], details: {} })),
+    ],
+    { hasCodexAuth: async () => true },
+  );
+
+  await assert.rejects(
+    search.execute("call-network", { query: "today's news" }),
+    failure,
+  );
+  assert.equal(attempts, 1);
 });
 
 test("allows bounded public HTTP and HTTPS page retrieval", async () => {

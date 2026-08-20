@@ -17,16 +17,13 @@ function logger(level, message, fields = {}) {
   process.stderr.write(`${JSON.stringify(safe)}\n`);
 }
 
-async function writeWebConfig(engineConfig) {
+async function writeWebConfig() {
   const path = join(homedir(), ".pi", "web-search.json");
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await writeFile(
     path,
     `${JSON.stringify(
-      buildWebSearchConfig({
-        baseUrl: engineConfig.baseUrl,
-        model: engineConfig.model,
-      }),
+      buildWebSearchConfig(),
       null,
       2,
     )}\n`,
@@ -36,7 +33,7 @@ async function writeWebConfig(engineConfig) {
 
 async function main() {
   const config = loadConfig();
-  await writeWebConfig(config.engine);
+  await writeWebConfig();
   const packagePath = require.resolve("pi-web-access/package.json");
   const engine = new PiEngine({
     ...config.engine,

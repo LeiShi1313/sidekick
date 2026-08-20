@@ -50,6 +50,12 @@ services:
     ports:
       - "127.0.0.1:${PI_AGENT_EXPOSE_PORT:-18790}:8790"
     volumes:
+      - type: bind
+        source: ${CODEX_AUTH_FILE:-/dev/null}
+        target: /run/secrets/codex-auth.json
+        read_only: true
+        bind:
+          create_host_path: false
       - agent-data:/agent-data
     logging:
       driver: json-file
