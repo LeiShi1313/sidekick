@@ -4942,9 +4942,11 @@ class AIConversationHandler:
             )
             if (
                 is_group
-                and loaded_context.current_reply_to_message_id is not None
+                and (
+                    loaded_context.current_reply_to_message_id is not None
+                    or current_mentions
+                )
                 and not customization_targets
-                and request_identity.requester.identity == self._owner_actor_id
             ):
                 request_identity = AgentRequestIdentity(
                     requester=request_identity.requester,
