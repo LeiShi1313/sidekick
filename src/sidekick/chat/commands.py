@@ -201,30 +201,35 @@ def parse_chat_command(
     if text is None:
         return None
     ai_prefix = normalize_ai_command_prefix(ai_prefix)
-    is_slash_command = text.startswith("/")
+    control_text = text
+    if ai_prefix != DEFAULT_AI_COMMAND_PREFIX and text.casefold().startswith(
+        f"{ai_prefix}_"
+    ):
+        control_text = f"{DEFAULT_AI_COMMAND_PREFIX}{text[len(ai_prefix) :]}"
+    is_control_candidate = control_text.startswith("/")
     is_ai_command = text.casefold().startswith(ai_prefix)
 
-    if not is_slash_command and not is_ai_command:
+    if not is_control_candidate and not is_ai_command:
         return None
 
-    if is_slash_command:
-        prefix = _parse_ai_prefix_control(text.strip())
+    if is_control_candidate:
+        prefix = _parse_ai_prefix_control(control_text.strip())
         if prefix is not None:
             return prefix
 
-        directory = _parse_directory_control(text)
+        directory = _parse_directory_control(control_text)
         if directory is not None:
             return directory
 
-        ai_limit = _parse_ai_limit_control(text.strip())
+        ai_limit = _parse_ai_limit_control(control_text.strip())
         if ai_limit is not None:
             return ai_limit
 
-        model = _parse_model_control(text.strip())
+        model = _parse_model_control(control_text.strip())
         if model is not None:
             return model
 
-        chat_access = _parse_chat_access_control(text.strip())
+        chat_access = _parse_chat_access_control(control_text.strip())
         if chat_access is not None:
             return chat_access
 
@@ -232,12 +237,12 @@ def parse_chat_command(
     if ai is not None:
         return ai
 
-    if is_slash_command:
-        memory_revision = _parse_memory_revision(text)
+    if is_control_candidate:
+        memory_revision = _parse_memory_revision(control_text)
         if memory_revision is not None:
             return memory_revision
 
-        control = text.strip()
+        control = control_text.strip()
         if control == "/ai_cancel":
             return AICancelCommand()
         if control == "/ai_allow":

@@ -153,6 +153,23 @@ def test_ai_trigger_uses_the_configured_group_command():
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("!ai_access open", ChatAccessCommand(action="open")),
+        ("!ai_access everyone", InvalidCommand(name="/ai_access")),
+        ("!ai_limit 60", AILimitCommand(action="set", cooldown_seconds=60)),
+        ("!ai_model default", AIModelCommand(action="reset")),
+        ("!ai_cancel", AICancelCommand()),
+        ("!ai_allow", AccessCommand(allowed=True)),
+        ("!ai_memory_status", MemoryStatusCommand()),
+        ("!ai_prefix $ask", AIPrefixCommand(action="set", prefix="$ask")),
+    ],
+)
+def test_ai_controls_accept_the_configured_group_prefix(text, expected):
+    assert parse_chat_command(text, ai_prefix="!ai") == expected
+
+
 @pytest.mark.parametrize("leader", punctuation)
 def test_ai_command_prefix_accepts_ascii_punctuation(leader):
     assert normalize_ai_command_prefix(f"{leader}Ask") == f"{leader}ask"

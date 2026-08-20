@@ -234,7 +234,7 @@ async def test_telegram_preserves_candidate_filter_and_attested_origin() -> None
         id=41,
         chat_id=-1001,
         peer_id=None,
-        raw_text="$ask hello",
+        raw_text="!ai_access open",
         reply_to_msg_id=None,
     )
     transport.origin = MessageOrigin.SIDEKICK_GENERATED

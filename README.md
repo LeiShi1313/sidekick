@@ -102,10 +102,11 @@ continuous ingestion for new messages in that chat. The configured Sidekick
 owner can inspect or change a group's per-person AI cooldown with `/ai_limit`,
 `/ai_limit <0-86400>`, or `/ai_limit default`; zero disables the cooldown but
 keeps the one-active-run safeguard. The owner can also inspect or replace that
-group's AI command with `/ai_prefix`, `/ai_prefix /ask`, or reset it with
+group's AI command with `/ai_prefix`, `/ai_prefix $ask`, or reset it with
 `/ai_prefix default`. A group override replaces `/ai` only for that group;
-fixed `/ai_*` management commands remain unchanged. Continuous and Dream
-ingestion are off per chat until explicitly enabled. Setting
+fixed `/ai_*` management commands remain available, and their equivalent
+group-prefixed forms use the override (for example, `$ask_access`). Continuous
+and Dream ingestion are off per chat until explicitly enabled. Setting
 `SIDEKICK_HINDSIGHT_URL` to an empty value disables memory; memory commands then
 report that Hindsight is disabled instead of silently changing ingestion state.
 A recalled or redacted WeChat message is excluded from later connector reads and

@@ -269,6 +269,30 @@ async def test_owner_can_open_and_restrict_ai_access_for_one_group(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_owner_can_open_group_access_with_the_configured_ai_prefix(tmp_path):
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        FakeGateway([]),
+        cooldown=0,
+    )
+    scope_id = "telegram:chat:-1001"
+    try:
+        await store.set_ai_command_prefix(scope_id, "!ai")
+
+        member_command = FakeMessage("!ai_access open", sender_id=20)
+        assert await handler.handle(member_command) is False
+        assert await store.is_chat_access_open(scope_id) is False
+
+        open_command = FakeMessage("!ai_access open", sender_id=10)
+
+        assert await handler.handle(open_command) is True
+        assert open_command.replies[0].text == "AI access opened for this group."
+        assert await store.is_chat_access_open(scope_id) is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_owner_can_set_inspect_and_reset_ai_limit_for_one_group(tmp_path):
     handler, store = await make_handler(
         tmp_path / "state.db",
