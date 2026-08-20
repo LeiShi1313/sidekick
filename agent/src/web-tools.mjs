@@ -306,14 +306,13 @@ function constrainSearch(definition) {
   return {
     ...definition,
     description:
-      "Search the public web through Exa. Returns raw cited results for the agent to synthesize.",
+      "Search the public web through OpenAI with Exa fallback. Returns raw cited results for the agent to synthesize.",
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const queries = normalizeQueries(params ?? {});
       const safe = {
         ...(Array.isArray(params?.queries)
           ? { queries }
           : { query: queries[0] }),
-        provider: "exa",
         workflow: "none",
         includeContent: false,
       };

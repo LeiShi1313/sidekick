@@ -17,7 +17,7 @@
     "linkedom": "0.16.11",
     "openai": "7.4.0",
     "pi-mcp-adapter": "2.21.0",
-    "pi-web-access": "0.13.0",
+    "pi-web-access": "0.24.0",
     "quickjs-emscripten": "0.32.0",
     "sharp": "0.35.3",
     "turndown": "7.2.4",

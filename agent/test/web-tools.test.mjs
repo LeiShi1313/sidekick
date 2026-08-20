@@ -54,7 +54,7 @@ function tools(options) {
   );
 }
 
-test("forces raw Exa search and bounds query count", async () => {
+test("uses configured search routing and bounds query count", async () => {
   let received;
   const [search] = constrainWebTools([
     tool("web_search", async (_id, params) => {
@@ -77,7 +77,7 @@ test("forces raw Exa search and bounds query count", async () => {
   );
 
   assert.deepEqual(received.queries, ["one", "two", "three", "four"]);
-  assert.equal(received.provider, "exa");
+  assert.equal("provider" in received, false);
   assert.equal(received.workflow, "none");
 });
 

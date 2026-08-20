@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +16,7 @@ import test from "node:test";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { buildWebSearchConfig } from "../src/config.mjs";
 import { bankReferenceTag } from "../src/knowledge-directory.mjs";
 import {
   PiEngine,
@@ -22,6 +31,9 @@ const MCP_TEST_EXTENSION_PATH = fileURLToPath(
 );
 const WEB_TEST_EXTENSION_PATH = fileURLToPath(
   new URL("../test-support/web-extension.mjs", import.meta.url),
+);
+const PRODUCTION_WEB_EXTENSION_PATH = fileURLToPath(
+  new URL("../node_modules/pi-web-access/index.ts", import.meta.url),
 );
 const TAIBU_MCP_EXTENSION_PATH = fileURLToPath(
   new URL("../src/taibu-mcp-extension.ts", import.meta.url),
@@ -70,6 +82,69 @@ async function fakeProvider(handler) {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     requests.push(body);
     handler(body, response, requests.length);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  return {
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    requests,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function fakeResponsesProxy() {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    requests.push({
+      authorization: request.headers.authorization,
+      body,
+      method: request.method,
+      url: request.url,
+    });
+    const citationUrl =
+      "https://developers.openai.com/api/docs/guides/tools-web-search";
+    const text = "Web search | OpenAI API";
+    const output = [
+      {
+        type: "web_search_call",
+        status: "completed",
+        action: {
+          sources: [{ title: text, url: citationUrl }],
+        },
+      },
+      {
+        type: "message",
+        status: "completed",
+        content: [
+          {
+            type: "output_text",
+            text,
+            annotations: [
+              {
+                type: "url_citation",
+                title: text,
+                url: citationUrl,
+                start_index: 0,
+                end_index: text.length,
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    writeSse(response, [
+      ...output.map((item) => ({
+        type: "response.output_item.done",
+        item,
+      })),
+      {
+        type: "response.completed",
+        response: { status: "completed", output },
+      },
+    ]);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
@@ -2102,6 +2177,122 @@ test("does not retry an empty response after a tool starts", async () => {
     });
   } finally {
     await app.close();
+  }
+});
+
+test("routes production web search through the configured Responses proxy", async () => {
+  const proxy = await fakeResponsesProxy();
+  const provider = await fakeProvider((_body, response, requestNumber) => {
+    if (requestNumber === 1) {
+      sendToolCall(response, {
+        id: "call-production-web-search",
+        name: "web_search",
+        args: {
+          query: "official OpenAI API web search guide",
+          provider: "exa",
+          workflow: "summary-review",
+        },
+      });
+      return;
+    }
+    sendText(response, "Search completed through proxy.");
+  });
+  const root = await mkdtemp(join(tmpdir(), "sidekick-web-proxy-test-"));
+  const configDir = join(root, "pi-config");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(
+    join(configDir, "web-search.json"),
+    `${JSON.stringify(
+      buildWebSearchConfig({ baseUrl: proxy.baseUrl, model: "search-model" }),
+      null,
+      2,
+    )}\n`,
+  );
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousApiKey = process.env.AI_API_KEY;
+  process.env.PI_CODING_AGENT_DIR = configDir;
+  process.env.AI_API_KEY = "proxy-search-key";
+  let engine;
+
+  try {
+    engine = new PiEngine({
+      baseUrl: provider.baseUrl,
+      apiKey: "test-key",
+      identityAliasKey: IDENTITY_ALIAS_KEY,
+      model: "test-model",
+      reasoningEffort: "off",
+      maxOutputTokens: 1_000,
+      contextWindow: 32_000,
+      requestTimeoutMs: 5_000,
+      imageModel: null,
+      imageRequestTimeoutMs: 5_000,
+      workspaceDir: join(root, "workspace"),
+      sessionDir: join(root, "sessions"),
+      auditDir: join(root, "audit"),
+      agentDir: join(root, "agent"),
+      webExtensionPath: PRODUCTION_WEB_EXTENSION_PATH,
+      mcpExtensionPath: null,
+      memoryUrl: null,
+      memoryToken: null,
+    });
+    await engine.initialize();
+    const events = await collect(
+      engine,
+      request("54545454-5454-4454-8454-545454545454", {
+        prompt: "Search the web.",
+      }),
+    );
+
+    assert.equal(events.at(-1).answer, "Search completed through proxy.");
+    assert(
+      events.some(
+        (event) =>
+          event.type === "tool_snapshot" &&
+          event.phase === "started" &&
+          event.tool === "web_search",
+      ),
+    );
+    assert.equal(proxy.requests.length, 1);
+    assert.deepEqual(proxy.requests[0], {
+      authorization: "Bearer proxy-search-key",
+      method: "POST",
+      url: "/v1/responses",
+      body: {
+        model: "search-model",
+        instructions:
+          "Search the web and return a concise answer grounded only in the web results. Include clickable source citations in the response text when possible.",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: "official OpenAI API web search guide",
+              },
+            ],
+          },
+        ],
+        tools: [{ type: "web_search" }],
+        include: ["web_search_call.action.sources"],
+        store: false,
+        stream: true,
+        tool_choice: "required",
+        parallel_tool_calls: true,
+      },
+    });
+    assert.match(
+      JSON.stringify(provider.requests[1].messages),
+      /Web search \| OpenAI API/,
+    );
+  } finally {
+    await engine?.shutdown();
+    await provider.close();
+    await proxy.close();
+    await rm(root, { recursive: true, force: true });
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousApiKey === undefined) delete process.env.AI_API_KEY;
+    else process.env.AI_API_KEY = previousApiKey;
   }
 });
 
