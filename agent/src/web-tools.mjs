@@ -24,6 +24,10 @@ const FORBIDDEN_HOSTS = new Set([
   "music.youtube.com",
 ]);
 
+// Best-effort blocklist of known IP-logging/link-tracking hosts (exact match
+// plus dot-subdomains). New domains, punycode lookalikes, and off-list
+// shortener chains are not covered; the egress proxy remains the primary
+// identity control.
 const TRACKER_HOSTS = new Set([
   "grabify.link",
   "urlto.me",
@@ -36,6 +40,7 @@ const TRACKER_HOSTS = new Set([
   "2no.co",
   "yip.su",
   "ipgrab.org",
+  "canarytokens.org",
 ]);
 
 const RECENCY_FILTERS = new Set(["day", "week", "month", "year"]);
@@ -95,7 +100,9 @@ function normalizedHostname(hostname) {
   return hostname
     .toLowerCase()
     .replace(/^\[|\]$/g, "")
-    .replace(/\.$/, "");
+    // Strip every trailing dot: resolvers treat "host.." like "host.", so a
+    // single-dot strip would let "grabify.link.." bypass exact matching.
+    .replace(/\.+$/, "");
 }
 
 function isPrivateOrReservedAddress(address) {
@@ -220,7 +227,7 @@ export function createPinnedRequester({
     if (egressProxy) {
       const port = Number(url.port) || (url.protocol === "https:" ? 443 : 80);
       tunnelSocket = wrapTunnelSocket(
-        await openEgressTunnel(egressProxy, { address, port }),
+        await openEgressTunnel(egressProxy, { address, port, signal }),
         url.protocol,
         hostname,
       );

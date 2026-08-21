@@ -131,17 +131,18 @@ async function establishConnectTunnel(socket, proxy, address, port) {
     const end = buffer.indexOf("\r\n\r\n");
     if (end === -1) return null;
     const statusLine = buffer.subarray(0, end).toString("latin1");
-    const status = Number(statusLine.split(" ")[1]);
-    if (!Number.isInteger(status)) {
+    const status = /^HTTP\/\d(?:\.\d)?[ \t]+(\d{3})/.exec(statusLine)?.[1];
+    if (status === undefined) {
       throw tunnelFailure(
         socket,
         "Egress proxy returned a malformed CONNECT response",
       );
     }
-    if (!(status >= 200 && status < 300)) {
+    const statusCode = Number(status);
+    if (!(statusCode >= 200 && statusCode < 300)) {
       throw tunnelFailure(
         socket,
-        `Egress proxy refused the CONNECT request (HTTP ${status})`,
+        `Egress proxy refused the CONNECT request (HTTP ${statusCode})`,
       );
     }
     return end + 4;
@@ -285,31 +286,47 @@ async function establishSocksTunnel(socket, proxy, address, port) {
       );
     }
     const atyp = buffer[3];
-    const boundLength =
-      atyp === SOCKS_ATYP_IPV4
-        ? 4
-        : atyp === SOCKS_ATYP_IPV6
-          ? 16
-          : atyp === SOCKS_ATYP_DOMAIN
-            ? buffer[4] + 1
-            : null;
-    if (boundLength === null) {
+    let boundLength;
+    if (atyp === SOCKS_ATYP_IPV4) {
+      boundLength = 4;
+    } else if (atyp === SOCKS_ATYP_IPV6) {
+      boundLength = 16;
+    } else if (atyp === SOCKS_ATYP_DOMAIN) {
+      // The length byte needs its own byte to exist before it can be read.
+      if (buffer.length < 5) return null;
+      boundLength = buffer[4] + 1;
+    } else {
       throw tunnelFailure(socket, "Egress proxy returned an unknown SOCKS5 address type");
     }
     const total = 4 + boundLength + 2;
+    if (!Number.isInteger(total)) {
+      throw tunnelFailure(socket, "Egress proxy returned a malformed SOCKS5 reply");
+    }
     return buffer.length < total ? null : total;
   });
   const leftover = reply.subarray(consumed);
   if (leftover.length > 0) socket.unshift(leftover);
 }
 
-export async function openEgressTunnel(proxy, { address, port }) {
-  const socket = netConnect({
-    host: proxy.host,
-    port: proxy.port,
-    autoSelectFamily: false,
-  });
+export async function openEgressTunnel(proxy, { address, port, signal }) {
+  // https proxies TLS-wrap the proxy leg itself; SNI authenticates the proxy
+  // host so Basic credentials never cross the wire in cleartext.
+  const socket =
+    proxy.protocol === "https"
+      ? tlsConnect({
+          host: proxy.host,
+          port: proxy.port,
+          servername: proxy.host,
+          rejectUnauthorized: true,
+        })
+      : netConnect({
+          host: proxy.host,
+          port: proxy.port,
+          autoSelectFamily: false,
+        });
   socket.setNoDelay(true);
+  const onAbort = () => socket.destroy();
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     await new Promise((resolve, reject) => {
       let settled = false;
@@ -328,7 +345,8 @@ export async function openEgressTunnel(proxy, { address, port }) {
       const onError = (error) => finish(reject, error);
       const onClose = () =>
         finish(reject, new Error("Egress proxy closed the connection"));
-      socket.once("connect", () => finish(resolve, undefined));
+      const readyEvent = proxy.protocol === "https" ? "secureConnect" : "connect";
+      socket.once(readyEvent, () => finish(resolve, undefined));
       socket.on("error", onError);
       socket.on("close", onClose);
     });
@@ -341,6 +359,8 @@ export async function openEgressTunnel(proxy, { address, port }) {
   } catch (error) {
     socket.destroy();
     throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 

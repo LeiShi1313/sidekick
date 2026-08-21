@@ -334,6 +334,7 @@ test("pins the actual HTTP socket lookup to the vetted address", async () => {
   const request = createPinnedRequester({
     httpRequest: transport,
     httpsRequest: transport,
+    egressProxy: null,
   });
 
   const response = await request({
@@ -383,6 +384,7 @@ test("destroys redirect and error bodies instead of draining unbounded data", as
     const request = createPinnedRequester({
       httpRequest: transport,
       httpsRequest: transport,
+      egressProxy: null,
     });
 
     const response = await request(
@@ -512,6 +514,9 @@ test("refuses known IP-logging hosts without contacting them", async () => {
     "https://www.urlto.me/2XUGq",
     "http://grabify.link/CHECK",
     "https://iplogger.org/xyz",
+    // Resolvers collapse trailing dots, so extra dots must not bypass the list.
+    "http://grabify.link../CHECK",
+    "https://www.urlto.me.../2XUGq",
   ]) {
     await assert.rejects(
       fetchContent.execute("call-8", { url }, undefined, undefined, {}),
@@ -602,7 +607,7 @@ test("tunnels pinned requests through an HTTP CONNECT egress proxy", async () =>
 function startSocksProxy({ auth = false } = {}) {
   const events = [];
   const server = createServer((socket) => {
-    let stage = auth ? "greeting" : "greeting";
+    let stage = "greeting";
     let pending = Buffer.alloc(0);
     const upstream = { socket: null };
     socket.on("data", function onData(chunk) {
@@ -759,5 +764,28 @@ test("parses egress proxy configuration strictly", () => {
     "socks5://host:notaport",
   ]) {
     assert.throws(() => parseEgressProxy(bad), /WEB_EGRESS_PROXY/);
+  }
+});
+
+test("requires TLS when the egress proxy URL uses https", async () => {
+  // A plaintext listener cannot complete the mandatory TLS handshake, so the
+  // tunnel must fail instead of sending the CONNECT request in cleartext.
+  const plainListener = createServer();
+  await listen(plainListener);
+  try {
+    const requester = createPinnedRequester({
+      egressProxy: parseEgressProxy(
+        `https://127.0.0.1:${plainListener.address().port}`,
+      ),
+    });
+    await assert.rejects(
+      requester({
+        url: new URL("http://target.example:80/page"),
+        address: "93.184.216.34",
+        family: 4,
+      }),
+    );
+  } finally {
+    plainListener.close();
   }
 });
