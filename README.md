@@ -58,6 +58,13 @@ non-canonical alias scoped to that bridge and Telegram chat. The alias can be
 retained in the room memory bank, but it cannot receive private-bank grants or
 merge across rooms.
 
+To deny specific Telegram accounts before AI routing, set
+`SIDEKICK_TELEGRAM_BLOCKED_USER_IDS` to a comma-separated list of numeric user
+IDs. The equivalent global `[telegram]` setting is
+`blocked_user_ids = [123456789]`. Denial takes precedence over individual
+allow-list entries and open group access. Use numeric IDs because Telegram
+usernames are mutable.
+
 WeChat and OneBot/QQ AI responses receive the mandatory
 `mainland-messaging-v1` output policy; Telegram does not. The policy asks the
 model to audit its complete response before delivery, and guarded responses are
