@@ -18,6 +18,7 @@ services:
       AI_IMAGE_REQUEST_TIMEOUT: ${AI_IMAGE_REQUEST_TIMEOUT:-180}
       TAIBU_MCP_URL: ${TAIBU_MCP_URL:-https://suanming.leishi.xyz/mcp}
       TAIBU_MCP_REQUEST_TIMEOUT_MS: ${TAIBU_MCP_REQUEST_TIMEOUT_MS:-30000}
+      WEB_EGRESS_PROXY: ${WEB_EGRESS_PROXY:-}
       PI_HOST: "0.0.0.0"
       PI_PORT: "8790"
       PI_DATA_DIR: /agent-data/.pi-agent

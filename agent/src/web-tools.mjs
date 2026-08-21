@@ -8,6 +8,11 @@ import TurndownService from "turndown";
 
 import { readUsableCodexAccessToken } from "./codex-access-token.mjs";
 import { sanitizeSensitiveValue } from "./privacy-redaction.mjs";
+import {
+  openEgressTunnel,
+  parseEgressProxy,
+  wrapTunnelSocket,
+} from "./egress-proxy.mjs";
 
 const FORBIDDEN_HOSTS = new Set([
   "github.com",
@@ -18,6 +23,26 @@ const FORBIDDEN_HOSTS = new Set([
   "m.youtube.com",
   "music.youtube.com",
 ]);
+
+// Best-effort blocklist of known IP-logging/link-tracking hosts (exact match
+// plus dot-subdomains). New domains, punycode lookalikes, and off-list
+// shortener chains are not covered; the egress proxy remains the primary
+// identity control.
+const TRACKER_HOSTS = new Set([
+  "grabify.link",
+  "urlto.me",
+  "iplogger.org",
+  "iplogger.ru",
+  "iplogger.co",
+  "iplogger.com",
+  "iplogger.net",
+  "iplogger.com.br",
+  "2no.co",
+  "yip.su",
+  "ipgrab.org",
+  "canarytokens.org",
+]);
+
 const RECENCY_FILTERS = new Set(["day", "week", "month", "year"]);
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 5;
@@ -75,7 +100,9 @@ function normalizedHostname(hostname) {
   return hostname
     .toLowerCase()
     .replace(/^\[|\]$/g, "")
-    .replace(/\.$/, "");
+    // Strip every trailing dot: resolvers treat "host.." like "host.", so a
+    // single-dot strip would let "grabify.link.." bypass exact matching.
+    .replace(/\.+$/, "");
 }
 
 function isPrivateOrReservedAddress(address) {
@@ -115,6 +142,14 @@ async function resolveAllowedTarget(raw, lookup) {
     throw new Error("URL credentials are not allowed");
   }
   const hostname = normalizedHostname(url.hostname);
+  if (
+    TRACKER_HOSTS.has(hostname) ||
+    [...TRACKER_HOSTS].some((host) => hostname.endsWith(`.${host}`))
+  ) {
+    throw new Error(
+      "URL host is not allowed (known IP-logging/link-tracking service)",
+    );
+  }
   if (
     !hostname ||
     hostname === "localhost" ||
@@ -177,6 +212,7 @@ function responseTooLarge() {
 export function createPinnedRequester({
   httpRequest: requestHttp = httpRequest,
   httpsRequest: requestHttps = httpsRequest,
+  egressProxy = parseEgressProxy(process.env.WEB_EGRESS_PROXY),
 } = {}) {
   return async function requestPinned(
     target,
@@ -185,26 +221,44 @@ export function createPinnedRequester({
     const { url, address, family } = target;
     const hostname = normalizedHostname(url.hostname);
     const transport = url.protocol === "https:" ? requestHttps : requestHttp;
-    const lookup = (_requestedHostname, options, callback) => {
-      const done = typeof options === "function" ? options : callback;
-      const wantsAll = typeof options === "object" && options?.all === true;
-      if (wantsAll) {
-        done(null, [{ address, family }]);
-      } else {
-        done(null, address, family);
-      }
-    };
+
+    let tunnelSocket = null;
+    let connection;
+    if (egressProxy) {
+      const port = Number(url.port) || (url.protocol === "https:" ? 443 : 80);
+      tunnelSocket = wrapTunnelSocket(
+        await openEgressTunnel(egressProxy, { address, port, signal }),
+        url.protocol,
+        hostname,
+      );
+      // agent must stay unset here: with `agent: false` Node spins up a
+      // one-off agent that ignores options.createConnection.
+      connection = { createConnection: () => tunnelSocket };
+    } else {
+      const lookup = (_requestedHostname, options, callback) => {
+        const done = typeof options === "function" ? options : callback;
+        const wantsAll = typeof options === "object" && options?.all === true;
+        if (wantsAll) {
+          done(null, [{ address, family }]);
+        } else {
+          done(null, address, family);
+        }
+      };
+      connection = { family, lookup, autoSelectFamily: false, agent: false };
+    }
 
     return await new Promise((resolve, reject) => {
       let settled = false;
       const succeed = (value) => {
         if (settled) return;
         settled = true;
+        tunnelSocket?.destroy();
         resolve(value);
       };
       const fail = (error) => {
         if (settled) return;
         settled = true;
+        tunnelSocket?.destroy();
         reject(error);
       };
       let request;
@@ -222,10 +276,7 @@ export function createPinnedRequester({
               "Cache-Control": "no-cache",
               "User-Agent": USER_AGENT,
             },
-            family,
-            lookup,
-            autoSelectFamily: false,
-            agent: false,
+            ...connection,
             signal,
             ...(url.protocol === "https:" && isIP(hostname) === 0
               ? { servername: hostname }

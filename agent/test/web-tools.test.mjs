@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { connect as netConnect, createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
 
+import { parseEgressProxy } from "../src/egress-proxy.mjs";
 import {
   constrainWebTools,
   createPinnedRequester,
@@ -331,6 +334,7 @@ test("pins the actual HTTP socket lookup to the vetted address", async () => {
   const request = createPinnedRequester({
     httpRequest: transport,
     httpsRequest: transport,
+    egressProxy: null,
   });
 
   const response = await request({
@@ -380,6 +384,7 @@ test("destroys redirect and error bodies instead of draining unbounded data", as
     const request = createPinnedRequester({
       httpRequest: transport,
       httpsRequest: transport,
+      egressProxy: null,
     });
 
     const response = await request(
@@ -492,4 +497,295 @@ test("withholds reflected requester metadata from fetched page results", async (
     JSON.stringify(result),
     /203\.0\.113\.42|runtime-node|Example City|Example Network/,
   );
+});
+
+test("refuses known IP-logging hosts without contacting them", async () => {
+  let requested = 0;
+  const [, fetchContent] = tools({
+    lookup: publicLookup,
+    request: async () => {
+      requested += 1;
+      return pageResponse();
+    },
+  });
+
+  for (const url of [
+    "https://urlto.me/2XUGq",
+    "https://www.urlto.me/2XUGq",
+    "http://grabify.link/CHECK",
+    "https://iplogger.org/xyz",
+    // Resolvers collapse trailing dots, so extra dots must not bypass the list.
+    "http://grabify.link../CHECK",
+    "https://www.urlto.me.../2XUGq",
+  ]) {
+    await assert.rejects(
+      fetchContent.execute("call-8", { url }, undefined, undefined, {}),
+      /not allowed.*IP-logging/i,
+    );
+  }
+  assert.equal(requested, 0);
+});
+
+test("blocks redirects that land on a known IP-logging host", async () => {
+  const requested = [];
+  const [, fetchContent] = tools({
+    lookup: publicLookup,
+    request: async (target) => {
+      requested.push(target.url.toString());
+      return pageResponse({
+        status: 302,
+        statusText: "Found",
+        headers: { location: "https://grabify.link/TRAP" },
+        body: "",
+      });
+    },
+  });
+
+  await assert.rejects(
+    fetchContent.execute("call-9", { url: "https://example.com/start" }, undefined, undefined, {}),
+    /not allowed.*IP-logging/i,
+  );
+  assert.equal(requested.length, 1);
+});
+
+function listen(server) {
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+}
+
+function startConnectProxy() {
+  const seen = [];
+  const server = createServer((socket) => {
+    let buffer = "";
+    socket.on("data", function onData(chunk) {
+      buffer += chunk.toString("latin1");
+      const end = buffer.indexOf("\r\n\r\n");
+      if (end === -1) return;
+      socket.off("data", onData);
+      const requestLine = buffer.slice(0, buffer.indexOf("\r\n"));
+      const authority = requestLine.split(" ")[1];
+      seen.push(authority);
+      const [host, port] = authority.split(":");
+      const upstream = netConnect(Number(port), host);
+      upstream.on("connect", () => {
+        socket.write("HTTP/1.1 200 Connection established\r\n\r\n");
+        socket.pipe(upstream);
+        upstream.pipe(socket);
+      });
+      upstream.on("error", () => socket.destroy());
+    });
+  });
+  return { server, seen };
+}
+
+test("tunnels pinned requests through an HTTP CONNECT egress proxy", async () => {
+  const proxy = startConnectProxy();
+  await listen(proxy.server);
+  const target = createHttpServer((_request, response) => {
+    response.setHeader("content-type", "text/plain");
+    response.end("tunnel-body");
+  });
+  await listen(target);
+
+  try {
+    const requester = createPinnedRequester({
+      egressProxy: parseEgressProxy(`http://127.0.0.1:${proxy.server.address().port}`),
+    });
+    const response = await requester({
+      url: new URL(`http://target.example:${target.address().port}/page`),
+      address: "127.0.0.1",
+      family: 4,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.toString(), "tunnel-body");
+    assert.deepEqual(proxy.seen, [`127.0.0.1:${target.address().port}`]);
+  } finally {
+    proxy.server.close();
+    target.close();
+  }
+});
+
+function startSocksProxy({ auth = false } = {}) {
+  const events = [];
+  const server = createServer((socket) => {
+    let stage = "greeting";
+    let pending = Buffer.alloc(0);
+    const upstream = { socket: null };
+    socket.on("data", function onData(chunk) {
+      pending = Buffer.concat([pending, chunk]);
+      if (stage === "greeting") {
+        if (pending.length < 2) return;
+        const count = pending[1];
+        if (pending.length < 2 + count) return;
+        const methods = [...pending.subarray(2, 2 + count)];
+        const chosen = auth && methods.includes(0x02) ? 0x02 : 0x00;
+        events.push({ stage: "method", chosen });
+        socket.write(Buffer.from([5, chosen]));
+        pending = pending.subarray(2 + count);
+        stage = chosen === 0x02 ? "auth" : "connect";
+        if (stage === "connect") return next();
+      }
+      if (stage === "auth") {
+        if (pending.length < 2) return;
+        const userLength = pending[1];
+        if (pending.length < 2 + userLength + 1) return;
+        const passLength = pending[2 + userLength];
+        if (pending.length < 3 + userLength + passLength) return;
+        events.push({
+          stage: "auth",
+          user: pending.subarray(2, 2 + userLength).toString(),
+          pass: pending.subarray(3 + userLength, 3 + userLength + passLength).toString(),
+        });
+        socket.write(Buffer.from([1, 0]));
+        pending = pending.subarray(3 + userLength + passLength);
+        stage = "connect";
+      }
+      if (stage === "connect") {
+        next();
+      }
+      function next() {
+        if (pending.length < 4) return;
+        const atyp = pending[3];
+        let address;
+        let offset;
+        if (atyp === 1) {
+          if (pending.length < 10) return;
+          address = [...pending.subarray(4, 8)].join(".");
+          offset = 8;
+        } else if (atyp === 4) {
+          if (pending.length < 22) return;
+          const groups = [];
+          for (let index = 4; index < 20; index += 2) {
+            groups.push(pending.readUInt16BE(index).toString(16));
+          }
+          address = groups.join(":");
+          offset = 20;
+        } else {
+          socket.destroy();
+          return;
+        }
+        const port = pending.readUInt16BE(offset);
+        events.push({ stage: "connect", address, port });
+        socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+        socket.off("data", onData);
+        upstream.socket = netConnect(port, address.includes(":") ? "::1" : address);
+        upstream.socket.on("connect", () => {
+          upstream.socket.pipe(socket);
+          socket.pipe(upstream.socket);
+        });
+        upstream.socket.on("error", () => socket.destroy());
+      }
+    });
+  });
+  return { server, events };
+}
+
+test("tunnels pinned requests through a SOCKS5 egress proxy", async () => {
+  const proxy = startSocksProxy();
+  await listen(proxy.server);
+  const target = createHttpServer((_request, response) => {
+    response.end("socks-body");
+  });
+  await listen(target);
+
+  try {
+    const requester = createPinnedRequester({
+      egressProxy: parseEgressProxy(`socks5://127.0.0.1:${proxy.server.address().port}`),
+    });
+    const response = await requester({
+      url: new URL(`http://target.example:${target.address().port}/page`),
+      address: "127.0.0.1",
+      family: 4,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.toString(), "socks-body");
+    assert.deepEqual(proxy.events, [
+      { stage: "method", chosen: 0 },
+      { stage: "connect", address: "127.0.0.1", port: target.address().port },
+    ]);
+  } finally {
+    proxy.server.close();
+    target.close();
+  }
+});
+
+test("negotiates SOCKS5 username and password authentication", async () => {
+  const proxy = startSocksProxy({ auth: true });
+  await listen(proxy.server);
+  const target = createHttpServer((_request, response) => {
+    response.end("socks-auth-body");
+  });
+  await listen(target);
+
+  try {
+    const requester = createPinnedRequester({
+      egressProxy: parseEgressProxy(
+        `socks5://alice:s3cret@127.0.0.1:${proxy.server.address().port}`,
+      ),
+    });
+    const response = await requester({
+      url: new URL(`http://target.example:${target.address().port}/page`),
+      address: "127.0.0.1",
+      family: 4,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.toString(), "socks-auth-body");
+    assert.deepEqual(proxy.events, [
+      { stage: "method", chosen: 2 },
+      { stage: "auth", user: "alice", pass: "s3cret" },
+      { stage: "connect", address: "127.0.0.1", port: target.address().port },
+    ]);
+  } finally {
+    proxy.server.close();
+    target.close();
+  }
+});
+
+test("parses egress proxy configuration strictly", () => {
+  assert.equal(parseEgressProxy(""), null);
+  assert.equal(parseEgressProxy(null), null);
+  assert.deepEqual(parseEgressProxy("socks5h://gw.internal"), {
+    protocol: "socks5",
+    host: "gw.internal",
+    port: 1080,
+    username: null,
+    password: null,
+  });
+  assert.deepEqual(parseEgressProxy("http://bob:hunter2@10.9.8.7:3128"), {
+    protocol: "http",
+    host: "10.9.8.7",
+    port: 3128,
+    username: "bob",
+    password: "hunter2",
+  });
+  for (const bad of [
+    "ftp://proxy.example",
+    "not a url",
+    "http://user:@host",
+    "socks5://host:notaport",
+  ]) {
+    assert.throws(() => parseEgressProxy(bad), /WEB_EGRESS_PROXY/);
+  }
+});
+
+test("requires TLS when the egress proxy URL uses https", async () => {
+  // A plaintext listener cannot complete the mandatory TLS handshake, so the
+  // tunnel must fail instead of sending the CONNECT request in cleartext.
+  const plainListener = createServer();
+  await listen(plainListener);
+  try {
+    const requester = createPinnedRequester({
+      egressProxy: parseEgressProxy(
+        `https://127.0.0.1:${plainListener.address().port}`,
+      ),
+    });
+    await assert.rejects(
+      requester({
+        url: new URL("http://target.example:80/page"),
+        address: "93.184.216.34",
+        family: 4,
+      }),
+    );
+  } finally {
+    plainListener.close();
+  }
 });
