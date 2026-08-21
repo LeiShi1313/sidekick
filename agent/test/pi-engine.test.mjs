@@ -1637,14 +1637,15 @@ test("gives the owner model only prior owner defaults for a merged target update
   assert.deepEqual(directiveWrites[0].tags, targetOwnerTags);
 });
 
-test("owner and delegated runs receive the same restricted tools", () => {
-  const genericTools = [
+test("delegated runs lose fetch_content but keep the other restricted tools", () => {
+  const ownerTools = [
     "web_search",
     "fetch_content",
     "code_exec",
   ];
+  const delegatedTools = ["web_search", "code_exec"];
   const toolsWithMemory = [
-    ...genericTools,
+    ...ownerTools,
     "memory_reflect",
     "memory_get_sources",
     "memory_query_current",
@@ -1652,28 +1653,29 @@ test("owner and delegated runs receive the same restricted tools", () => {
     "memory_find_sources",
     "memory_update_requester",
   ];
-  const memoryToolNames = toolsWithMemory.slice(genericTools.length);
+  const memoryToolNames = toolsWithMemory.slice(ownerTools.length);
 
-  assert.deepEqual(toolNamesForPolicy("owner"), genericTools);
-  assert.deepEqual(toolNamesForPolicy("delegated"), genericTools);
+  assert.deepEqual(toolNamesForPolicy("owner"), ownerTools);
+  assert.deepEqual(toolNamesForPolicy("delegated"), delegatedTools);
   assert.deepEqual(toolNamesForPolicy("owner", memoryToolNames), toolsWithMemory);
   assert.deepEqual(
     toolNamesForPolicy("delegated", memoryToolNames),
-    toolsWithMemory,
+    [...delegatedTools, ...memoryToolNames],
   );
   assert.deepEqual(toolNamesForPolicy("none"), []);
   assert.deepEqual(toolNamesForPolicy("none", memoryToolNames), []);
   assert.deepEqual(toolNamesForPolicy("owner", [], true), [
-    ...genericTools,
+    ...ownerTools,
     "mcp",
   ]);
   assert.deepEqual(toolNamesForPolicy("delegated", memoryToolNames, true), [
-    ...toolsWithMemory,
+    ...delegatedTools,
+    ...memoryToolNames,
     "mcp",
   ]);
   assert.deepEqual(toolNamesForPolicy("none", memoryToolNames, true), []);
   assert.deepEqual(toolNamesForPolicy("delegated", [], false, true), [
-    ...genericTools,
+    ...delegatedTools,
     "image_generate",
   ]);
   assert.deepEqual(toolNamesForPolicy("none", [], false, true), []);
