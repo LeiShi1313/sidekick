@@ -67,6 +67,13 @@ const RESTRICTED_TOOLS = Object.freeze([
   "code_exec",
 ]);
 const TOOL_POLICIES = new Set(["owner", "delegated", "none"]);
+// Delegated runs never contact arbitrary URLs; only the owner may fetch pages.
+const POLICY_RESTRICTED_TOOLS = Object.freeze({
+  owner: RESTRICTED_TOOLS,
+  delegated: Object.freeze(
+    RESTRICTED_TOOLS.filter((name) => name !== "fetch_content"),
+  ),
+});
 const PUBLIC_AGENT_CWD = "/workspace";
 const EMPTY_RESPONSE_RETRY_PROMPT =
   "Your previous response was empty. Complete the original request now, " +
@@ -353,7 +360,6 @@ export function buildRunPrompt({
     origin.scopeId,
   );
 }
-
 export function toolNamesForPolicy(
   policy,
   memoryToolNames = [],
@@ -363,7 +369,7 @@ export function toolNamesForPolicy(
   if (!TOOL_POLICIES.has(policy)) throw new Error("Unknown tool policy");
   if (policy === "none") return [];
   return [
-    ...RESTRICTED_TOOLS,
+    ...POLICY_RESTRICTED_TOOLS[policy],
     ...memoryToolNames,
     ...(mcpEnabled ? ["mcp"] : []),
     ...(imageEnabled ? [IMAGE_TOOL_NAME] : []),
