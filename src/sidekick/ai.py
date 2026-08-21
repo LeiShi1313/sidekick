@@ -4406,6 +4406,7 @@ class AIConversationHandler:
         run_store: AIRunStateWriter | None = None,
         adapter_instance_id: str | None = None,
         logger: Any | None = None,
+        denied_actor_ids: frozenset[str] = frozenset(),
     ):
         if memory_command_delete_delay < 0:
             raise ValueError("memory_command_delete_delay cannot be negative")
@@ -4421,6 +4422,12 @@ class AIConversationHandler:
                 adapter_instance_id,
                 maximum=128,
             )
+        normalized_denied_actor_ids = frozenset(denied_actor_ids)
+        if any(
+            not is_canonical_actor_id(actor_id)
+            for actor_id in normalized_denied_actor_ids
+        ):
+            raise ValueError("Denied actors require canonical actor identities")
         self._owner_id = owner_id
         self._responder = responder
         self._store = store
@@ -4437,6 +4444,7 @@ class AIConversationHandler:
         self._transport = transport or responder.transport or ObjectChatTransport()
         self._identity_codec = identity_codec or prompt_builder.identity_codec
         self._owner_actor_id = self._identity_codec.actor_id(owner_id)
+        self._denied_actor_ids = normalized_denied_actor_ids
         self._run_store = run_store
         self._adapter_instance_id = (
             adapter_instance_id or f"{self._identity_codec.source}-local"
@@ -4475,10 +4483,17 @@ class AIConversationHandler:
                     "Ignoring outgoing message with indeterminate local provenance"
                 )
             return None
+        principal_actor_id = self._identity_codec.actor_id(message.sender_id)
+        if principal_actor_id in self._denied_actor_ids:
+            if self._logger is not None:
+                self._logger.info(
+                    "Ignoring message from denied actor (actor_id=%s)",
+                    principal_actor_id,
+                )
+            return None
         requester_actor_id = self._prompt_builder.message_actor_id(message)
         if requester_actor_id is None:
             return None
-        principal_actor_id = self._identity_codec.actor_id(message.sender_id)
         message_text = self._prompt_builder.message_text(message)
         scope_id = self._identity_codec.scope_id(message.chat_id)
         ai_prefix = DEFAULT_AI_COMMAND_PREFIX

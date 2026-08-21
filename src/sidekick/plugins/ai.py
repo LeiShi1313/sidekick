@@ -331,6 +331,10 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             run_store=self._store,
             adapter_instance_id=self._ops_settings.instance_id,
             logger=self.logger,
+            denied_actor_ids=frozenset(
+                TELEGRAM_IDENTITY_CODEC.actor_id(user_id)
+                for user_id in self.service.config.blocked_user_ids
+            ),
         )
         inbound_source = TelegramInboundMessageSource(self.client)
         self._ai_workflow = AIWorkflow(

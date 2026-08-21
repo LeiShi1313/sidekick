@@ -15,6 +15,10 @@ from sidekick.ai import (
     PromptBuilder,
 )
 from sidekick.ai_memory import MemoryRetainResult
+from sidekick.ai_workflow import AIWorkflow
+from sidekick.chat.provenance import MessageOrigin
+from sidekick.inbound import InboundSourceRevision
+from sidekick.inbound_store import SQLiteInboundWorkStore
 from sidekick.memory_directory import DirectorySource
 from sidekick.telegram.ai_identity import TELEGRAM_IDENTITY_CODEC
 
@@ -161,6 +165,7 @@ async def make_handler(
     cooldown=30.0,
     memory=None,
     directory_source_resolver=None,
+    denied_actor_ids=frozenset(),
 ):
     store = await AIStateRepository(path).connect()
     limiter = AIRateLimiter(store, cooldown_seconds=cooldown, clock=clock)
@@ -176,6 +181,7 @@ async def make_handler(
         directory_source_resolver=directory_source_resolver,
         memory_command_delete_delay=0,
         identity_codec=TELEGRAM_IDENTITY_CODEC,
+        denied_actor_ids=denied_actor_ids,
     )
     return handler, store
 
@@ -266,6 +272,101 @@ async def test_owner_can_open_and_restrict_ai_access_for_one_group(tmp_path):
         assert gateway.requests[2].tool_policy == "delegated"
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_denied_actor_cannot_use_ai_when_group_access_is_open(tmp_path):
+    gateway = FakeGateway(["must not be called"])
+    denied_actor = actor_id(20)
+    handler, store = await make_handler(
+        tmp_path / "state.db",
+        gateway,
+        cooldown=0,
+        denied_actor_ids=frozenset({denied_actor}),
+    )
+    try:
+        await store.allow_user(denied_actor)
+        await store.set_chat_access_open("telegram:chat:-1001", True)
+        request = FakeMessage("/ai blocked question", sender_id=20)
+
+        classification = await handler.classify(request)
+
+        assert classification.disposition == "immediate"
+        assert await handler.handle(request) is False
+        assert request.replies == []
+        assert gateway.requests == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovered_queued_request_is_superseded_when_actor_becomes_denied(
+    tmp_path,
+):
+    message = FakeMessage("/ai queued before restart", sender_id=20)
+
+    class RestartSource:
+        async def fetch(self, work):
+            return InboundSourceRevision(
+                version="message:v1",
+                state="present",
+                payload=message,
+                attested_origin=work.attested_origin,
+            )
+
+        async def materialize(self, payload):
+            return payload
+
+    database = tmp_path / "state.db"
+    gateway = FakeGateway(["must not be called"])
+    handler, state_store = await make_handler(database, gateway, cooldown=0)
+    inbound_store = await SQLiteInboundWorkStore(database).connect()
+    await inbound_store.initialize_source(
+        "telegram-test",
+        epoch="owner-10",
+        initial_cursor=0,
+    )
+    await state_store.set_chat_access_open("telegram:chat:-1001", True)
+    workflow = AIWorkflow(
+        RestartSource(),
+        inbound_store,
+        "telegram-test",
+        handler,
+        generation_concurrency=1,
+    )
+    await workflow.accept(
+        cursor=message.id,
+        chat_id=message.chat_id,
+        message_id=message.id,
+        kind="message",
+        attested_origin=MessageOrigin.INCOMING,
+    )
+    assert await workflow._process_intake_one() == "queued"
+    await inbound_store.close()
+    await state_store.close()
+
+    denied_handler, restarted_state_store = await make_handler(
+        database,
+        gateway,
+        cooldown=0,
+        denied_actor_ids=frozenset({actor_id(20)}),
+    )
+    restarted_inbound_store = await SQLiteInboundWorkStore(database).connect()
+    restarted_workflow = AIWorkflow(
+        RestartSource(),
+        restarted_inbound_store,
+        "telegram-test",
+        denied_handler,
+        generation_concurrency=1,
+    )
+    try:
+        assert await restarted_workflow._process_generation_one() == "stale"
+        assert await restarted_workflow._process_generation_one() == "idle"
+        assert message.replies == []
+        assert gateway.requests == []
+    finally:
+        await restarted_inbound_store.close()
+        await restarted_state_store.close()
 
 
 @pytest.mark.asyncio

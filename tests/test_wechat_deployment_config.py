@@ -37,6 +37,7 @@ def render_compose() -> dict[str, object]:
         "SIDEKICK_ONEBOT_SELF_ID": "123456789",
         "SIDEKICK_TELEGRAM_PI_TOKEN": "telegram-pi-token-that-is-long-enough",
         "SIDEKICK_TELEGRAM_MATRIX_BRIDGE_BOT_IDS": "6332621450,7000000000",
+        "SIDEKICK_TELEGRAM_BLOCKED_USER_IDS": "123456789",
         "SIDEKICK_ONEBOT_PI_TOKEN": "onebot-pi-token-that-is-long-enough",
         "SIDEKICK_WECHAT_HOST_PI_TOKEN": "wechat-host-pi-token-that-is-long-enough",
         "SIDEKICK_WECHAT_PEER_PI_TOKEN": "wechat-peer-pi-token-that-is-long-enough",
@@ -75,6 +76,18 @@ def test_telegram_worker_receives_matrix_bridge_bot_ids() -> None:
             "SIDEKICK_TELEGRAM_MATRIX_BRIDGE_BOT_IDS"
         ]
         == "6332621450,7000000000"
+    )
+
+
+@pytest.mark.skipif(not docker_compose_available(), reason="Docker Compose is required")
+def test_telegram_worker_receives_blocked_user_ids() -> None:
+    rendered = render_compose()
+
+    assert (
+        rendered["services"]["ai"]["environment"][
+            "SIDEKICK_TELEGRAM_BLOCKED_USER_IDS"
+        ]
+        == "123456789"
     )
 
 
