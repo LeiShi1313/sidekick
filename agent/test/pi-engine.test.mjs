@@ -815,6 +815,42 @@ test("does not add continuation guidance to a root request", () => {
   assert.doesNotMatch(prompt, /<host_conversation_continuity>/);
 });
 
+test("stamps the run with the host-resolved UTC time", () => {
+  const prompt = buildRunPrompt({
+    prompt: "What day is it?",
+    context: [],
+    identity: requestIdentity(),
+    origin: runOrigin(),
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+    now: new Date("2026-08-22T09:41:00.500Z"),
+  });
+
+  assert.match(prompt, /<host_time>/);
+  assert.match(
+    prompt,
+    /Host-resolved current UTC time: 2026-08-22T09:41:00Z \(Saturday\)\./,
+  );
+  assert.match(prompt, /treat it as authoritative over any assumed date/i);
+  assert.ok(
+    prompt.indexOf("<host_time>") < prompt.indexOf("<current_request>"),
+  );
+});
+
+test("defaults host_time to the current wall clock", () => {
+  const prompt = buildRunPrompt({
+    prompt: "What day is it?",
+    context: [],
+    identity: requestIdentity(),
+    origin: runOrigin(),
+    identityAliasKey: IDENTITY_ALIAS_KEY,
+  });
+
+  assert.match(
+    prompt,
+    /Host-resolved current UTC time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \(/,
+  );
+});
+
 test("identifies the host-resolved requester for first-person references", () => {
   const prompt = buildRunPrompt({
     prompt: "What have I been doing with AI?",
@@ -1089,6 +1125,7 @@ test("retains an owner's participant target when a third person continues", asyn
     assert.match(userPrompts[0], /Current request replies to \[m1\]/);
     assert.match(userPrompts[0], /<host_participant_bindings>/);
     assert.match(userPrompts[0], /reply_author/);
+    assert.match(userPrompts[0], /<host_time>/);
     assert.match(userPrompts[0], /Untrusted display label: Target/i);
     assert.doesNotMatch(
       JSON.stringify(continuationMessages),
