@@ -268,6 +268,26 @@ function replaceModelIdentityIds(value, aliases) {
   return result;
 }
 
+const WEEKDAY_NAMES = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+
+function hostTimeSection(now) {
+  const iso = now.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return (
+    "<host_time>\n" +
+    `Host-resolved current UTC time: ${iso} (${WEEKDAY_NAMES[now.getUTCDay()]}).\n` +
+    "This applies to the current_request in this message; earlier messages carry the host time at which they were sent. Use it as the reference for relative-time reasoning and treat it as authoritative over any assumed date.\n" +
+    "</host_time>"
+  );
+}
+
 export function buildRunPrompt({
   prompt,
   context,
@@ -276,8 +296,9 @@ export function buildRunPrompt({
   memory,
   continuation = false,
   identityAliasKey,
+  now = new Date(),
 }) {
-  const sections = [];
+  const sections = [hostTimeSection(now)];
   const identityAliases = modelIdentityAliases(
     identity,
     identityAliasKey,
@@ -1196,6 +1217,7 @@ export class PiEngine {
         identityAliasKey: this.config.identityAliasKey,
         identityScope: request.origin.scopeId,
       };
+      const promptIssuedAt = new Date();
       persistenceState = {
         privacyOptions,
         userMessageContent: buildRunPrompt({
@@ -1203,6 +1225,7 @@ export class PiEngine {
           context: request.context.filter(({ kind }) => kind === "conversation"),
           continuation: request.sessionId !== null,
           identityAliasKey: this.config.identityAliasKey,
+          now: promptIssuedAt,
         }),
       };
       sanitizeConversationHistoryInPlace(session.messages, privacyOptions);
@@ -1397,6 +1420,7 @@ export class PiEngine {
         ...enrichedRequest,
         continuation: request.sessionId !== null,
         identityAliasKey: this.config.identityAliasKey,
+        now: promptIssuedAt,
       });
       let initialPrompt = preparedPrompt;
       if (finalizationDelayMs === 0) {
