@@ -1,8 +1,9 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { CODEX_ACCESS_TOKEN_COMMAND } from "./codex-access-token.mjs";
+import { isHostIdentity } from "./host-identity.mjs";
 
 const REASONING_LEVELS = new Set([
   "none",
@@ -42,7 +43,6 @@ const TOOL_GRANT_GROUP_EXPANSIONS = Object.freeze({
   mcp: ["mcp"],
   memory: ["memory_*"],
 });
-const TOOL_GRANTS_USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:@._-]{0,199}$/;
 
 function required(name) {
   const value = process.env[name]?.trim();
@@ -156,13 +156,13 @@ export function parseToolGrants(raw, allowedScopeIds) {
       "Invalid tool grants configuration: expects users or scopes",
     );
   }
-  const users = {};
+  const users = Object.create(null);
   if (document.users !== undefined) {
     if (!document.users || typeof document.users !== "object" || Array.isArray(document.users)) {
       throw new Error("Invalid tool grants configuration: users must be an object");
     }
     for (const [id, entry] of Object.entries(document.users)) {
-      if (!TOOL_GRANTS_USER_ID_RE.test(id)) {
+      if (!isHostIdentity(id)) {
         throw new Error(
           `Invalid tool grants configuration: bad user id "${id}"`,
         );
@@ -170,7 +170,7 @@ export function parseToolGrants(raw, allowedScopeIds) {
       users[id] = parseToolGrantEntry(entry, `users.${id}`);
     }
   }
-  const scopes = {};
+  const scopes = Object.create(null);
   if (document.scopes !== undefined) {
     if (!document.scopes || typeof document.scopes !== "object" || Array.isArray(document.scopes)) {
       throw new Error("Invalid tool grants configuration: scopes must be an object");
@@ -198,6 +198,20 @@ export function parseToolGrants(raw, allowedScopeIds) {
 function loadToolGrants(allowedScopeIds) {
   const path = process.env.PI_AGENT_TOOL_GRANTS_FILE?.trim();
   if (!path) return null;
+  const MAX_TOOL_GRANTS_FILE_BYTES = 1024 * 1024;
+  let stats;
+  try {
+    stats = statSync(path);
+  } catch (error) {
+    throw new Error(
+      `Unreadable tool grants configuration at ${path}: ${error.code ?? error.message}`,
+    );
+  }
+  if (!stats.isFile() || stats.size > MAX_TOOL_GRANTS_FILE_BYTES) {
+    throw new Error(
+      `Invalid tool grants configuration at ${path}: expected a file of at most ${MAX_TOOL_GRANTS_FILE_BYTES} bytes`,
+    );
+  }
   let raw;
   try {
     raw = readFileSync(path, "utf8");

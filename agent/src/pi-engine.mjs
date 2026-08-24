@@ -408,14 +408,15 @@ export function resolveGrantedToolNames(
   const userId = typeof requesterId === "string" ? requesterId : "";
   const scopeId =
     typeof adapterInstanceId === "string" ? adapterInstanceId : "";
-  let entry = null;
-  let matchedRule = null;
-  if (userId && grants.users?.[userId]) {
-    entry = grants.users[userId];
-    matchedRule = { kind: "user", id: userId };
-  } else if (scopeId && grants.scopes?.[scopeId]) {
-    entry = grants.scopes[scopeId];
-    matchedRule = { kind: "scope", id: scopeId };
+  const ownEntry = (map, key) =>
+    key && map && typeof map === "object" && Object.hasOwn(map, key)
+      ? map[key]
+      : null;
+  let entry = ownEntry(grants.users, userId);
+  let matchedRule = entry ? { kind: "user", id: userId } : null;
+  if (!entry) {
+    entry = ownEntry(grants.scopes, scopeId);
+    if (entry) matchedRule = { kind: "scope", id: scopeId };
   }
   if (!entry) return { matchedRule: null, names: [...resolved] };
   const expand = (tokens) => {
@@ -1228,7 +1229,8 @@ export class PiEngine {
       const toolNames = granted.names;
       if (granted.matchedRule) {
         void record("tools.granted", {
-          matchedRule: granted.matchedRule,
+          matchedRuleKind: granted.matchedRule.kind,
+          matchedRuleId: granted.matchedRule.id,
           addedTools: toolNames.filter(
             (name) => !policyToolNames.includes(name),
           ),

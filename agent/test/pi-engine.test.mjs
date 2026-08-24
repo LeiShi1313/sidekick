@@ -3865,6 +3865,16 @@ test("applies configured tool grants to the run's active tools", async () => {
       (tool) => tool?.function?.name,
     );
     assert.equal(deniedTools.includes("code_exec"), false);
+    const deniedAudit = await app.engine.getRunAudit(
+      "41414141-4141-4141-8141-414141414141",
+    );
+    const grantEvent = deniedAudit.events.find(
+      (event) => event.type === "tools.granted",
+    );
+    assert.equal(grantEvent.data.matchedRuleKind, "user");
+    assert.equal(grantEvent.data.matchedRuleId, "chat:user:alice");
+    assert.deepEqual(grantEvent.data.removedTools, ["code_exec"]);
+    assert.deepEqual(grantEvent.data.addedTools, []);
 
     await collect(
       app.engine,

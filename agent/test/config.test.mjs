@@ -144,7 +144,7 @@ test("parses per-user tool grants with groups and fail-closed validation", () =>
   assert.throws(
     () =>
       parseToolGrants(
-        JSON.stringify({ users: { "a:b": { allow: ["nope"] } } }),
+        JSON.stringify({ users: { "chat:user:abc": { allow: ["nope"] } } }),
         allowedScopes,
       ),
     /unknown token "nope"/,
@@ -168,7 +168,32 @@ test("parses per-user tool grants with groups and fail-closed validation", () =>
   assert.throws(
     () =>
       parseToolGrants(
-        JSON.stringify({ users: { "a:b": { allow: ["web"], extra: [] } } }),
+        JSON.stringify({ users: { "alice": { allow: ["web"] } } }),
+        allowedScopes,
+      ),
+    /bad user id/,
+  );
+  assert.throws(
+    () =>
+      parseToolGrants(
+        JSON.stringify({ users: { [`telegram:user:${"a".repeat(300)}`]: { allow: ["web"] } } }),
+        allowedScopes,
+      ),
+    /bad user id/,
+  );
+  const bridgeId =
+    "telegram:matrix-bridge:123%3A-100%3Aabcdef0123456789abcdef0123456789";
+  assert.deepEqual(
+    parseToolGrants(
+      JSON.stringify({ users: { [bridgeId]: { deny: ["mcp"] } } }),
+      allowedScopes,
+    ).users[bridgeId],
+    { deny: ["mcp"] },
+  );
+  assert.throws(
+    () =>
+      parseToolGrants(
+        JSON.stringify({ users: { "chat:user:abc": { allow: ["web"], extra: [] } } }),
         allowedScopes,
       ),
     /accepts only allow and deny/,
@@ -190,7 +215,7 @@ test("wires the mounted tool grants file into the engine configuration", () => {
   );
   process.env.PI_AGENT_TOOL_GRANTS_FILE = path;
   try {
-    assert.deepEqual(loadConfig().engine.toolGrants, {
+    assert.deepEqual(JSON.parse(JSON.stringify(loadConfig().engine.toolGrants)), {
       scopes: {},
       users: {
         "telegram:user:419540347": {
