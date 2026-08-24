@@ -42,6 +42,13 @@ function suppliedChars(data, countKey, textKey) {
     (typeof data[textKey] === "string" ? data[textKey].length : 0);
 }
 
+function toolNameList(value) {
+  return (Array.isArray(value) ? value : [])
+    .map((name) => safeString(name, 64))
+    .filter((name) => name !== null && name.length > 0)
+    .slice(0, 32);
+}
+
 function safeSourceHandle(value) {
   return typeof value === "string" && /^source_[0-9]+$/.test(value)
     ? value
@@ -320,6 +327,14 @@ export function minimizeAuditData(type, value = {}) {
       return {
         code: safeString(data.code, 128) ?? "FAILED",
         sessionId: safeString(data.sessionId, 128),
+      };
+    case "tools.granted":
+      return {
+        matchedRuleKind: safeString(data.matchedRuleKind, 16),
+        matchedRuleId: safeString(data.matchedRuleId, 256),
+        addedTools: toolNameList(data.addedTools),
+        removedTools: toolNameList(data.removedTools),
+        toolCount: safeInteger(data.toolCount),
       };
     case "audit.scrubbed":
       return { reason: safeString(data.reason, 128) ?? "legacy_unreadable" };

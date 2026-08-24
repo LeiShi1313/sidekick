@@ -33,6 +33,12 @@ async function writeWebConfig() {
 
 async function main() {
   const config = loadConfig();
+  if (config.engine.toolGrants) {
+    logger("info", "Tool grants loaded", {
+      userRules: Object.keys(config.engine.toolGrants.users).length,
+      scopeRules: Object.keys(config.engine.toolGrants.scopes).length,
+    });
+  }
   await writeWebConfig();
   const packagePath = require.resolve("pi-web-access/package.json");
   const engine = new PiEngine({
