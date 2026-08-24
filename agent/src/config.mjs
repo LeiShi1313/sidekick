@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +23,26 @@ const OPERATOR_CAPABILITIES = Object.freeze([
   "history",
   "status",
 ]);
+
+const TOOL_GRANT_TOKENS = new Set([
+  "web_search",
+  "fetch_content",
+  "code_exec",
+  "image_generate",
+  "mcp",
+  "web",
+  "code",
+  "images",
+  "memory",
+]);
+const TOOL_GRANT_GROUP_EXPANSIONS = Object.freeze({
+  web: ["web_search", "fetch_content"],
+  code: ["code_exec"],
+  images: ["image_generate"],
+  mcp: ["mcp"],
+  memory: ["memory_*"],
+});
+const TOOL_GRANTS_USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:@._-]{0,199}$/;
 
 function required(name) {
   const value = process.env[name]?.trim();
@@ -73,6 +94,121 @@ export function buildWebSearchConfig() {
   };
 }
 
+function parseToolGrantEntry(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid tool grants configuration: ${label} must be an object`);
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => key !== "allow" && key !== "deny")
+  ) {
+    throw new Error(
+      `Invalid tool grants configuration: ${label} accepts only allow and deny`,
+    );
+  }
+  const entry = {};
+  for (const key of ["allow", "deny"]) {
+    if (!(key in value)) continue;
+    const tokens = value[key];
+    if (
+      !Array.isArray(tokens) ||
+      tokens.length < 1 ||
+      tokens.some((token) => typeof token !== "string")
+    ) {
+      throw new Error(
+        `Invalid tool grants configuration: ${label}.${key} must be a non-empty array of strings`,
+      );
+    }
+    const names = [];
+    for (const token of tokens) {
+      if (!TOOL_GRANT_TOKENS.has(token)) {
+        throw new Error(
+          `Invalid tool grants configuration: unknown token "${token}" in ${label}.${key}`,
+        );
+      }
+      for (const name of TOOL_GRANT_GROUP_EXPANSIONS[token] ?? [token]) {
+        if (!names.includes(name)) names.push(name);
+      }
+    }
+    entry[key] = Object.freeze(names);
+  }
+  return Object.freeze(entry);
+}
+
+export function parseToolGrants(raw, allowedScopeIds) {
+  let document;
+  try {
+    document = JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid tool grants configuration: malformed JSON");
+  }
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    throw new Error("Invalid tool grants configuration: must be an object");
+  }
+  const keys = Object.keys(document);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => key !== "users" && key !== "scopes") ||
+    (document.users === undefined && document.scopes === undefined)
+  ) {
+    throw new Error(
+      "Invalid tool grants configuration: expects users or scopes",
+    );
+  }
+  const users = {};
+  if (document.users !== undefined) {
+    if (!document.users || typeof document.users !== "object" || Array.isArray(document.users)) {
+      throw new Error("Invalid tool grants configuration: users must be an object");
+    }
+    for (const [id, entry] of Object.entries(document.users)) {
+      if (!TOOL_GRANTS_USER_ID_RE.test(id)) {
+        throw new Error(
+          `Invalid tool grants configuration: bad user id "${id}"`,
+        );
+      }
+      users[id] = parseToolGrantEntry(entry, `users.${id}`);
+    }
+  }
+  const scopes = {};
+  if (document.scopes !== undefined) {
+    if (!document.scopes || typeof document.scopes !== "object" || Array.isArray(document.scopes)) {
+      throw new Error("Invalid tool grants configuration: scopes must be an object");
+    }
+    for (const [scopeId, entry] of Object.entries(document.scopes)) {
+      if (!allowedScopeIds?.has(scopeId)) {
+        throw new Error(
+          `Invalid tool grants configuration: unknown scope "${scopeId}"`,
+        );
+      }
+      scopes[scopeId] = parseToolGrantEntry(entry, `scopes.${scopeId}`);
+    }
+  }
+  if (Object.keys(users).length === 0 && Object.keys(scopes).length === 0) {
+    throw new Error(
+      "Invalid tool grants configuration: no user or scope rules",
+    );
+  }
+  return Object.freeze({
+    users: Object.freeze(users),
+    scopes: Object.freeze(scopes),
+  });
+}
+
+function loadToolGrants(allowedScopeIds) {
+  const path = process.env.PI_AGENT_TOOL_GRANTS_FILE?.trim();
+  if (!path) return null;
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    throw new Error(
+      `Unreadable tool grants configuration at ${path}: ${error.code ?? error.message}`,
+    );
+  }
+  return parseToolGrants(raw, allowedScopeIds);
+}
+
 export function loadConfig() {
   const reasoningEffort =
     process.env.AI_REASONING_EFFORT?.trim().toLowerCase() || "none";
@@ -83,7 +219,7 @@ export function loadConfig() {
     process.env.PI_DATA_DIR?.trim() || join(homedir(), ".pi-agent");
   const memoryUrl =
     process.env.MEMORY_API_URL?.trim().replace(/\/$/, "") || null;
-  return {
+  const config = {
     host: process.env.PI_HOST?.trim() || "0.0.0.0",
     port: integer("PI_PORT", 8790, { max: 65_535 }),
     clients: [
@@ -160,4 +296,8 @@ export function loadConfig() {
       agentDir: join(dataDir, "agent"),
     },
   };
+  config.engine.toolGrants = loadToolGrants(
+    new Set(config.clients.map(({ adapterInstanceId }) => adapterInstanceId)),
+  );
+  return config;
 }

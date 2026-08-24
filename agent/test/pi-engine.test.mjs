@@ -21,6 +21,7 @@ import { bankReferenceTag } from "../src/knowledge-directory.mjs";
 import {
   PiEngine,
   buildRunPrompt,
+  resolveGrantedToolNames,
   toolNamesForPolicy,
 } from "../src/pi-engine.mjs";
 import { requesterMemoryTags } from "../src/requester-memory.mjs";
@@ -481,6 +482,7 @@ async function fixture(handler, overrides = {}) {
     memoryFetch: overrides.memoryFetch,
     sessionHistory: overrides.sessionHistory,
     auditStore: overrides.auditStore,
+    toolGrants: overrides.toolGrants ?? null,
   });
   return {
     engine,
@@ -3723,6 +3725,158 @@ test("describes an image without writing it to an Agent Session", async () => {
     assert.match(serialized, /data:image\/png;base64,aW1hZ2UtZGF0YQ==/);
     assert.equal(app.provider.requests[0].reasoning_effort, "low");
     assert.deepEqual(await readdir(app.engine.config.sessionDir), []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("resolves per-user tool grants over policy bases", () => {
+  const available = new Set([
+    "web_search",
+    "fetch_content",
+    "code_exec",
+    "image_generate",
+    "mcp",
+    "memory_reflect",
+    "memory_update_requester",
+  ]);
+  const grants = {
+    scopes: { "wechat-peer": { allow: ["fetch_content"] } },
+    users: {
+      "telegram:user:42": {
+        allow: ["web_search", "fetch_content"],
+        deny: ["image_generate"],
+      },
+      "telegram:user:43": { deny: ["memory_*"] },
+    },
+  };
+
+  const userResolved = resolveGrantedToolNames(
+    ["web_search", "code_exec", "image_generate"],
+    {
+      policy: "delegated",
+      grants,
+      requesterId: "telegram:user:42",
+      adapterInstanceId: "wechat-peer",
+      availableNames: available,
+    },
+  );
+  assert.deepEqual(userResolved.matchedRule, {
+    kind: "user",
+    id: "telegram:user:42",
+  });
+  assert.deepEqual(userResolved.names.sort(), [
+    "code_exec",
+    "fetch_content",
+    "web_search",
+  ]);
+
+  const scopeResolved = resolveGrantedToolNames(
+    ["web_search", "code_exec"],
+    {
+      policy: "delegated",
+      grants,
+      requesterId: "telegram:user:99",
+      adapterInstanceId: "wechat-peer",
+      availableNames: available,
+    },
+  );
+  assert.deepEqual(scopeResolved.matchedRule, {
+    kind: "scope",
+    id: "wechat-peer",
+  });
+  assert.deepEqual(scopeResolved.names.sort(), [
+    "code_exec",
+    "fetch_content",
+    "web_search",
+  ]);
+
+  const unmatched = resolveGrantedToolNames(["web_search", "code_exec"], {
+    policy: "delegated",
+    grants,
+    requesterId: "telegram:user:99",
+    adapterInstanceId: "qq-default",
+    availableNames: available,
+  });
+  assert.deepEqual(unmatched, {
+    matchedRule: null,
+    names: ["web_search", "code_exec"],
+  });
+
+  assert.deepEqual(
+    resolveGrantedToolNames([], {
+      policy: "owner",
+      grants: {
+        users: { "u:1": { allow: ["web_search"], deny: ["web_search"] } },
+      },
+      requesterId: "u:1",
+      adapterInstanceId: "x",
+      availableNames: available,
+    }).names,
+    [],
+  );
+
+  assert.deepEqual(
+    resolveGrantedToolNames(["memory_reflect"], {
+      policy: "owner",
+      grants: { users: { "u:2": { deny: ["memory_*"] } } },
+      requesterId: "u:2",
+      adapterInstanceId: "x",
+      availableNames: available,
+    }).names,
+    [],
+  );
+
+  assert.deepEqual(
+    resolveGrantedToolNames(["code_exec"], {
+      policy: "delegated",
+      grants: { users: { "u:3": { allow: ["fetch_content"] } } },
+      requesterId: "u:3",
+      adapterInstanceId: "x",
+      availableNames: new Set(["code_exec"]),
+    }).names,
+    ["code_exec"],
+  );
+
+  assert.deepEqual(
+    resolveGrantedToolNames([], {
+      policy: "none",
+      grants: { users: { "u:4": { allow: ["web_search", "fetch_content"] } } },
+      requesterId: "u:4",
+      adapterInstanceId: "x",
+      availableNames: available,
+    }),
+    { matchedRule: null, names: [] },
+  );
+});
+
+test("applies configured tool grants to the run's active tools", async () => {
+  const app = await fixture((_body, response) => sendText(response, "done"), {
+    toolGrants: {
+      users: { "chat:user:alice": { deny: ["code_exec"] } },
+    },
+  });
+  try {
+    await collect(
+      app.engine,
+      request("41414141-4141-4141-8141-414141414141", { toolPolicy: "owner" }),
+    );
+    const deniedTools = (app.provider.requests[0].tools ?? []).map(
+      (tool) => tool?.function?.name,
+    );
+    assert.equal(deniedTools.includes("code_exec"), false);
+
+    await collect(
+      app.engine,
+      request("42424242-4242-4242-8242-424242424242", {
+        toolPolicy: "owner",
+        identity: requestIdentity("chat:user:bob", "Bob"),
+      }),
+    );
+    const allowedTools = (app.provider.requests.at(-1).tools ?? []).map(
+      (tool) => tool?.function?.name,
+    );
+    assert.equal(allowedTools.includes("code_exec"), true);
   } finally {
     await app.close();
   }
