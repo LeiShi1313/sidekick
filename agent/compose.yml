@@ -28,6 +28,7 @@ services:
       PI_AGENT_WECHAT_HOST_TOKEN: ${PI_AGENT_WECHAT_HOST_TOKEN}
       PI_AGENT_WECHAT_PEER_TOKEN: ${PI_AGENT_WECHAT_PEER_TOKEN}
       PI_AGENT_PLAYGROUND_TOKEN: ${PI_AGENT_PLAYGROUND_TOKEN}
+      PI_AGENT_TOOL_GRANTS_FILE: ${PI_AGENT_TOOL_GRANTS_FILE:-}
       PI_AGENT_TELEGRAM_INSTANCE_ID: ${PI_AGENT_TELEGRAM_INSTANCE_ID:-telegram-default}
       PI_AGENT_ONEBOT_INSTANCE_ID: ${PI_AGENT_ONEBOT_INSTANCE_ID:-qq-default}
       PI_AGENT_WECHAT_HOST_INSTANCE_ID: ${PI_AGENT_WECHAT_HOST_INSTANCE_ID:-wechat-host}
@@ -54,6 +55,12 @@ services:
       - type: bind
         source: ${CODEX_AUTH_FILE:-/dev/null}
         target: /run/secrets/codex-auth.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TOOL_GRANTS_FILE:-/dev/null}
+        target: /run/secrets/tool-grants.json
         read_only: true
         bind:
           create_host_path: false

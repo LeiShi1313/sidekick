@@ -397,6 +397,51 @@ export function toolNamesForPolicy(
   ];
 }
 
+export function resolveGrantedToolNames(
+  baseNames,
+  { policy, grants, requesterId, adapterInstanceId, availableNames },
+) {
+  const resolved = new Set(baseNames);
+  if (policy === "none" || !grants) {
+    return { matchedRule: null, names: [...resolved] };
+  }
+  const userId = typeof requesterId === "string" ? requesterId : "";
+  const scopeId =
+    typeof adapterInstanceId === "string" ? adapterInstanceId : "";
+  let entry = null;
+  let matchedRule = null;
+  if (userId && grants.users?.[userId]) {
+    entry = grants.users[userId];
+    matchedRule = { kind: "user", id: userId };
+  } else if (scopeId && grants.scopes?.[scopeId]) {
+    entry = grants.scopes[scopeId];
+    matchedRule = { kind: "scope", id: scopeId };
+  }
+  if (!entry) return { matchedRule: null, names: [...resolved] };
+  const expand = (tokens) => {
+    const names = new Set();
+    for (const token of tokens) {
+      const wildcard = token.indexOf("*");
+      if (wildcard === -1) {
+        names.add(token);
+        continue;
+      }
+      const prefix = token.slice(0, wildcard);
+      for (const name of availableNames) {
+        if (name.startsWith(prefix)) names.add(name);
+      }
+    }
+    return names;
+  };
+  for (const name of expand(entry.allow ?? [])) {
+    if (availableNames.has(name)) resolved.add(name);
+  }
+  for (const name of expand(entry.deny ?? [])) {
+    resolved.delete(name);
+  }
+  return { matchedRule, names: [...resolved] };
+}
+
 function createCodeTool() {
   return defineTool({
     name: "code_exec",
@@ -1158,12 +1203,41 @@ export class PiEngine {
         },
         tryAcquire: () => this.imageGenerationGate.tryAcquire(),
       });
-      const toolNames = toolNamesForPolicy(
+      const policyToolNames = toolNamesForPolicy(
         request.toolPolicy,
         allMemoryTools.map(({ name }) => name),
         mcpEnabled,
         imageTools.length > 0,
       );
+      const grantableNames = new Set([
+        ...(this.config.webExtensionPath
+          ? ["web_search", "fetch_content"]
+          : []),
+        ...(mcpEnabled ? ["mcp"] : []),
+        ...allMemoryTools.map(({ name }) => name),
+        ...imageTools.map(({ name }) => name),
+        this.codeTool.name,
+      ]);
+      const granted = resolveGrantedToolNames(policyToolNames, {
+        policy: request.toolPolicy,
+        grants: this.config.toolGrants,
+        requesterId: request.identity?.requester?.id ?? null,
+        adapterInstanceId: request.origin?.adapterInstanceId ?? null,
+        availableNames: grantableNames,
+      });
+      const toolNames = granted.names;
+      if (granted.matchedRule) {
+        void record("tools.granted", {
+          matchedRule: granted.matchedRule,
+          addedTools: toolNames.filter(
+            (name) => !policyToolNames.includes(name),
+          ),
+          removedTools: policyToolNames.filter(
+            (name) => !toolNames.includes(name),
+          ),
+          toolCount: toolNames.length,
+        });
+      }
       const modelRuntime = await this.#modelRuntime();
       const customTools = [this.codeTool, ...allMemoryTools, ...imageTools].map(
         (definition) =>

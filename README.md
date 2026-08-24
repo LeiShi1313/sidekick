@@ -259,6 +259,16 @@ docker compose --env-file .env -f docker-compose.yml up -d
 docker compose -f proxy/compose.yml up -d
 ```
 
+Per-user tool grants are optional. Write a JSON file with `users` keyed by
+host identity IDs and `scopes` keyed by adapter instance IDs, where each rule
+has `allow`/`deny` arrays of tool names (`web_search`, `fetch_content`,
+`code_exec`, `image_generate`, `mcp`) or groups (`web`, `code`, `images`,
+`mcp`, `memory`); deny wins. Point `TOOL_GRANTS_FILE` at the file, set
+`PI_AGENT_TOOL_GRANTS_FILE=/run/secrets/tool-grants.json` in `agent/.env`, and
+recreate `pi-agent` to apply. Grants only toggle tool availability; fetch
+hardening (egress proxy, TLS requirements, deny lists) applies to every run
+regardless of grants.
+
 Human-facing services are available through the dashboard proxy:
 
 - `http://sidekick.localhost:18865`: service index.

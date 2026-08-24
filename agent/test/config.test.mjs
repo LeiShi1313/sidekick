@@ -1,7 +1,14 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildWebSearchConfig, loadConfig } from "../src/config.mjs";
+import {
+  buildWebSearchConfig,
+  loadConfig,
+  parseToolGrants,
+} from "../src/config.mjs";
 
 test("builds mounted Codex search with bounded Exa fallback", () => {
   const config = buildWebSearchConfig();
@@ -106,4 +113,95 @@ test("loads the standalone agent configuration without Sidekick names", () => {
 
   delete process.env.AI_IMAGE_MODEL;
   assert.equal(loadConfig().engine.imageModel, null);
+});
+
+test("parses per-user tool grants with groups and fail-closed validation", () => {
+  const allowedScopes = new Set(["wechat-peer"]);
+  const parsed = parseToolGrants(
+    JSON.stringify({
+      scopes: { "wechat-peer": { deny: ["mcp"] } },
+      users: {
+        "telegram:user:419540347": { allow: ["web"] },
+        "qq:user:123456": { allow: ["memory"], deny: ["fetch_content", "web"] },
+      },
+    }),
+    allowedScopes,
+  );
+
+  assert.deepEqual(parsed.users["telegram:user:419540347"], {
+    allow: ["web_search", "fetch_content"],
+  });
+  assert.deepEqual(parsed.users["qq:user:123456"], {
+    allow: ["memory_*"],
+    deny: ["fetch_content", "web_search"],
+  });
+  assert.deepEqual(parsed.scopes["wechat-peer"], { deny: ["mcp"] });
+
+  assert.throws(
+    () => parseToolGrants("not json", allowedScopes),
+    /malformed JSON/,
+  );
+  assert.throws(
+    () =>
+      parseToolGrants(
+        JSON.stringify({ users: { "a:b": { allow: ["nope"] } } }),
+        allowedScopes,
+      ),
+    /unknown token "nope"/,
+  );
+  assert.throws(
+    () =>
+      parseToolGrants(
+        JSON.stringify({ scopes: { unknown: { deny: ["mcp"] } } }),
+        allowedScopes,
+      ),
+    /unknown scope "unknown"/,
+  );
+  assert.throws(
+    () =>
+      parseToolGrants(
+        JSON.stringify({ users: { "bad id!": { allow: ["web"] } } }),
+        allowedScopes,
+      ),
+    /bad user id/,
+  );
+  assert.throws(
+    () =>
+      parseToolGrants(
+        JSON.stringify({ users: { "a:b": { allow: ["web"], extra: [] } } }),
+        allowedScopes,
+      ),
+    /accepts only allow and deny/,
+  );
+  assert.throws(
+    () => parseToolGrants(JSON.stringify({ users: {} }), allowedScopes),
+    /no user or scope rules/,
+  );
+});
+
+test("wires the mounted tool grants file into the engine configuration", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sidekick-config-grants-"));
+  const path = join(dir, "tool-grants.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      users: { "telegram:user:419540347": { allow: ["web"] } },
+    }),
+  );
+  process.env.PI_AGENT_TOOL_GRANTS_FILE = path;
+  try {
+    assert.deepEqual(loadConfig().engine.toolGrants, {
+      scopes: {},
+      users: {
+        "telegram:user:419540347": {
+          allow: ["web_search", "fetch_content"],
+        },
+      },
+    });
+    process.env.PI_AGENT_TOOL_GRANTS_FILE = join(dir, "missing.json");
+    assert.throws(() => loadConfig(), /Unreadable tool grants configuration/);
+  } finally {
+    delete process.env.PI_AGENT_TOOL_GRANTS_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
