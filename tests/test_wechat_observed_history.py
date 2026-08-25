@@ -39,6 +39,7 @@ def observed(
     sender_display_name: str | None = "Alice Global",
     sender_group_alias: str | None = None,
     reply_to_message_id: str | None = None,
+    content_redacted: bool = False,
 ) -> WeChatObservedMessage:
     common = {
         "id": message_id,
@@ -56,6 +57,7 @@ def observed(
         direction="in",
         message_type=message_type,
         content=content,
+        content_redacted=content_redacted,
         sender_id="wxid_alice",
         sender_display_name=sender_display_name,
         sender_group_alias=sender_group_alias,
@@ -280,5 +282,75 @@ async def test_reply_context_stops_at_connector_gaps_and_cycles(tmp_path) -> Non
             "102",
         }
         assert [message.message_id for message in gap_context.messages] == ["103"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_chain_traverses_app_quote_targets(tmp_path) -> None:
+    card = observed(
+        "101",
+        message_type="app",
+        content="matrix-reply-unique-live-20260816T1312Z",
+    )
+    quote = observed(
+        "102",
+        message_type="app",
+        content="/ai 这是什么复述一遍",
+        reply_to_message_id=card.id,
+    )
+    client = ObservedClient(exact={card.id: card, quote.id: quote})
+    store = await open_store(tmp_path / "wechat.db")
+    transport = WeChatChatTransport(
+        client,
+        store,
+        CONNECTOR_KEY,
+        native_reply_ready=False,
+    )
+    prompt_builder = PromptBuilder(
+        transport=transport,
+        max_context_messages=5,
+    )
+    source = WeChatHistorySource(client, store, CONNECTOR_KEY)
+    try:
+        context = await prompt_builder.load_reply_chain(
+            await source.fetch_message(CHAT_ID, quote.id)
+        )
+
+        assert {message.message_id for message in context.messages} == {
+            "101",
+            "102",
+        }
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recent_history_includes_unredacted_app_messages_only(tmp_path) -> None:
+    client = ObservedClient(
+        (
+            page(
+                observed("101", message_type="app", content=""),
+                observed(
+                    "102",
+                    message_type="app",
+                    content="matrix-reply-unique-live-20260816T1312Z",
+                ),
+                observed(
+                    "103",
+                    message_type="app",
+                    content="hidden payload",
+                    content_redacted=True,
+                ),
+            ),
+        )
+    )
+    store = await open_store(tmp_path / "wechat.db")
+    source = WeChatHistorySource(client, store, CONNECTOR_KEY)
+    trigger = SimpleNamespace(chat_id=CHAT_ID, id="104")
+    try:
+        messages = await source.fetch_recent(trigger, before=trigger, limit=3)
+
+        assert [message.id for message in messages] == ["102"]
     finally:
         await store.close()
