@@ -1164,10 +1164,14 @@ def _supports_history_context(
         and observed.media_id is not None
     ):
         return True
-    return (
-        not observed.content_redacted
-        and observed.message_type in {"text", "link", "chat_history"}
-    )
+    if observed.content_redacted:
+        return False
+    if observed.message_type in {"text", "link", "chat_history"}:
+        return True
+    # App projections carry the card title as content — the sender's own
+    # caption for native quote-replies (subtype 57). Empty titles carry no
+    # context, so only non-empty ones are usable.
+    return observed.message_type == "app" and bool(observed.content)
 
 
 def _history_time_bounds(since: datetime, until: datetime) -> tuple[int, int]:
