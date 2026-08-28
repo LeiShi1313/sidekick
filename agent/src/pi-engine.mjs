@@ -1537,9 +1537,6 @@ export class PiEngine {
         sessionId: session.sessionId,
       });
       const receiveNativeImage = (output) => {
-        if (!toolNames.includes(IMAGE_TOOL_NAME)) {
-          throw new Error("Provider returned unsupported native image output");
-        }
         if (hasGeneratedAttachment) {
           nativeImageIgnored = true;
           return;

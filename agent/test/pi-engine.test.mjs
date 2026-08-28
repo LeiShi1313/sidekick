@@ -2040,7 +2040,52 @@ test("keeps concurrent native image outputs correlated to their runs", async () 
   }
 });
 
-test("rejects native image output when image generation is unavailable", async () => {
+test("streams provider-native images when image generation is denied", async () => {
+  const encoded = Buffer.from([
+    0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const app = await fixture(
+    (_body, response) => {
+      sendNativeImage(response, `data:image/jpeg;base64,${encoded}`);
+    },
+    {
+      imageModel: "gpt-image-2",
+      imageClient: { images: { generate: async () => assert.fail() } },
+      toolGrants: {
+        users: { "chat:user:alice": { deny: ["image_generate"] } },
+      },
+    },
+  );
+  try {
+    const events = await collect(
+      app.engine,
+      request("46464646-4646-4646-8646-464646464646", {
+        prompt: "Generate a new logo",
+      }),
+    );
+
+    const providerRequest = app.provider.requests[0];
+    const toolNames = (providerRequest.tools ?? []).map(
+      (tool) => tool?.function?.name,
+    );
+    assert.equal(toolNames.includes("image_generate"), false);
+    assert.deepEqual(
+      events.find((event) => event.type === "attachment"),
+      {
+        type: "attachment",
+        filename: "generated-image.jpg",
+        mimeType: "image/jpeg",
+        displayAs: "image",
+        data: encoded,
+      },
+    );
+    assert.equal(events.at(-1).type, "run_completed");
+  } finally {
+    await app.close();
+  }
+});
+
+test("streams provider-native images when image generation is unavailable", async () => {
   const encoded = Buffer.from([
     0xff, 0xd8, 0xff, 0x00, 0x00, 0x00, 0xff, 0xd9,
   ]).toString("base64");
@@ -2056,12 +2101,11 @@ test("rejects native image output when image generation is unavailable", async (
     );
 
     assert.equal(app.provider.requests.length, 1, JSON.stringify(events));
-    assert.equal(events.some((event) => event.type === "attachment"), false);
-    assert.deepEqual(events.at(-1), {
-      type: "run_failed",
-      code: "PROVIDER_ERROR",
-      message: "Agent provider request failed",
-    });
+    assert.equal(
+      events.find((event) => event.type === "attachment").data,
+      encoded,
+    );
+    assert.equal(events.at(-1).type, "run_completed");
   } finally {
     await app.close();
   }
