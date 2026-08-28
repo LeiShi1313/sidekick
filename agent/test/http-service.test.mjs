@@ -340,6 +340,119 @@ test("isolates adapter credentials by capability and instance identity", async (
   }
 });
 
+test("accepts scoped owner customization mutations with a dedicated capability", async () => {
+  const received = [];
+  const clients = [
+    {
+      id: "telegram",
+      token: "telegram-customization-token-long-enough",
+      capabilities: ["customizations"],
+      adapterInstanceId: "telegram-default",
+      scopePrefix: "telegram:",
+    },
+    {
+      id: "runs-only",
+      token: "runs-only-agent-token-that-is-long-enough",
+      capabilities: ["runs"],
+      adapterInstanceId: "telegram-default",
+    },
+  ];
+  const app = await listen(
+    {
+      async appendOwnerCustomization(request) {
+        received.push(request);
+        return { saved: true, unchanged: false };
+      },
+    },
+    clients,
+  );
+  const mutation = {
+    origin: {
+      scopeId: "telegram:chat:-1001",
+      adapterInstanceId: "telegram-default",
+    },
+    targetId: "telegram:user:41",
+    instruction:
+      "这个人，只要提猫猫，就禁用所有的tool call，只回复喵喵喵就可以了",
+  };
+  try {
+    const accepted = await fetch(`${app.baseUrl}/v1/owner-customizations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer telegram-customization-token-long-enough",
+      },
+      body: JSON.stringify(mutation),
+    });
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), { saved: true, unchanged: false });
+    assert.deepEqual(received, [mutation]);
+
+    const unicodeMutation = {
+      ...mutation,
+      instruction: "😀".repeat(1_001),
+    };
+    const unicodeAccepted = await fetch(
+      `${app.baseUrl}/v1/owner-customizations`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer telegram-customization-token-long-enough",
+        },
+        body: JSON.stringify(unicodeMutation),
+      },
+    );
+    assert.equal(unicodeAccepted.status, 200);
+    assert.deepEqual(received[1], unicodeMutation);
+
+    const controlRejected = await fetch(
+      `${app.baseUrl}/v1/owner-customizations`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer telegram-customization-token-long-enough",
+        },
+        body: JSON.stringify({
+          ...mutation,
+          instruction: "before\tafter",
+        }),
+      },
+    );
+    assert.equal(controlRejected.status, 400);
+
+    const forbidden = await fetch(`${app.baseUrl}/v1/owner-customizations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer runs-only-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify(mutation),
+    });
+    assert.equal(forbidden.status, 403);
+
+    const impersonation = await fetch(`${app.baseUrl}/v1/owner-customizations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer telegram-customization-token-long-enough",
+      },
+      body: JSON.stringify({
+        ...mutation,
+        origin: {
+          scopeId: "qq:group:42",
+          adapterInstanceId: "telegram-default",
+        },
+      }),
+    });
+    assert.equal(impersonation.status, 403);
+    assert.equal(received.length, 2);
+  } finally {
+    await app.close();
+  }
+});
+
 test("restricts a WeChat credential to its exact connector account", async () => {
   let calls = 0;
   const app = await listen(

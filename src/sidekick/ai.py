@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -47,6 +48,7 @@ from sidekick.chat.commands import (
     AILimitCommand,
     AIModelCommand,
     AIPrefixCommand,
+    AIPreferenceCommand,
     AccessCommand,
     BankGrantCommand,
     ChatCommand,
@@ -227,6 +229,14 @@ class AgentEvent:
 class AgentGateway(Protocol):
     async def list_models(self) -> AgentModelCatalog: ...
 
+    async def append_owner_customization(
+        self,
+        *,
+        origin: AgentRunOrigin,
+        target_identity: str,
+        instruction: str,
+    ) -> None: ...
+
     def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]: ...
 
     async def cancel(self, run_id: str) -> bool: ...
@@ -286,6 +296,46 @@ class PiAgentGateway:
             return AgentModelCatalog(default_model, tuple(models))
         except ValueError as exc:
             raise RuntimeError("Pi model catalog is malformed") from exc
+
+    async def append_owner_customization(
+        self,
+        *,
+        origin: AgentRunOrigin,
+        target_identity: str,
+        instruction: str,
+    ) -> None:
+        session = self._get_session()
+        async with session.post(
+            f"{self._base_url}/v1/owner-customizations",
+            json={
+                "origin": {
+                    "scopeId": origin.scope_id,
+                    "adapterInstanceId": origin.adapter_instance_id,
+                },
+                "targetId": target_identity,
+                "instruction": instruction,
+            },
+            headers=self._headers,
+            timeout=self._timeout,
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    "Pi owner customization failed with "
+                    f"HTTP {response.status}"
+                )
+            try:
+                payload = await response.json()
+            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "Pi owner customization response is malformed"
+                ) from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"saved", "unchanged"}
+            or payload["saved"] is not True
+            or not isinstance(payload["unchanged"], bool)
+        ):
+            raise RuntimeError("Pi owner customization response is malformed")
 
     async def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]:
         payload = {
@@ -1222,6 +1272,19 @@ class AIResponder:
 
     async def list_models(self) -> AgentModelCatalog:
         return await self._gateway.list_models()
+
+    async def append_owner_customization(
+        self,
+        *,
+        origin: AgentRunOrigin,
+        target_identity: str,
+        instruction: str,
+    ) -> None:
+        await self._gateway.append_owner_customization(
+            origin=origin,
+            target_identity=target_identity,
+            instruction=instruction,
+        )
 
     @property
     def transport(self) -> ChatTransport:
@@ -4656,6 +4719,14 @@ class AIConversationHandler:
                 message,
                 command.instruction,
             )
+        if isinstance(command, AIPreferenceCommand):
+            if not is_owner_control:
+                return False
+            return await self._handle_owner_preference_command(
+                message,
+                scope_id,
+                command.instruction,
+            )
         if isinstance(command, InvalidCommand):
             if not is_owner_control:
                 return False
@@ -6256,6 +6327,93 @@ class AIConversationHandler:
         return tuple(bank_id for bank_id in grants if is_canonical_bank_id(bank_id))[
             :MAX_AGENT_BANK_GRANTS
         ]
+
+    async def _handle_owner_preference_command(
+        self,
+        message: ReplyTarget,
+        scope_id: str,
+        instruction: str,
+    ) -> bool:
+        instruction = unicodedata.normalize(
+            "NFC",
+            instruction.replace("\r\n", "\n"),
+        ).strip()
+        usage = "Usage: reply to a user with /ai_preference <instruction>"
+        if not instruction or len(instruction) > 2_000:
+            await self._reply_memory_excluded(
+                message,
+                usage,
+                kind="memory-control",
+            )
+            return True
+        if self._memory is None:
+            await self._reply_memory_excluded(
+                message,
+                "Owner preference is unavailable because Hindsight is disabled.",
+                kind="memory-control",
+            )
+            return True
+        target = await self._transport.get_reply(message)
+        if target is None or target.sender_id is None:
+            await self._reply_memory_excluded(
+                message,
+                usage,
+                kind="memory-control",
+            )
+            return True
+        target_is_ai = False
+        if target.chat_id is not None:
+            marker = await self._store.get_answer(
+                self._identity_codec.scope_id(target.chat_id),
+                target.id,
+            )
+            target_is_ai = marker is not None
+        target_identity = await self._prompt_builder.resolve_identity(target)
+        target_actor_id = (
+            target_identity.subject_id
+            or self._prompt_builder.message_actor_id(target)
+        )
+        if (
+            target_is_ai
+            or not target_identity.is_human
+            or target_actor_id is None
+            or target_actor_id == self._owner_actor_id
+            or not is_owner_customization_target_actor_id(
+                target_actor_id,
+                scope_id,
+            )
+        ):
+            await self._reply_memory_excluded(
+                message,
+                "Reply directly to another human message when saving "
+                "an owner preference.",
+                kind="memory-control",
+            )
+            return True
+        try:
+            await self._responder.append_owner_customization(
+                origin=AgentRunOrigin(
+                    scope_id=scope_id,
+                    adapter_instance_id=self._adapter_instance_id,
+                ),
+                target_identity=target_actor_id,
+                instruction=instruction,
+            )
+        except Exception as exc:
+            self._log_memory_failure("owner preference", exc)
+            await self._reply_memory_excluded(
+                message,
+                "Owner preference was not saved. Retry the command.",
+                kind="memory-control",
+            )
+            return True
+        await self._reply_memory_excluded(
+            message,
+            "Owner preference saved.",
+            kind="memory-control",
+        )
+        return True
+
 
     async def _handle_memory_command(
         self,

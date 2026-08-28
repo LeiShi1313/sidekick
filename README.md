@@ -112,8 +112,12 @@ keeps the one-active-run safeguard. The owner can also inspect or replace that
 group's AI command with `/ai_prefix`, `/ai_prefix $ask`, or reset it with
 `/ai_prefix default`. A group override replaces `/ai` only for that group;
 fixed `/ai_*` management commands remain available, and their equivalent
-group-prefixed forms use the override (for example, `$ask_access`). Continuous
-and Dream ingestion are off per chat until explicitly enabled. Setting
+group-prefixed forms use the override (for example, `$ask_access`).
+The owner can reply to a human message with `/ai_preference <instruction>` to
+append that exact text as best-effort guidance for the participant's future
+requests in that chat. Saving owner guidance does not change active tools or
+override system rules.
+Continuous and Dream ingestion are off per chat until explicitly enabled. Setting
 `SIDEKICK_HINDSIGHT_URL` to an empty value disables memory; memory commands then
 report that Hindsight is disabled instead of silently changing ingestion state.
 A recalled or redacted WeChat message is excluded from later connector reads and

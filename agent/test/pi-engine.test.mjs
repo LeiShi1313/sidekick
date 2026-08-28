@@ -1399,7 +1399,7 @@ test("owns initial memory retrieval and injects recalled evidence", async () => 
       },
     });
     assert.equal(events.at(-1).answer, "Richard favors lower prices.");
-    assert.equal(recalls.length, 6);
+    assert.equal(recalls.length, 7);
     assert(
       recalls.some(({ body }) => body?.query.includes("Identity anchors")),
     );

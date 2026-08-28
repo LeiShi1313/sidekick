@@ -188,6 +188,49 @@ async def test_pi_gateway_streams_validated_ndjson_events() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pi_gateway_appends_owner_customization() -> None:
+    received = None
+
+    async def owner_customizations(request: web.Request) -> web.Response:
+        nonlocal received
+        assert request.headers["Authorization"] == (
+            "Bearer test-agent-token-that-is-long-enough"
+        )
+        received = await request.json()
+        return web.json_response({"saved": True, "unchanged": False})
+
+    app = web.Application()
+    app.router.add_post("/v1/owner-customizations", owner_customizations)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url, token="test-agent-token-that-is-long-enough", timeout=5
+    )
+    instruction = (
+        "这个人，只要提猫猫，就禁用所有的tool call，只回复喵喵喵就可以了"
+    )
+    try:
+        await gateway.append_owner_customization(
+            origin=AgentRunOrigin(
+                scope_id="telegram:chat:-1001",
+                adapter_instance_id="telegram-default",
+            ),
+            target_identity="telegram:user:41",
+            instruction=instruction,
+        )
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert received == {
+        "origin": {
+            "scopeId": "telegram:chat:-1001",
+            "adapterInstanceId": "telegram-default",
+        },
+        "targetId": "telegram:user:41",
+        "instruction": instruction,
+    }
+
+@pytest.mark.asyncio
 async def test_pi_gateway_sends_nonempty_customization_targets() -> None:
     received = None
 

@@ -10,6 +10,7 @@ import {
   isRequesterCustomizationPrincipal,
 } from "./host-identity.mjs";
 import { isModelId } from "./model-id.mjs";
+import { normalizeOwnerCustomization } from "./requester-memory.mjs";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_RUN_BODY_BYTES = 3 * 1024 * 1024;
@@ -34,6 +35,7 @@ const CLIENT_CAPABILITIES = new Set([
   "attachments",
   "history",
   "status",
+  "customizations",
 ]);
 
 function json(response, status, payload) {
@@ -450,6 +452,39 @@ export function validateRunRequest(value) {
   };
 }
 
+export function validateOwnerCustomizationRequest(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !hasOnlyKeys(value, new Set(["origin", "targetId", "instruction"]))
+  ) {
+    return null;
+  }
+  const origin = value.origin;
+  const instruction = normalizeOwnerCustomization(value.instruction);
+  if (
+    !origin ||
+    typeof origin !== "object" ||
+    Array.isArray(origin) ||
+    !hasOnlyKeys(origin, new Set(["scopeId", "adapterInstanceId"])) ||
+    !isBankId(origin.scopeId) ||
+    !IDENTIFIER_RE.test(origin.adapterInstanceId ?? "") ||
+    !isOwnerCustomizationTargetPrincipal(value.targetId, origin.scopeId) ||
+    instruction === null
+  ) {
+    return null;
+  }
+  return {
+    origin: {
+      scopeId: origin.scopeId,
+      adapterInstanceId: origin.adapterInstanceId,
+    },
+    targetId: value.targetId,
+    instruction,
+  };
+}
+
 function decodeBase64(value) {
   if (
     typeof value !== "string" ||
@@ -643,6 +678,21 @@ function principalAllowsRun(principal, run) {
   return true;
 }
 
+function principalAllowsOwnerCustomization(principal, mutation) {
+  if (principal.adapterInstanceId === null) return true;
+  if (mutation.origin.adapterInstanceId !== principal.adapterInstanceId) {
+    return false;
+  }
+  if (
+    principal.scopePrefix !== null &&
+    (!mutation.origin.scopeId.startsWith(principal.scopePrefix) ||
+      !mutation.targetId.startsWith(principal.scopePrefix))
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function createAgentServer({ engine, clients, logger = console }) {
   const serviceClients = preparedClients(clients);
   return createServer(async (request, response) => {
@@ -795,6 +845,64 @@ export function createAgentServer({ engine, clients, logger = console }) {
           error: {
             code: "HISTORY_UNAVAILABLE",
             message: "Run history unavailable",
+          },
+        });
+      }
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/v1/owner-customizations"
+    ) {
+      if (!requireCapability(response, principal, "customizations")) return;
+      let mutation;
+      try {
+        mutation = validateOwnerCustomizationRequest(await readJson(request));
+      } catch {
+        mutation = null;
+      }
+      if (!mutation) {
+        json(response, 400, {
+          error: {
+            code: "INVALID_REQUEST",
+            message: "Invalid owner customization request",
+          },
+        });
+        return;
+      }
+      if (!principalAllowsOwnerCustomization(principal, mutation)) {
+        json(response, 403, {
+          error: { code: "FORBIDDEN", message: "Forbidden" },
+        });
+        return;
+      }
+      const result = await engine.appendOwnerCustomization(mutation);
+      if (result?.saved === true && typeof result.unchanged === "boolean") {
+        json(response, 200, result);
+      } else if (
+        new Set(["invalid_customization", "customization_too_large"]).has(
+          result?.reason,
+        )
+      ) {
+        json(response, 422, {
+          error: {
+            code: "INVALID_CUSTOMIZATION",
+            message: "Owner customization is structurally invalid",
+          },
+        });
+      } else if (result?.reason === "integrity_error") {
+        json(response, 409, {
+          error: {
+            code: "CUSTOMIZATION_CONFLICT",
+            message: "Owner customization state is inconsistent",
+          },
+        });
+      } else {
+        json(response, 502, {
+          error: {
+            code: "CUSTOMIZATION_UNAVAILABLE",
+            message: "Owner customization is unavailable",
           },
         });
       }

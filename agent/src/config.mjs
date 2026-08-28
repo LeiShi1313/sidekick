@@ -18,6 +18,7 @@ const ADAPTER_CAPABILITIES = Object.freeze([
   "models",
   "runs",
   "attachments",
+  "customizations",
 ]);
 const OPERATOR_CAPABILITIES = Object.freeze([
   ...ADAPTER_CAPABILITIES,

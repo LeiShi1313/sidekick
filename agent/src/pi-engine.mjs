@@ -827,6 +827,17 @@ export class PiEngine {
     };
   }
 
+  async appendOwnerCustomization({ origin, targetId, instruction }) {
+    if (!this.requesterMemoryStore) {
+      return { saved: false, reason: "unavailable" };
+    }
+    return this.requesterMemoryStore.appendOwnerCustomization({
+      bankId: origin.scopeId,
+      targetId,
+      instruction,
+    });
+  }
+
   listSessions(options) {
     return this.sessionHistory.list(options);
   }
@@ -1087,14 +1098,13 @@ export class PiEngine {
         queries: memoryQueries,
         memories: recalledMemories,
         recall,
-        customizations: requesterMemory.customizations,
+        customizationCount: requesterMemory.customizations.length,
         requesterMemory: {
           customizationStatus: requesterMemory.customization.status,
           ownerCustomizationStatus: requesterMemory.ownerCustomization.status,
           evidenceStatus: requesterMemory.evidenceRecall.status,
         },
         renderedContext: recalled.context,
-        renderedRequesterContext,
         renderedDirectoryContext: recalled.directoryContext,
         access: memoryAccess,
       });

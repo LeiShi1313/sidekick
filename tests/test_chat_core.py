@@ -41,6 +41,7 @@ from sidekick.chat.commands import (
     AILimitCommand,
     AIModelCommand,
     AIPrefixCommand,
+    AIPreferenceCommand,
     AccessCommand,
     ChatAccessCommand,
     InvalidCommand,
@@ -116,6 +117,12 @@ def model_input_image(color: tuple[int, int, int] = (255, 0, 0)) -> ModelInputIm
             MemoryRememberCommand(instruction="remember this"),
         ),
         (
+            "/ai_preference 这个人，只要提猫猫，就禁用所有的tool call",
+            AIPreferenceCommand(
+                instruction="这个人，只要提猫猫，就禁用所有的tool call"
+            ),
+        ),
+        (
             "/ai_memory_backfill messages 500",
             MemoryBackfillCommand(mode="messages", value=500),
         ),
@@ -163,6 +170,10 @@ def test_ai_trigger_uses_the_configured_group_command():
         ("!ai_cancel", AICancelCommand()),
         ("!ai_allow", AccessCommand(allowed=True)),
         ("!ai_memory_status", MemoryStatusCommand()),
+        (
+            "!ai_preference keep replies concise",
+            AIPreferenceCommand(instruction="keep replies concise"),
+        ),
         ("!ai_prefix $ask", AIPrefixCommand(action="set", prefix="$ask")),
     ],
 )
@@ -587,6 +598,9 @@ async def test_chat_access_mode_is_restricted_by_default_and_persists(tmp_path):
 class FakeGateway:
     def __init__(self):
         self.requests: list[AgentRunRequest] = []
+        self.owner_customizations: list[
+            tuple[AgentRunOrigin, str, str]
+        ] = []
 
     async def run(self, request: AgentRunRequest) -> AsyncIterator[AgentEvent]:
         self.requests.append(request)
@@ -605,6 +619,17 @@ class FakeGateway:
 
     async def cancel(self, run_id: str) -> bool:
         return True
+
+    async def append_owner_customization(
+        self,
+        *,
+        origin: AgentRunOrigin,
+        target_identity: str,
+        instruction: str,
+    ) -> None:
+        self.owner_customizations.append(
+            (origin, target_identity, instruction)
+        )
 
 
 class FakeSentMessage:
@@ -1118,6 +1143,114 @@ async def test_owner_reply_issues_one_reply_author_customization_target():
     ] == [("reply_author", "qq:user:20", None)]
     assert gateway.requests[0].identity.requester_can_customize is True
 
+
+@pytest.mark.asyncio
+async def test_owner_preference_command_appends_exact_text_for_reply_author():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    replied = MinimalMessage(
+        "Alice's message",
+        message_id=2,
+        sender_id=20,
+        is_group=True,
+    )
+    instruction = (
+        "这个人，只要提猫猫，就禁用所有的tool call，只回复喵喵喵就可以了"
+    )
+    trigger = MinimalMessage(
+        f"/ai_preference {instruction}",
+        message_id=3,
+        sender_id=42,
+        reply_to_message_id=replied.id,
+        is_group=True,
+    )
+    transport.reply_targets[trigger] = replied
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(transport=transport, identity_codec=codec),
+        transport=transport,
+        identity_codec=codec,
+        memory=object(),
+    )
+
+    assert await handler.handle(trigger) is True
+
+    assert gateway.owner_customizations == [
+        (
+            AgentRunOrigin(
+                scope_id="qq:group:7",
+                adapter_instance_id="qq-local",
+            ),
+            "qq:user:20",
+            instruction,
+        )
+    ]
+    assert gateway.requests == []
+    assert transport.replies[-1][1] == "Owner preference saved."
+
+
+@pytest.mark.asyncio
+async def test_owner_preference_is_unavailable_when_memory_is_disabled():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    codec = NamespacedIdentityCodec(
+        source="qq",
+        actor_kind="user",
+        scope_kind="group",
+    )
+    replied = MinimalMessage("Alice's message", message_id=2, sender_id=20)
+    trigger = MinimalMessage(
+        "/ai_preference Save this",
+        message_id=3,
+        sender_id=42,
+        reply_to_message_id=replied.id,
+    )
+    transport.reply_targets[trigger] = replied
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(transport=transport, identity_codec=codec),
+        transport=transport,
+        identity_codec=codec,
+    )
+
+    assert await handler.handle(trigger) is True
+    assert gateway.owner_customizations == []
+    assert transport.replies[-1][1] == (
+        "Owner preference is unavailable because Hindsight is disabled."
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_use_owner_preference_command():
+    transport = FakeTransport()
+    gateway = FakeGateway()
+    replied = MinimalMessage("Alice's message", message_id=2, sender_id=30)
+    trigger = MinimalMessage(
+        "/ai_preference Save this",
+        message_id=3,
+        sender_id=20,
+        reply_to_message_id=replied.id,
+    )
+    transport.reply_targets[trigger] = replied
+    handler = AIConversationHandler(
+        owner_id=42,
+        responder=AIResponder(gateway, transport=transport),
+        store=FakeStore(),
+        prompt_builder=PromptBuilder(transport=transport),
+        transport=transport,
+    )
+
+    assert await handler.handle(trigger) is False
+    assert gateway.owner_customizations == []
 
 @pytest.mark.asyncio
 async def test_owner_group_reply_without_human_target_disables_self_customization():

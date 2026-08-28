@@ -64,6 +64,11 @@ class AIPrefixCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class AIPreferenceCommand:
+    instruction: str
+
+
+@dataclass(frozen=True, slots=True)
 class AccessCommand:
     allowed: bool
 
@@ -151,6 +156,7 @@ ChatCommand: TypeAlias = (
     | AILimitCommand
     | AIModelCommand
     | AIPrefixCommand
+    | AIPreferenceCommand
     | AccessCommand
     | ChatAccessCommand
     | DirectoryPublishCommand
@@ -238,6 +244,10 @@ def parse_chat_command(
         return ai
 
     if is_control_candidate:
+        preference = _parse_owner_preference(control_text)
+        if preference is not None:
+            return preference
+
         memory_revision = _parse_memory_revision(control_text)
         if memory_revision is not None:
             return memory_revision
@@ -364,6 +374,15 @@ def _parse_ai(text: str, prefix: str) -> AIAskCommand | None:
         prompt=text[cursor:].strip(),
         recent_messages=recent_messages,
     )
+
+
+def _parse_owner_preference(text: str) -> AIPreferenceCommand | None:
+    name = "/ai_preference"
+    if text == name:
+        return AIPreferenceCommand(instruction="")
+    if text.startswith((f"{name} ", f"{name}\n", f"{name}\t")):
+        return AIPreferenceCommand(instruction=text[len(name) :].strip())
+    return None
 
 
 def _parse_memory_revision(text: str) -> MemoryRememberCommand | None:

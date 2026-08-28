@@ -532,10 +532,8 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
       completedCount: 2,
       failedCount: 0,
     });
-    assert.deepEqual(memoryEvent.data.customizations, [
-      "Call me Captain.",
-      "Use headings by default.",
-    ]);
+    assert.equal(memoryEvent.data.customizationCount, 2);
+    assert.equal("customizations" in memoryEvent.data, false);
     assert.deepEqual(memoryEvent.data.requesterMemory, {
       customizationStatus: "available",
       ownerCustomizationStatus: "available",
@@ -543,7 +541,7 @@ test("projects current-bank run decisions into a diagnostic summary", async () =
     });
     assert.doesNotMatch(
       JSON.stringify(detail),
-      /PRIVATE_DUPLICATE_RENDERED_CONTEXT|PRIVATE_REQUESTER_RENDERED_CONTEXT|PRIVATE_MEMORY_ACCESS_TOKEN/,
+      /Call me Captain|Use headings by default|PRIVATE_DUPLICATE_RENDERED_CONTEXT|PRIVATE_REQUESTER_RENDERED_CONTEXT|PRIVATE_MEMORY_ACCESS_TOKEN/,
     );
   } finally {
     await app.close();

@@ -137,12 +137,11 @@ function memoryContextMetadata(value) {
       .map(recalledMemoryMetadata)
       .filter((memory) => memory !== null)
       .slice(0, MAX_RECALLED_MEMORIES),
-    customizations: (Array.isArray(data.customizations)
-      ? data.customizations
-      : [])
-      .map((customization) => safeString(customization, 2_000))
-      .filter((customization) => customization !== null)
-      .slice(0, 2),
+    customizationCount: suppliedCount(
+      data,
+      "customizationCount",
+      "customizations",
+    ),
     requesterMemory: {
       customizationStatus: safeString(
         requesterMemory.customizationStatus,
