@@ -198,6 +198,7 @@ class MemoryOutboxDrainResult:
 class PreparedMemoryDocument:
     episode: MemoryEpisode
     window_message_ids: frozenset[ExternalId]
+    force_new_session: bool = False
 
 
 class MemoryIngestionBusyError(RuntimeError):
@@ -209,10 +210,6 @@ class DreamCycleTimeoutError(TimeoutError):
 
 
 class DreamBackfillLimitError(RuntimeError):
-    pass
-
-
-class MemoryThreadLimitError(RuntimeError):
     pass
 
 
@@ -584,6 +581,7 @@ class ChatMemoryIngestor:
                 if (
                     open_session is not None
                     and not open_session.sealed
+                    and not prepared_document.force_new_session
                     and pending_document_accepts(
                         open_session,
                         episode,
@@ -1106,10 +1104,6 @@ class ChatMemoryIngestor:
         document_groups: dict[str, dict[ExternalId, ReplyTarget]] = {}
         for root_id, document_id in assigned_documents.items():
             grouped = root_groups[root_id]
-            if len(grouped) > self._ingestion_settings.max_thread_messages:
-                raise MemoryThreadLimitError(
-                    f"Thread {root_id} exceeds the configured memory thread bound"
-                )
             document_group = document_groups.setdefault(document_id, {})
             document_group.update(grouped)
 
@@ -1127,6 +1121,12 @@ class ChatMemoryIngestor:
                 receipts[open_document_id] = receipt
                 loaded_candidate_only = open_document_id not in document_groups
                 document_groups.setdefault(open_document_id, {})
+        continuation_document_ids = self._split_oversized_document_groups(
+            chat_id,
+            document_groups,
+            receipts,
+            window_ids,
+        )
 
         await self._hydrate_previous_events(
             chat_id,
@@ -1168,12 +1168,9 @@ class ChatMemoryIngestor:
                 tuple[HumanObservation, ...],
             ]
         ] = []
+        thread_limit = self._ingestion_settings.max_thread_messages
         for root_id in unassigned_root_ids:
             grouped = root_groups[root_id]
-            if len(grouped) > self._ingestion_settings.max_thread_messages:
-                raise MemoryThreadLimitError(
-                    f"Thread {root_id} exceeds the configured memory thread bound"
-                )
             observations = tuple(
                 sorted(
                     (
@@ -1187,8 +1184,17 @@ class ChatMemoryIngestor:
                     ),
                 )
             )
-            if observations:
-                unassigned_roots.append((root_id, grouped, observations))
+            for start in range(0, len(observations), thread_limit):
+                chunk = observations[start : start + thread_limit]
+                if not chunk:
+                    continue
+                chunk_ids = {observation.message_id for observation in chunk}
+                chunk_group = {
+                    message_id: message
+                    for message_id, message in grouped.items()
+                    if message_id in chunk_ids
+                }
+                unassigned_roots.append((chunk[0].message_id, chunk_group, chunk))
         unassigned_roots.sort(key=lambda item: (item[2][0].occurred_at, str(item[0])))
 
         for root_id, grouped, observations in unassigned_roots:
@@ -1228,13 +1234,6 @@ class ChatMemoryIngestor:
                 grouped.values(),
                 key=lambda message: (_message_datetime(message), message.id),
             )
-            if (
-                document_id.startswith(f"{self._identity_codec.source}:thread:")
-                and len(ordered) > self._ingestion_settings.max_thread_messages
-            ):
-                raise MemoryThreadLimitError(
-                    f"Document {document_id} exceeds the memory thread bound"
-                )
             observations = tuple(
                 observation_by_id[message.id]
                 for message in ordered
@@ -1260,6 +1259,7 @@ class ChatMemoryIngestor:
                 PreparedMemoryDocument(
                     episode=episode,
                     window_message_ids=window_message_ids,
+                    force_new_session=document_id in continuation_document_ids,
                 )
             )
         documents.sort(
@@ -1272,6 +1272,74 @@ class ChatMemoryIngestor:
             )
         )
         return tuple(documents)
+
+    def _split_oversized_document_groups(
+        self,
+        chat_id: ExternalId,
+        document_groups: dict[str, dict[ExternalId, ReplyTarget]],
+        receipts: dict[str, MemoryDocumentReceipt],
+        window_ids: set[ExternalId],
+    ) -> frozenset[str]:
+        """Route newly observed overflow into bounded continuation sessions."""
+        continuation_groups: dict[str, dict[ExternalId, ReplyTarget]] = {}
+        configured_limit = self._ingestion_settings.max_thread_messages
+        for document_id, grouped in tuple(document_groups.items()):
+            receipt = receipts.get(document_id)
+            if receipt is None:
+                continue
+            previous_ids: set[ExternalId] = set()
+            for source_id, _ in receipt.event_versions:
+                parsed = self._identity_codec.parse_message_source_id(source_id)
+                if parsed is None:
+                    continue
+                source_chat_id, message_id = parsed
+                if source_chat_id == chat_id:
+                    previous_ids.add(message_id)
+            effective_limit = max(configured_limit, len(previous_ids))
+            if len(previous_ids | set(grouped)) <= effective_limit:
+                continue
+
+            document_groups[document_id] = {
+                message_id: message
+                for message_id, message in grouped.items()
+                if message_id in previous_ids
+            }
+            new_messages = sorted(
+                (
+                    message
+                    for message_id, message in grouped.items()
+                    if message_id in window_ids and message_id not in previous_ids
+                ),
+                key=lambda message: (_message_datetime(message), message.id),
+            )
+            for start in range(0, len(new_messages), configured_limit):
+                chunk = new_messages[start : start + configured_limit]
+                if not chunk:
+                    continue
+                first = chunk[0]
+                continuation_id = _memory_session_document_id(
+                    self._identity_codec,
+                    chat_id,
+                    first.id,
+                    _message_datetime(first),
+                )
+                continuation = continuation_groups.setdefault(continuation_id, {})
+                continuation.update({message.id: message for message in chunk})
+            if self._logger is not None:
+                self._logger.warning(
+                    "Memory document reached thread bound; continuing in bounded "
+                    "sessions (scope=%s, document=%s, existing=%s, grouped=%s, "
+                    "new=%s, limit=%s)",
+                    self._identity_codec.scope_id(chat_id),
+                    document_id,
+                    len(previous_ids),
+                    len(grouped),
+                    len(new_messages),
+                    configured_limit,
+                )
+        for document_id, grouped in continuation_groups.items():
+            document_groups.setdefault(document_id, {}).update(grouped)
+        return frozenset(continuation_groups)
 
     async def _hydrate_previous_events(
         self,
@@ -1298,23 +1366,6 @@ class ChatMemoryIngestor:
                     previous_ids.append(message_id)
                     if message_id not in known:
                         missing_ids.add(message_id)
-            if document_id.startswith(f"{self._identity_codec.source}:thread:"):
-                limit = self._ingestion_settings.max_thread_messages
-            elif _is_memory_session_document(self._identity_codec, document_id):
-                limit = max(
-                    self._ingestion_settings.max_thread_messages,
-                    self._ingestion_settings.segmentation.max_events,
-                )
-            else:
-                # Legacy ID-packed documents can be larger than new sessions.
-                limit = max(
-                    self._ingestion_settings.max_messages,
-                    self._ingestion_settings.max_thread_messages,
-                )
-            if len(grouped) + len(previous_ids) > limit:
-                raise MemoryThreadLimitError(
-                    f"Document {document_id} exceeds its configured memory bound"
-                )
             previous_by_document[document_id] = tuple(previous_ids)
 
         semaphore = asyncio.Semaphore(self._ingestion_settings.preprocess_concurrency)
@@ -1452,9 +1503,7 @@ class ChatMemoryIngestor:
             if current.id in seen:
                 break
             if len(newest_first) >= self._ingestion_settings.max_thread_messages:
-                raise MemoryThreadLimitError(
-                    f"Reply chain at message {message.id} exceeds the configured bound"
-                )
+                break
             seen.add(current.id)
             newest_first.append(current)
             parent_id = current.reply_to_msg_id
