@@ -31,7 +31,6 @@ from sidekick.ai_memory_ingestion import (
     ChatMemoryIngestor,
     DreamBackfillLimitError,
     MemoryIngestionBusyError,
-    MemoryThreadLimitError,
     MemoryIngestionSettings,
 )
 from sidekick.ai_memory_segments import (
@@ -1409,6 +1408,89 @@ async def test_continuous_memory_resumes_after_cursor_and_checkpoints_success(tm
 
 
 @pytest.mark.asyncio
+async def test_continuous_memory_continues_after_existing_thread_reaches_bound(
+    tmp_path,
+):
+    class MutableClock:
+        value = NOW.timestamp()
+
+        def __call__(self):
+            return self.value
+
+    clock = MutableClock()
+    root = FakeMessage(42, "Root", date=NOW - timedelta(seconds=20))
+    first_reply = FakeMessage(
+        43,
+        "First reply",
+        reply_to=root,
+        date=NOW - timedelta(seconds=15),
+    )
+    second_reply = FakeMessage(
+        44,
+        "Second reply",
+        reply_to=first_reply,
+        date=NOW - timedelta(seconds=10),
+    )
+    source = FakeSource((root, first_reply, second_reply))
+    memory = FakeMemory()
+    store, scanner = await make_scanner(
+        tmp_path,
+        source,
+        memory,
+        clock=clock,
+        max_thread_messages=3,
+        max_events=30,
+        idle_gap=timedelta(minutes=5),
+    )
+    scope_id = "telegram:chat:-1001"
+    await store.set_continuous_memory_enabled(
+        scope_id,
+        True,
+        cursor_message_id=41,
+    )
+    try:
+        staged = await scanner.run_continuous_scope(-1001)
+        assert staged.messages_seen == 3
+        assert memory.retain_calls == []
+
+        later_reply = FakeMessage(
+            45,
+            "Later reply",
+            reply_to=second_reply,
+            date=NOW + timedelta(seconds=10),
+        )
+        source.window = (later_reply,)
+        source.by_id[later_reply.id] = later_reply
+        clock.value = (NOW + timedelta(seconds=20)).timestamp()
+
+        continued = await scanner.run_continuous_scope(-1001)
+
+        assert continued.messages_seen == 1
+        assert continued.messages_retained == 3
+        state = await store.get_memory_scope_state(scope_id)
+        assert state.continuous_cursor_message_id == later_reply.id
+        assert state.continuous_last_error is None
+        assert [event.text for event in memory.retain_calls[0]["episode"].events] == [
+            "Root",
+            "First reply",
+            "Second reply",
+        ]
+        outbox = await store.list_memory_outbox_documents(
+            scope_id,
+            pipeline="continuous",
+        )
+        assert len(outbox) == 1
+        assert outbox[0].document.episode.document_id == (
+            "telegram:memory-session:-1001:20260713T120010Z:45"
+        )
+        assert [event.text for event in outbox[0].document.episode.events] == [
+            "Later reply"
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_continuous_memory_retains_one_document_after_the_chat_is_quiet(
     tmp_path,
 ):
@@ -2124,7 +2206,7 @@ async def test_channel_post_preserves_existing_document_identity(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_thread_limit_refuses_to_advance_without_a_stable_complete_root(tmp_path):
+async def test_thread_limit_truncates_ancestry_and_retains_every_message(tmp_path):
     root = FakeMessage(50, "Root")
     reply = FakeMessage(51, "Reply", reply_to=root)
     source = FakeSource([root, reply])
@@ -2136,12 +2218,16 @@ async def test_thread_limit_refuses_to_advance_without_a_stable_complete_root(tm
         max_thread_messages=1,
     )
     try:
-        with pytest.raises(MemoryThreadLimitError, match="exceeds"):
-            await scanner.run_scope(-1001)
+        result = await scanner.run_scope(-1001)
+
+        assert result.messages_retained == 2
+        assert [
+            [event.text for event in call["episode"].events]
+            for call in memory.retain_calls
+        ] == [["Root"], ["Reply"]]
         state = await store.get_memory_dream_state("telegram:chat:-1001")
-        assert state.cursor_message_id is None
-        assert state.scanned_until_at is None
-        assert memory.retain_calls == []
+        assert state.cursor_message_id == reply.id
+        assert state.last_error is None
     finally:
         await store.close()
 
