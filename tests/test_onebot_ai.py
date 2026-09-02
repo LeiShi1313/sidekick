@@ -115,6 +115,7 @@ async def test_onebot_runtime_applies_mainland_output_policy(tmp_path) -> None:
         plugin._handler._responder._output_policy.policy_id
         == MAINLAND_MESSAGING_POLICY_ID
     )
+    assert plugin._handler._responder._initial_status is None
 
 
 def group_event(
@@ -499,6 +500,43 @@ def test_onebot_message_rejects_malformed_external_events(patch):
             payload,
             action_client=RecordingActionClient(),
         )
+
+
+@pytest.mark.asyncio
+async def test_onebot_transport_defers_placeholder_and_sends_one_final_reply():
+    action_client = RecordingActionClient(responses=[{"message_id": 502}])
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=action_client,
+    )
+    transport = OneBotChatTransport(action_client)
+
+    sent = await transport.draft_reply(trigger)
+    await transport.delete(sent)
+    assert action_client.calls == []
+
+    streamed = await transport.update(
+        sent,
+        "partial",
+        presentation="agent",
+        wait=False,
+    )
+    finalized = await transport.update(
+        sent,
+        "**Final**",
+        presentation="agent",
+        wait=True,
+    )
+
+    assert streamed is False
+    assert finalized is True
+    assert sent.id == 502
+    assert sent.text == "Final"
+    assert [call[0] for call in action_client.calls] == ["send_group_msg"]
+    assert action_client.calls[0][1]["message"][1] == {
+        "type": "text",
+        "data": {"text": "Final"},
+    }
 
 
 @pytest.mark.asyncio

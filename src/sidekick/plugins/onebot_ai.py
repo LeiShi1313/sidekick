@@ -226,6 +226,7 @@ class OneBotAI(metaclass=PluginMount):
         responder = AIResponder(
             self._gateway,
             max_output_chars=self._settings.max_output_chars,
+            initial_status=None,
             transport=transport,
             output_policy=output_policy,
             logger=self.logger,
