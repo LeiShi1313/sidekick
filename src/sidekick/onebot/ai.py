@@ -447,7 +447,11 @@ class OneBotChatTransport:
         )
         fingerprint = message_fingerprint(
             text=text,
-            reply_to_message_id=trigger.id,
+            reply_to_message_id=(
+                trigger.id
+                if any(segment["type"] == "reply" for segment in message)
+                else None
+            ),
             has_attachment=any(
                 segment["type"] not in {"reply", "text", "markdown"}
                 for segment in message
@@ -462,7 +466,18 @@ class OneBotChatTransport:
                     response = await self._client.call(action, params)
                 else:
                     response = await self._client.call(action, params, timeout=timeout)
-            except (OneBotActionError, OneBotNotConnectedError):
+            except OneBotActionError as exc:
+                reservation.failed()
+                if "getMsgsByMsgId" in str(exc) and any(
+                    segment["type"] == "reply" for segment in message
+                ):
+                    return await self._send_segments(
+                        trigger,
+                        [segment for segment in message if segment["type"] != "reply"],
+                        timeout=timeout,
+                    )
+                raise
+            except OneBotNotConnectedError:
                 reservation.failed()
                 raise
             if not isinstance(response, dict):
