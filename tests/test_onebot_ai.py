@@ -565,6 +565,61 @@ async def test_onebot_transport_replaces_placeholder_with_one_final_reply():
 
 
 @pytest.mark.asyncio
+async def test_onebot_transport_retries_reply_lookup_timeout_without_reply():
+    action_client = RecordingActionClient(
+        responses=[
+            OneBotActionError(
+                "send_group_msg",
+                1200,
+                "invoke timeout, wrapperSession.getMsgService().getMsgsByMsgId",
+            ),
+            {"message_id": 502},
+        ]
+    )
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=action_client,
+    )
+
+    sent = await OneBotChatTransport(action_client).reply(
+        trigger,
+        "Final answer",
+        presentation="agent",
+    )
+
+    assert sent.id == 502
+    assert action_client.calls[1][1]["message"] == [
+        {"type": "text", "data": {"text": "Final answer"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_onebot_transport_does_not_retry_send_timeout():
+    action_client = RecordingActionClient(
+        responses=[
+            OneBotActionError(
+                "send_group_msg",
+                1200,
+                "invoke timeout, wrapperSession.getMsgService().sendMsg",
+            )
+        ]
+    )
+    trigger = OneBotMessage.from_payload(
+        group_event(),
+        action_client=action_client,
+    )
+
+    with pytest.raises(OneBotActionError, match="sendMsg"):
+        await OneBotChatTransport(action_client).reply(
+            trigger,
+            "Final answer",
+            presentation="agent",
+        )
+
+    assert len(action_client.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_onebot_transport_suppresses_echo_that_arrives_before_send_receipt():
     class RacingActionClient:
         def __init__(self) -> None:
