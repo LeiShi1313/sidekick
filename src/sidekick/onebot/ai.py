@@ -251,6 +251,7 @@ class OneBotSentMessage:
     id: int
     text: str | None
     trigger: OneBotMessage
+    sent: bool = True
 
 
 class OneBotChatTransport:
@@ -262,6 +263,16 @@ class OneBotChatTransport:
     @property
     def indeterminate_outbound_count(self) -> int:
         return self._generated_messages.indeterminate_count
+
+    async def draft_reply(self, message: Any) -> OneBotSentMessage:
+        if not isinstance(message, OneBotMessage):
+            raise RuntimeError("OneBot transport requires a OneBot message")
+        return OneBotSentMessage(
+            id=message.id,
+            text=None,
+            trigger=message,
+            sent=False,
+        )
 
     async def get_reply(self, message: Any) -> OneBotMessage | None:
         reply_id = getattr(message, "reply_to_msg_id", None)
@@ -372,10 +383,13 @@ class OneBotChatTransport:
         if not wait:
             return False
         rendered = self._render(text, presentation)
+        placeholder_id = message.id if message.sent else None
         final_message_id = await self._send(message.trigger, rendered)
-        placeholder_id = message.id
         message.id = final_message_id
         message.text = rendered
+        message.sent = True
+        if placeholder_id is None:
+            return True
         try:
             await self._client.call(
                 "delete_msg",
@@ -390,6 +404,8 @@ class OneBotChatTransport:
         return True
 
     async def delete(self, message: Any) -> None:
+        if isinstance(message, OneBotSentMessage) and not message.sent:
+            return
         message_id = getattr(message, "id", None)
         if isinstance(message_id, int):
             await self._client.call(
