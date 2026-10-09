@@ -1378,6 +1378,11 @@ export class PiEngine {
       let toolExecutionStarted = false;
       let turnNumber = 0;
       let turnStartedAt = null;
+      // Provider latency split per turn: response start vs first streamed delta.
+      let responseStartedInTurn = false;
+      let deltaSeenInTurn = false;
+      const turnElapsedMs = () =>
+        turnStartedAt === null ? null : Math.max(0, Date.now() - turnStartedAt);
       const emitText = (delta) => {
         if (!delta) return;
         queue.push({
@@ -1392,6 +1397,8 @@ export class PiEngine {
         textStream = new SensitiveTextStream(privacyOptions);
         turnNumber += 1;
         turnStartedAt = Date.now();
+        responseStartedInTurn = false;
+        deltaSeenInTurn = false;
         this.#updateActiveRun(activeRun, {
           phase: "model_running",
           currentTool: null,
@@ -1402,10 +1409,29 @@ export class PiEngine {
         if (event.type === "turn_start") {
           markTurnStarted();
         } else if (
-          event.type === "message_update" &&
-          event.assistantMessageEvent.type === "text_delta"
+          event.type === "message_start" &&
+          event.message?.role === "assistant" &&
+          !responseStartedInTurn
         ) {
-          emitText(textStream.push(event.assistantMessageEvent.delta));
+          // Emitted once the provider has answered the HTTP request.
+          responseStartedInTurn = true;
+          void record("model.response.started", {
+            turn: turnNumber,
+            elapsedMs: turnElapsedMs(),
+          });
+        } else if (event.type === "message_update") {
+          const kind = event.assistantMessageEvent.type;
+          if (kind.endsWith("_delta") && !deltaSeenInTurn) {
+            deltaSeenInTurn = true;
+            void record("model.first_delta", {
+              turn: turnNumber,
+              kind,
+              elapsedMs: turnElapsedMs(),
+            });
+          }
+          if (kind === "text_delta") {
+            emitText(textStream.push(event.assistantMessageEvent.delta));
+          }
         } else if (event.type === "message_end") {
           sanitizeMessageInPlace(event.message, privacyOptions);
         } else if (event.type === "tool_execution_start") {

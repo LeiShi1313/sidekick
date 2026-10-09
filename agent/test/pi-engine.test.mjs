@@ -3390,12 +3390,34 @@ test("records a correlated run audit with memory, model, and tool details", asyn
       "session.opened",
       "model.input",
       "model.turn.started",
+      "model.response.started",
+      "model.first_delta",
       "model.turn.completed",
       "tool.started",
       "tool.completed",
       "run.completed",
     ]) {
       assert(types.includes(type), `missing ${type}`);
+    }
+    const responseStarts = audit.events.filter(
+      (event) => event.type === "model.response.started",
+    );
+    const firstDeltas = audit.events.filter(
+      (event) => event.type === "model.first_delta",
+    );
+    assert.deepEqual(
+      responseStarts.map((event) => event.data.turn),
+      [1, 2],
+    );
+    assert.deepEqual(
+      firstDeltas.map((event) => [event.data.turn, event.data.kind]),
+      [
+        [1, "toolcall_delta"],
+        [2, "text_delta"],
+      ],
+    );
+    for (const event of [...responseStarts, ...firstDeltas]) {
+      assert(Number.isInteger(event.data.elapsedMs) && event.data.elapsedMs >= 0);
     }
     const requestEvent = audit.events.find((event) => event.type === "run.request");
     assert.equal(

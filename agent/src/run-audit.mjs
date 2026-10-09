@@ -246,6 +246,17 @@ export function minimizeAuditData(type, value = {}) {
       };
     case "model.turn.started":
       return { turn: safeInteger(data.turn) };
+    case "model.response.started":
+      return {
+        turn: safeInteger(data.turn),
+        elapsedMs: safeInteger(data.elapsedMs),
+      };
+    case "model.first_delta":
+      return {
+        turn: safeInteger(data.turn),
+        kind: safeString(data.kind, 32),
+        elapsedMs: safeInteger(data.elapsedMs),
+      };
     case "run.budget.finalizing":
       return {
         elapsedMs: safeInteger(data.elapsedMs),
