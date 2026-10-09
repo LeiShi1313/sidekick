@@ -47,6 +47,7 @@ import {
   assertSessionBinding,
   bindSession,
   hardenSessionPersistence,
+  limitHistoryImagesInPlace,
   scrubSessionDirectory,
 } from "./session-persistence.mjs";
 import { SessionHistory } from "./session-history.mjs";
@@ -54,6 +55,7 @@ import { TAIBU_MCP_GUIDANCE } from "./taibu-mcp-config.mjs";
 import { constrainWebTools } from "./web-tools.mjs";
 
 const PROVIDER = "openai-compatible";
+const DEFAULT_HISTORY_IMAGE_LIMIT = 4;
 const MAX_CATALOG_MODELS = 256;
 const SILENT_PROVIDER_LOGGER = Object.freeze({
   debug() {},
@@ -1308,13 +1310,21 @@ export class PiEngine {
         privacyOptions,
         userMessageContent: buildRunPrompt({
           ...request,
-          context: request.context.filter(({ kind }) => kind === "conversation"),
+          // Reference context carries attachment descriptions, which remain
+          // the fallback once an older image is evicted from replay.
+          context: request.context.filter(
+            ({ kind }) => kind === "conversation" || kind === "reference",
+          ),
           continuation: request.sessionId !== null,
           identityAliasKey: this.config.identityAliasKey,
           now: promptIssuedAt,
         }),
       };
       sanitizeConversationHistoryInPlace(session.messages, privacyOptions);
+      limitHistoryImagesInPlace(
+        session.messages,
+        this.config.historyImageLimit ?? DEFAULT_HISTORY_IMAGE_LIMIT,
+      );
 
       const runStartedAtMs = Date.parse(activeRun.startedAt);
       const elapsedRunMs = () => Math.max(0, Date.now() - runStartedAtMs);

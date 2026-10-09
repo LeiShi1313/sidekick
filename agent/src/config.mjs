@@ -299,6 +299,10 @@ export function loadConfig() {
       contextWindow: integer("AI_CONTEXT_WINDOW", 128_000, {
         min: 4_096,
       }),
+      historyImageLimit: integer("AI_SESSION_HISTORY_IMAGES", 4, {
+        min: 0,
+        max: 32,
+      }),
       requestTimeoutMs:
         integer("AI_REQUEST_TIMEOUT", 90, { max: 3_600 }) * 1_000,
       imageRequestTimeoutMs:

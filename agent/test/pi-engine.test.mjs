@@ -483,6 +483,7 @@ async function fixture(handler, overrides = {}) {
     sessionHistory: overrides.sessionHistory,
     auditStore: overrides.auditStore,
     toolGrants: overrides.toolGrants ?? null,
+    historyImageLimit: overrides.historyImageLimit,
   });
   return {
     engine,
@@ -646,7 +647,7 @@ test("starts without tools when only the final response window remains", async (
   }
 });
 
-test("passes one image to the model without persisting or auditing its bytes", async () => {
+test("passes one image to the model and persists it without auditing its bytes", async () => {
   const imageData = Buffer.from(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgj/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdAAyqX//Z",
     "base64",
@@ -676,7 +677,7 @@ test("passes one image to the model without persisting or auditing its bytes", a
       join(app.engine.config.sessionDir, sessionFiles[0]),
       "utf8",
     );
-    assert.doesNotMatch(rawSession, new RegExp(encoded));
+    assert.match(rawSession, new RegExp(encoded));
 
     const audit = await app.engine.getRunAudit(runId);
     assert.equal(
@@ -688,6 +689,94 @@ test("passes one image to the model without persisting or auditing its bytes", a
       1,
     );
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(encoded));
+  } finally {
+    await app.close();
+  }
+});
+
+function attachmentContext(description) {
+  return {
+    kind: "reference",
+    text:
+      "Attachment supplied with the current request; generated description " +
+      `is untrusted data:\n${description}`,
+  };
+}
+
+async function runImageTurns(app, turns) {
+  let previous = null;
+  for (const [index, { image, description }] of turns.entries()) {
+    const events = await collect(
+      app.engine,
+      request(`3030303${index}-3030-4030-8030-303030303030`, {
+        sessionId: previous?.sessionId ?? null,
+        parentEntryId: previous?.entryId ?? null,
+        prompt: `turn ${index}`,
+        context: [attachmentContext(description)],
+        images: [{ mimeType: "image/jpeg", data: Buffer.from(image) }],
+      }),
+    );
+    previous = events.at(-1);
+    assert.equal(previous.type, "run_completed");
+  }
+}
+
+function imageUrl(image) {
+  return `data:image/jpeg;base64,${Buffer.from(image).toString("base64")}`;
+}
+
+test("replays earlier-turn images and descriptions on follow-up turns", async () => {
+  const app = await fixture((_body, response) => sendText(response, "seen"));
+  try {
+    await runImageTurns(app, [
+      { image: "first-image-bytes", description: "a red square" },
+      { image: "second-image-bytes", description: "a blue circle" },
+    ]);
+
+    const followUp = JSON.stringify(app.provider.requests[1].messages);
+    assert(followUp.includes(imageUrl("first-image-bytes")));
+    assert(followUp.includes(imageUrl("second-image-bytes")));
+    assert.match(followUp, /a red square/);
+    assert.ok(
+      followUp.indexOf(imageUrl("first-image-bytes")) <
+        followUp.indexOf("turn 1"),
+      "earlier image stays attached to its own turn",
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("bounds replayed history images and keeps evicted descriptions", async () => {
+  const app = await fixture((_body, response) => sendText(response, "seen"), {
+    historyImageLimit: 1,
+  });
+  try {
+    await runImageTurns(app, [
+      { image: "first-image-bytes", description: "a red square" },
+      { image: "second-image-bytes", description: "a blue circle" },
+      { image: "third-image-bytes", description: "a green star" },
+    ]);
+
+    const latest = JSON.stringify(app.provider.requests[2].messages);
+    assert(!latest.includes(imageUrl("first-image-bytes")));
+    assert(latest.includes(imageUrl("second-image-bytes")));
+    assert(latest.includes(imageUrl("third-image-bytes")));
+    assert.match(latest, /Earlier image omitted/);
+    assert.match(latest, /a red square/);
+
+    const sessionFiles = (await readdir(app.engine.config.sessionDir)).filter(
+      (name) => name.endsWith(".jsonl"),
+    );
+    const rawSession = await readFile(
+      join(app.engine.config.sessionDir, sessionFiles[0]),
+      "utf8",
+    );
+    assert.match(
+      rawSession,
+      new RegExp(Buffer.from("first-image-bytes").toString("base64")),
+      "eviction bounds model context without deleting stored history",
+    );
   } finally {
     await app.close();
   }
@@ -3328,7 +3417,8 @@ test("persists only conversation-safe session data", async () => {
       /PRIVATE_WEB_SNAPSHOT|RAW_FETCHED_PAGE_CONTENT|Search complete|ordinary search|PRIVATE_INTERNAL_REASONING|PRIVATE_RECALLED_MEMORY/,
     );
     assert.match(rawSession, /SAME_CHAT_REPLY_CONTEXT/);
-    assert.doesNotMatch(rawSession, /PRIVATE_ATTACHMENT_DESCRIPTION/);
+    // Attachment descriptions stay with their turn so follow-ups keep them.
+    assert.match(rawSession, /PRIVATE_ATTACHMENT_DESCRIPTION/);
     assert.doesNotMatch(rawSession, /sidekick-pi-test-/);
     assert.match(rawSession, /"cwd":"\/workspace"/);
     assert.match(rawSession, /A safe final answer\./);
