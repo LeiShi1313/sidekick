@@ -12,6 +12,7 @@ from types import TracebackType
 from typing import Any
 
 from sidekick.chat.identity import ExternalId
+from sidekick.chat.replies import same_chat_reply_id
 
 
 class MessageOrigin(Enum):
@@ -75,7 +76,7 @@ def observed_message_fingerprint(message: Any) -> MessageFingerprint:
     )
     return message_fingerprint(
         text=text if isinstance(text, str) else None,
-        reply_to_message_id=getattr(message, "reply_to_msg_id", None),
+        reply_to_message_id=same_chat_reply_id(message),
         has_attachment=has_attachment,
     )
 

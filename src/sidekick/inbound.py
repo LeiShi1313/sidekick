@@ -7,6 +7,7 @@ from sidekick.ai import ReplyTarget
 from sidekick.chat.commands import is_ai_candidate_text
 from sidekick.chat.identity import ExternalId
 from sidekick.chat.provenance import MessageOrigin
+from sidekick.chat.replies import same_chat_reply_id
 
 
 InboundWorkKind = Literal["message", "message_remove"]
@@ -80,4 +81,4 @@ class InboundSourceUnavailable(Exception):
 
 
 def is_ai_candidate(message: ReplyTarget) -> bool:
-    return is_ai_candidate_text(message.raw_text) or message.reply_to_msg_id is not None
+    return is_ai_candidate_text(message.raw_text) or same_chat_reply_id(message) is not None

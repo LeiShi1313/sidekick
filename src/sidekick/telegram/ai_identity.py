@@ -20,6 +20,7 @@ from sidekick.ai import (
     ReplyTarget,
 )
 from sidekick.chat.identity import IdentityCodec, NamespacedIdentityCodec
+from sidekick.chat.replies import is_cross_chat_reply, same_chat_reply_id
 from sidekick.memory_directory import DirectorySource
 from sidekick.telegram.message_links import parse_telegram_message_link
 
@@ -458,52 +459,80 @@ def telegram_memory_event_metadata(
     if isinstance(post_author, str) and post_author.strip():
         metadata["post_author"] = post_author.strip()[:256]
     reply = getattr(message, "reply_to", None)
+    external = is_cross_chat_reply(message)
     quote_text = getattr(reply, "quote_text", None)
     if isinstance(quote_text, str) and quote_text.strip():
         quotation: dict[str, Any] = {"text": quote_text.strip()[:4_000]}
-        reply_id = getattr(message, "reply_to_msg_id", None)
+        reply_id = same_chat_reply_id(message)
         if isinstance(chat_id, int) and isinstance(reply_id, int):
             quotation["source_id"] = codec.message_source_id(chat_id, reply_id)
+        if external:
+            quotation["external"] = True
         quote_offset = getattr(reply, "quote_offset", None)
         if isinstance(quote_offset, int) and quote_offset >= 0:
             quotation["offset"] = quote_offset
         metadata["quotation"] = quotation
 
+    if external:
+        replied: dict[str, Any] = _origin_attribution(
+            getattr(reply, "reply_from", None),
+            codec,
+        )
+        reply_peer = getattr(reply, "reply_to_peer_id", None)
+        reply_id = getattr(reply, "reply_to_msg_id", None)
+        if reply_peer is not None and isinstance(reply_id, int):
+            try:
+                replied["source_id"] = codec.message_source_id(
+                    telegram_utils.get_peer_id(reply_peer),
+                    reply_id,
+                )
+            except (TypeError, ValueError):
+                pass
+        metadata["external_reply"] = replied
+
     forward = getattr(message, "fwd_from", None)
     if forward is not None:
-        attribution: dict[str, Any] = {}
-        from_name = getattr(forward, "from_name", None)
-        if isinstance(from_name, str) and from_name.strip():
-            attribution["actor_display_name"] = from_name.strip()[:256]
-        from_id = getattr(forward, "from_id", None)
-        if isinstance(from_id, telegram_types.PeerUser):
-            attribution["actor_id"] = codec.actor_id(from_id.user_id)
-        source_peer = getattr(forward, "saved_from_peer", None) or from_id
-        source_message_id = getattr(forward, "saved_from_msg_id", None) or getattr(
-            forward,
-            "channel_post",
-            None,
-        )
-        if source_peer is not None and isinstance(source_message_id, int):
-            try:
-                source_chat_id = telegram_utils.get_peer_id(source_peer)
-            except (TypeError, ValueError):
-                source_chat_id = None
-            if isinstance(source_chat_id, int):
-                attribution["source_id"] = codec.message_source_id(
-                    source_chat_id,
-                    source_message_id,
-                )
-        forwarded_at = getattr(forward, "date", None)
-        if isinstance(forwarded_at, datetime):
-            if forwarded_at.tzinfo is None:
-                forwarded_at = forwarded_at.replace(tzinfo=UTC)
-            attribution["source_time"] = (
-                forwarded_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
-            )
+        attribution = _origin_attribution(forward, codec)
         if attribution:
             metadata["forwarded_from"] = attribution
     return metadata
+
+
+def _origin_attribution(header: Any | None, codec: IdentityCodec) -> dict[str, Any]:
+    """Describe a MessageFwdHeader: who originally wrote a message and where."""
+    attribution: dict[str, Any] = {}
+    if header is None:
+        return attribution
+    from_name = getattr(header, "from_name", None)
+    if isinstance(from_name, str) and from_name.strip():
+        attribution["actor_display_name"] = from_name.strip()[:256]
+    from_id = getattr(header, "from_id", None)
+    if isinstance(from_id, telegram_types.PeerUser):
+        attribution["actor_id"] = codec.actor_id(from_id.user_id)
+    source_peer = getattr(header, "saved_from_peer", None) or from_id
+    source_message_id = getattr(header, "saved_from_msg_id", None) or getattr(
+        header,
+        "channel_post",
+        None,
+    )
+    if source_peer is not None and isinstance(source_message_id, int):
+        try:
+            source_chat_id = telegram_utils.get_peer_id(source_peer)
+        except (TypeError, ValueError):
+            source_chat_id = None
+        if isinstance(source_chat_id, int):
+            attribution["source_id"] = codec.message_source_id(
+                source_chat_id,
+                source_message_id,
+            )
+    origin_at = getattr(header, "date", None)
+    if isinstance(origin_at, datetime):
+        if origin_at.tzinfo is None:
+            origin_at = origin_at.replace(tzinfo=UTC)
+        attribution["source_time"] = (
+            origin_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        )
+    return attribution
 
 
 def telegram_display_name(entity: Any | None) -> str | None:
