@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 import hmac
+import logging
 import os
+import time
 from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
+
+from sidekick.runtime.logging import build_logger
 
 
 _MAX_BODY_BYTES = 64 * 1024 * 1024
@@ -46,6 +50,9 @@ class MemoryEgressGatewaySettings:
     host: str = "127.0.0.1"
     port: int = 8080
     timeout: float = 300.0
+    # Seconds before one duplicate embedding request is raced against a slow
+    # one. Embeddings are idempotent; 0 disables hedging.
+    embedding_hedge_delay: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -70,6 +77,8 @@ class MemoryEgressGatewaySettings:
             raise ValueError("Memory egress port must be between 1 and 65535")
         if self.timeout <= 0:
             raise ValueError("Memory egress timeout must be positive")
+        if self.embedding_hedge_delay < 0:
+            raise ValueError("Memory egress embedding hedge delay cannot be negative")
 
     @classmethod
     def from_env(
@@ -84,6 +93,12 @@ class MemoryEgressGatewaySettings:
             timeout = float(values.get("MEMORY_EGRESS_TIMEOUT", "300").strip())
         except ValueError as exc:
             raise ValueError("MEMORY_EGRESS_TIMEOUT must be numeric") from exc
+        try:
+            embedding_hedge_delay = float(
+                values.get("MEMORY_EMBEDDING_HEDGE_DELAY", "0").strip()
+            )
+        except ValueError as exc:
+            raise ValueError("MEMORY_EMBEDDING_HEDGE_DELAY must be numeric") from exc
         return cls(
             llm_upstream_url=values.get("MEMORY_LLM_UPSTREAM_URL", "").strip(),
             llm_api_key=values.get("MEMORY_LLM_UPSTREAM_API_KEY", "").strip(),
@@ -98,14 +113,21 @@ class MemoryEgressGatewaySettings:
             host=values.get("MEMORY_EGRESS_HOST", "127.0.0.1").strip(),
             port=port,
             timeout=timeout,
+            embedding_hedge_delay=embedding_hedge_delay,
         )
 
 
 class MemoryEgressGateway:
     """Authenticated, fixed-route egress for Hindsight provider calls."""
 
-    def __init__(self, settings: MemoryEgressGatewaySettings):
+    def __init__(
+        self,
+        settings: MemoryEgressGatewaySettings,
+        *,
+        logger: logging.Logger | None = None,
+    ):
         self._settings = settings
+        self._logger = logger or build_logger(__name__)
         self._expected_authorization = f"Bearer {settings.internal_token}"
         self._session: aiohttp.ClientSession | None = None
         self.application = web.Application(
@@ -188,6 +210,8 @@ class MemoryEgressGateway:
             request,
             upstream_url=f"{self._settings.embedding_upstream_url}/embeddings",
             upstream_api_key=self._settings.embedding_api_key,
+            hedge_delay=self._settings.embedding_hedge_delay,
+            timing_label="embedding",
         )
 
     async def _proxy(
@@ -196,6 +220,8 @@ class MemoryEgressGateway:
         *,
         upstream_url: str,
         upstream_api_key: str,
+        hedge_delay: float = 0.0,
+        timing_label: str | None = None,
     ) -> web.Response:
         authorization = request.headers.get("Authorization", "")
         if not hmac.compare_digest(authorization, self._expected_authorization):
@@ -215,6 +241,31 @@ class MemoryEgressGateway:
                 "Content-Type", "application/json"
             ),
         }
+
+        def attempt() -> Awaitable[_UpstreamResult]:
+            return self._forward(upstream_url, body, headers)
+
+        started = time.perf_counter()
+        if hedge_delay > 0:
+            result, attempts = await _first_success(attempt, hedge_delay)
+        else:
+            result, attempts = await attempt(), 1
+        if timing_label is not None:
+            self._logger.info(
+                "Memory egress %s status=%d duration_ms=%d attempts=%d",
+                timing_label,
+                result.status,
+                round((time.perf_counter() - started) * 1000),
+                attempts,
+            )
+        return result.response()
+
+    async def _forward(
+        self,
+        upstream_url: str,
+        body: bytes,
+        headers: Mapping[str, str],
+    ) -> _UpstreamResult:
         assert self._session is not None
         try:
             async with self._session.post(
@@ -224,10 +275,9 @@ class MemoryEgressGateway:
                 allow_redirects=False,
             ) as upstream:
                 if not 200 <= upstream.status < 300:
-                    return _error_response(
-                        upstream.status,
-                        "UPSTREAM_ERROR",
-                        "Provider request failed",
+                    return _UpstreamResult(
+                        status=upstream.status,
+                        error_code="UPSTREAM_ERROR",
                         headers={
                             name: upstream.headers[name]
                             for name in ("Retry-After",)
@@ -235,22 +285,82 @@ class MemoryEgressGateway:
                         },
                     )
                 payload = await _bounded_body(upstream)
-                response_headers = {
-                    name: upstream.headers[name]
-                    for name in ("Content-Type",)
-                    if name in upstream.headers
-                }
-                return web.Response(
-                    body=payload,
+                return _UpstreamResult(
                     status=upstream.status,
-                    headers=response_headers,
+                    payload=payload,
+                    headers={
+                        name: upstream.headers[name]
+                        for name in ("Content-Type",)
+                        if name in upstream.headers
+                    },
                 )
         except (aiohttp.ClientError, asyncio.TimeoutError, _ResponseTooLarge):
+            return _UpstreamResult(status=502, error_code="UPSTREAM_UNAVAILABLE")
+
+
+@dataclass(frozen=True, slots=True)
+class _UpstreamResult:
+    status: int
+    payload: bytes | None = None
+    error_code: str | None = None
+    headers: Mapping[str, str] | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error_code is None
+
+    def response(self) -> web.Response:
+        if self.error_code == "UPSTREAM_UNAVAILABLE":
             return _error_response(
-                502,
-                "UPSTREAM_UNAVAILABLE",
+                self.status,
+                self.error_code,
                 "Provider service unavailable",
             )
+        if self.error_code is not None:
+            return _error_response(
+                self.status,
+                self.error_code,
+                "Provider request failed",
+                headers=self.headers,
+            )
+        return web.Response(
+            body=self.payload,
+            status=self.status,
+            headers=self.headers,
+        )
+
+
+async def _first_success(
+    attempt: Callable[[], Awaitable[_UpstreamResult]],
+    hedge_delay: float,
+) -> tuple[_UpstreamResult, int]:
+    """Race one duplicate after `hedge_delay`; the first success wins."""
+    tasks = [asyncio.ensure_future(attempt())]
+    try:
+        done, _ = await asyncio.wait(tasks, timeout=hedge_delay)
+        if done:
+            return tasks[0].result(), 1
+        tasks.append(asyncio.ensure_future(attempt()))
+        pending = set(tasks)
+        failure: _UpstreamResult | None = None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                result = task.result()
+                if result.succeeded:
+                    return result, 2
+                failure = failure or result
+        assert failure is not None
+        return failure, 2
+    finally:
+        unfinished = [task for task in tasks if not task.done()]
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            await asyncio.gather(*unfinished, return_exceptions=True)
 
 
 class _ResponseTooLarge(RuntimeError):

@@ -81,6 +81,7 @@ services:
       MEMORY_LLM_UPSTREAM_API_KEY: ${MEMORY_LLM_API_KEY}
       MEMORY_EMBEDDING_UPSTREAM_URL: ${MEMORY_EMBEDDING_BASE_URL:-http://ollama-embedding-ollama-1:11434/v1}
       MEMORY_EMBEDDING_UPSTREAM_API_KEY: ${MEMORY_EMBEDDING_API_KEY:-ollama}
+      MEMORY_EMBEDDING_HEDGE_DELAY: ${MEMORY_EMBEDDING_HEDGE_DELAY:-0.8}
     networks:
       - memory-backend
       - memory-egress
