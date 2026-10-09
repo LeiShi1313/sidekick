@@ -981,6 +981,10 @@ export class PiEngine {
       }
     };
     let terminalRecorded = false;
+    // Adapters may raise or lower reasoning for one run; otherwise use config.
+    const thinkingLevel = request.reasoningEffort
+      ? normalizeThinkingLevel(request.reasoningEffort)
+      : this.thinkingLevel;
     const model = request.model
       ? { ...this.model, id: request.model, name: request.model }
       : this.model;
@@ -1262,7 +1266,7 @@ export class PiEngine {
         agentDir: this.config.agentDir,
         modelRuntime,
         model,
-        thinkingLevel: this.thinkingLevel,
+        thinkingLevel,
         tools: toolNames,
         customTools,
         resourceLoader,
@@ -1557,7 +1561,7 @@ export class PiEngine {
           provider: model.provider,
           api: model.api,
           reasoning: model.reasoning,
-          thinkingLevel: this.thinkingLevel,
+          thinkingLevel,
         },
         systemPrompt: request.systemPrompt,
         prompt: initialPrompt,

@@ -1735,3 +1735,41 @@ test("rejects an invalid attachment description from the engine", async () => {
     await app.close();
   }
 });
+
+test("accepts a known per-run reasoning effort and rejects unknown ones", async () => {
+  const received = [];
+  const app = await listen({
+    async *run(request) {
+      received.push(request);
+      yield { type: "run_completed", sessionId: "s", entryId: "e", answer: "ok" };
+    },
+    async cancel() {
+      return false;
+    },
+  });
+  const post = (body) =>
+    fetch(`${app.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-agent-token-that-is-long-enough",
+      },
+      body: JSON.stringify(body),
+    });
+  try {
+    const accepted = await post({ ...validRun, reasoningEffort: "xhigh" });
+    assert.equal(accepted.status, 200);
+    await accepted.text();
+    assert.equal(received[0].reasoningEffort, "xhigh");
+
+    for (const reasoningEffort of ["extreme", 3, ""]) {
+      const rejected = await post({ ...validRun, reasoningEffort });
+      assert.equal(rejected.status, 400);
+    }
+    const omitted = await post(validRun);
+    await omitted.text();
+    assert.equal("reasoningEffort" in received[1], false);
+  } finally {
+    await app.close();
+  }
+});

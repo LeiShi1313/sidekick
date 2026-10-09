@@ -243,6 +243,11 @@ class AgentGateway(Protocol):
     async def cancel(self, run_id: str) -> bool: ...
 
 
+AGENT_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+
 class PiAgentGateway:
     def __init__(
         self,
@@ -250,6 +255,8 @@ class PiAgentGateway:
         *,
         token: str,
         timeout: float = 90.0,
+        default_model: str | None = None,
+        default_reasoning_effort: str | None = None,
     ):
         self._base_url = base_url.rstrip("/")
         if not self._base_url.startswith(("http://", "https://")):
@@ -258,6 +265,14 @@ class PiAgentGateway:
             raise ValueError("Pi agent token must contain at least 24 characters")
         if timeout <= 0:
             raise ValueError("Pi agent timeout must be positive")
+        if (
+            default_reasoning_effort is not None
+            and default_reasoning_effort not in AGENT_REASONING_EFFORTS
+        ):
+            raise ValueError("Unknown Pi agent reasoning effort")
+        # Adapter-level defaults: a chat's /ai_model override still wins.
+        self._default_model = default_model
+        self._default_reasoning_effort = default_reasoning_effort
         self._headers = {"Authorization": f"Bearer {token}"}
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._run_budget_ms = max(1, int(timeout * 1_000))
@@ -293,6 +308,8 @@ class PiAgentGateway:
             raise RuntimeError("Pi model catalog is malformed")
         if not all(isinstance(model, str) for model in models):
             raise RuntimeError("Pi model catalog is malformed")
+        if self._default_model in models:
+            default_model = self._default_model
         try:
             return AgentModelCatalog(default_model, tuple(models))
         except ValueError as exc:
@@ -367,8 +384,11 @@ class PiAgentGateway:
         }
         if request.tool_policy != "owner":
             payload["runBudgetMs"] = self._run_budget_ms
-        if request.model is not None:
-            payload["model"] = request.model
+        model = request.model or self._default_model
+        if model is not None:
+            payload["model"] = model
+        if self._default_reasoning_effort is not None:
+            payload["reasoningEffort"] = self._default_reasoning_effort
         if request.images:
             payload["images"] = [
                 {
@@ -823,10 +843,17 @@ class AISettings:
     hindsight_url: str | None = None
     hindsight_token: str | None = None
     hindsight_timeout: float = 90.0
+    default_model: str | None = None
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.agent_token) < 24:
             raise ValueError("Pi agent token must contain at least 24 characters")
+        if (
+            self.reasoning_effort is not None
+            and self.reasoning_effort not in AGENT_REASONING_EFFORTS
+        ):
+            raise ValueError("SIDEKICK_AI_REASONING_EFFORT is not a known effort")
         if self.hindsight_url is not None and (
             self.hindsight_token is None or len(self.hindsight_token) < 24
         ):
@@ -884,6 +911,12 @@ class AISettings:
                 os.environ.get("SIDEKICK_HINDSIGHT_TOKEN", "").strip() or None
             ),
             hindsight_timeout=float(os.environ.get("SIDEKICK_HINDSIGHT_TIMEOUT", "90")),
+            default_model=os.environ.get("SIDEKICK_AI_DEFAULT_MODEL", "").strip()
+            or None,
+            reasoning_effort=os.environ.get("SIDEKICK_AI_REASONING_EFFORT", "")
+            .strip()
+            .lower()
+            or None,
         )
 
 

@@ -9,6 +9,7 @@ import {
   isOwnerCustomizationTargetPrincipal,
   isRequesterCustomizationPrincipal,
 } from "./host-identity.mjs";
+import { REASONING_LEVELS } from "./config.mjs";
 import { isModelId } from "./model-id.mjs";
 import { normalizeOwnerCustomization } from "./requester-memory.mjs";
 
@@ -187,6 +188,7 @@ export function validateRunRequest(value) {
   const includeMemorySnapshot = value.includeMemorySnapshot;
   const runBudgetMs = value.runBudgetMs;
   const model = value.model;
+  const reasoningEffort = value.reasoningEffort;
   const suppliedOrigin = value.origin;
   const suppliedIdentity = value.identity;
   const images = validateModelImages(value.images);
@@ -211,6 +213,10 @@ export function validateRunRequest(value) {
     !(
       model === undefined ||
       isModelId(model)
+    ) ||
+    !(
+      reasoningEffort === undefined ||
+      REASONING_LEVELS.has(reasoningEffort)
     ) ||
     !(
       includeMemorySnapshot === undefined ||
@@ -446,6 +452,7 @@ export function validateRunRequest(value) {
     origin,
     ...(runBudgetMs === undefined ? {} : { runBudgetMs }),
     ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(includeMemorySnapshot ? { includeMemorySnapshot: true } : {}),
     ...(memory ? { memory } : {}),
     ...(images.length > 0 ? { images } : {}),

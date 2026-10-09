@@ -4047,3 +4047,23 @@ test("applies configured tool grants to the run's active tools", async () => {
     await app.close();
   }
 });
+
+test("uses a per-run reasoning effort over the configured default", async () => {
+  const app = await fixture((_body, response) => sendText(response, "ok"), {
+    reasoningEffort: "medium",
+  });
+  try {
+    await collect(app.engine, request("40404040-4040-4040-8040-404040404040"));
+    await collect(
+      app.engine,
+      request("50505050-5050-4050-8050-505050505050", { reasoningEffort: "xhigh" }),
+    );
+    assert.equal(app.provider.requests[0].reasoning_effort, "medium");
+    assert.equal(app.provider.requests[1].reasoning_effort, "xhigh");
+    const audit = await app.engine.getRunAudit("50505050-5050-4050-8050-505050505050");
+    const input = audit.events.find((event) => event.type === "model.input");
+    assert.equal(input.data.model.thinkingLevel, "xhigh");
+  } finally {
+    await app.close();
+  }
+});

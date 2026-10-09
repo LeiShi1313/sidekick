@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CODEX_ACCESS_TOKEN_COMMAND } from "./codex-access-token.mjs";
 import { isHostIdentity } from "./host-identity.mjs";
 
-const REASONING_LEVELS = new Set([
+export const REASONING_LEVELS = new Set([
   "none",
   "minimal",
   "low",

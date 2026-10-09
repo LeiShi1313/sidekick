@@ -627,3 +627,119 @@ async def test_pi_gateway_sends_bounded_attachment_for_description() -> None:
         "filename": "diagram.jpg",
         "data": "aW1hZ2UtYnl0ZXM=",
     }
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_applies_adapter_model_and_reasoning_defaults() -> None:
+    received: list[dict] = []
+
+    async def runs(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        return web.Response(
+            text=(
+                '{"type":"run_completed","sessionId":"session-1",'
+                '"entryId":"entry-1","answer":"done"}\n'
+            ),
+            content_type="application/x-ndjson",
+        )
+
+    async def models(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"defaultModel": "gpt-5.6-terra", "models": ["gpt-5.6-terra", "gpt-6-astra"]}
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    app.router.add_get("/v1/models", models)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url,
+        token="test-agent-token-that-is-long-enough",
+        timeout=5,
+        default_model="gpt-6-astra",
+        default_reasoning_effort="xhigh",
+    )
+    try:
+        _ = [event async for event in gateway.run(run_request())]
+        _ = [
+            event
+            async for event in gateway.run(replace(run_request(), model="gpt-5.6-terra"))
+        ]
+        catalog = await gateway.list_models()
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert received[0]["model"] == "gpt-6-astra"
+    assert received[0]["reasoningEffort"] == "xhigh"
+    assert received[1]["model"] == "gpt-5.6-terra"
+    assert received[1]["reasoningEffort"] == "xhigh"
+    assert catalog.default_model == "gpt-6-astra"
+
+
+@pytest.mark.asyncio
+async def test_pi_gateway_keeps_server_defaults_without_adapter_overrides() -> None:
+    received: list[dict] = []
+
+    async def runs(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        return web.Response(
+            text=(
+                '{"type":"run_completed","sessionId":"session-1",'
+                '"entryId":"entry-1","answer":"done"}\n'
+            ),
+            content_type="application/x-ndjson",
+        )
+
+    async def models(_request: web.Request) -> web.Response:
+        return web.json_response({"defaultModel": "gpt-5.6-terra", "models": ["gpt-5.6-terra"]})
+
+    app = web.Application()
+    app.router.add_post("/v1/runs", runs)
+    app.router.add_get("/v1/models", models)
+    runner, base_url = await serve(app)
+    gateway = PiAgentGateway(
+        base_url,
+        token="test-agent-token-that-is-long-enough",
+        timeout=5,
+        default_model="gpt-6-astra",
+    )
+    try:
+        _ = [event async for event in gateway.run(run_request())]
+        catalog = await gateway.list_models()
+    finally:
+        await gateway.close()
+        await runner.cleanup()
+
+    assert "reasoningEffort" not in received[0]
+    assert catalog.default_model == "gpt-5.6-terra"
+
+
+def test_pi_gateway_rejects_unknown_reasoning_effort() -> None:
+    with pytest.raises(ValueError, match="reasoning effort"):
+        PiAgentGateway(
+            "http://127.0.0.1:1",
+            token="test-agent-token-that-is-long-enough",
+            default_reasoning_effort="extreme",
+        )
+
+
+def test_ai_settings_reads_adapter_model_defaults(monkeypatch) -> None:
+    from sidekick.ai import AISettings
+
+    monkeypatch.setenv("SIDEKICK_PI_TOKEN", "test-agent-token-that-is-long-enough")
+    monkeypatch.setenv("SIDEKICK_HINDSIGHT_URL", "")
+    monkeypatch.setenv("SIDEKICK_AI_DEFAULT_MODEL", "gpt-6-astra")
+    monkeypatch.setenv("SIDEKICK_AI_REASONING_EFFORT", "XHigh")
+    settings = AISettings.from_env()
+    assert settings.default_model == "gpt-6-astra"
+    assert settings.reasoning_effort == "xhigh"
+
+    monkeypatch.setenv("SIDEKICK_AI_REASONING_EFFORT", "extreme")
+    with pytest.raises(ValueError, match="SIDEKICK_AI_REASONING_EFFORT"):
+        AISettings.from_env()
+
+    monkeypatch.delenv("SIDEKICK_AI_DEFAULT_MODEL")
+    monkeypatch.delenv("SIDEKICK_AI_REASONING_EFFORT")
+    settings = AISettings.from_env()
+    assert settings.default_model is None and settings.reasoning_effort is None

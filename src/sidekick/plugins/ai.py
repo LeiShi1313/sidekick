@@ -125,6 +125,8 @@ class TelegramAI(TelegramCommand, metaclass=PluginMount):
             settings.agent_url,
             token=settings.agent_token,
             timeout=settings.request_timeout,
+            default_model=settings.default_model,
+            default_reasoning_effort=settings.reasoning_effort,
         )
         self._responder: AIResponder | None = None
         self._transport: TelegramChatTransport | None = None

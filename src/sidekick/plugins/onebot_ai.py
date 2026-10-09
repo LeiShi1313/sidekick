@@ -114,6 +114,8 @@ class OneBotAI(metaclass=PluginMount):
             self._settings.agent_url,
             token=self._settings.agent_token,
             timeout=self._settings.request_timeout,
+            default_model=self._settings.default_model,
+            default_reasoning_effort=self._settings.reasoning_effort,
         )
         self._store = AIStateRepository(self._settings.state_path)
         self._inbound_store = SQLiteInboundWorkStore(self._settings.state_path)

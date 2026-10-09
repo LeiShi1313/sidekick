@@ -144,6 +144,8 @@ class WeChatAI(metaclass=PluginMount):
             self._settings.agent_url,
             token=self._settings.agent_token,
             timeout=self._settings.request_timeout,
+            default_model=self._settings.default_model,
+            default_reasoning_effort=self._settings.reasoning_effort,
         )
         self._memory = (
             HindsightMemoryClient(
