@@ -3030,3 +3030,44 @@ async def test_poison_dream_document_dead_letters_without_blocking_later_history
         assert replayed.dead_lettered_at is None
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_chat_reply_does_not_adopt_a_same_numbered_local_parent(tmp_path):
+    # A 2022 message in this chat shares its ID with a channel post that a
+    # current member replies to from another chat.
+    unrelated = FakeMessage(
+        5708,
+        "Unrelated message from long ago",
+        sender_id=30,
+        date=datetime(2022, 1, 21, 2, 39, tzinfo=UTC),
+    )
+    external_reply = FakeMessage(1016612, "Agreed with the channel post")
+    external_reply.reply_to_msg_id = 5708
+    external_reply.reply_to = telegram_types.MessageReplyHeader(
+        reply_to_msg_id=5708,
+        reply_to_peer_id=telegram_types.PeerChannel(channel_id=987654321),
+        quote_text="Channel post excerpt",
+    )
+    source = FakeSource([external_reply], ancestors=[unrelated])
+    memory = FakeMemory()
+    store, scanner = await make_scanner(tmp_path, source, memory)
+    try:
+        result = await scanner.run_scope(-1001)
+
+        assert result.messages_retained == 1
+        assert (-1001, 5708) not in source.message_calls
+        (call,) = memory.retain_calls
+        assert call["episode"].document_id.endswith(":1016612")
+        (event,) = call["episode"].events
+        assert event.text == "Agreed with the channel post"
+        assert event.reply_to_source_id is None
+        assert event.metadata["quotation"] == {
+            "text": "Channel post excerpt",
+            "external": True,
+        }
+        assert event.metadata["external_reply"] == {
+            "source_id": "telegram:message:-1000987654321:5708",
+        }
+    finally:
+        await store.close()

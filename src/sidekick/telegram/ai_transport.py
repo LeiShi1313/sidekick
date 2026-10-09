@@ -32,6 +32,7 @@ from sidekick.chat.provenance import (
     message_fingerprint,
     observed_message_fingerprint,
 )
+from sidekick.chat.replies import ExternalReply, is_cross_chat_reply
 from sidekick.chat.transport import ChatPresentation, SentMessage
 
 
@@ -182,9 +183,63 @@ class TelegramChatTransport:
     def indeterminate_outbound_count(self) -> int:
         return self._generated_messages.indeterminate_count
 
+    EXTERNAL_REPLY_FETCH_TIMEOUT = 5.0
+    EXTERNAL_REPLY_MAX_CHARS = 2_000
+
     async def get_reply(self, message: Any) -> Any | None:
+        # A cross-chat reply ID names a message in another chat; looking it up
+        # here would return an unrelated local message with the same number.
+        if is_cross_chat_reply(message):
+            return None
         operation = getattr(message, "get_reply_message", None)
         return await operation() if callable(operation) else None
+
+    async def describe_external_reply(
+        self,
+        message: Any,
+        *,
+        fetch_source: bool,
+    ) -> ExternalReply | None:
+        if not is_cross_chat_reply(message):
+            return None
+        header = message.reply_to
+        origin = getattr(getattr(header, "reply_from", None), "from_name", None)
+        text = getattr(header, "quote_text", None)
+        if not (isinstance(text, str) and text.strip()):
+            text = (
+                await self._fetch_external_text(message, header)
+                if fetch_source
+                else None
+            )
+        return ExternalReply(
+            origin=origin.strip()[:256]
+            if isinstance(origin, str) and origin.strip()
+            else None,
+            text=text.strip()[: self.EXTERNAL_REPLY_MAX_CHARS]
+            if isinstance(text, str) and text.strip()
+            else None,
+        )
+
+    async def _fetch_external_text(self, message: Any, header: Any) -> str | None:
+        client = getattr(message, "client", None)
+        peer = getattr(header, "reply_to_peer_id", None)
+        source_id = getattr(header, "reply_to_msg_id", None)
+        if client is None or peer is None or not isinstance(source_id, int):
+            return None
+        try:
+            source = await asyncio.wait_for(
+                client.get_messages(peer, ids=source_id),
+                timeout=self.EXTERNAL_REPLY_FETCH_TIMEOUT,
+            )
+        except Exception as exc:
+            if self._logger is not None:
+                self._logger.debug(
+                    "Telegram external reply source unavailable (%s)",
+                    type(exc).__name__,
+                )
+            return None
+        text = getattr(source, "raw_text", None)
+        return text if isinstance(text, str) else None
 
     async def reply(
         self,

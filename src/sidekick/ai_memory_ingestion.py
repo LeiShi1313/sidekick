@@ -28,6 +28,7 @@ from sidekick.chat.commands import (
     MemoryBackfillCommand,
 )
 from sidekick.chat.identity import ExternalId, IdentityCodec
+from sidekick.chat.replies import same_chat_reply_id
 from sidekick.ai_memory import (
     MemoryClient,
     MemoryClientError,
@@ -1478,7 +1479,7 @@ class ChatMemoryIngestor:
                     occurred_at=_message_datetime(message),
                     mentioned_at=_message_datetime(message),
                     identity=identity,
-                    reply_to_message_id=message.reply_to_msg_id,
+                    reply_to_message_id=same_chat_reply_id(message),
                     mentioned_users=mentioned_users,
                     metadata=self._prompt_builder.resolve_metadata(message),
                 )
@@ -1506,7 +1507,7 @@ class ChatMemoryIngestor:
                 break
             seen.add(current.id)
             newest_first.append(current)
-            parent_id = current.reply_to_msg_id
+            parent_id = same_chat_reply_id(current)
             if parent_id is None:
                 break
             parent = known.get(parent_id)
