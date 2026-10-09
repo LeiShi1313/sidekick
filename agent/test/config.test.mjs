@@ -113,6 +113,13 @@ test("loads the standalone agent configuration without Sidekick names", () => {
 
   delete process.env.AI_IMAGE_MODEL;
   assert.equal(loadConfig().engine.imageModel, null);
+
+  assert.equal(config.engine.historyImageLimit, 4);
+  process.env.AI_SESSION_HISTORY_IMAGES = "0";
+  assert.equal(loadConfig().engine.historyImageLimit, 0);
+  process.env.AI_SESSION_HISTORY_IMAGES = "33";
+  assert.throws(() => loadConfig(), /AI_SESSION_HISTORY_IMAGES/);
+  delete process.env.AI_SESSION_HISTORY_IMAGES;
 });
 
 test("parses per-user tool grants with groups and fail-closed validation", () => {

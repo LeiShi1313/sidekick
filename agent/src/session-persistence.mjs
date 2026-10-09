@@ -127,7 +127,10 @@ function safeContentPart(part) {
     };
   }
   if (part.type === "image") {
-    return { type: "text", text: "[Image omitted after use]" };
+    if (typeof part.data !== "string" || typeof part.mimeType !== "string") {
+      return null;
+    }
+    return { type: "image", data: part.data, mimeType: part.mimeType };
   }
   if (part.type === "text") return { type: "text", text: part.text };
   return null;
@@ -150,7 +153,15 @@ export function sessionSafeMessage(message, state = {}) {
   const hasTrustedUserContent =
     copy.role === "user" && state.userMessageContent !== undefined;
   if (hasTrustedUserContent) {
-    copy.content = state.userMessageContent;
+    // Keep the turn's input images beside its host-built prompt so follow-up
+    // turns can still see them; limitHistoryImagesInPlace bounds the replay.
+    const images = Array.isArray(copy.content)
+      ? copy.content.filter((part) => part?.type === "image")
+      : [];
+    copy.content =
+      images.length > 0
+        ? [{ type: "text", text: state.userMessageContent }, ...images]
+        : state.userMessageContent;
   } else {
     copy = stripMessageInjectedContext(copy);
   }
@@ -171,6 +182,28 @@ export function sessionSafeMessage(message, state = {}) {
     }
   }
   return copy;
+}
+
+export const HISTORY_IMAGE_OMITTED =
+  "[Earlier image omitted to bound context; rely on its description if present.]";
+
+// Keeps only the newest `limit` user images in replayed history. Stored
+// sessions keep every image; only the model context of this run is bounded.
+export function limitHistoryImagesInPlace(messages, limit) {
+  let kept = 0;
+  for (let index = (messages?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    for (let part = message.content.length - 1; part >= 0; part -= 1) {
+      if (message.content[part]?.type !== "image") continue;
+      if (kept < limit) {
+        kept += 1;
+      } else {
+        message.content[part] = { type: "text", text: HISTORY_IMAGE_OMITTED };
+      }
+    }
+  }
+  return messages;
 }
 
 function messageText(content) {
